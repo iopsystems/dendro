@@ -1,0 +1,183 @@
+//! Opening a `rezolus` `.rez` v3 archive, whose stream column is named
+//! `sampler`.
+//!
+//! The fixture is built here with raw SQL rather than checked in as a binary,
+//! so the schema this crate promises to read is written down in a form a
+//! reader can check against the compatibility views in `db.rs`. If those views
+//! and this DDL ever disagree, that is the bug this file exists to catch.
+
+use std::collections::BTreeMap;
+
+use dendro::db::{Db, WalRow};
+use dendro::read;
+use dendro::segment::{Segment, SegmentEncoder};
+
+/// The v3 schema, verbatim: identical to v4 but for `segments.sampler` and
+/// `wal.sampler`, which v4 calls `stream`.
+const V3_SCHEMA: &str = "
+CREATE TABLE recordings(
+  id INTEGER PRIMARY KEY,
+  labels TEXT NOT NULL,
+  metadata TEXT NOT NULL,
+  complete INTEGER NOT NULL DEFAULT 0,
+  clock_anchor_wall_ns INTEGER NOT NULL
+);
+CREATE TABLE segments(
+  recording_id INTEGER NOT NULL REFERENCES recordings(id),
+  sampler TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  rows INTEGER NOT NULL,
+  first_ts INTEGER NOT NULL,
+  last_ts INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  PRIMARY KEY (recording_id, sampler, seq)
+);
+CREATE INDEX segments_by_time ON segments(recording_id, sampler, last_ts);
+CREATE TABLE wal(
+  recording_id INTEGER NOT NULL,
+  sampler TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  wall_offset INTEGER NOT NULL,
+  row BLOB NOT NULL,
+  PRIMARY KEY (recording_id, sampler, ts)
+);
+CREATE TABLE clock_offsets(
+  recording_id INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  offset_ns INTEGER NOT NULL
+);
+CREATE TABLE schema_version(version INTEGER NOT NULL);
+INSERT INTO schema_version(version) VALUES (3);
+";
+
+/// Reports the rows it was given without decoding them — enough to prove the
+/// WAL tail was found and keyed correctly, which is what the views affect.
+struct CountingEncoder;
+
+impl SegmentEncoder for CountingEncoder {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Segment {
+            bytes: format!("tail:{}", rows.len()).into_bytes(),
+            rows: rows.len() as u64,
+            first_ts: rows[0].ts,
+        }))
+    }
+}
+
+fn write_v3_fixture(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(V3_SCHEMA).unwrap();
+    conn.execute(
+        "INSERT INTO recordings(id, labels, metadata, complete, clock_anchor_wall_ns) \
+         VALUES (1, ?1, '{}', 1, 0)",
+        [r#"{"source":"weather"}"#],
+    )
+    .unwrap();
+    // One sealed segment...
+    conn.execute(
+        "INSERT INTO segments(recording_id, sampler, seq, rows, first_ts, last_ts, bytes) \
+         VALUES (1, 'temps', 0, 2, 10, 20, ?1)",
+        [b"sealed".to_vec()],
+    )
+    .unwrap();
+    // ...and two unsealed rows past it, plus one the watermark must exclude.
+    for (ts, live) in [(20u64, false), (30, true), (40, true)] {
+        conn.execute(
+            "INSERT INTO wal(recording_id, sampler, ts, wall_offset, row) VALUES (1, 'temps', ?1, 0, ?2)",
+            rusqlite::params![ts as i64, format!("row{ts}").into_bytes()],
+        )
+        .unwrap();
+        let _ = live;
+    }
+}
+
+#[test]
+fn a_legacy_v3_archive_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.rez");
+    write_v3_fixture(&path);
+
+    let db = Db::open(&path).expect("a v3 archive should open");
+    let recordings = read::read_archive(&db, &CountingEncoder).expect("read");
+    assert_eq!(recordings.len(), 1);
+
+    let rec = &recordings[0];
+    assert_eq!(
+        rec.labels,
+        BTreeMap::from([("source".to_string(), "weather".to_string())])
+    );
+    assert!(rec.complete);
+
+    let (stream, segments) = &rec.streams[0];
+    assert_eq!(stream, "temps");
+    // The sealed segment, then the live tail — and the tail holds the two rows
+    // past `last_ts`, not all three. The watermark has to survive the views.
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0], b"sealed");
+    assert_eq!(segments[1], b"tail:2");
+}
+
+/// The catalog is reachable through the views, not just the row data.
+#[test]
+fn a_legacy_v3_archive_answers_catalog_questions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.rez");
+    write_v3_fixture(&path);
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.all_streams(1).unwrap(), vec!["temps".to_string()]);
+    assert_eq!(db.read_segments(1, "temps").unwrap().len(), 1);
+    assert_eq!(db.live_wal(1, "temps").unwrap().len(), 2);
+}
+
+/// Writing is refused, and the message says why rather than leaking SQLite's
+/// `cannot modify segments because it is a view`.
+#[test]
+fn a_legacy_v3_archive_refuses_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.rez");
+    write_v3_fixture(&path);
+
+    let mut db = Db::open(&path).unwrap();
+    let err = db
+        .insert_wal_rows(
+            1,
+            &[WalRow {
+                stream: "temps".to_string(),
+                ts: 50,
+                wall_offset: 0,
+                row: b"row50".to_vec(),
+            }],
+        )
+        .expect_err("a v3 archive must not accept a write");
+    assert!(
+        err.contains("v3") && err.contains("readable but not writable"),
+        "the refusal should name the schema and the reason, got: {err}"
+    );
+    assert!(
+        !err.contains("because it is a view"),
+        "SQLite's own message should not reach the caller, got: {err}"
+    );
+}
+
+/// An unknown version is refused rather than guessed at: reading a catalog
+/// under the wrong shape yields wrong data, not an error.
+#[test]
+fn an_unknown_schema_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("future.rez");
+    write_v3_fixture(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE schema_version SET version = 99", [])
+        .unwrap();
+
+    let err = match Db::open(&path) {
+        Ok(_) => panic!("an unknown version must not open"),
+        Err(e) => e,
+    };
+    assert!(err.contains("99"), "got: {err}");
+}
