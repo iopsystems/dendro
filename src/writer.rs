@@ -107,7 +107,7 @@ type ErrorSlot = Arc<Mutex<Option<String>>>;
 /// tick. The point of a cap at all is that a shrunken working set drains back
 /// to the filesystem gradually; a full `VACUUM` would return the same space in
 /// one step and stall the recording for seconds doing it.
-const RECLAIM_PAGES_PER_PASS: u32 = 100;
+pub const RECLAIM_PAGES_PER_PASS: u32 = 100;
 
 /// Reclaim only once the free list exceeds this fraction of the file, as a
 /// divisor: `freelist_count * RECLAIM_FREELIST_DIVISOR > page_count`.
@@ -117,7 +117,7 @@ const RECLAIM_PAGES_PER_PASS: u32 = 100;
 /// need. This fires only when the working set genuinely shrank and left the
 /// file many times larger than its contents, which is the one situation where
 /// handing pages back is worth anything.
-const RECLAIM_FREELIST_DIVISOR: u32 = 10;
+pub const RECLAIM_FREELIST_DIVISOR: u32 = 10;
 
 /// Handle to the writer thread. Every fallible hand-off reports the writer's
 /// stored error, in the required order: send-failure → join → report.
@@ -345,8 +345,8 @@ impl Archive {
     /// The synchronous shape callers had before `finalize` was split: the
     /// handle can only *queue* completion now, since the archive owns the
     /// thread, so anything that reads the file straight afterwards has to join
-    /// too. Mirrors `RezStream::finalize` in the recorder.
-    #[cfg(test)]
+    /// too.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn finalize_single(
         mut self,
         writer: RecordingWriter,
@@ -755,7 +755,8 @@ fn writer_loop(
 /// noticeable fraction of the file. See the two constants for why the guard is
 /// there: without it this would run every pass for no gain, and without the
 /// reclaim a buffer that shrank would keep its high-water size forever.
-fn reclaim_if_fragmented(db: &Db) -> Result<(), String> {
+#[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
+pub fn reclaim_if_fragmented(db: &Db) -> Result<(), String> {
     if should_reclaim(
         db.pragma_u32("freelist_count")?,
         db.pragma_u32("page_count")?,
@@ -768,7 +769,8 @@ fn reclaim_if_fragmented(db: &Db) -> Result<(), String> {
 /// The guard, as a decision rather than a branch — because it is a decision
 /// about COST, not about outcome: reclaiming an unfragmented file is a no-op
 /// either way, so the only way to test the threshold is to ask it directly.
-fn should_reclaim(free_pages: u32, pages: u32) -> bool {
+#[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
+pub fn should_reclaim(free_pages: u32, pages: u32) -> bool {
     free_pages.saturating_mul(RECLAIM_FREELIST_DIVISOR) > pages
 }
 

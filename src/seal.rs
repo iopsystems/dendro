@@ -185,7 +185,7 @@ impl SegmentAccount {
     }
 
     /// The row and age targets the *current* open segment seals at.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn targets(&self) -> (usize, Duration) {
         (self.max_rows, self.max_age)
     }

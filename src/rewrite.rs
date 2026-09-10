@@ -255,3 +255,54 @@ pub fn project_segment_columns(
     }
     Ok(Some(buf))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+
+    /// Every table in the schema is either copied by
+    /// [`copy_recordings_into`] or deliberately not carried, and this
+    /// test is what makes that a decision rather than an oversight.
+    ///
+    /// The weakness of copying instead of deleting is exactly here: a delete
+    /// preserves whatever it does not remove, so schema growth is free, while
+    /// a copy only carries what it was told to. Adding a table to the schema
+    /// without teaching the copy about it would silently drop that table from
+    /// every combined, filtered or dumped archive — a data-loss bug with no
+    /// error and no symptom until someone queries for what is missing.
+    ///
+    /// So: adding a table here fails this test. Either copy it in
+    /// [`copy_recordings_into`] or add it to `NOT_CARRIED` with the reason.
+    #[test]
+    fn every_schema_table_is_either_copied_or_deliberately_dropped() {
+        /// Carried across by [`copy_recordings_into`].
+        const COPIED: &[&str] = &["recordings", "segments", "wal", "clock_offsets"];
+        /// Not carried, and correct not to be.
+        const NOT_CARRIED: &[&str] = &[
+            // Written by `Db::create` for the destination itself; copying
+            // the source's would say nothing new and could disagree.
+            "schema_version",
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema.dendro");
+        let db = Db::create(&path).unwrap();
+
+        let mut actual = db.user_table_names().unwrap();
+        actual.sort();
+        let mut expected: Vec<String> = COPIED
+            .iter()
+            .chain(NOT_CARRIED)
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+
+        assert_eq!(
+            actual, expected,
+            "the schema changed. [`copy_recordings_into`] copies a fixed set of tables, so a \
+             new one is silently dropped from every combined/filtered/dumped archive until it \
+             is handled. Copy it, or list it in NOT_CARRIED with the reason."
+        );
+    }
+}
