@@ -27,6 +27,23 @@ written*, by a separate process, with no coordination: the rows are already
 committed, and `read_archive` materializes them into an in-memory segment. A
 stream still inside its first seal period is not invisible.
 
+![The write path](docs/write-path.svg)
+
+*One row, from a caller's append to a sealed segment. Rounded runs, square
+holds; the segmented glyph on the WAL is a history you can look back over, the
+single cell before it is a hand-off with capacity 1 and no history at all.
+Dashed means outside dendro — which is why the encoder sits in its own dashed
+"yours" box. Pink follows unsealed bytes, orange sealed.*
+
+In words: the caller appends rows through `SourceWriter::wal`, which hands them
+to the writer thread over a channel bounded at 1 — the block is the
+backpressure. The writer commits the batch as one transaction, so the rows are
+durable and readable immediately. `SealPolicy` then decides from rows, bytes and
+age whether the open segment is due; when it is, the caller's `SegmentEncoder`
+turns that stream's live rows into parquet, the segment is inserted, and only
+then is the WAL pruned — only for that stream, and only up to the sealed
+`last_ts`.
+
 ## Why SQLite
 
 The container needs three things that a directory or a tar does not give you:
@@ -93,6 +110,19 @@ The prune that follows a seal runs **outside** the seal transaction, so the
 `wal` table routinely still holds rows a sealed segment already covers. The
 watermark is what makes that harmless, which in turn is what lets the prune be
 a pure background optimisation with no correctness role.
+
+![The read path](docs/read-path.svg)
+
+*Why an archive reads correctly while it is being written. Same encoding as the
+write path. The tail is solid, not dashed: it is dendro's, it just never reaches
+the file.*
+
+In words: a stream's sealed segments come back in `seq` order. Its live WAL rows
+are those past the watermark — `ts > MAX(last_ts)` over that stream's own
+segments, in its own source — and those are handed to the same `SegmentEncoder`
+the writer uses, producing one more segment that exists only in memory. The
+splice puts it last. What the caller receives is parquet bytes, openable with
+any parquet reader.
 
 ## Staleness of a copy
 

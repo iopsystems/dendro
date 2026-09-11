@@ -80,6 +80,21 @@ Plus five that are not containers:
 | **catalog** | The SQLite tables describing sources, streams and segments. |
 | **encoder** | Your `SegmentEncoder`. The only thing that knows what a row means. |
 
+![The dendro model](docs/model.svg)
+
+*What nests, and what is only a shared key. Left: the model, as a reader should
+hold it. Bottom: how it is actually stored. **Unfilled means nothing stores it**
+— the one claim most readers get wrong is that a stream has no table of its own;
+it is a column that rows in `segments` and `wal` carry, and the reader is what
+gathers them. A filled tint names the table that stores that concept; a
+segmented glyph is a history; dotted edges read "stored as".*
+
+In words: an archive is one file. It holds sources, each naming some streams. A
+stream is many segments end to end, and a segment holds rows. In the catalog,
+a source is a row in `sources`, a segment is a row in `segments` with its
+parquet in the `bytes` column, and an unsealed row is a row in `wal`. A stream
+is the `stream` column of the last two, and nothing else.
+
 A source is a *namespace*, not a box. It is what makes a stream name
 unambiguous, and what gives its rows a shared wall-clock anchor — timestamps are
 `anchor + monotonic elapsed`, so one source is one clock. Nothing is stored "in"
@@ -140,4 +155,5 @@ the internal `.rez` v3 format. Archives written by that version still open
 read-only; see `LEGACY_SCHEMA_VERSION`.
 
 The design reasoning, including what was measured to arrive at it, is in
-[DESIGN.md](DESIGN.md).
+[DESIGN.md](DESIGN.md). The diagrams, how they are generated, and what their
+visual channels mean are in [docs/](docs/README.md).

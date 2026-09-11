@@ -49,3 +49,21 @@ jobs:
       # actually using the reader build.
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo test --no-default-features
+
+  # The diagrams are derived from the crate's own structures, so a rename they
+  # claim either shows up in the regenerated output or breaks the generator.
+  # This job is what makes that a build failure rather than a stale picture.
+  diagrams:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y graphviz
+      - run: docs/regen.sh
+      - name: Diagrams are up to date
+        run: |
+          if ! git diff --exit-code -- docs/; then
+            echo "::error::docs/ is stale - run docs/regen.sh and commit the result" >&2
+            exit 1
+          fi
