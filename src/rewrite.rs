@@ -90,6 +90,25 @@ pub fn copy_sources_into(
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
 ) -> Result<usize, String> {
+    // ONE snapshot over every read of the source. The destination transaction
+    // is the caller's and is on another connection, so this only bounds what we
+    // read.
+    //
+    // Without it the source can move underneath a copy that takes four
+    // separate reads of it - sources, streams, segments, live WAL. A seal
+    // landing mid-copy is visible to some of those and not others, and
+    // retention landing mid-copy can evict a segment between the query that
+    // selected it and the read that copies its bytes. `read_snapshot`'s own
+    // doc names that second one; this is the path it was describing.
+    src.read_snapshot(|src| copy_sources_snapshotted(src, tx, spec, encoder))
+}
+
+fn copy_sources_snapshotted(
+    src: &Db,
+    tx: &Tx<'_>,
+    spec: &CopySpec<'_>,
+    encoder: &dyn SegmentEncoder,
+) -> Result<usize, String> {
     let sources = src.read_sources()?;
     let mut copied = 0usize;
     for rec in &sources {

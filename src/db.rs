@@ -169,6 +169,38 @@ const LIVE_WAL_PREDICATE: &str = "source_id = ?1 AND stream = ?2 \
             WHERE source_id = ?1 AND stream = ?2), \
            0)";
 
+/// The largest timestamp this container can store.
+///
+/// SQLite integers are signed 64-bit, so a `u64` above this cannot round-trip
+/// through a column and — much worse — compares as NEGATIVE in every `ORDER BY`
+/// and every `<`/`>` the catalog runs. For epoch nanoseconds this is the year
+/// 2262; for a caller using some other clock domain it is a real bound, and one
+/// it should hear about rather than discover.
+pub const MAX_TIMESTAMP: u64 = i64::MAX as u64;
+
+/// A timestamp on its way INTO the archive. Rejected rather than clamped: a
+/// stored value that silently became something else is corruption, and the
+/// caller is the only one who can say what it meant.
+fn stored_ts(v: u64, what: &str) -> Result<i64, String> {
+    if v > MAX_TIMESTAMP {
+        return Err(format!(
+            "{what} is {v}, above the largest timestamp this container can \
+             store ({MAX_TIMESTAMP}). SQLite integers are signed, so a larger \
+             value would compare as negative in every ordering and range the \
+             catalog runs."
+        ));
+    }
+    Ok(v as i64)
+}
+
+/// A timestamp used as a query BOUND. Clamped rather than rejected: the
+/// unbounded edge is spelled `u64::MAX`, whose cast is `-1`, and a bound that
+/// silently selects nothing is how `evict_before(u64::MAX)` came to mean
+/// "evict nothing at all".
+fn ts_bound(v: u64) -> i64 {
+    v.min(MAX_TIMESTAMP) as i64
+}
+
 /// An open handle on a dendro archive.
 pub struct Db {
     conn: Connection,
@@ -862,14 +894,9 @@ impl Db {
                    AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
             )
             .map_err(|e| format!("failed to query segments for {stream}: {e}"))?;
-        // Clamped, not cast: `u64::MAX as i64` is -1, which would silently
+        // `ts_bound`, not a cast: `u64::MAX as i64` is -1, which would silently
         // select nothing at all for an unbounded upper edge.
-        let params = rusqlite::params![
-            source_id,
-            stream,
-            start.min(i64::MAX as u64) as i64,
-            end.min(i64::MAX as u64) as i64,
-        ];
+        let params = rusqlite::params![source_id, stream, ts_bound(start), ts_bound(end),];
         Self::collect_segments(&mut stmt, params, stream)
     }
 
@@ -889,6 +916,15 @@ impl Db {
         &self,
         f: impl FnOnce(&Self) -> Result<T, String>,
     ) -> Result<T, String> {
+        // Re-entrant: a caller already inside a snapshot keeps that one rather
+        // than failing on SQLite's "cannot start a transaction within a
+        // transaction". `read_archive` wraps a whole source and then calls
+        // `stream_segments`, which wraps a stream, and the outer snapshot is
+        // the one that matters - it is what makes the streams consistent with
+        // each other as well as with themselves.
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
         self.conn
             .execute_batch("BEGIN DEFERRED")
             .map_err(|e| format!("failed to open a read snapshot: {e}"))?;
@@ -1154,7 +1190,7 @@ impl Db {
         self.conn
             .execute(
                 "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
-                rusqlite::params![source_id, stream, upto_ts as i64],
+                rusqlite::params![source_id, stream, ts_bound(upto_ts)],
             )
             .map_err(|e| format!("failed to prune WAL for {stream}: {e}"))
     }
@@ -1226,7 +1262,7 @@ impl Db {
                 wal_rows: 0,
             };
             for stream in &streams {
-                let params = rusqlite::params![source_id, stream, cutoff_ts as i64];
+                let params = rusqlite::params![source_id, stream, ts_bound(cutoff_ts)];
                 total.segments += tx
                     .tx
                     .execute(
@@ -1302,7 +1338,7 @@ impl Db {
         cutoff_ts: u64,
     ) -> Result<Evicted, String> {
         self.transaction(|tx| {
-            let params = rusqlite::params![source_id, cutoff_ts as i64];
+            let params = rusqlite::params![source_id, ts_bound(cutoff_ts)];
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
@@ -1533,7 +1569,7 @@ impl Tx<'_> {
             stmt.execute(rusqlite::params![
                 source_id,
                 r.stream,
-                r.ts as i64,
+                stored_ts(r.ts, "a WAL row timestamp")?,
                 r.wall_offset,
                 r.row,
             ])
@@ -1552,7 +1588,11 @@ impl Tx<'_> {
         self.tx
             .execute(
                 "INSERT INTO clock_offsets(source_id, ts, offset_ns) VALUES (?1, ?2, ?3)",
-                rusqlite::params![source_id, ts as i64, offset_ns],
+                rusqlite::params![
+                    source_id,
+                    stored_ts(ts, "a clock offset timestamp")?,
+                    offset_ns
+                ],
             )
             .map_err(|e| format!("failed to insert clock offset: {e}"))?;
         Ok(())
@@ -1579,7 +1619,11 @@ fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64, String
     conn.execute(
         "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns) \
          VALUES (?1, ?2, 0, ?3)",
-        rusqlite::params![labels, metadata, meta.clock_anchor_wall_ns as i64],
+        rusqlite::params![
+            labels,
+            metadata,
+            stored_ts(meta.clock_anchor_wall_ns, "a source clock anchor")?
+        ],
     )
     .map_err(|e| format!("failed to insert source: {e}"))?;
     Ok(conn.last_insert_rowid())
@@ -1604,8 +1648,8 @@ fn insert_segment_sql(
             stream,
             seq as i64,
             meta.rows as i64,
-            meta.first_ts as i64,
-            meta.last_ts as i64,
+            stored_ts(meta.first_ts, "a segment first_ts")?,
+            stored_ts(meta.last_ts, "a segment last_ts")?,
             bytes,
         ],
     )
@@ -2001,6 +2045,114 @@ mod tests {
             vec!["cpu_usage", "drivehealth"],
             "all_streams() must see it — this is the whole point of the accessor"
         );
+    }
+
+    /// `evict_before(u64::MAX)` means "evict everything", and used to mean the
+    /// exact opposite.
+    ///
+    /// `u64::MAX as i64` is -1, so `last_ts < -1` matched nothing and the call
+    /// returned `Ok(Evicted { 0, 0 })`. A retention loop written against the
+    /// obvious sentinel silently never evicted, and the archive grew forever.
+    #[test]
+    fn an_unbounded_cutoff_evicts_everything_rather_than_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        db.insert_segment(
+            id,
+            "s",
+            0,
+            &SegmentMeta {
+                rows: 1,
+                first_ts: 10,
+                last_ts: 20,
+            },
+            b"x",
+        )
+        .unwrap();
+        db.insert_wal_rows(
+            id,
+            &[WalRow {
+                stream: "s".to_string(),
+                ts: 30,
+                wall_offset: 0,
+                row: vec![1],
+            }],
+        )
+        .unwrap();
+
+        let evicted = db.evict_before(id, u64::MAX).unwrap();
+        assert_eq!(evicted.segments, 1);
+        assert_eq!(evicted.wal_rows, 1);
+        assert!(db.all_streams(id).unwrap().is_empty());
+    }
+
+    /// A timestamp too large to round-trip through a signed column is refused,
+    /// not silently stored as something else.
+    ///
+    /// Stored and clamped are different answers on purpose: a query BOUND
+    /// clamps, because `u64::MAX` there means "no upper edge" and the caller
+    /// gets what it asked for. A stored VALUE cannot be clamped without
+    /// becoming a different timestamp than the one handed in.
+    #[test]
+    fn a_timestamp_that_cannot_round_trip_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+
+        let too_big = MAX_TIMESTAMP + 1;
+        let err = db
+            .insert_wal_rows(
+                id,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts: too_big,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .expect_err("a WAL row above MAX_TIMESTAMP must not be accepted");
+        assert!(err.contains("above the largest timestamp"), "got: {err}");
+
+        let err = db
+            .insert_segment(
+                id,
+                "s",
+                0,
+                &SegmentMeta {
+                    rows: 1,
+                    first_ts: 0,
+                    last_ts: too_big,
+                },
+                b"x",
+            )
+            .expect_err("a segment span above MAX_TIMESTAMP must not be accepted");
+        assert!(err.contains("above the largest timestamp"), "got: {err}");
+
+        // The boundary itself is fine, and round-trips.
+        db.insert_wal_rows(
+            id,
+            &[WalRow {
+                stream: "s".to_string(),
+                ts: MAX_TIMESTAMP,
+                wall_offset: 0,
+                row: vec![1],
+            }],
+        )
+        .unwrap();
+        assert_eq!(db.read_wal(id, "s").unwrap()[0].ts, MAX_TIMESTAMP);
     }
 
     /// Retention can be per stream, and a pass names the streams it touches.

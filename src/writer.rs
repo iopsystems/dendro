@@ -81,7 +81,6 @@ enum Msg {
     Shutdown,
     /// Reply once everything queued ahead of this has been committed. Carries
     /// no data and changes nothing — see [`SourceWriter::sync`].
-    #[cfg(any(test, feature = "test-support"))]
     Sync(SyncSender<()>),
     /// Answer with how many transactions the writer's connection has
     /// committed. A barrier as well as a question, exactly as `Sync` is: the
@@ -490,12 +489,15 @@ impl SourceWriter {
     /// inherent to an asynchronous writer and harmless. Tests do assert it, and
     /// without a barrier they race the writer. Give this a `cfg`-free home the
     /// moment a real caller needs to see its own last tick.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn sync(&mut self) -> Result<(), String> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::Sync(tx))?;
-        let _ = rx.recv();
-        Ok(())
+        // A closed reply channel means the writer exited before it reached this
+        // barrier, which is exactly the case a caller is syncing to find out
+        // about. Discarding it — `let _ = rx.recv()` — made `sync` report
+        // success for work that was never committed, so a failed seal reached
+        // the caller as `Ok(())` and only surfaced on some later send.
+        rx.recv().map_err(|_| take_writer_error(&self.err))
     }
 
     /// Record this source's final clock offset and mark it complete.
@@ -655,7 +657,6 @@ fn writer_loop(
         match received {
             // Nothing to do but answer: arriving here at all means every
             // message queued before it has already been handled.
-            #[cfg(any(test, feature = "test-support"))]
             Ok(Msg::Sync(reply)) => {
                 let _ = reply.send(());
             }
@@ -824,10 +825,12 @@ fn seal_batch(
             // already sealed is not an error worth failing the source over.
             continue;
         };
-        // `last_ts`/`wall_offset`: always the raw WAL span's own last row,
-        // — an encoder's dropped run is always a LEADING one (retention
-        // removes a prefix, never punches a hole), so the last row is never
-        // itself dropped. `first_ts`/`rows` are NOT this simple — see below.
+        // The raw span's last row. This is the UPPER BOUND the encoder's
+        // answer is checked against, not a catalog fact: it says how far the
+        // encoder was allowed to claim coverage, and nothing more. It used to
+        // be written into the catalog and used for the prune, on the reasoning
+        // that a dropped run is always a leading one — which is circular, since
+        // the prune is what destroyed the evidence when it was not.
         let (last_ts, wall_offset) = (last.ts, last.wall_offset);
         let Some(tail) = encoder
             .encode(&stream, &rows)
@@ -835,9 +838,37 @@ fn seal_batch(
         else {
             continue;
         };
-        // `>=`, so a later stream wins a tie.
-        if observation.is_none_or(|(seen, _)| last_ts >= seen) {
-            observation = Some((last_ts, wall_offset));
+        // The encoder is a trust boundary, so check what came back before it
+        // reaches the catalog. Every one of these is cheap and every one of
+        // them, unchecked, is silent: a segment claiming coverage it does not
+        // have makes the prune delete rows that are in no segment, and an
+        // inverted or invented span makes the segment invisible to every range
+        // query while still advancing the watermark.
+        //
+        // The rule is that an encoder may drop rows but may not INVENT them:
+        // its span has to sit inside the span it was handed.
+        let first_in = rows.first().expect("checked non-empty above").ts;
+        if tail.rows == 0
+            || tail.rows > rows.len() as u64
+            || tail.first_ts > tail.last_ts
+            || tail.first_ts < first_in
+            || tail.last_ts > last_ts
+        {
+            return Err(format!(
+                "the encoder returned a segment for {stream} that does not \
+                 describe the rows it was given: it claims {} row(s) over \
+                 [{}, {}], from {} row(s) over [{first_in}, {last_ts}]",
+                tail.rows,
+                tail.first_ts,
+                tail.last_ts,
+                rows.len()
+            ));
+        }
+        // `>=`, so a later stream wins a tie. From the SEGMENT's last row: an
+        // observation paired with a timestamp no segment covers is one a reader
+        // cannot line up against anything.
+        if observation.is_none_or(|(seen, _)| tail.last_ts >= seen) {
+            observation = Some((tail.last_ts, wall_offset));
         }
         // Bumped before the commit, which is safe only because the writer
         // exits on its first error: no later batch ever reuses this map.
@@ -849,18 +880,20 @@ fn seal_batch(
             stream,
             seq: *seq,
             meta: SegmentMeta {
-                // From `tail`, NOT `rows.len()`/`rows.first().ts`: an
-                // encoder may drop leading rows it cannot decode on their
-                // own, and those are real WAL rows that never reach the
-                // segment. The raw WAL span would then catalog a row count and
-                // a start the catalog does not agree with the bytes being
-                // inserted. For an encoder that never drops a row this is the
-                // same number either way, which is exactly why taking it from
-                // the segment costs nothing and taking it from the input is a
-                // latent bug.
+                // ALL THREE from `tail`, never from the input rows. An encoder
+                // may drop rows it cannot decode on their own, and those are
+                // real WAL rows that never reach the segment; cataloguing the
+                // input's span would claim coverage the bytes do not have.
+                //
+                // `last_ts` is the one that used to come from the input, and it
+                // was the expensive one: it is what the WAL prune below and the
+                // read watermark are both computed from, so a dropped trailing
+                // row was deleted from the WAL, absent from the segment, and
+                // hidden by a watermark claiming to cover it. Taken from the
+                // segment, that row simply stays live and seals next time.
                 rows: tail.rows,
                 first_ts: tail.first_ts,
-                last_ts,
+                last_ts: tail.last_ts,
             },
             bytes: tail.bytes,
         });

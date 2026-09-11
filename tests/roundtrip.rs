@@ -83,6 +83,7 @@ impl SegmentEncoder for ReadingEncoder {
             bytes: encode_batch(schema, &batch)?,
             rows: rows.len() as u64,
             first_ts: ts[0],
+            last_ts: ts[ts.len() - 1],
         }))
     }
 }

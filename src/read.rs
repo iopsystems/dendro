@@ -36,11 +36,26 @@ pub struct SourceSegments {
 ///   (`ts > MAX(last_ts)` of that stream's own segments) is what guarantees the
 ///   seam has no duplicate row, so nothing here has to de-duplicate.
 pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>, String> {
+    db.read_snapshot(|db| read_archive_snapshotted(db, encoder))
+}
+
+/// ONE snapshot for the whole archive, so the streams are consistent with each
+/// other as well as with themselves.
+///
+/// Per stream, the hazard is that a seal landing between the segment read and
+/// the WAL read puts rows in neither - the segment is missing from the first,
+/// and the watermark it installed shadows the same rows in the second. Across
+/// streams, it is that two streams answer from different instants, which makes
+/// a single archive internally inconsistent for anything that joins them.
+fn read_archive_snapshotted(
+    db: &Db,
+    encoder: &dyn SegmentEncoder,
+) -> Result<Vec<SourceSegments>, String> {
     let mut out = Vec::new();
     for src in db.read_sources()? {
         let mut streams = Vec::new();
         for stream in db.all_streams(src.id)? {
-            let segments = stream_segments(db, src.id, &stream, encoder)?;
+            let segments = stream_segments_snapshotted(db, src.id, &stream, encoder)?;
             // Only reachable if a stream's every WAL row was pruned without its
             // segment landing — which the seal ordering rules out. A stream
             // with no bytes has nothing to open, so skip rather than hand the
@@ -69,6 +84,25 @@ pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceS
 /// still holds rows a sealed segment already covers; replaying the raw table
 /// would splice those rows in a second time.
 pub fn stream_segments(
+    db: &Db,
+    source_id: i64,
+    stream: &str,
+    encoder: &dyn SegmentEncoder,
+) -> Result<Vec<Vec<u8>>, String> {
+    db.read_snapshot(|db| stream_segments_snapshotted(db, source_id, stream, encoder))
+}
+
+/// [`stream_segments`] without opening a snapshot, for a caller that already
+/// holds one.
+///
+/// **The snapshot is not an optimisation.** Reading the segments and then the
+/// live WAL as two statements leaves a window in which a seal commits between
+/// them: the segment is missing from the first read, and the watermark it
+/// installed shadows those same rows in the second, so they appear in neither
+/// half and the reader loses them silently. The prune is not even required -
+/// the watermark alone is enough. One snapshot is what makes
+/// `MAX(last_ts)` and the rows it shadows the same instant's facts.
+fn stream_segments_snapshotted(
     db: &Db,
     source_id: i64,
     stream: &str,

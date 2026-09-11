@@ -11,24 +11,34 @@ use parquet::file::properties::WriterProperties;
 
 use crate::db::WalRow;
 
-/// One sealed segment: parquet bytes plus the two catalog facts that cannot be
-/// recovered from the WAL rows alone.
+/// One sealed segment: parquet bytes plus the catalog facts about what is in
+/// them.
 ///
-/// `rows` and `first_ts` come from the SEGMENT, not from the input slice.
-/// An encoder is free to drop leading rows — a caller whose row shape needs a
-/// schema anchor may not be able to encode rows that precede the first one
-/// carrying it — and cataloguing `rows.len()` against bytes that hold fewer
-/// would leave the catalog disagreeing with the data.
+/// **Every field describes the SEGMENT, not the rows it was given.** An encoder
+/// is free to drop rows it cannot encode - one whose rows reference a schema
+/// anchor that retention has evicted has no other option - and the container
+/// has to catalog what was actually written or the catalog and the bytes
+/// disagree.
 ///
-/// `last_ts` is deliberately absent: the caller already has it from the last
-/// `WalRow` it passed in, and an encoder that dropped rows only ever drops a
-/// LEADING run, so the last input row is always in the segment. Returning it
-/// here would just be a second place for it to drift from the one in use.
+/// `last_ts` matters most, because it is what the WAL prune and the read
+/// watermark are computed from. Taking it from the INPUT instead, as this
+/// crate did until it was measured, deletes rows the segment does not contain:
+/// they are gone from the WAL, absent from the bytes, and shadowed by a
+/// watermark that claims coverage up to a timestamp nothing holds. Reporting it
+/// here means a dropped trailing row simply stays live and is sealed by the
+/// next batch.
+///
+/// The writer validates these against the rows it supplied - see
+/// `writer::seal_batch`. An encoder cannot invent coverage it was not given.
 #[derive(Debug, PartialEq)]
 pub struct Segment {
     pub bytes: Vec<u8>,
+    /// How many rows are in `bytes`.
     pub rows: u64,
+    /// The timestamp of the first row in `bytes`.
     pub first_ts: u64,
+    /// The timestamp of the last row in `bytes`.
+    pub last_ts: u64,
 }
 
 /// Turns a stream's WAL rows into one parquet segment.

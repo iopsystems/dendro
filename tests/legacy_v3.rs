@@ -69,6 +69,7 @@ impl SegmentEncoder for CountingEncoder {
             bytes: format!("tail:{}", rows.len()).into_bytes(),
             rows: rows.len() as u64,
             first_ts: rows[0].ts,
+            last_ts: rows[rows.len() - 1].ts,
         }))
     }
 }
