@@ -26,11 +26,12 @@ pub const STAGGER_BUCKETS: u64 = 64;
 /// within it. Named rather than spelled `""` at each call site so the reason
 /// travels with the value.
 #[cfg_attr(not(test), allow(dead_code))]
+#[doc(hidden)]
 pub const SINGLE_SOURCE_KEY: &str = "";
 
 /// When an open segment is due to be sealed. Byte-first: the byte cap is the
 /// one that bounds both the builder's memory footprint and the encoder's input,
-/// and it is maintained O(1) per entry by `TableBuilder::push_row`.
+/// and it is maintained O(1) per entry by the caller as it stages a row.
 ///
 /// **The age bound exists for the kill-loss window, not finalize cost.** The
 /// byte and row caps alone bound finalize time and memory — a slow stream's
@@ -88,7 +89,7 @@ impl Default for SealPolicy {
 /// Everything the seal decision reads about an open segment, and none of the
 /// rows.
 ///
-/// **Separate from `TableBuilder` because only one of the two containers keeps
+/// **Separate from the caller's own buffering because only one of the two keeps
 /// the rows.** A buffering writer encodes the builder it has been filling; this one
 /// writes each row to the WAL and rebuilds the table from it at seal time, so
 /// it has nothing to ask `rows()` or `approx_bytes()` of. Both must still seal
@@ -148,7 +149,7 @@ impl SegmentAccount {
     }
 
     /// Account one appended row. `bytes` is roughly the encoded size of that
-    /// row, which is exactly what `TableBuilder::push_row` would have charged.
+    /// row, which is exactly what the caller's own row accounting would have charged.
     pub fn add_row(&mut self, bytes: usize) {
         self.rows += 1;
         self.approx_bytes += bytes;
@@ -295,7 +296,7 @@ pub fn stagger_bucket(stream: &str, source_key: &str) -> u64 {
 /// Whether two source keys draw the SAME stagger bucket for EVERY stream.
 ///
 /// Not a string comparison — an exact statement about
-/// [`stagger_bucket`](stagger_bucket)'s algebra. The absorb is affine in each
+/// [`stagger_bucket`]'s algebra. The absorb is affine in each
 /// byte modulo `STAGGER_BUCKETS`, and `x ^ 0x20` is `x + 32 (mod 64)` with
 /// `51 * 32 == 32 (mod 64)`, so flipping bit 5 of one absorbed byte XORs 0x20
 /// through the whole chain and flipping it in a second byte cancels that out.

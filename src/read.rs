@@ -126,10 +126,17 @@ fn stream_segments_snapshotted(
 
 /// Where one stream's segment bytes come from, resolved lazily.
 ///
+/// **Nothing in this crate produces one.** It is here for a caller doing its
+/// own lazy resolution — typically one that needs a stream's names at open and
+/// its bytes only when that stream is actually read.
+///
+/// Named for the bytes rather than the origin because `source` already means
+/// something else here: one producer, one clock domain, one label set.
+///
 /// A caller typically needs one segment per stream at open — enough to learn
 /// what the stream holds — and the catalog answers everything else. Deferring
 /// the rest until a stream is actually read is the difference worth having.
-pub enum SegmentSource {
+pub enum SegmentBytes {
     Bytes(Vec<Vec<u8>>),
     Db {
         path: PathBuf,
@@ -152,13 +159,13 @@ pub enum SegmentSource {
     },
 }
 
-impl SegmentSource {
+impl SegmentBytes {
     /// Every segment of this stream, materialized. Call it when the stream is
     /// actually read.
     pub fn all(&self, encoder: &dyn SegmentEncoder) -> Result<Vec<Vec<u8>>> {
         match self {
-            SegmentSource::Bytes(b) => Ok(b.clone()),
-            SegmentSource::Db {
+            SegmentBytes::Bytes(b) => Ok(b.clone()),
+            SegmentBytes::Db {
                 path,
                 source_id,
                 stream,
@@ -169,7 +176,7 @@ impl SegmentSource {
                 let db = Db::open_read_only(path)?;
                 stream_segments(&db, *source_id, stream, encoder)
             }
-            SegmentSource::SharedDb {
+            SegmentBytes::SharedDb {
                 db,
                 source_id,
                 stream,

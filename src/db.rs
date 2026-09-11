@@ -79,9 +79,11 @@ const _: () = assert!(
 
 /// The schema this build writes. Written once at creation.
 ///
-/// v4 renamed the stream column of `segments` and `wal` from `stream` to
-/// `stream`: the container stores streams of rows, and what a caller puts in
-/// one is its own business. v3 files still open — see [`LEGACY_SCHEMA_VERSION`].
+/// v4 renamed the stream column of `segments` and `wal` from `sampler` to
+/// `stream`, and `recordings`/`recording_id` to `sources`/`source_id`. The
+/// container stores streams of rows grouped by source, and what a caller puts
+/// in one is its own business. v3 files still open — see
+/// [`LEGACY_SCHEMA_VERSION`].
 const SCHEMA_VERSION: i64 = 4;
 
 /// The pre-`dendro` schema, written by `rezolus` when this container was still
@@ -204,6 +206,18 @@ fn stored_ts(v: u64, what: &'static str) -> Result<i64> {
 /// "evict nothing at all".
 fn ts_bound(v: u64) -> i64 {
     v.min(MAX_TIMESTAMP) as i64
+}
+
+/// How an archive's pages stand. See [`Db::page_stats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageStats {
+    /// Pages in the file.
+    pub pages: u32,
+    /// Of those, how many are on the free list: reusable, but not yet returned
+    /// to the filesystem.
+    pub free: u32,
+    /// Bytes per page, welded into the file at creation.
+    pub page_size: u32,
 }
 
 /// An open handle on a dendro archive.
@@ -491,7 +505,7 @@ impl Db {
     /// the sidecar is a separate file that a caller holding one archive blob
     /// never has — and it is not where an archive's own liveness lives: unsealed
     /// rows are rows of the `wal` TABLE, inside this image, and
-    /// `materialize_wal_tail` reads them like any other.
+    /// the read path materializes them like any other.
     pub fn open_bytes(bytes: Vec<u8>) -> Result<Self> {
         const HEADER: &[u8] = b"SQLite format 3\0";
         const JOURNAL_MODE_ROLLBACK: u8 = 1;
@@ -1181,7 +1195,7 @@ impl Db {
 
     /// A stream's sealed segments as the CATALOG sees them: how many segments,
     /// how many rows across them, and the span they cover. **No BLOB is read** —
-    /// `parquet metadata` describes a 197 MB archive from this, and pulling
+    /// A catalog summary describes a 197 MB archive from this, and pulling
     /// `bytes` back only to discard it is exactly the cost the catalog exists to
     /// avoid.
     pub fn segment_span(&self, source_id: i64, stream: &str) -> Result<(u64, Span)> {
@@ -1398,6 +1412,22 @@ impl Db {
         Ok(out)
     }
 
+    /// How the archive's pages stand: how many there are, how many are free,
+    /// and how big one is.
+    ///
+    /// What a retention loop needs to decide whether a reclaim is worth running
+    /// — freed pages are reused, so the file's bound is its high-water mark and
+    /// a shrunken working set shows up here as free pages rather than as a
+    /// smaller file. Offered as an accessor rather than leaving callers to read
+    /// pragmas, so "this is SQLite underneath" stays an implementation detail.
+    pub fn page_stats(&self) -> Result<PageStats> {
+        Ok(PageStats {
+            pages: self.pragma_u32("page_count")?,
+            free: self.pragma_u32("freelist_count")?,
+            page_size: self.pragma_u32("page_size")?,
+        })
+    }
+
     /// What the archive occupies on disk, in bytes.
     ///
     /// `page_count * page_size`, so it is the FILE's size rather than the sum
@@ -1406,9 +1436,8 @@ impl Db {
     /// is the number a size cap wants, since it is the number the filesystem
     /// sees. It does not include the `-wal` sidecar.
     pub fn archive_bytes(&self) -> Result<u64> {
-        let pages = self.pragma_u32("page_count")? as u64;
-        let size = self.pragma_u32("page_size")? as u64;
-        Ok(pages * size)
+        let s = self.page_stats()?;
+        Ok(s.pages as u64 * s.page_size as u64)
     }
 
     fn evict(
@@ -1526,7 +1555,7 @@ impl Db {
     /// Every user table in this database, by name — SQLite's own internal
     /// tables (`sqlite_*`) excluded.
     ///
-    /// Exists so `rez_v3_rewrite` can assert that its fixed copy list still
+    /// Exists so [`crate::rewrite`] can assert that its fixed copy list still
     /// covers the whole schema: a copy carries only what it is told to, so a
     /// table added here without being handled there would vanish silently
     /// from every rewritten archive.
@@ -1572,6 +1601,7 @@ impl Db {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn pragma_u32(&self, name: &str) -> Result<u32> {
         let value = self.pragma_i64(name)?;
         u32::try_from(value)
@@ -1579,6 +1609,7 @@ impl Db {
     }
 
     /// Signed, because `cache_size` is negative when denominated in kibibytes.
+    #[doc(hidden)]
     pub fn pragma_i64(&self, name: &str) -> Result<i64> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
@@ -1605,6 +1636,7 @@ impl Db {
         Ok(out)
     }
 
+    #[doc(hidden)]
     pub fn pragma_string(&self, name: &str) -> Result<String> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
@@ -2811,7 +2843,7 @@ mod tests {
 
     #[test]
     fn segment_span_summarizes_the_catalog_without_reading_a_blob() {
-        // `parquet metadata` describes a production archive (197 MB, 149 segments)
+        // a catalog summary describes a production archive (197 MB, 149 segments)
         // from these numbers, so they must come from the catalog columns and
         // nothing else. The bytes here are deliberately NOT parquet: an
         // implementation that reached into a segment to count its rows — or
@@ -2872,7 +2904,7 @@ mod tests {
 
     #[test]
     fn live_wal_span_counts_the_same_rows_live_wal_returns() {
-        // The depth `parquet metadata` reports is "how many unsealed rows are
+        // The depth a status readout reports is "how many unsealed rows are
         // recoverable", which is exactly what the reader will materialize —
         // so it must apply the SAME watermark `live_wal` does, not count the
         // raw table. Sealed-but-not-yet-pruned rows (the straddle the deferred

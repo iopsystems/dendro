@@ -61,7 +61,7 @@ pub trait SegmentEncoder {
 ///
 /// A boxed `std::error::Error` rather than this crate's own: the failure is the
 /// CALLER's, and stringifying it at the boundary threw away whatever type it
-/// had. Wrapped in [`Error::Encoder`](crate::Error::Encoder), which keeps it as
+/// had. Wrapped in [`Error::Encoder`](crate::Error), which keeps it as
 /// `source()`, so a caller can downcast back to its own error rather than
 /// matching on a message it built.
 pub type EncodeResult =

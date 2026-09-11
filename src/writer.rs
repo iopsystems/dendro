@@ -122,6 +122,7 @@ type ErrorSlot = Arc<Mutex<Option<Arc<Error>>>>;
 /// tick. The point of a cap at all is that a shrunken working set drains back
 /// to the filesystem gradually; a full `VACUUM` would return the same space in
 /// one step and stall the source for seconds doing it.
+#[doc(hidden)]
 pub const RECLAIM_PAGES_PER_PASS: u32 = 100;
 
 /// Reclaim only once the free list exceeds this fraction of the file, as a
@@ -132,6 +133,7 @@ pub const RECLAIM_PAGES_PER_PASS: u32 = 100;
 /// need. This fires only when the working set genuinely shrank and left the
 /// file many times larger than its contents, which is the one situation where
 /// handing pages back is worth anything.
+#[doc(hidden)]
 pub const RECLAIM_FREELIST_DIVISOR: u32 = 10;
 
 /// Handle to the writer thread. Every fallible hand-off reports the writer's
@@ -290,7 +292,7 @@ impl Archive {
     /// Commit one tick's staged rows for EVERY source, as one transaction.
     ///
     /// The multi-source counterpart to [`SourceWriter::wal`]. Each
-    /// source's rows come from [`the caller::stage`]; this hands them
+    /// source's rows come from the caller's staging; this hands them
     /// over together so the archive pays one commit — one fsync at
     /// `synchronous=FULL` — per tick rather than one per endpoint.
     ///
@@ -416,7 +418,7 @@ pub struct SourceWriter {
 impl SourceWriter {
     /// The archive being written — valid and readable while it is written.
     ///
-    /// Reachable only through `the caller::path`, which no live caller
+    /// Reachable only through a caller that stages per source, which no live caller
     /// uses: the recorder asks the archive directly. Kept because a recorder
     /// naming its own output is the obvious thing to want.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -825,6 +827,7 @@ fn writer_loop(
 /// there: without it this would run every pass for no gain, and without the
 /// reclaim a buffer that shrank would keep its high-water size forever.
 #[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
+#[doc(hidden)]
 pub fn reclaim_if_fragmented(db: &Db) -> Result<()> {
     if should_reclaim(
         db.pragma_u32("freelist_count")?,
@@ -839,6 +842,7 @@ pub fn reclaim_if_fragmented(db: &Db) -> Result<()> {
 /// about COST, not about outcome: reclaiming an unfragmented file is a no-op
 /// either way, so the only way to test the threshold is to ask it directly.
 #[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
+#[doc(hidden)]
 pub fn should_reclaim(free_pages: u32, pages: u32) -> bool {
     free_pages.saturating_mul(RECLAIM_FREELIST_DIVISOR) > pages
 }
@@ -1016,7 +1020,7 @@ fn seal_batch(
     // a large delete on the tick path. `live_wal`'s watermark filter makes a
     // crash between the commit above and the delete below harmless — a
     // straddling row is simply not live — which leaves the prune a pure
-    // background optimisation. `RezTx` does not expose `prune_wal`, so this
+    // background optimisation. `Tx` does not expose `prune_wal`, so this
     // ordering is enforced by the type, not by this comment.
     //
     // Each stream is pruned only up to its OWN segment's `last_ts`: rows a
