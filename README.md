@@ -72,6 +72,10 @@ other two are boundaries.
   archive kept for a long time gets slower and there is no mechanism to fix it.
   A rolling buffer is unaffected, because eviction removes the old ones.
   [Journal](docs/journal/2026-09-11-segment-compaction.md).
+- **One source's failure can end the recording for every source.** A duplicate
+  `(stream, ts)`, or an encoder returning `Err`, exits the writer thread for the
+  whole archive, and there is no way to reopen and resume.
+  [Journal](docs/journal/2026-09-11-writer-failure-blast-radius.md).
 - **There is no index over what is inside a row.** The catalog knows sources,
   streams and time — nothing about series or labels, because dendro does not
   know what a row means. Finding which segments contain a particular series

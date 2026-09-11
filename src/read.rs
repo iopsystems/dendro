@@ -119,6 +119,27 @@ fn stream_segments_snapshotted(
             source,
         })?
     {
+        // Cross-checked against the span the catalog would have recorded. The
+        // writer validates the same thing when it seals; a reader materializing
+        // the same rows with the same encoder must agree, and if it does not,
+        // the encoder is not deterministic and the tail is not what the next
+        // seal will write. Cheap, and it was one line away from being skipped
+        // entirely — `tail.rows` and `tail.first_ts` were discarded here.
+        if let Some(first) = live.first() {
+            if tail.first_ts < first.ts || tail.rows > live.len() as u64 {
+                return Err(Error::EncoderContract {
+                    stream: stream.to_string(),
+                    detail: format!(
+                        "materializing the live tail claimed {} row(s) from {}, \
+                         starting at {} before the first live row {}",
+                        tail.rows,
+                        live.len(),
+                        tail.first_ts,
+                        first.ts
+                    ),
+                });
+            }
+        }
         segments.push(tail.bytes);
     }
     Ok(segments)

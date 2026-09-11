@@ -53,6 +53,11 @@ pub struct Segment {
 /// state, so anything an encode needs must travel in the rows.
 ///
 /// `None` means the rows produce no segment.
+///
+/// **Called with an empty slice**, on every read of a stream with nothing
+/// unsealed — which is every read of a finalized archive. An implementation
+/// that indexes `rows[0]` without checking panics inside the reader, and on the
+/// seal path the reader is the writer thread. Return `Ok(None)`.
 pub trait SegmentEncoder {
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
 }

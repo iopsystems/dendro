@@ -45,6 +45,14 @@ The container needs three things that a directory or a tar does not give you:
 SQLite is used as a transactional allocator with a queryable catalog, **not as
 a query engine**. It never looks inside a segment.
 
+dendro itself looks inside one in exactly one place, and it is worth naming
+because the sentence above invites the opposite conclusion:
+`rewrite::project_segment_columns` decodes a segment's parquet to drop columns
+and re-encodes it with the archive's writer properties. Every other copy moves
+the BLOB verbatim. That is also why a segment is parquet rather than a format of
+the caller's choosing — see
+[the encoder boundary](docs/journal/2026-09-11-encoder-boundary.md).
+
 ### Why parquet blobs inside a database
 
 Because the two layers answer different questions and are good at different
