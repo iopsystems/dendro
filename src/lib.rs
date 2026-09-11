@@ -61,13 +61,13 @@
 //! connection on its own thread:
 //!
 //! ```no_run
-//! # use dendro::{db::WalRow, segment::{Segment, SegmentEncoder}, writer::Archive};
-//! # use dendro::db::RecordingMeta;
+//! # #[cfg(feature = "write")]
+//! # fn demo() -> Result<(), String> {
+//! # use dendro::{db::{RecordingMeta, WalRow}, segment::{Segment, SegmentEncoder}, writer::Archive};
 //! # struct MyEncoder;
 //! # impl SegmentEncoder for MyEncoder {
 //! #     fn encode(&self, _: &str, _: &[WalRow]) -> Result<Option<Segment>, String> { Ok(None) }
 //! # }
-//! # fn main() -> Result<(), String> {
 //! # let seed = RecordingMeta { labels: Default::default(), metadata: Default::default(), clock_anchor_wall_ns: 0 };
 //! # let rows: Vec<WalRow> = vec![];
 //! let mut archive = Archive::create("out.dendro".as_ref(), Box::new(MyEncoder))?;
