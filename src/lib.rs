@@ -24,7 +24,7 @@
 //! | term | meaning |
 //! |---|---|
 //! | **archive** | The file. One SQLite database, holding everything below — one file at rest, three while it is open; see [`db`]. |
-//! | **stream** | A named sequence of rows. Streams are independent: each accumulates, seals and expires on its own schedule. A stream runs the length of the archive. |
+//! | **stream** | A named sequence of rows inside a source. Streams are independent — each accumulates, seals and expires on its own schedule — and **transient**: one can start late, stop early, have gaps, and stop existing altogether once its rows are evicted. |
 //! | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
 //! | **row** | One timestamped payload. Opaque to dendro. |
 //!
@@ -44,6 +44,27 @@
 //! timestamps are `anchor + monotonic elapsed`, so one source is one clock. It
 //! is deliberately not a rung on the ladder above: nothing is stored "in" a
 //! source that is not in one of its streams.
+//!
+//! **A stream is not a box either, and it is thinner than it looks.** There is
+//! no `streams` table: a stream is a name that rows in `segments` and `wal`
+//! carry, and the set of streams is derived by [`Db::all_streams`], which
+//! unions those two columns. Three consequences, all of which a caller will
+//! eventually meet:
+//!
+//! * A stream needs no declaration. It exists from its first row.
+//! * A stream has no lifetime of its own. It can begin partway through a
+//!   source, stop before the source does, and leave gaps — nothing in the
+//!   container says otherwise, and nothing records what its span was meant to
+//!   be.
+//! * A stream can stop existing. Once retention has evicted its last segment
+//!   and its last WAL row it vanishes from `all_streams` entirely, and the
+//!   archive keeps no record that it was ever there. Reusing the name later
+//!   simply starts a new one.
+//!
+//! The sources ladder is therefore about containment, not lifetime: an archive
+//! holds what its sources' streams currently hold, and nothing more.
+//!
+//! [`Db::all_streams`]: db::Db::all_streams
 //!
 //! Note what is NOT in either list: nothing about metrics, samples, series or
 //! observations. dendro came out of a telemetry agent and is a good fit for

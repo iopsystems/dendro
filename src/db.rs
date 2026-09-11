@@ -175,7 +175,7 @@ const LIVE_WAL_PREDICATE: &str = "source_id = ?1 AND stream = ?2 \
      AND ts > COALESCE( \
            (SELECT MAX(last_ts) FROM segments \
             WHERE source_id = ?1 AND stream = ?2), \
-           0)";
+           -1)";
 
 /// The largest timestamp this container can store.
 ///
@@ -1157,10 +1157,18 @@ impl Db {
     /// segments for its own stream, full stop — one idempotent rule that needs
     /// no ordering guarantee between sealing and pruning.
     ///
-    /// `COALESCE(..., 0)` is what makes the rule correct for a stream with
+    /// `COALESCE(..., -1)` is what makes the rule correct for a stream with
     /// no segments at all, not just a straddling one: the subquery's `MAX`
-    /// over zero rows is SQL `NULL`, which `COALESCE` turns into `0`, so
-    /// `ts > 0` — every row with a real timestamp — is live. That is exactly
+    /// over zero rows is SQL `NULL`, which `COALESCE` turns into `-1`, so
+    /// `ts > -1` — every row there is — is live.
+    ///
+    /// **-1, not 0.** A timestamp is a `u64` and zero is a legal one, so a
+    /// watermark of 0 made a row at ts=0 invisible for the entire life of a
+    /// stream that had not yet sealed: durable, never read, never reported. It
+    /// only looked safe because this crate came out of a telemetry agent whose
+    /// timestamps are nanoseconds since the epoch. -1 is below every value a
+    /// timestamp column can now hold, because `stored_ts` refuses anything
+    /// above `MAX_TIMESTAMP` and a `u64` has no negatives. That is exactly
     /// the quiet-table case: a stream that has never sealed keeps its WHOLE
     /// history live. That is the property a segment-only container cannot
     /// offer: with kill-safety per segment, a stream that had not sealed one
@@ -2347,6 +2355,58 @@ mod tests {
             .is_err(),
             "and neither may a segment"
         );
+    }
+
+    /// A row at timestamp zero is a row.
+    ///
+    /// The watermark for a stream with no segments used to be `0`, and the
+    /// predicate is `ts >`, so ts=0 was invisible for the entire life of a
+    /// stream that had not yet sealed - durable, never read, never reported. It
+    /// looked safe only because this crate came out of an agent whose
+    /// timestamps are nanoseconds since the epoch.
+    #[test]
+    fn a_row_at_timestamp_zero_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        for ts in [0u64, 1, 2] {
+            db.insert_wal_rows(
+                id,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .unwrap();
+        }
+
+        let live: Vec<u64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+        assert_eq!(live, vec![0, 1, 2], "ts=0 is a timestamp like any other");
+        assert_eq!(db.live_wal_span(id, "s").unwrap().rows, 3);
+
+        // And once something seals, the watermark works normally.
+        db.insert_segment(
+            id,
+            "s",
+            0,
+            &SegmentMeta {
+                rows: 2,
+                first_ts: 0,
+                last_ts: 1,
+            },
+            b"x",
+        )
+        .unwrap();
+        let live: Vec<u64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+        assert_eq!(live, vec![2]);
     }
 
     /// A read-only handle reads everything and refuses to write.

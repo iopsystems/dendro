@@ -95,7 +95,7 @@ Four things nest, and they are the whole model:
 | term | meaning |
 |---|---|
 | **archive** | The file. One SQLite database. |
-| **stream** | A named sequence of rows. Streams accumulate, seal and expire independently, and a stream runs the length of the archive. |
+| **stream** | A named sequence of rows inside a source. Streams are independent — each accumulates, seals and expires on its own schedule — and **transient**: one can start late, stop early, have gaps, and stop existing altogether once its rows are evicted. |
 | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
 | **row** | One timestamped payload. Opaque to dendro. |
 
@@ -115,6 +115,14 @@ unambiguous, and what gives its rows a shared wall-clock anchor — timestamps a
 `anchor + monotonic elapsed`, so one source is one clock. Nothing is stored "in"
 a source that is not in one of its streams, which is why it is not a rung on the
 ladder above.
+
+A stream is thinner still. There is no `streams` table — a stream is a name that
+rows in `segments` and `wal` carry, and the set of them is derived by unioning
+those two columns. So a stream needs no declaration, has no lifetime of its own
+(it can start late, stop early, and leave gaps), and **stops existing** once
+retention takes its last segment and its last WAL row: it disappears from
+`all_streams` and the archive keeps no record that it was there. Reusing the
+name later just starts a new one.
 
 ## Quick start
 
