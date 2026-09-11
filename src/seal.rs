@@ -1,7 +1,7 @@
 //! When to seal: the policy that decides how long a stream's rows accumulate
 //! in the WAL before they become a segment.
 //!
-//! [`SealPolicy`] answers "is this open segment due?" and [`SegmentAccount`]
+//! [`SealPolicy`](crate::seal::SealPolicy) answers "is this open segment due?" and [`SegmentAccount`](crate::seal::SegmentAccount)
 //! maintains the byte and row counts that question is asked against. Both are
 //! properties of *segmenting a source* rather than of the container it
 //! lands in, so a plain source and a rolling buffer use exactly the same
@@ -147,7 +147,7 @@ impl SegmentAccount {
         }
     }
 
-    /// Account one appended row. `bytes` is [`entries_approx_bytes`] of that
+    /// Account one appended row. `bytes` is roughly the encoded size of that
     /// row, which is exactly what `TableBuilder::push_row` would have charged.
     pub fn add_row(&mut self, bytes: usize) {
         self.rows += 1;

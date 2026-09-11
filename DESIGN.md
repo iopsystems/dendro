@@ -94,10 +94,49 @@ The prune that follows a seal runs **outside** the seal transaction, so the
 watermark is what makes that harmless, which in turn is what lets the prune be
 a pure background optimisation with no correctness role.
 
+## How many files an archive is
+
+One, at rest. Three, while anyone has it open.
+
+| state | on disk |
+|---|---|
+| after a clean `finalize` + `join` | **just the archive** |
+| while a writer has it open | archive, `-wal`, `-shm` |
+| while a *reader* has it open | archive, `-wal` (empty), `-shm` |
+| after that reader closes | **just the archive** |
+| after an unclean kill | all three, and see below |
+
+The sidecars are SQLite's, not dendro's: `-wal` holds commits not yet folded
+into the archive, `-shm` is the cross-process index that lets readers find them.
+They appear whenever the file is opened — a read is enough — and SQLite removes
+them on a clean close. So the artifact you hand someone is a single file, and
+the three-file state is a property of the archive being *in use*, not of the
+format.
+
+**An unclean kill is the case to know about.** The sidecars survive it, and the
+archive alone can be worth nothing: a writer killed before its first checkpoint
+leaves a 4 KiB archive with *no tables in it at all*, and a 1.9 MiB `-wal`
+holding the entire recording. Opening the set recovers it in full and folds the
+sidecar back in; copying only the archive at that moment loses everything.
+
+This is what the checkpoint bounds, and the bound is worth stating in rows
+rather than bytes. A 400-append run killed with no checkpoint recovers **no
+rows** from the archive alone; the same run checkpointing every 200 ms recovers
+**390 of 400**, the remainder being the un-checkpointed tail. At the shipped
+`CHECKPOINT_INTERVAL` of 10 s and a 1 s append cadence, that tail is about ten
+appends.
+
+**dendro never rewrites an archive just because you opened it.** Normalizing a
+crashed archive back to one file on open would be easy and is deliberately not
+done: an open is also how you read a rolling buffer another process is still
+appending to, and a reader that mutates its subject is a reader you cannot
+point at production. The same rule is why a legacy-schema archive is read
+through temporary views rather than migrated in place. If you want one file
+back, take a copy — see below — or finalize the source.
+
 ## Staleness of a copy
 
-SQLite commits into a `-wal` sidecar file. An archive is therefore up to
-three files on disk while it is open, and a plain `cp` of just the archive
+SQLite commits into a `-wal` sidecar file, so a plain `cp` of just the archive
 silently ends early — sometimes very early. Two mechanisms bound this, and they
 answer different questions:
 

@@ -1057,7 +1057,7 @@ impl Db {
     }
 
     /// How many rows a stream's live WAL holds, and the span they cover —
-    /// **without materializing them**. Same watermark as [`live_wal`] (they
+    /// **without materializing them**. Same watermark as [`live_wal`](Self::live_wal) (they
     /// share `LIVE_WAL_PREDICATE`, so the depth cannot drift from the rows the
     /// reader replays); this is the aggregate form, for callers that want the
     /// number rather than the payload.

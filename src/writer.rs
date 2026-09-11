@@ -7,7 +7,7 @@
 //! bytes are all resident at once (see `seal_batch`).
 //!
 //! **A seal batch is one transaction**, and the file at `path` is a valid,
-//! openable archive from the moment [`Archive::create`] returns. There is no
+//! openable archive from the moment [`Archive::create`](crate::writer::Archive::create) returns. There is no
 //! staging file, no rename, and no separate manifest to keep in step — the
 //! catalog IS the database, so the container gets transactions instead of
 //! imitating them.
@@ -590,7 +590,7 @@ fn writer_thread(
 /// as of the last checkpoint and nothing after it. That copy is not corrupt; it
 /// simply ends early, and nothing about it says so.
 ///
-/// [`crate::rez_sqlite`]'s autocheckpoint bounds how many BYTES can accumulate
+/// [`crate::db`]'s autocheckpoint bounds how many BYTES can accumulate
 /// (4 MiB). It cannot bound how much TIME they represent: a busy source
 /// crosses 4 MiB in seconds, a quiet one in hours, and the quiet one is the
 /// case where a copy is silently useless. Measured before this existed: 123

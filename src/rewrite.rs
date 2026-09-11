@@ -9,8 +9,8 @@
 //! second set of bugs.
 //!
 //! Two decisions here are the caller's, because they are about what rows MEAN:
-//! which streams to keep ([`CopySpec::keep_streams`]) and which columns of a
-//! segment to keep ([`ColumnFilter`]).
+//! which streams to keep ([`CopySpec::keep_streams`](crate::rewrite::CopySpec::keep_streams)) and which columns of a
+//! segment to keep ([`ColumnFilter`](crate::rewrite::ColumnFilter)).
 
 use std::collections::BTreeMap;
 

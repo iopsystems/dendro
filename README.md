@@ -126,6 +126,23 @@ extracted from.
   `cp` on an archive someone is writing silently ends early. `Db::vacuum_into`
   reads through the sidecar without pausing the writer.
 
+## One file, or three
+
+An archive is **one file at rest** — after a clean finalize, the sidecars are
+gone and what is left is the thing you hand someone. It is **three while open**:
+SQLite adds `-wal` and `-shm` whenever the file is opened, a read included, and
+removes them on a clean close.
+
+The case to know about is an unclean kill, which leaves all three behind and can
+leave the archive itself holding nothing — a writer killed before its first
+checkpoint leaves a 4 KiB archive with no tables and a 1.9 MiB `-wal` holding
+the whole recording. Opening the set recovers it; copying only the archive at
+that moment does not. `CHECKPOINT_INTERVAL` bounds how much can be stranded
+there, and `Db::vacuum_into` takes an exact copy without pausing the writer.
+
+dendro does not rewrite an archive on open, including to tidy that up. See
+[DESIGN.md](DESIGN.md#how-many-files-an-archive-is).
+
 ## Features
 
 | feature | default | what it gates |

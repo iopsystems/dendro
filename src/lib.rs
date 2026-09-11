@@ -23,7 +23,7 @@
 //!
 //! | term | meaning |
 //! |---|---|
-//! | **archive** | The file. One SQLite database, holding everything below. |
+//! | **archive** | The file. One SQLite database, holding everything below — one file at rest, three while it is open; see [`db`]. |
 //! | **stream** | A named sequence of rows. Streams are independent: each accumulates, seals and expires on its own schedule. A stream runs the length of the archive. |
 //! | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
 //! | **row** | One timestamped payload. Opaque to dendro. |
@@ -95,6 +95,21 @@
 //!
 //! Reading hands back parquet BYTES. dendro does not open them and has no
 //! opinion about the query engine that will — see [`read::read_archive`].
+//!
+//! # One file, or three
+//!
+//! An archive is one file at rest and three while anyone has it open: SQLite
+//! adds a `-wal` and a `-shm` whenever the file is opened — a read is enough —
+//! and removes them on a clean close. An unclean kill leaves all three, and can
+//! leave the archive itself holding nothing, with the whole recording in the
+//! sidecar until something opens the set and folds it back in.
+//!
+//! **Opening an archive never rewrites it**, including to tidy that up. An open
+//! is also how you read a buffer another process is still appending to, and a
+//! reader that mutates its subject is a reader you cannot point at production.
+//! The same rule is why a legacy-schema archive is read through temporary views
+//! rather than migrated in place ([`db::Db::open`]). To get one file back, take
+//! a copy with [`db::Db::vacuum_into`], or finalize the source.
 //!
 //! [`SegmentEncoder`]: segment::SegmentEncoder
 //! [`Segment`]: segment::Segment
