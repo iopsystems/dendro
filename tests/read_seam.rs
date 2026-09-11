@@ -338,3 +338,118 @@ fn an_encoder_cannot_invent_coverage() {
         "got: {err}"
     );
 }
+
+/// Retention through the writer: per stream, and it reports what it did.
+///
+/// Both halves were unreachable. `evict_streams_before` existed only on `Db`,
+/// so using it meant a second writing connection to a file the writer thread
+/// owns; and the writer discarded the `Evicted` count, which is what tells a
+/// caller "the window moved" from "nothing was old enough yet".
+#[test]
+#[cfg(feature = "write")]
+fn retention_runs_through_the_writer_and_reports_what_it_removed() {
+    use dendro::writer::Archive;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    for stream in ["debug/a", "metric/b"] {
+        for ts in [10u64, 20] {
+            src.wal(vec![WalRow {
+                stream: stream.to_string(),
+                ts,
+                wall_offset: 0,
+                row: vec![1],
+            }])
+            .unwrap();
+        }
+        src.seal(vec![stream.to_string()]).unwrap();
+    }
+    src.sync().unwrap();
+
+    let evicted = src
+        .evict_streams_before(100, Box::new(|s: &str| s.starts_with("debug/")))
+        .unwrap();
+    assert_eq!(evicted.segments, 1, "only the debug stream's segment");
+
+    let db = Db::open_read_only(&path).unwrap();
+    assert_eq!(db.all_streams(1).unwrap(), vec!["metric/b".to_string()]);
+}
+
+/// Two seal batches landing on one timestamp leave ONE clock observation.
+///
+/// Sealing streams one at a time is an ordinary thing to do, and it used to
+/// write two rows at the same `ts` with different offsets — a series a consumer
+/// cannot read uniformly. The finalize path guarded against exactly this and
+/// the seal path did not.
+#[test]
+#[cfg(feature = "write")]
+fn two_seals_at_one_timestamp_leave_one_clock_observation() {
+    use dendro::writer::Archive;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    for (stream, offset) in [("a", 11i64), ("s", 22)] {
+        src.wal(vec![WalRow {
+            stream: stream.to_string(),
+            ts: 100,
+            wall_offset: offset,
+            row: vec![1],
+        }])
+        .unwrap();
+        src.seal(vec![stream.to_string()]).unwrap();
+    }
+    src.sync().unwrap();
+
+    let db = Db::open_read_only(&path).unwrap();
+    let offsets = db.read_clock_offsets(1).unwrap();
+    assert_eq!(
+        offsets.len(),
+        1,
+        "one timestamp, one observation; got {offsets:?}"
+    );
+    assert_eq!(offsets[0].0, 100);
+}
+
+/// Retention cuts the clock-offset series too, or a rolling buffer is not
+/// bounded: one row per seal batch, forever.
+#[test]
+#[cfg(feature = "write")]
+fn retention_bounds_the_clock_offset_series() {
+    use dendro::writer::Archive;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    for ts in [10u64, 20, 30] {
+        src.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 1,
+            row: vec![1],
+        }])
+        .unwrap();
+        src.seal(vec!["s".to_string()]).unwrap();
+    }
+    src.sync().unwrap();
+
+    let db = Db::open_read_only(&path).unwrap();
+    assert_eq!(db.read_clock_offsets(1).unwrap().len(), 3);
+    drop(db);
+
+    src.evict_before(25).unwrap();
+    src.sync().unwrap();
+
+    let db = Db::open_read_only(&path).unwrap();
+    let left: Vec<u64> = db
+        .read_clock_offsets(1)
+        .unwrap()
+        .iter()
+        .map(|o| o.0)
+        .collect();
+    assert_eq!(left, vec![30], "observations older than the cutoff go too");
+}

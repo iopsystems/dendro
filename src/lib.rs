@@ -104,12 +104,21 @@
 //! leave the archive itself holding nothing, with the whole recording in the
 //! sidecar until something opens the set and folds it back in.
 //!
-//! **Opening an archive never rewrites it**, including to tidy that up. An open
-//! is also how you read a buffer another process is still appending to, and a
-//! reader that mutates its subject is a reader you cannot point at production.
-//! The same rule is why a legacy-schema archive is read through temporary views
-//! rather than migrated in place ([`db::Db::open`]). To get one file back, take
-//! a copy with [`db::Db::vacuum_into`], or finalize the source.
+//! **dendro never rewrites an archive on its own account** — it does not
+//! migrate a legacy schema in place, and it does not normalize a crashed one.
+//! An open is how you read a buffer another process is still appending to, and
+//! a reader that rearranges its subject is a reader you cannot point at
+//! production.
+//!
+//! SQLite is not so restrained, and the distinction matters. A read-write
+//! connection that is the last one open **checkpoints on close**, so
+//! [`db::Db::open`] on a crashed archive folds the sidecar back in and deletes
+//! it — measured at 4 KiB to 110 KiB from nothing but an open and a drop. That
+//! is usually what you want and it is never what a reader should do by
+//! surprise, so [`db::Db::open_read_only`] exists and leaves all three files
+//! exactly as it found them. Use it for anything pointed at a live buffer, at
+//! an artifact you do not own, or at read-only media, where `open` fails
+//! outright because its durability pragmas are themselves writes.
 //!
 //! [`SegmentEncoder`]: segment::SegmentEncoder
 //! [`Segment`]: segment::Segment

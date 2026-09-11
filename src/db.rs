@@ -207,6 +207,8 @@ pub struct Db {
     /// True when this handle is on a [`LEGACY_SCHEMA_VERSION`] file, reading it
     /// through [`LEGACY_VIEWS_SQL`]. Read-only; see [`Db::writable`].
     legacy: bool,
+    /// True when this handle was opened by [`Db::open_read_only`].
+    read_only: bool,
     /// Committed transactions. See [`Db::commits`].
     #[cfg(any(test, feature = "test-support"))]
     commits: std::cell::Cell<u64>,
@@ -240,6 +242,7 @@ impl Db {
         let db = Db {
             conn,
             legacy: false,
+            read_only: false,
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
@@ -347,6 +350,7 @@ impl Db {
         let db = Db {
             conn,
             legacy: false,
+            read_only: false,
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
@@ -399,6 +403,7 @@ impl Db {
         let mut db = Db {
             conn,
             legacy: false,
+            read_only: false,
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
@@ -413,6 +418,49 @@ impl Db {
         // short-lived, offline and bounded by the dump, so no long-running
         // process holds it.
         db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
+        db.adopt_schema()?;
+        Ok(db)
+    }
+
+    /// Open an archive WITHOUT the ability to modify it, and without SQLite
+    /// modifying it either.
+    ///
+    /// [`open`](Self::open) takes a read-write connection, and that has two
+    /// consequences a reader usually does not want. SQLite checkpoints a WAL
+    /// database when the last connection to it closes, so a pure read can
+    /// rewrite the archive and delete its sidecars — measured at 4 KiB to 61 KiB
+    /// on a crashed archive, from nothing but an open and a drop. And the
+    /// durability pragmas `open` applies are themselves writes, so `open` fails
+    /// outright on read-only media with `attempt to write a readonly database`.
+    ///
+    /// This opens `SQLITE_OPEN_READ_ONLY` and sets `query_only`, so neither
+    /// this crate nor SQLite writes to the file. Use it for anything pointed at
+    /// a buffer another process is still appending to, at an artifact you do
+    /// not own, or at read-only media.
+    ///
+    /// What it cannot do is recover: an archive whose sidecar holds
+    /// un-checkpointed commits is read as far as the sidecar can be read, and
+    /// the sidecar is not folded back in. That is the trade — a reader that
+    /// leaves its subject alone cannot also tidy it up.
+    pub fn open_read_only(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| format!("failed to open {} read-only: {e}", path.display()))?;
+        let mut db = Db {
+            conn,
+            legacy: false,
+            read_only: true,
+            #[cfg(any(test, feature = "test-support"))]
+            commits: std::cell::Cell::new(0),
+        };
+        // Only the pragmas that are pure connection state. `synchronous` and
+        // `wal_autocheckpoint` are durability knobs for a writer and are
+        // themselves writes; `query_only` is what makes the refusal SQLite's
+        // rather than ours, so a bug here fails loudly instead of mutating.
+        db.set_pragma("cache_size", READER_CACHE_SIZE_KIB)?;
+        db.set_pragma("query_only", "1")?;
         db.adopt_schema()?;
         Ok(db)
     }
@@ -469,6 +517,7 @@ impl Db {
         let mut db = Db {
             conn,
             legacy: false,
+            read_only: false,
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
@@ -539,6 +588,12 @@ impl Db {
     /// is a view` — which reads like a bug in this crate — into a sentence that
     /// names the file and the way forward.
     fn writable(&self) -> Result<(), String> {
+        if self.read_only {
+            return Err(
+                "this archive was opened read-only; reopen it with `Db::open` to modify it"
+                    .to_string(),
+            );
+        }
         if self.legacy {
             return Err(format!(
                 "this archive is schema v{LEGACY_SCHEMA_VERSION}, which is \
@@ -1347,6 +1402,18 @@ impl Db {
                 .tx
                 .execute(wal_sql, params)
                 .map_err(|e| format!("failed to evict WAL rows: {e}"))?;
+            // The clock-offset series is per SOURCE, so it is cut by the same
+            // cutoff whichever streams the pass named. Without this the series
+            // is the one part of a rolling buffer that grows without bound: one
+            // row per seal batch, forever, faithfully re-copied by every
+            // rewrite. Small in bytes and unbounded in shape, in exactly the
+            // mode that runs for months.
+            tx.tx
+                .execute(
+                    "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < ?2",
+                    rusqlite::params![source_id, ts_bound(cutoff_ts)],
+                )
+                .map_err(|e| format!("failed to evict clock offsets: {e}"))?;
             Ok(Evicted { segments, wal_rows })
         })
     }
@@ -1587,7 +1654,8 @@ impl Tx<'_> {
     ) -> Result<(), String> {
         self.tx
             .execute(
-                "INSERT INTO clock_offsets(source_id, ts, offset_ns) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO clock_offsets(source_id, ts, offset_ns) \
+                 VALUES (?1, ?2, ?3)",
                 rusqlite::params![
                     source_id,
                     stored_ts(ts, "a clock offset timestamp")?,
@@ -1714,10 +1782,18 @@ CREATE TABLE wal(
   row BLOB NOT NULL,
   PRIMARY KEY (source_id, stream, ts)
 );
+-- `PRIMARY KEY (source_id, ts)`: at most one observation per source per
+-- timestamp. Two seal batches landing on the same `last_ts` - streams sealed
+-- one at a time, which is an ordinary thing to do - used to write two rows with
+-- different offsets, and a consumer could not read the series uniformly. The
+-- constraint is what makes that impossible rather than merely unlikely; see
+-- `insert_clock_offset`, which is `INSERT OR IGNORE` so the first observation
+-- at a timestamp wins.
 CREATE TABLE clock_offsets(
   source_id INTEGER NOT NULL,
   ts INTEGER NOT NULL,
-  offset_ns INTEGER NOT NULL
+  offset_ns INTEGER NOT NULL,
+  PRIMARY KEY (source_id, ts)
 );
 CREATE TABLE schema_version(version INTEGER NOT NULL);
 ";
@@ -2153,6 +2229,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.read_wal(id, "s").unwrap()[0].ts, MAX_TIMESTAMP);
+    }
+
+    /// A read-only handle reads everything and refuses to write.
+    ///
+    /// The refusal is belt and braces: `writable()` catches it with a message
+    /// that says what to do, and `query_only` means SQLite would refuse too if
+    /// a path ever slipped past that guard.
+    #[test]
+    fn a_read_only_handle_reads_but_will_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.dendro");
+        {
+            let mut db = Db::create(&path).unwrap();
+            let id = db
+                .insert_source(&SourceMeta {
+                    labels: [("host".to_string(), "web-01".to_string())]
+                        .into_iter()
+                        .collect(),
+                    metadata: BTreeMap::new(),
+                    clock_anchor_wall_ns: 7,
+                })
+                .unwrap();
+            db.insert_segment(
+                id,
+                "s",
+                0,
+                &SegmentMeta {
+                    rows: 2,
+                    first_ts: 10,
+                    last_ts: 20,
+                },
+                b"sealed",
+            )
+            .unwrap();
+            db.insert_wal_rows(
+                id,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts: 30,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .unwrap();
+        }
+
+        let mut db = Db::open_read_only(&path).unwrap();
+        let sources = db.read_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].meta.labels["host"], "web-01");
+        assert_eq!(db.all_streams(sources[0].id).unwrap(), vec!["s"]);
+        assert_eq!(db.read_segments(sources[0].id, "s").unwrap().len(), 1);
+        assert_eq!(db.live_wal(sources[0].id, "s").unwrap().len(), 1);
+
+        let err = db
+            .insert_wal_rows(
+                sources[0].id,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts: 40,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .expect_err("a read-only handle must refuse a write");
+        assert!(err.contains("opened read-only"), "got: {err}");
+        assert!(
+            db.evict_before(sources[0].id, 100).is_err(),
+            "retention is a write too"
+        );
     }
 
     /// Retention can be per stream, and a pass names the streams it touches.

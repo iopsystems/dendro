@@ -22,7 +22,7 @@
 //! never reach the send-error path here: the source would skip finalize and
 //! the thread would never be joined.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -31,8 +31,14 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::db::{Db, SegmentMeta, SourceMeta, WalRow};
+use crate::db::{Db, Evicted, SegmentMeta, SourceMeta, WalRow};
 use crate::segment::SegmentEncoder;
+
+/// Which streams a retention pass touches; `None` is the whole source.
+///
+/// Boxed and `Send` because the decision is the caller's and crosses the
+/// channel to the writer thread.
+pub type StreamFilter = Box<dyn Fn(&str) -> bool + Send>;
 
 enum Msg {
     /// Insert a `sources` row and hand its id back.
@@ -60,8 +66,20 @@ enum Msg {
     /// One seal batch for one source = one transaction.
     Seal { source_id: i64, batch: Vec<String> },
     /// Retention: drop everything wholly older than `cutoff_ts`, then trickle
-    /// freed pages back if the free list has grown. Only a caller with a retention policy sends this.
-    Evict { source_id: i64, cutoff_ts: u64 },
+    /// freed pages back if the free list has grown. Only a caller with a
+    /// retention policy sends this.
+    ///
+    /// `streams` restricts the pass, so different streams can be worth
+    /// different amounts of time; `None` is the whole source. It is boxed
+    /// because the decision is the caller's and crosses a thread boundary —
+    /// dendro knows what a cutoff means but not which streams are worth
+    /// keeping.
+    Evict {
+        source_id: i64,
+        cutoff_ts: u64,
+        streams: Option<StreamFilter>,
+        reply: SyncSender<Result<Evicted, String>>,
+    },
     /// One source's last clock observation; marks *that* source complete.
     ///
     /// Does NOT stop the writer: an archive may hold several sources and the
@@ -457,11 +475,41 @@ impl SourceWriter {
     ///
     /// Fire-and-forget, like `wal` and `seal`: a failure surfaces on the next
     /// hand-off, which is the convention the whole writer follows.
-    pub fn evict_before(&mut self, cutoff_ts: u64) -> Result<(), String> {
+    pub fn evict_before(&mut self, cutoff_ts: u64) -> Result<Evicted, String> {
+        self.evict(cutoff_ts, None)
+    }
+
+    /// [`evict_before`](Self::evict_before), restricted to the streams `keep`
+    /// accepts.
+    ///
+    /// The writer-side spelling of
+    /// [`Db::evict_streams_before`](crate::db::Db::evict_streams_before), and
+    /// the one to use: reaching the `Db` method directly means a second writing
+    /// connection to a file this thread already owns, which stalls on SQLite's
+    /// write lock for `busy_timeout` and then fails.
+    pub fn evict_streams_before(
+        &mut self,
+        cutoff_ts: u64,
+        keep: StreamFilter,
+    ) -> Result<Evicted, String> {
+        self.evict(cutoff_ts, Some(keep))
+    }
+
+    /// Both spellings, and the reply that makes the count reachable.
+    ///
+    /// Synchronous, unlike the other hand-offs: a retention pass is not on the
+    /// append path, and a caller running one wants to know what it did — that
+    /// is the difference between "the window moved" and "nothing was old enough
+    /// yet", and a size-bounded policy needs it to decide whether to cut again.
+    fn evict(&mut self, cutoff_ts: u64, streams: Option<StreamFilter>) -> Result<Evicted, String> {
+        let (tx, rx) = sync_channel(0);
         self.send(Msg::Evict {
             source_id: self.source_id,
             cutoff_ts,
-        })
+            streams,
+            reply: tx,
+        })?;
+        rx.recv().map_err(|_| take_writer_error(&self.err))?
     }
 
     /// Block until everything handed off so far has been committed.
@@ -618,9 +666,6 @@ fn writer_loop(
     // two sources of the same host have the same stream names and each
     // needs its own sequence.
     let mut next_seq: BTreeMap<(i64, String), u64> = BTreeMap::new();
-    // Timestamps each source's `clock_offsets` series already carries. Only
-    // finalize reads it, but it has to be maintained as batches seal.
-    let mut observed: BTreeMap<i64, BTreeSet<u64>> = BTreeMap::new();
     // How many sources were opened, and how many closed cleanly. Reclaim at
     // exit only when they match: an unclean exit is the recovery artifact and
     // must not pay for a vacuum on the way down.
@@ -676,15 +721,29 @@ fn writer_loop(
                 let _ = reply.send(db.commits());
             }
             Ok(Msg::Seal { source_id, batch }) => {
-                if let Some(ts) = seal_batch(db, source_id, &mut next_seq, batch, encoder)? {
-                    observed.entry(source_id).or_default().insert(ts);
-                }
+                seal_batch(db, source_id, &mut next_seq, batch, encoder)?;
             }
             Ok(Msg::Evict {
                 source_id,
                 cutoff_ts,
+                streams,
+                reply,
             }) => {
-                db.evict_before(source_id, cutoff_ts)?;
+                // Reported, not swallowed. `Evicted` exists so a caller can
+                // tell "the window moved" from "nothing was old enough yet",
+                // and the writer used to throw it away - which made it
+                // unreachable through the only supported path.
+                let evicted = match streams {
+                    Some(keep) => db.evict_streams_before(source_id, cutoff_ts, &*keep),
+                    None => db.evict_before(source_id, cutoff_ts),
+                };
+                let failed = evicted.is_err();
+                let _ = reply.send(evicted);
+                if failed {
+                    // The caller has the error; the writer stays up. Retention
+                    // failing is not a reason to lose the recording.
+                    continue;
+                }
                 reclaim_if_fragmented(db)?;
             }
             Ok(Msg::Finalize {
@@ -697,13 +756,15 @@ fn writer_loop(
                 // timestamp and consumers could not read it uniformly. The
                 // row-derived value wins because it is a projection of the
                 // `:wall_offset` column the segment itself carries. Same rule,
-                let novel = !observed
-                    .get(&source_id)
-                    .is_some_and(|o| o.contains(&clock_offset.0));
+                // No `novel` check any more: `clock_offsets` is keyed
+                // `(source_id, ts)` and inserted `OR IGNORE`, so the first
+                // observation at a timestamp wins and a second is dropped by
+                // the schema. That is strictly better than the set this used to
+                // consult — the set only covered the finalize path, so two seal
+                // batches landing on one `last_ts` still wrote conflicting
+                // rows, and it grew for the life of the writer.
                 db.transaction(|tx| {
-                    if novel {
-                        tx.insert_clock_offset(source_id, clock_offset.0, clock_offset.1)?;
-                    }
+                    tx.insert_clock_offset(source_id, clock_offset.0, clock_offset.1)?;
                     tx.mark_complete(source_id)
                 })?;
                 finalized += 1;
@@ -801,7 +862,7 @@ fn seal_batch(
     next_seq: &mut BTreeMap<(i64, String), u64>,
     batch: Vec<String>,
     encoder: &(dyn SegmentEncoder + Send),
-) -> Result<Option<u64>, String> {
+) -> Result<(), String> {
     // Read and encode BEFORE the transaction opens. Both are proportional to
     // segment size and would hold the write lock for their whole duration.
     //
@@ -820,9 +881,21 @@ fn seal_batch(
     for stream in batch {
         let rows = db.live_wal(source_id, &stream)?;
         let Some(last) = rows.last() else {
-            // No live rows: nothing to catalog and nothing to prune. The ingest
-            // side never seals an empty segment, and a stream whose rows were
-            // already sealed is not an error worth failing the source over.
+            // No live rows: nothing to catalog and nothing to prune. A stream
+            // whose rows were all sealed already is not an error worth failing
+            // the source over.
+            //
+            // A stream nobody has ever written is a different thing, and it is
+            // almost always a typo in the name handed to `seal`. Silence there
+            // is expensive: the rows the caller meant to seal stay in the WAL
+            // forever, so the archive grows without bound and re-encodes its
+            // whole history on every read, with nothing anywhere saying why.
+            if db.read_segments(source_id, &stream)?.is_empty() {
+                warn!(
+                    "asked to seal `{stream}`, which has no live rows and has \
+                     never sealed a segment - is the name right?"
+                );
+            }
             continue;
         };
         // The raw span's last row. This is the UPPER BOUND the encoder's
@@ -934,5 +1007,5 @@ fn seal_batch(
     for e in &encoded {
         db.prune_wal(source_id, &e.stream, e.meta.last_ts)?;
     }
-    Ok(observation.map(|(ts, _)| ts))
+    Ok(())
 }

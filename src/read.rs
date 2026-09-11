@@ -158,7 +158,10 @@ impl SegmentSource {
                 source_id,
                 stream,
             } => {
-                let db = Db::open(path)?;
+                // Read-only: this is a pure read, and a read-write connection
+                // that happens to be the last one open checkpoints the archive
+                // on close. See [`Db::open_read_only`].
+                let db = Db::open_read_only(path)?;
                 stream_segments(&db, *source_id, stream, encoder)
             }
             SegmentSource::SharedDb {

@@ -126,13 +126,21 @@ rows** from the archive alone; the same run checkpointing every 200 ms recovers
 `CHECKPOINT_INTERVAL` of 10 s and a 1 s append cadence, that tail is about ten
 appends.
 
-**dendro never rewrites an archive just because you opened it.** Normalizing a
-crashed archive back to one file on open would be easy and is deliberately not
-done: an open is also how you read a rolling buffer another process is still
-appending to, and a reader that mutates its subject is a reader you cannot
-point at production. The same rule is why a legacy-schema archive is read
-through temporary views rather than migrated in place. If you want one file
-back, take a copy — see below — or finalize the source.
+**dendro never rewrites an archive on its own account.** It does not migrate a
+legacy schema in place, and it will not normalize a crashed archive back to one
+file for you: an open is also how you read a rolling buffer another process is
+still appending to, and a reader that rearranges its subject is a reader you
+cannot point at production.
+
+**SQLite is less restrained, and that is worth knowing before you point a
+reader at something.** A read-write connection that is the last one open
+checkpoints on close. So `Db::open` on a crashed archive folds the sidecar back
+in and unlinks it — measured at 4 KiB to 110 KiB, sidecars gone, from nothing
+but an open and a drop. Usually that is what you want. When it is not,
+`Db::open_read_only` opens `SQLITE_OPEN_READ_ONLY` with `query_only` set and
+leaves all three files byte-identical; it is also the only one that works on
+read-only media, since the durability pragmas `open` applies are writes. What
+it gives up is recovery: it reads the sidecar but does not fold it back in.
 
 ## Staleness of a copy
 

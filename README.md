@@ -142,12 +142,13 @@ extracted from.
 
 ## Also here
 
-- **Retention, as policy you write.** `evict_before` drops everything wholly
-  older than a cutoff; `evict_streams_before` restricts that to the streams a
-  predicate accepts, so different streams can be worth different amounts of
-  time. `segment_sizes` and `archive_bytes` are what a size cap walks. Freed
-  pages trickle back to the filesystem, which is what bounds a rolling buffer.
-  dendro supplies the mechanism and never applies a policy of its own.
+- **Retention, as policy you write.** `SourceWriter::evict_before` drops
+  everything wholly older than a cutoff and reports what it removed;
+  `evict_streams_before` restricts that to the streams a predicate accepts, so
+  different streams can be worth different amounts of time. `segment_sizes` and
+  `archive_bytes` are what a size cap walks. Freed pages trickle back to the
+  filesystem, which is what bounds a rolling buffer. dendro supplies the
+  mechanism and never applies a policy of its own.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
@@ -169,7 +170,11 @@ the whole recording. Opening the set recovers it; copying only the archive at
 that moment does not. `CHECKPOINT_INTERVAL` bounds how much can be stranded
 there, and `Db::vacuum_into` takes an exact copy without pausing the writer.
 
-dendro does not rewrite an archive on open, including to tidy that up. See
+dendro never rewrites an archive on its own account. SQLite does, though:
+a read-write connection that is the last one open checkpoints on close, so
+`Db::open` on a crashed archive folds the sidecar in and deletes it.
+`Db::open_read_only` leaves all three files alone, and is the one to point at a
+live buffer or read-only media. See
 [DESIGN.md](DESIGN.md#how-many-files-an-archive-is).
 
 ## Features
