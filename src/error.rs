@@ -33,16 +33,6 @@ pub enum Error {
     /// found, so a caller can tell "too new, upgrade dendro" from "too old".
     UnsupportedSchema { found: i64, writes: i64, reads: i64 },
 
-    /// A timestamp too large to round-trip through a signed column. Clamping it
-    /// would silently store a different timestamp than the caller handed in;
-    /// see [`crate::db::MAX_TIMESTAMP`].
-    TimestampOutOfRange {
-        /// What the value was for - "a WAL row timestamp", "a segment last_ts".
-        what: &'static str,
-        value: u64,
-        max: u64,
-    },
-
     /// The caller's [`SegmentEncoder`](crate::segment::SegmentEncoder) failed.
     /// Its own error is preserved rather than stringified, so a caller can
     /// downcast back to it.
@@ -110,13 +100,6 @@ impl fmt::Display for Error {
                 f,
                 "unsupported archive schema version {found}: this build writes \
                  v{writes} and reads v{reads}"
-            ),
-            Error::TimestampOutOfRange { what, value, max } => write!(
-                f,
-                "{what} is {value}, above the largest timestamp this container \
-                 can store ({max}). SQLite integers are signed, so a larger \
-                 value would compare as negative in every ordering and range \
-                 the catalog runs."
             ),
             Error::Encoder { stream, source } => {
                 write!(f, "failed to encode a {stream} segment: {source}")

@@ -99,7 +99,7 @@ pub struct SourceMeta {
     pub metadata: BTreeMap<String, String>,
     /// Wall-clock reading (ns since epoch) at source start. Row timestamps
     /// are `anchor + monotonic elapsed`, so this pins the timeline to wall time.
-    pub clock_anchor_wall_ns: u64,
+    pub clock_anchor_wall_ns: i64,
 }
 
 /// A row of the `sources` table.
@@ -119,8 +119,8 @@ pub struct SourceRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
     pub rows: u64,
-    pub first_ts: u64,
-    pub last_ts: u64,
+    pub first_ts: i64,
+    pub last_ts: i64,
 }
 
 /// A row of the `segments` table for one `(source, stream)`.
@@ -142,7 +142,7 @@ pub struct SegmentRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalRow {
     pub stream: String,
-    pub ts: u64,
+    pub ts: i64,
     pub wall_offset: i64,
     pub row: Vec<u8>,
 }
@@ -162,8 +162,8 @@ pub struct Evicted {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub rows: u64,
-    pub first_ts: Option<u64>,
-    pub last_ts: Option<u64>,
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
 }
 
 /// The recovery rule, as a `WHERE` clause: a WAL row is live iff its `ts` is
@@ -172,41 +172,12 @@ pub struct Span {
 /// reported WAL depth can never disagree with the rows the reader will replay.
 /// See [`Db::live_wal`] for why the rule is what it is.
 const LIVE_WAL_PREDICATE: &str = "source_id = ?1 AND stream = ?2 \
-     AND ts > COALESCE( \
-           (SELECT MAX(last_ts) FROM segments \
-            WHERE source_id = ?1 AND stream = ?2), \
-           -1)";
-
-/// The largest timestamp this container can store.
-///
-/// SQLite integers are signed 64-bit, so a `u64` above this cannot round-trip
-/// through a column and — much worse — compares as NEGATIVE in every `ORDER BY`
-/// and every `<`/`>` the catalog runs. For epoch nanoseconds this is the year
-/// 2262; for a caller using some other clock domain it is a real bound, and one
-/// it should hear about rather than discover.
-pub const MAX_TIMESTAMP: u64 = i64::MAX as u64;
-
-/// A timestamp on its way INTO the archive. Rejected rather than clamped: a
-/// stored value that silently became something else is corruption, and the
-/// caller is the only one who can say what it meant.
-fn stored_ts(v: u64, what: &'static str) -> Result<i64> {
-    if v > MAX_TIMESTAMP {
-        return Err(Error::TimestampOutOfRange {
-            what,
-            value: v,
-            max: MAX_TIMESTAMP,
-        });
-    }
-    Ok(v as i64)
-}
-
-/// A timestamp used as a query BOUND. Clamped rather than rejected: the
-/// unbounded edge is spelled `u64::MAX`, whose cast is `-1`, and a bound that
-/// silently selects nothing is how `evict_before(u64::MAX)` came to mean
-/// "evict nothing at all".
-fn ts_bound(v: u64) -> i64 {
-    v.min(MAX_TIMESTAMP) as i64
-}
+     AND ( \
+       ts > (SELECT MAX(last_ts) FROM segments \
+             WHERE source_id = ?1 AND stream = ?2) \
+       OR NOT EXISTS (SELECT 1 FROM segments \
+                      WHERE source_id = ?1 AND stream = ?2) \
+     )";
 
 /// How an archive's pages stand. See [`Db::page_stats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -752,7 +723,7 @@ impl Db {
                     })?,
                     // Round-trips through INTEGER; wall-clock nanoseconds stay
                     // inside i64 until the year 2262.
-                    clock_anchor_wall_ns: anchor as u64,
+                    clock_anchor_wall_ns: anchor,
                 },
                 complete: complete != 0,
             });
@@ -860,8 +831,8 @@ impl Db {
                     r.get::<_, i64>(0)? as u64,
                     SegmentMeta {
                         rows: r.get::<_, i64>(1)? as u64,
-                        first_ts: r.get::<_, i64>(2)? as u64,
-                        last_ts: r.get::<_, i64>(3)? as u64,
+                        first_ts: r.get::<_, i64>(2)?,
+                        last_ts: r.get::<_, i64>(3)?,
                     },
                 ))
             })
@@ -949,8 +920,8 @@ impl Db {
                 seq: seq as u64,
                 meta: SegmentMeta {
                     rows: n_rows as u64,
-                    first_ts: first_ts as u64,
-                    last_ts: last_ts as u64,
+                    first_ts,
+                    last_ts,
                 },
                 bytes,
             });
@@ -973,8 +944,8 @@ impl Db {
         &self,
         source_id: i64,
         stream: &str,
-        start: u64,
-        end: u64,
+        start: i64,
+        end: i64,
     ) -> Result<Vec<SegmentRow>> {
         let mut stmt = self
             .conn
@@ -984,9 +955,7 @@ impl Db {
                    AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
             )
             .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
-        // `ts_bound`, not a cast: `u64::MAX as i64` is -1, which would silently
-        // select nothing at all for an unbounded upper edge.
-        let params = rusqlite::params![source_id, stream, ts_bound(start), ts_bound(end),];
+        let params = rusqlite::params![source_id, stream, start, end,];
         Self::collect_segments(&mut stmt, params, stream)
     }
 
@@ -1160,15 +1129,15 @@ impl Db {
     /// `COALESCE(..., -1)` is what makes the rule correct for a stream with
     /// no segments at all, not just a straddling one: the subquery's `MAX`
     /// over zero rows is SQL `NULL`, which `COALESCE` turns into `-1`, so
-    /// `ts > -1` — every row there is — is live.
+    /// every row there is, is live.
     ///
-    /// **-1, not 0.** A timestamp is a `u64` and zero is a legal one, so a
-    /// watermark of 0 made a row at ts=0 invisible for the entire life of a
-    /// stream that had not yet sealed: durable, never read, never reported. It
-    /// only looked safe because this crate came out of a telemetry agent whose
-    /// timestamps are nanoseconds since the epoch. -1 is below every value a
-    /// timestamp column can now hold, because `stored_ts` refuses anything
-    /// above `MAX_TIMESTAMP` and a `u64` has no negatives. That is exactly
+    /// **`NOT EXISTS`, not a sentinel.** This was
+    /// `ts > COALESCE(MAX(last_ts), 0)`, which made a row at ts=0 invisible for
+    /// the entire life of a stream that had not yet sealed — durable, never
+    /// read, never reported. Lowering the sentinel to -1 fixed that case and
+    /// moved the boundary rather than removing it: timestamps are `i64`, so
+    /// there is no value below every legal one. Asking whether any segment
+    /// exists has no boundary to get wrong. That is exactly
     /// the quiet-table case: a stream that has never sealed keeps its WHOLE
     /// history live. That is the property a segment-only container cannot
     /// offer: with kill-safety per segment, a stream that had not sealed one
@@ -1235,8 +1204,8 @@ impl Db {
             .query_row(sql, rusqlite::params![source_id, stream], |row| {
                 Ok(Span {
                     rows: row.get::<_, i64>(0)? as u64,
-                    first_ts: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                    last_ts: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    first_ts: row.get::<_, Option<i64>>(1)?,
+                    last_ts: row.get::<_, Option<i64>>(2)?,
                 })
             })
     }
@@ -1264,7 +1233,7 @@ impl Db {
                 .map_err(|e| Error::Message(format!("failed to read WAL row for {stream}: {e}")))?;
             out.push(WalRow {
                 stream,
-                ts: ts as u64,
+                ts,
                 wall_offset,
                 row: data,
             });
@@ -1282,12 +1251,12 @@ impl Db {
     /// that is why WAL rows are per-stream rather than whole snapshots — a
     /// slow-sealing table's prune must not touch, or be blocked by, any other
     /// stream's tail.
-    pub fn prune_wal(&self, source_id: i64, stream: &str, upto_ts: u64) -> Result<usize> {
+    pub fn prune_wal(&self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
         self.writable()?;
         self.conn
             .execute(
                 "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
-                rusqlite::params![source_id, stream, ts_bound(upto_ts)],
+                rusqlite::params![source_id, stream, upto_ts],
             )
             .map_err(|e| Error::Message(format!("failed to prune WAL for {stream}: {e}")))
     }
@@ -1315,7 +1284,7 @@ impl Db {
     /// and it only stops it if the two land together: a straddling row has
     /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
     /// the segment delete un-shadows.
-    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: u64) -> Result<Evicted> {
+    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: i64) -> Result<Evicted> {
         self.writable()?;
         self.evict(
             source_id,
@@ -1344,7 +1313,7 @@ impl Db {
     pub fn evict_streams_before(
         &mut self,
         source_id: i64,
-        cutoff_ts: u64,
+        cutoff_ts: i64,
         evict: &dyn Fn(&str) -> bool,
     ) -> Result<Evicted> {
         self.writable()?;
@@ -1359,7 +1328,7 @@ impl Db {
                 wal_rows: 0,
             };
             for stream in &streams {
-                let params = rusqlite::params![source_id, stream, ts_bound(cutoff_ts)];
+                let params = rusqlite::params![source_id, stream, cutoff_ts];
                 total.segments += tx
                     .tx
                     .execute(
@@ -1398,7 +1367,7 @@ impl Db {
     /// a reader would splice them back in as a tail, silently duplicating rows
     /// that were already sealed. Evicting by cutoff can only ever remove a
     /// prefix, which is why it is the shape this offers.
-    pub fn segment_sizes(&self, source_id: i64) -> Result<Vec<(u64, u64)>> {
+    pub fn segment_sizes(&self, source_id: i64) -> Result<Vec<(i64, u64)>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1408,7 +1377,7 @@ impl Db {
             .map_err(|e| Error::Message(format!("failed to query segment sizes: {e}")))?;
         let rows = stmt
             .query_map([source_id], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64))
             })
             .map_err(|e| Error::Message(format!("failed to query segment sizes: {e}")))?;
         let mut out = Vec::new();
@@ -1453,10 +1422,10 @@ impl Db {
         source_id: i64,
         segments_sql: &str,
         wal_sql: &str,
-        cutoff_ts: u64,
+        cutoff_ts: i64,
     ) -> Result<Evicted> {
         self.transaction(|tx| {
-            let params = rusqlite::params![source_id, ts_bound(cutoff_ts)];
+            let params = rusqlite::params![source_id, cutoff_ts];
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
@@ -1474,7 +1443,7 @@ impl Db {
             tx.tx
                 .execute(
                     "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < ?2",
-                    rusqlite::params![source_id, ts_bound(cutoff_ts)],
+                    rusqlite::params![source_id, cutoff_ts],
                 )
                 .map_err(|e| Error::Message(format!("failed to evict clock offsets: {e}")))?;
             Ok(Evicted { segments, wal_rows })
@@ -1534,7 +1503,7 @@ impl Db {
     /// together — from catalog columns alone. `None` when the source holds
     /// no rows at all, which for a rolling buffer means "nothing within the
     /// lookback".
-    pub fn source_time_span(&self, source_id: i64) -> Result<(Option<u64>, Option<u64>)> {
+    pub fn source_time_span(&self, source_id: i64) -> Result<(Option<i64>, Option<i64>)> {
         self.conn
             .query_row(
                 "SELECT MIN(first_ts), MAX(last_ts) FROM ( \
@@ -1542,12 +1511,7 @@ impl Db {
                    UNION ALL \
                    SELECT ts, ts FROM wal WHERE source_id = ?1)",
                 [source_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?.map(|v| v as u64),
-                        row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                    ))
-                },
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .map_err(|e| Error::Message(format!("failed to measure source {source_id}: {e}")))
     }
@@ -1625,7 +1589,7 @@ impl Db {
     }
 
     /// The source's `(ts, offset_ns)` clock observations, oldest first.
-    pub fn read_clock_offsets(&self, source_id: i64) -> Result<Vec<(u64, i64)>> {
+    pub fn read_clock_offsets(&self, source_id: i64) -> Result<Vec<(i64, i64)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT ts, offset_ns FROM clock_offsets WHERE source_id = ?1 ORDER BY ts")
@@ -1639,7 +1603,7 @@ impl Db {
         for row in rows {
             let (ts, offset) =
                 row.map_err(|e| Error::Message(format!("failed to read clock offset: {e}")))?;
-            out.push((ts as u64, offset));
+            out.push((ts, offset));
         }
         Ok(out)
     }
@@ -1704,7 +1668,7 @@ impl Tx<'_> {
             stmt.execute(rusqlite::params![
                 source_id,
                 r.stream,
-                stored_ts(r.ts, "a WAL row timestamp")?,
+                r.ts,
                 r.wall_offset,
                 r.row,
             ])
@@ -1716,16 +1680,12 @@ impl Tx<'_> {
     }
 
     /// Append one `(ts, offset_ns)` clock observation for the source.
-    pub fn insert_clock_offset(&self, source_id: i64, ts: u64, offset_ns: i64) -> Result<()> {
+    pub fn insert_clock_offset(&self, source_id: i64, ts: i64, offset_ns: i64) -> Result<()> {
         self.tx
             .execute(
                 "INSERT OR IGNORE INTO clock_offsets(source_id, ts, offset_ns) \
                  VALUES (?1, ?2, ?3)",
-                rusqlite::params![
-                    source_id,
-                    stored_ts(ts, "a clock offset timestamp")?,
-                    offset_ns
-                ],
+                rusqlite::params![source_id, ts, offset_ns],
             )
             .map_err(|e| Error::Message(format!("failed to insert clock offset: {e}")))?;
         Ok(())
@@ -1754,11 +1714,7 @@ fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64> {
     conn.execute(
         "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns) \
          VALUES (?1, ?2, 0, ?3)",
-        rusqlite::params![
-            labels,
-            metadata,
-            stored_ts(meta.clock_anchor_wall_ns, "a source clock anchor")?
-        ],
+        rusqlite::params![labels, metadata, meta.clock_anchor_wall_ns],
     )
     .map_err(|e| Error::Message(format!("failed to insert source: {e}")))?;
     Ok(conn.last_insert_rowid())
@@ -1783,8 +1739,8 @@ fn insert_segment_sql(
             stream,
             seq as i64,
             meta.rows as i64,
-            stored_ts(meta.first_ts, "a segment first_ts")?,
-            stored_ts(meta.last_ts, "a segment last_ts")?,
+            meta.first_ts,
+            meta.last_ts,
             bytes,
         ],
     )
@@ -2230,131 +2186,70 @@ mod tests {
         )
         .unwrap();
 
-        let evicted = db.evict_before(id, u64::MAX).unwrap();
+        let evicted = db.evict_before(id, i64::MAX).unwrap();
         assert_eq!(evicted.segments, 1);
         assert_eq!(evicted.wal_rows, 1);
         assert!(db.all_streams(id).unwrap().is_empty());
     }
 
-    /// A timestamp too large to round-trip through a signed column is refused,
-    /// not silently stored as something else.
+    /// The whole signed range is usable, including negatives.
     ///
-    /// Stored and clamped are different answers on purpose: a query BOUND
-    /// clamps, because `u64::MAX` there means "no upper edge" and the caller
-    /// gets what it asked for. A stored VALUE cannot be clamped without
-    /// becoming a different timestamp than the one handed in.
+    /// The column is signed because SQLite has exactly one integer storage
+    /// class and it is `i64` — a value above `i64::MAX` does not error there,
+    /// it silently becomes a REAL and loses precision. So the API takes what
+    /// the column takes. Taking `u64` and rejecting half of it, which this did
+    /// until it was questioned, offered a range the store could not hold while
+    /// refusing one it could: a negative timestamp is simply before 1970.
     #[test]
-    fn a_timestamp_that_cannot_round_trip_is_refused() {
+    fn timestamps_span_the_whole_signed_range() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
-                clock_anchor_wall_ns: 0,
+                clock_anchor_wall_ns: i64::MIN,
             })
             .unwrap();
 
-        let too_big = MAX_TIMESTAMP + 1;
-        let err = db
-            .insert_wal_rows(
+        // Pre-epoch, the epoch itself, and both extremes.
+        let extremes = [i64::MIN, -1_000_000_000, 0, 1, i64::MAX];
+        for ts in extremes {
+            db.insert_wal_rows(
                 id,
                 &[WalRow {
                     stream: "s".to_string(),
-                    ts: too_big,
+                    ts,
                     wall_offset: 0,
                     row: vec![1],
                 }],
             )
-            .expect_err("a WAL row above MAX_TIMESTAMP must not be accepted");
-        assert!(
-            matches!(err, Error::TimestampOutOfRange { .. }),
-            "got: {err:?}"
+            .unwrap();
+        }
+
+        let back: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+        assert_eq!(back, extremes, "every one round-trips, in order");
+        assert_eq!(
+            db.read_sources().unwrap()[0].meta.clock_anchor_wall_ns,
+            i64::MIN
         );
 
-        let err = db
-            .insert_segment(
-                id,
-                "s",
-                0,
-                &SegmentMeta {
-                    rows: 1,
-                    first_ts: 0,
-                    last_ts: too_big,
-                },
-                b"x",
-            )
-            .expect_err("a segment span above MAX_TIMESTAMP must not be accepted");
-        assert!(
-            matches!(err, Error::TimestampOutOfRange { .. }),
-            "got: {err:?}"
-        );
-
-        // The boundary itself is fine, and round-trips.
-        db.insert_wal_rows(
+        // And the watermark still works at the extremes: it is not a sentinel
+        // value any more, so there is no timestamp it cannot distinguish.
+        db.insert_segment(
             id,
-            &[WalRow {
-                stream: "s".to_string(),
-                ts: MAX_TIMESTAMP,
-                wall_offset: 0,
-                row: vec![1],
-            }],
+            "s",
+            0,
+            &SegmentMeta {
+                rows: 3,
+                first_ts: i64::MIN,
+                last_ts: 0,
+            },
+            b"x",
         )
         .unwrap();
-        assert_eq!(db.read_wal(id, "s").unwrap()[0].ts, MAX_TIMESTAMP);
-    }
-
-    /// A row addressed to a source that does not exist is refused.
-    ///
-    /// `Archive::wal_tick` takes a bare `i64` source id, built by zipping
-    /// endpoints to ids. An off-by-one there used to commit an entire
-    /// endpoint's rows under an id no source row has: durable, invisible to
-    /// every read, and unrecoverable. The `REFERENCES` clause was in the schema
-    /// the whole time and did nothing, because SQLite ignores foreign keys
-    /// unless the connection asks for them.
-    #[test]
-    fn a_row_for_a_source_that_does_not_exist_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
-        let real = db
-            .insert_source(&SourceMeta {
-                labels: BTreeMap::new(),
-                metadata: BTreeMap::new(),
-                clock_anchor_wall_ns: 0,
-            })
-            .unwrap();
-
-        let err = db
-            .insert_wal_rows(
-                real + 1,
-                &[WalRow {
-                    stream: "s".to_string(),
-                    ts: 1,
-                    wall_offset: 0,
-                    row: vec![1],
-                }],
-            )
-            .expect_err("a WAL row must not name a source that does not exist");
-        assert!(
-            err.to_string().to_lowercase().contains("foreign key"),
-            "got: {err}"
-        );
-
-        assert!(
-            db.insert_segment(
-                real + 1,
-                "s",
-                0,
-                &SegmentMeta {
-                    rows: 1,
-                    first_ts: 0,
-                    last_ts: 1,
-                },
-                b"x",
-            )
-            .is_err(),
-            "and neither may a segment"
-        );
+        let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+        assert_eq!(live, vec![1, i64::MAX]);
     }
 
     /// A row at timestamp zero is a row.
@@ -2375,7 +2270,7 @@ mod tests {
                 clock_anchor_wall_ns: 0,
             })
             .unwrap();
-        for ts in [0u64, 1, 2] {
+        for ts in [0i64, 1, 2] {
             db.insert_wal_rows(
                 id,
                 &[WalRow {
@@ -2388,7 +2283,7 @@ mod tests {
             .unwrap();
         }
 
-        let live: Vec<u64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+        let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
         assert_eq!(live, vec![0, 1, 2], "ts=0 is a timestamp like any other");
         assert_eq!(db.live_wal_span(id, "s").unwrap().rows, 3);
 
@@ -2405,7 +2300,7 @@ mod tests {
             b"x",
         )
         .unwrap();
-        let live: Vec<u64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+        let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
         assert_eq!(live, vec![2]);
     }
 
@@ -2562,7 +2457,7 @@ mod tests {
         .unwrap();
         // ts=20 straddles: sealed into the segment, still present in the WAL
         // because the prune runs outside the seal transaction.
-        for ts in [10u64, 20, 30] {
+        for ts in [10i64, 20, 30] {
             db.insert_wal_rows(
                 id,
                 &[WalRow {
@@ -2645,11 +2540,11 @@ mod tests {
             })
             .unwrap();
         let empty = db.archive_bytes().unwrap();
-        for seq in 0..40u64 {
+        for seq in 0..40i64 {
             db.insert_segment(
                 id,
                 "s",
-                seq,
+                seq as u64,
                 &SegmentMeta {
                     rows: 1,
                     first_ts: seq * 10,
@@ -2665,7 +2560,7 @@ mod tests {
             "{empty} -> {full}: writing must grow the file"
         );
 
-        db.evict_before(id, u64::MAX).unwrap();
+        db.evict_before(id, i64::MAX).unwrap();
         assert_eq!(
             db.archive_bytes().unwrap(),
             full,
@@ -2756,11 +2651,11 @@ mod tests {
         (dir, db, rid)
     }
 
-    fn wal_row(stream: &str, ts: u64) -> WalRow {
+    fn wal_row(stream: &str, ts: i64) -> WalRow {
         WalRow {
             stream: stream.to_string(),
             ts,
-            wall_offset: ts as i64,
+            wall_offset: ts,
             row: format!("row@{ts}").into_bytes(),
         }
     }

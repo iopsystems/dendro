@@ -4,6 +4,35 @@ Why dendro is shaped the way it is. The measurements cited here were taken in
 [rezolus](https://github.com/iopsystems/rezolus), the telemetry agent this
 format was extracted from, on a production fleet.
 
+## Why timestamps are `i64`
+
+Because SQLite has exactly one integer storage class and it is signed 64-bit.
+There is no unsigned option, and a value above `i64::MAX` does not error on the
+way in — it silently becomes a `REAL` and loses precision:
+
+```
+sqlite> INSERT INTO t VALUES(9223372036854775808); SELECT v, typeof(v) FROM t;
+9.22337203685478e+18|real
+```
+
+So the API takes what the column takes. It used to take `u64` and refuse
+anything above `i64::MAX`, which was the worst of both: it advertised a range
+the store could not hold, and refused one it could, since a negative timestamp
+is simply before 1970.
+
+Taking `u64` also cost two real bugs, both measured before the type changed. A
+row at ts=0 was invisible for the life of a stream that had not sealed, because
+the watermark for a stream with no segments was `COALESCE(MAX(last_ts), 0)`
+against a `ts >` predicate. And `evict_before(u64::MAX)` — the obvious spelling
+of "drop everything" — evicted nothing, because `u64::MAX as i64` is `-1`.
+
+The watermark now asks whether any segment exists rather than comparing against
+a sentinel, so there is no longer a timestamp it cannot distinguish.
+
+For scale: epoch nanoseconds reach `i64::MAX` on **2262-04-11T23:47:16Z**, the
+same ceiling `pandas.Timestamp` and Go's `UnixNano` have. Real telemetry was
+never going to hit it. Sentinels and non-epoch clock domains hit it immediately.
+
 ## Why a WAL at all
 
 The alternative is to seal often enough that losing an open batch does not

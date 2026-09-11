@@ -26,7 +26,7 @@
 //! | **archive** | The file. One SQLite database, holding everything below — one file at rest, three while it is open; see [`db`]. |
 //! | **stream** | A named sequence of rows inside a source. Streams are independent — each accumulates, seals and expires on its own schedule — and **transient**: one can start late, stop early, have gaps, and stop existing altogether once its rows are evicted. |
 //! | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
-//! | **row** | One timestamped payload. Opaque to dendro. |
+//! | **row** | One timestamped payload. The timestamp is an `i64` — SQLite's only integer type, so negative means before 1970 — and the payload is opaque to dendro. |
 //!
 //! Plus five that are not containers:
 //!

@@ -77,7 +77,7 @@ enum Msg {
     /// keeping.
     Evict {
         source_id: i64,
-        cutoff_ts: u64,
+        cutoff_ts: i64,
         streams: Option<StreamFilter>,
         reply: SyncSender<Result<Evicted>>,
     },
@@ -88,7 +88,7 @@ enum Msg {
     /// dropped and the channel closes — see `writer_thread`.
     Finalize {
         source_id: i64,
-        clock_offset: (u64, i64),
+        clock_offset: (i64, i64),
     },
     /// Stop the writer, whatever else is still holding a sender.
     ///
@@ -366,7 +366,7 @@ impl Archive {
     /// thread, so anything that reads the file straight afterwards has to join
     /// too.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn finalize_single(mut self, writer: SourceWriter, clock_offset: (u64, i64)) -> Result<()> {
+    pub fn finalize_single(mut self, writer: SourceWriter, clock_offset: (i64, i64)) -> Result<()> {
         let queued = writer.finalize(clock_offset);
         let joined = self.join();
         queued.and(joined)
@@ -476,7 +476,7 @@ impl SourceWriter {
     ///
     /// Fire-and-forget, like `wal` and `seal`: a failure surfaces on the next
     /// hand-off, which is the convention the whole writer follows.
-    pub fn evict_before(&mut self, cutoff_ts: u64) -> Result<Evicted> {
+    pub fn evict_before(&mut self, cutoff_ts: i64) -> Result<Evicted> {
         self.evict(cutoff_ts, None)
     }
 
@@ -488,7 +488,7 @@ impl SourceWriter {
     /// the one to use: reaching the `Db` method directly means a second writing
     /// connection to a file this thread already owns, which stalls on SQLite's
     /// write lock for `busy_timeout` and then fails.
-    pub fn evict_streams_before(&mut self, cutoff_ts: u64, keep: StreamFilter) -> Result<Evicted> {
+    pub fn evict_streams_before(&mut self, cutoff_ts: i64, keep: StreamFilter) -> Result<Evicted> {
         self.evict(cutoff_ts, Some(keep))
     }
 
@@ -498,7 +498,7 @@ impl SourceWriter {
     /// append path, and a caller running one wants to know what it did — that
     /// is the difference between "the window moved" and "nothing was old enough
     /// yet", and a size-bounded policy needs it to decide whether to cut again.
-    fn evict(&mut self, cutoff_ts: u64, streams: Option<StreamFilter>) -> Result<Evicted> {
+    fn evict(&mut self, cutoff_ts: i64, streams: Option<StreamFilter>) -> Result<Evicted> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::Evict {
             source_id: self.source_id,
@@ -559,7 +559,7 @@ impl SourceWriter {
     /// "recovery artifact".
     ///
     /// A barrier costs nothing here: this is the last thing a source does.
-    pub fn finalize(mut self, clock_offset: (u64, i64)) -> Result<()> {
+    pub fn finalize(mut self, clock_offset: (i64, i64)) -> Result<()> {
         self.send(Msg::Finalize {
             source_id: self.source_id,
             clock_offset,
@@ -894,7 +894,7 @@ fn seal_batch(
     // one table's timestamp against another's. Derived from the rows just
     // sealed, so every entry in the series is a projection of the
     // `:wall_offset` column it summarizes.
-    let mut observation: Option<(u64, i64)> = None;
+    let mut observation: Option<(i64, i64)> = None;
     for stream in batch {
         let rows = db.live_wal(source_id, &stream)?;
         let Some(last) = rows.last() else {

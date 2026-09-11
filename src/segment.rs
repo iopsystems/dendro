@@ -37,9 +37,9 @@ pub struct Segment {
     /// How many rows are in `bytes`.
     pub rows: u64,
     /// The timestamp of the first row in `bytes`.
-    pub first_ts: u64,
+    pub first_ts: i64,
     /// The timestamp of the last row in `bytes`.
-    pub last_ts: u64,
+    pub last_ts: i64,
 }
 
 /// Turns a stream's WAL rows into one parquet segment.

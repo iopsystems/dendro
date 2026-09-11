@@ -46,7 +46,7 @@ fn source() -> SourceMeta {
 fn unsealed(path: &std::path::Path) -> i64 {
     let mut db = Db::create(path).unwrap();
     let id = db.insert_source(&source()).unwrap();
-    for ts in 1..=3u64 {
+    for ts in 1..=3i64 {
         db.insert_wal_rows(
             id,
             &[WalRow {
@@ -190,7 +190,7 @@ fn read_archive_holds_one_snapshot_across_streams() {
     // `a` sorts before `s`, so it is read first and its encode runs before the
     // reads of `s`.
     for stream in ["a", "s"] {
-        for ts in 1..=3u64 {
+        for ts in 1..=3i64 {
             db.insert_wal_rows(
                 id,
                 &[WalRow {
@@ -258,7 +258,7 @@ fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
     let path = dir.path().join("a.dendro");
     let mut archive = Archive::create(&path, Box::new(DropsLast)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
-    for ts in 1..=3u64 {
+    for ts in 1..=3i64 {
         src.wal(vec![WalRow {
             stream: "s".to_string(),
             ts,
@@ -313,7 +313,7 @@ fn an_encoder_cannot_invent_coverage() {
                 bytes: b"lies".to_vec(),
                 rows: 9_999,
                 first_ts: 0,
-                last_ts: u64::MAX,
+                last_ts: i64::MAX,
             }))
         }
     }
@@ -357,7 +357,7 @@ fn retention_runs_through_the_writer_and_reports_what_it_removed() {
     let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for stream in ["debug/a", "metric/b"] {
-        for ts in [10u64, 20] {
+        for ts in [10i64, 20] {
             src.wal(vec![WalRow {
                 stream: stream.to_string(),
                 ts,
@@ -427,7 +427,7 @@ fn retention_bounds_the_clock_offset_series() {
     let path = dir.path().join("a.dendro");
     let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
-    for ts in [10u64, 20, 30] {
+    for ts in [10i64, 20, 30] {
         src.wal(vec![WalRow {
             stream: "s".to_string(),
             ts,
@@ -447,7 +447,7 @@ fn retention_bounds_the_clock_offset_series() {
     src.sync().unwrap();
 
     let db = Db::open_read_only(&path).unwrap();
-    let left: Vec<u64> = db
+    let left: Vec<i64> = db
         .read_clock_offsets(1)
         .unwrap()
         .iter()

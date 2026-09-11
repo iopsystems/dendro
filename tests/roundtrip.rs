@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -56,7 +56,7 @@ impl SegmentEncoder for ReadingEncoder {
         if rows.is_empty() {
             return Ok(None);
         }
-        let mut ts = Vec::with_capacity(rows.len());
+        let mut ts: Vec<i64> = Vec::with_capacity(rows.len());
         let mut values = Vec::with_capacity(rows.len());
         let mut notes = Vec::with_capacity(rows.len());
         for r in rows {
@@ -66,14 +66,14 @@ impl SegmentEncoder for ReadingEncoder {
             notes.push(reading.note);
         }
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("timestamp", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
             Field::new("note", DataType::Utf8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(ts.clone())) as ArrayRef,
+                Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
                 Arc::new(Int64Array::from(values)) as ArrayRef,
                 Arc::new(StringArray::from(notes)) as ArrayRef,
             ],
@@ -108,7 +108,7 @@ fn seed(source: &str) -> SourceMeta {
     }
 }
 
-fn row(stream: &str, ts: u64, value: i64, note: &str) -> WalRow {
+fn row(stream: &str, ts: i64, value: i64, note: &str) -> WalRow {
     WalRow {
         stream: stream.to_string(),
         ts,
@@ -122,7 +122,7 @@ fn row(stream: &str, ts: u64, value: i64, note: &str) -> WalRow {
 }
 
 /// Decode a segment back to `(timestamp, value, note)` triples.
-fn decode(bytes: &[u8]) -> Vec<(u64, i64, String)> {
+fn decode(bytes: &[u8]) -> Vec<(i64, i64, String)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
         .expect("open segment")
@@ -135,8 +135,8 @@ fn decode(bytes: &[u8]) -> Vec<(u64, i64, String)> {
             .column_by_name("timestamp")
             .expect("timestamp")
             .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("u64")
+            .downcast_ref::<Int64Array>()
+            .expect("i64")
             .clone();
         let values = batch.column_by_name("value").map(|c| {
             c.as_any()
@@ -164,7 +164,7 @@ fn decode(bytes: &[u8]) -> Vec<(u64, i64, String)> {
     out
 }
 
-fn all_rows(path: &std::path::Path, stream: &str) -> Vec<(u64, i64, String)> {
+fn all_rows(path: &std::path::Path, stream: &str) -> Vec<(i64, i64, String)> {
     let db = Db::open(path).expect("open");
     let sources = read::read_archive(&db, &ReadingEncoder).expect("read");
     let rec = sources.first().expect("a source");

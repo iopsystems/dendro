@@ -36,8 +36,8 @@ pub trait ColumnFilter {
 pub struct CopySpec<'a> {
     /// Row-timestamp bound in nanoseconds. The rewrite tools copy everything;
     /// a ranged dump narrows it to the incident window.
-    pub start: u64,
-    pub end: u64,
+    pub start: i64,
+    pub end: i64,
     /// Keep only the streams this accepts; `None` keeps every stream.
     ///
     /// A predicate rather than a name set because a caller may group streams
@@ -60,7 +60,7 @@ impl CopySpec<'_> {
     pub fn everything() -> Self {
         CopySpec {
             start: 0,
-            end: u64::MAX,
+            end: i64::MAX,
             keep_streams: None,
             metadata_extra: None,
             keep_columns: None,
