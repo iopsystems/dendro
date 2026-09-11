@@ -56,6 +56,32 @@ That is the entire schema boundary. dendro owns storage, cataloguing,
 retention, checkpointing and segment mechanics; you own the columns. It has no
 opinion about your query engine either — reads hand back parquet bytes.
 
+## Known gaps
+
+Three things worth knowing before you build on it. The first is a trap; the
+other two are boundaries.
+
+- **Out-of-order appends are accepted and never read.** A row whose timestamp is
+  at or below its stream's newest sealed segment is committed, occupies space
+  for the life of the archive, and is invisible to every read path — with no
+  error. dendro is built for producers that append monotonically. If yours can
+  deliver a late sample, this will lose it silently.
+  [Journal](docs/journal/2026-09-11-out-of-order-appends.md).
+- **Segments are never merged.** They are created by a seal and destroyed whole
+  by eviction; nothing compacts them. Read cost tracks segment *count*, so an
+  archive kept for a long time gets slower and there is no mechanism to fix it.
+  A rolling buffer is unaffected, because eviction removes the old ones.
+  [Journal](docs/journal/2026-09-11-segment-compaction.md).
+- **There is no index over what is inside a row.** The catalog knows sources,
+  streams and time — nothing about series or labels, because dendro does not
+  know what a row means. Finding which segments contain a particular series
+  means reading parquet footers. That is the boundary working as intended, but
+  it means a database built on dendro brings its own index.
+
+Retention is not on that list: it is per stream, by time, with the size
+accounting a cap needs — see `evict_streams_before`, `segment_sizes` and
+`archive_bytes`.
+
 ## Vocabulary
 
 Four things nest, and they are the whole model:
@@ -116,9 +142,12 @@ extracted from.
 
 ## Also here
 
-- **Retention.** `evict_before` drops everything wholly older than a cutoff and
-  trickles freed pages back to the filesystem, which is what makes a rolling
-  buffer of bounded size work.
+- **Retention, as policy you write.** `evict_before` drops everything wholly
+  older than a cutoff; `evict_streams_before` restricts that to the streams a
+  predicate accepts, so different streams can be worth different amounts of
+  time. `segment_sizes` and `archive_bytes` are what a size cap walks. Freed
+  pages trickle back to the filesystem, which is what bounds a rolling buffer.
+  dendro supplies the mechanism and never applies a policy of its own.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
@@ -157,4 +186,5 @@ the internal `.rez` v3 format. Archives written by that version still open
 read-only; see `LEGACY_SCHEMA_VERSION`.
 
 The design reasoning, including what was measured to arrive at it, is in
-[DESIGN.md](DESIGN.md).
+[DESIGN.md](DESIGN.md). Known gaps and the reasoning behind leaving them open
+are in [docs/journal/](docs/journal/README.md).

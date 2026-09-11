@@ -1192,6 +1192,108 @@ impl Db {
         )
     }
 
+    /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
+    /// accepts.
+    ///
+    /// Retention is the caller's policy, the way sealing is: dendro knows what
+    /// a cutoff means but not that debug counters are worth a day and the
+    /// metric they explain is worth a month. A predicate rather than a name
+    /// set, matching [`CopySpec::keep_streams`](crate::rewrite::CopySpec), so a
+    /// caller whose streams are grouped under some coarser unit can retain by
+    /// that unit.
+    ///
+    /// Still ONE transaction, for the reason
+    /// [`evict_before`](Self::evict_before) gives — but note the scope is now
+    /// per stream, which is what makes that reason keep holding: the WAL delete
+    /// that stops a segment delete from un-shadowing rows has to carry the same
+    /// stream as the segment delete, or it would either miss rows or take rows
+    /// belonging to a stream this pass is meant to leave alone.
+    pub fn evict_streams_before(
+        &mut self,
+        source_id: i64,
+        cutoff_ts: u64,
+        evict: &dyn Fn(&str) -> bool,
+    ) -> Result<Evicted, String> {
+        self.writable()?;
+        let streams: Vec<String> = self
+            .all_streams(source_id)?
+            .into_iter()
+            .filter(|s| evict(s))
+            .collect();
+        self.transaction(|tx| {
+            let mut total = Evicted {
+                segments: 0,
+                wal_rows: 0,
+            };
+            for stream in &streams {
+                let params = rusqlite::params![source_id, stream, cutoff_ts as i64];
+                total.segments += tx
+                    .tx
+                    .execute(
+                        "DELETE FROM segments \
+                         WHERE source_id = ?1 AND stream = ?2 AND last_ts < ?3",
+                        params,
+                    )
+                    .map_err(|e| format!("failed to evict {stream} segments: {e}"))?;
+                total.wal_rows += tx
+                    .tx
+                    .execute(
+                        "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
+                        params,
+                    )
+                    .map_err(|e| format!("failed to evict {stream} WAL rows: {e}"))?;
+            }
+            Ok(total)
+        })
+    }
+
+    /// Sealed segment sizes across a source, oldest first: `(last_ts, bytes)`.
+    ///
+    /// What a size-bounded policy walks. Accumulate from the front until the
+    /// running total covers the overage, then pass that entry's `last_ts + 1`
+    /// to [`evict_before`](Self::evict_before) — segments are immutable, so a
+    /// cutoff is the only granularity there is.
+    ///
+    /// **There is deliberately no "drop these segments" primitive.** Dropping
+    /// an arbitrary segment is not safe in the way dropping a prefix is:
+    /// removing a stream's NEWEST segment lowers [`live_wal`](Self::live_wal)'s
+    /// watermark, and WAL rows that segment already covered become live again —
+    /// a reader would splice them back in as a tail, silently duplicating rows
+    /// that were already sealed. Evicting by cutoff can only ever remove a
+    /// prefix, which is why it is the shape this offers.
+    pub fn segment_sizes(&self, source_id: i64) -> Result<Vec<(u64, u64)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT last_ts, length(bytes) FROM segments \
+                 WHERE source_id = ?1 ORDER BY last_ts",
+            )
+            .map_err(|e| format!("failed to query segment sizes: {e}"))?;
+        let rows = stmt
+            .query_map([source_id], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(|e| format!("failed to query segment sizes: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed to read a segment size: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// What the archive occupies on disk, in bytes.
+    ///
+    /// `page_count * page_size`, so it is the FILE's size rather than the sum
+    /// of what is live in it: pages freed by eviction stay counted until
+    /// [`incremental_vacuum`](Self::incremental_vacuum) hands them back. That
+    /// is the number a size cap wants, since it is the number the filesystem
+    /// sees. It does not include the `-wal` sidecar.
+    pub fn archive_bytes(&self) -> Result<u64, String> {
+        let pages = self.pragma_u32("page_count")? as u64;
+        let size = self.pragma_u32("page_size")? as u64;
+        Ok(pages * size)
+    }
+
     fn evict(
         &mut self,
         source_id: i64,
@@ -1898,6 +2000,198 @@ mod tests {
             db.all_streams(rid).unwrap(),
             vec!["cpu_usage", "drivehealth"],
             "all_streams() must see it — this is the whole point of the accessor"
+        );
+    }
+
+    /// Retention can be per stream, and a pass names the streams it touches.
+    ///
+    /// The reason the predicate exists: a caller keeping debug counters for a
+    /// day and the metric they explain for a month cannot express that with one
+    /// cutoff over a whole source.
+    #[test]
+    fn per_stream_eviction_leaves_the_streams_it_was_not_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        let sm = |first_ts, last_ts| SegmentMeta {
+            rows: 1,
+            first_ts,
+            last_ts,
+        };
+        for stream in ["debug/a", "debug/b", "metric/c"] {
+            db.insert_segment(id, stream, 0, &sm(0, 9), b"old").unwrap();
+            db.insert_segment(id, stream, 1, &sm(100, 109), b"new")
+                .unwrap();
+        }
+
+        // Coarser than a stream name on purpose: this is the unit an operator
+        // names, and it owns several streams.
+        let evicted = db
+            .evict_streams_before(id, 50, &|s: &str| s.starts_with("debug/"))
+            .unwrap();
+        assert_eq!(
+            evicted.segments, 2,
+            "one old segment from each debug stream"
+        );
+
+        for stream in ["debug/a", "debug/b"] {
+            let got = db.read_segments(id, stream).unwrap();
+            assert_eq!(got.len(), 1, "{stream} keeps only its newer segment");
+            assert_eq!(got[0].bytes, b"new");
+        }
+        assert_eq!(
+            db.read_segments(id, "metric/c").unwrap().len(),
+            2,
+            "a stream the predicate rejected must be untouched"
+        );
+    }
+
+    /// A per-stream pass keeps the invariant the whole-source one rests on: a
+    /// WAL row a deleted segment covered goes with it.
+    ///
+    /// Without that, deleting the segment lowers `live_wal`'s watermark and the
+    /// rows it shadowed come back as a tail — the reader splices rows it has
+    /// already seen. The stream scoping is what makes the two deletes line up.
+    #[test]
+    fn per_stream_eviction_takes_the_wal_rows_its_segments_shadowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        db.insert_segment(
+            id,
+            "s",
+            0,
+            &SegmentMeta {
+                rows: 2,
+                first_ts: 0,
+                last_ts: 20,
+            },
+            b"sealed",
+        )
+        .unwrap();
+        // ts=20 straddles: sealed into the segment, still present in the WAL
+        // because the prune runs outside the seal transaction.
+        for ts in [10u64, 20, 30] {
+            db.insert_wal_rows(
+                id,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.live_wal(id, "s").unwrap().len(), 1, "only ts=30 is live");
+
+        db.evict_streams_before(id, 25, &|_| true).unwrap();
+
+        assert!(db.read_segments(id, "s").unwrap().is_empty());
+        let live = db.live_wal(id, "s").unwrap();
+        assert_eq!(
+            live.len(),
+            1,
+            "the shadowed rows went with the segment; only ts=30 remains, \
+             and it was live before"
+        );
+        assert_eq!(live[0].ts, 30);
+    }
+
+    /// `segment_sizes` is what a size cap walks: oldest first, real bytes.
+    #[test]
+    fn segment_sizes_are_oldest_first_and_measure_the_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        // Inserted newest-first, and across two streams, so the ordering under
+        // test cannot be the insertion order.
+        db.insert_segment(
+            id,
+            "b",
+            0,
+            &SegmentMeta {
+                rows: 1,
+                first_ts: 90,
+                last_ts: 99,
+            },
+            &[0u8; 300],
+        )
+        .unwrap();
+        db.insert_segment(
+            id,
+            "a",
+            0,
+            &SegmentMeta {
+                rows: 1,
+                first_ts: 0,
+                last_ts: 9,
+            },
+            &[0u8; 100],
+        )
+        .unwrap();
+
+        assert_eq!(db.segment_sizes(id).unwrap(), vec![(9, 100), (99, 300)]);
+    }
+
+    /// `archive_bytes` is the file the filesystem sees, which is what a size
+    /// cap is written against — and it does NOT shrink on eviction alone.
+    #[test]
+    fn archive_bytes_counts_the_file_including_pages_not_yet_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let id = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+        let empty = db.archive_bytes().unwrap();
+        for seq in 0..40u64 {
+            db.insert_segment(
+                id,
+                "s",
+                seq,
+                &SegmentMeta {
+                    rows: 1,
+                    first_ts: seq * 10,
+                    last_ts: seq * 10 + 9,
+                },
+                &[7u8; 4096],
+            )
+            .unwrap();
+        }
+        let full = db.archive_bytes().unwrap();
+        assert!(
+            full > empty,
+            "{empty} -> {full}: writing must grow the file"
+        );
+
+        db.evict_before(id, u64::MAX).unwrap();
+        assert_eq!(
+            db.archive_bytes().unwrap(),
+            full,
+            "eviction frees pages for reuse but does not return them - that is \
+             what `incremental_vacuum` is for, and a size cap has to know it"
         );
     }
 
