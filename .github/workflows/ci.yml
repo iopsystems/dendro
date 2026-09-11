@@ -60,10 +60,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y graphviz
-      - run: docs/regen.sh
-      - name: Diagrams are up to date
+      # The `.dot` is this crate's own string output, so it is deterministic and
+      # can be diffed. The SVG is NOT: graphviz 2.43 (Ubuntu) and 16.0
+      # (Homebrew) lay the same graph out differently, down to the preamble, so
+      # diffing rendered bytes would fail for everyone whose graphviz is not the
+      # committer's. `check_diagrams` closes that gap by asserting the committed
+      # SVG draws the same nodes and edges the `.dot` declares - the claim,
+      # rather than the pixels.
+      - name: The .dot sources are up to date
         run: |
-          if ! git diff --exit-code -- docs/; then
-            echo "::error::docs/ is stale - run docs/regen.sh and commit the result" >&2
+          cargo run --quiet --example gen_diagrams
+          if ! git diff --exit-code -- 'docs/*.dot'; then
+            echo "::error::docs/*.dot is stale - run docs/regen.sh and commit the result" >&2
             exit 1
           fi
+      - name: The committed SVGs match their sources
+        run: cargo run --quiet --example check_diagrams
+      # And the rendering checks run against THIS graphviz too, not only the
+      # one the diagrams were committed from.
+      - name: Bounds and collisions hold on this graphviz
+        run: |
+          for f in model write-path read-path; do
+            dot -Tsvg "docs/$f.dot" -o "docs/$f.svg"
+          done
+          cargo run --quiet --example check_diagrams
+          git checkout -- docs/

@@ -4,7 +4,7 @@
 //! looks right can render into a picture that is not. These checks run against
 //! the SVG graphviz actually produced.
 //!
-//! Two properties, both of which a reader notices immediately and no assertion
+//! Three properties. Two of them a reader notices immediately and no assertion
 //! on the `.dot` would catch:
 //!
 //! * **Bounds.** Every drawn point sits inside the declared `viewBox`.
@@ -14,10 +14,23 @@
 //!   through otherwise-empty space is invisible to it, and edges are what the
 //!   key tends to land on.
 //!
+//! And one that exists because the geometry is NOT reproducible:
+//!
+//! * **The committed SVG makes the same claims as its `.dot`.** graphviz 2.43
+//!   and 16.0 lay the same graph out differently - different sizes, different
+//!   coordinates, even a different SVG preamble - so CI cannot diff the
+//!   rendered bytes against a locally rendered copy. It diffs the `.dot`, which
+//!   is deterministic because it is just this crate's string output, and then
+//!   checks here that the SVG beside it still draws exactly that set of nodes
+//!   and edges. That catches the failure a byte-diff was there to catch - a
+//!   regenerated `.dot` with a stale SVG next to it - without pinning a
+//!   graphviz version nobody else will have.
+//!
 //! Run by `docs/regen.sh`, which fails the build rather than warning - a
 //! warning about a diagram nobody is currently looking at is a warning nobody
 //! reads.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +120,66 @@ fn group<'a>(svg: &'a str, title: &str) -> Option<&'a str> {
     Some(&svg[start..end])
 }
 
+/// Node ids and edges declared by a `.dot`, as graphviz will title them.
+fn declared(dot: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut nodes = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    for line in dot.lines() {
+        let line = line.trim();
+        if line.starts_with("//") || line.starts_with("--") {
+            continue;
+        }
+        if let Some((lhs, rhs)) = line.split_once("->") {
+            let a = lhs.split_whitespace().next_back().unwrap_or("").trim();
+            let b = rhs
+                .trim_start()
+                .split([' ', '[', ';'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !a.is_empty() && !b.is_empty() {
+                edges.insert(format!("{a}->{b}"));
+                nodes.insert(a.to_string());
+                nodes.insert(b.to_string());
+            }
+        } else if let Some((id, _)) = line.split_once(" [") {
+            let id = id.trim();
+            // Attribute defaults (`node [...]`, `edge [...]`) are not nodes.
+            if !id.is_empty()
+                && id != "node"
+                && id != "edge"
+                && id != "graph"
+                && id.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                nodes.insert(id.to_string());
+            }
+        }
+    }
+    (nodes, edges)
+}
+
+/// Node ids and edges the SVG actually draws.
+fn rendered(svg: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let unescape = |s: &str| s.replace("&#45;", "-").replace("&gt;", ">");
+    let mut nodes = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    for (class, set) in [("node", &mut nodes), ("edge", &mut edges)] {
+        let marker = format!("class=\"{class}\"");
+        let mut rest = svg;
+        while let Some(i) = rest.find(&marker) {
+            rest = &rest[i + marker.len()..];
+            if let Some(t) = rest
+                .split("<title>")
+                .nth(1)
+                .and_then(|s| s.split("</title>").next())
+            {
+                set.insert(unescape(t));
+            }
+        }
+    }
+    (nodes, edges)
+}
+
 fn check(path: &Path) -> Result<(), String> {
     let svg = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = path.file_name().unwrap().to_string_lossy();
@@ -139,6 +212,30 @@ fn check(path: &Path) -> Result<(), String> {
         return Err(format!(
             "{name}: drawn extent {span:?} is wider than the viewBox {view:?}"
         ));
+    }
+
+    // -- the SVG draws what the .dot declares ------------------------------
+    let dot_path = path.with_extension("dot");
+    let dot =
+        std::fs::read_to_string(&dot_path).map_err(|e| format!("{}: {e}", dot_path.display()))?;
+    let (want_nodes, want_edges) = declared(&dot);
+    let (got_nodes, got_edges) = rendered(&svg);
+    for (what, want, got) in [
+        ("node", &want_nodes, &got_nodes),
+        ("edge", &want_edges, &got_edges),
+    ] {
+        let missing: Vec<_> = want.difference(got).cloned().collect();
+        let extra: Vec<_> = got.difference(want).cloned().collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            return Err(format!(
+                "{name}: the SVG does not draw what {} declares.\n\
+                 missing {what}s: {:?}\n  extra {what}s: {:?}\n\
+                 The SVG is stale - run docs/regen.sh and commit the result.",
+                dot_path.file_name().unwrap().to_string_lossy(),
+                missing,
+                extra
+            ));
+        }
     }
 
     // -- the key does not collide -----------------------------------------
@@ -207,7 +304,12 @@ fn check(path: &Path) -> Result<(), String> {
         edges += 1;
         r = &r[i + 12..];
     }
-    println!("{name}: bounds ok; key clears {edges} edges by {closest:.0}pt");
+    println!(
+        "{name}: {} nodes / {} edges match the .dot; bounds ok; \
+         key clears {edges} edges by {closest:.0}pt",
+        got_nodes.len(),
+        got_edges.len()
+    );
     Ok(())
 }
 
