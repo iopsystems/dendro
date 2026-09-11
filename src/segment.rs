@@ -10,6 +10,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::db::WalRow;
+use crate::error::{Error, Result};
 
 /// One sealed segment: parquet bytes plus the catalog facts about what is in
 /// them.
@@ -53,27 +54,37 @@ pub struct Segment {
 ///
 /// `None` means the rows produce no segment.
 pub trait SegmentEncoder {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String>;
+    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
 }
 
+/// What an encoder returns.
+///
+/// A boxed `std::error::Error` rather than this crate's own: the failure is the
+/// CALLER's, and stringifying it at the boundary threw away whatever type it
+/// had. Wrapped in [`Error::Encoder`](crate::Error::Encoder), which keeps it as
+/// `source()`, so a caller can downcast back to its own error rather than
+/// matching on a message it built.
+pub type EncodeResult =
+    std::result::Result<Option<Segment>, Box<dyn std::error::Error + Send + Sync>>;
+
 impl<T: SegmentEncoder + ?Sized> SegmentEncoder for &T {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
         (**self).encode(stream, rows)
     }
 }
 
 /// Encode one `RecordBatch` as a segment's parquet bytes, with the archive's
 /// writer properties. The usual last step of a [`SegmentEncoder::encode`].
-pub fn encode_batch(schema: Arc<Schema>, batch: &RecordBatch) -> Result<Vec<u8>, String> {
+pub fn encode_batch(schema: Arc<Schema>, batch: &RecordBatch) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(writer_props()))
-        .map_err(|e| format!("failed to open a segment writer: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to open a segment writer: {e}")))?;
     writer
         .write(batch)
-        .map_err(|e| format!("failed to write a segment: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to write a segment: {e}")))?;
     writer
         .close()
-        .map_err(|e| format!("failed to finish a segment: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to finish a segment: {e}")))?;
     Ok(buf)
 }
 

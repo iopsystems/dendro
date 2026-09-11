@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 
 use crate::db::{Db, SegmentMeta, Tx};
+use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
 /// Which columns of a segment survive a [`project_segment_columns`] pass.
@@ -89,7 +90,7 @@ pub fn copy_sources_into(
     tx: &Tx<'_>,
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
-) -> Result<usize, String> {
+) -> Result<usize> {
     // ONE snapshot over every read of the source. The destination transaction
     // is the caller's and is on another connection, so this only bounds what we
     // read.
@@ -108,7 +109,7 @@ fn copy_sources_snapshotted(
     tx: &Tx<'_>,
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
-) -> Result<usize, String> {
+) -> Result<usize> {
     let sources = src.read_sources()?;
     let mut copied = 0usize;
     for rec in &sources {
@@ -176,7 +177,7 @@ fn copy_sources_snapshotted(
             // right. See [`Segment`](crate::segment::Segment).
             let materialized = encoder
                 .encode(&table, &tail)
-                .map_err(|e| format!("failed to seal the {table} tail: {e}"))?;
+                .map_err(|e| Error::Message(format!("failed to seal the {table} tail: {e}")))?;
             if let Some(materialized) = materialized {
                 let meta = SegmentMeta {
                     rows: materialized.rows,
@@ -219,15 +220,12 @@ fn copy_sources_snapshotted(
 /// implementation that drops a column its own reader needs to place rows in
 /// time will produce a segment that opens and answers wrongly, so
 /// [`ColumnFilter::keep`] should accept those unconditionally.
-pub fn project_segment_columns(
-    bytes: &[u8],
-    keep: &dyn ColumnFilter,
-) -> Result<Option<Vec<u8>>, String> {
+pub fn project_segment_columns(bytes: &[u8], keep: &dyn ColumnFilter) -> Result<Option<Vec<u8>>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::ArrowWriter;
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
-        .map_err(|e| format!("failed to open a segment for projection: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to open a segment for projection: {e}")))?;
     let schema = builder.schema().clone();
 
     let mut indices: Vec<usize> = Vec::new();
@@ -245,11 +243,11 @@ pub fn project_segment_columns(
     let projected_schema = std::sync::Arc::new(
         schema
             .project(&indices)
-            .map_err(|e| format!("failed to project a segment schema: {e}"))?,
+            .map_err(|e| Error::Message(format!("failed to project a segment schema: {e}")))?,
     );
     let reader = builder
         .build()
-        .map_err(|e| format!("failed to read a segment for projection: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to read a segment for projection: {e}")))?;
 
     let mut buf: Vec<u8> = Vec::new();
     {
@@ -258,19 +256,20 @@ pub fn project_segment_columns(
             projected_schema,
             Some(crate::segment::writer_props()),
         )
-        .map_err(|e| format!("failed to open a projected segment writer: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to open a projected segment writer: {e}")))?;
         for batch in reader {
-            let batch = batch.map_err(|e| format!("failed to read a segment batch: {e}"))?;
+            let batch = batch
+                .map_err(|e| Error::Message(format!("failed to read a segment batch: {e}")))?;
             let projected = batch
                 .project(&indices)
-                .map_err(|e| format!("failed to project a segment batch: {e}"))?;
-            writer
-                .write(&projected)
-                .map_err(|e| format!("failed to write a projected segment batch: {e}"))?;
+                .map_err(|e| Error::Message(format!("failed to project a segment batch: {e}")))?;
+            writer.write(&projected).map_err(|e| {
+                Error::Message(format!("failed to write a projected segment batch: {e}"))
+            })?;
         }
         writer
             .close()
-            .map_err(|e| format!("failed to finalize a projected segment: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to finalize a projected segment: {e}")))?;
     }
     Ok(Some(buf))
 }

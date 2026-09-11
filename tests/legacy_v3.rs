@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use dendro::db::{Db, WalRow};
 use dendro::read;
-use dendro::segment::{Segment, SegmentEncoder};
+use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
 /// The v3 schema, verbatim. Identical to v4 in shape; only the names differ,
 /// and this const is the record of exactly which ones — if it and
@@ -61,7 +61,7 @@ INSERT INTO schema_version(version) VALUES (3);
 struct CountingEncoder;
 
 impl SegmentEncoder for CountingEncoder {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -161,11 +161,11 @@ fn a_legacy_v3_archive_refuses_a_write() {
         )
         .expect_err("a v3 archive must not accept a write");
     assert!(
-        err.contains("v3") && err.contains("readable but not writable"),
-        "the refusal should name the schema and the reason, got: {err}"
+        matches!(err, dendro::Error::ReadOnly(dendro::ReadOnly::LegacySchema)),
+        "the refusal should be the typed one a caller can branch on, got: {err:?}"
     );
     assert!(
-        !err.contains("because it is a view"),
+        !err.to_string().contains("because it is a view"),
         "SQLite's own message should not reach the caller, got: {err}"
     );
 }
@@ -186,5 +186,8 @@ fn an_unknown_schema_version_is_refused() {
         Ok(_) => panic!("an unknown version must not open"),
         Err(e) => e,
     };
-    assert!(err.contains("99"), "got: {err}");
+    assert!(
+        matches!(err, dendro::Error::UnsupportedSchema { found: 99, .. }),
+        "the version found must be recoverable without parsing a sentence, got: {err:?}"
+    );
 }

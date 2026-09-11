@@ -75,11 +75,11 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "write")]
-//! # fn demo() -> Result<(), String> {
-//! # use dendro::{db::{SourceMeta, WalRow}, segment::{Segment, SegmentEncoder}, writer::Archive};
+//! # fn demo() -> dendro::Result<()> {
+//! # use dendro::{db::{SourceMeta, WalRow}, segment::{EncodeResult, SegmentEncoder}, writer::Archive};
 //! # struct MyEncoder;
 //! # impl SegmentEncoder for MyEncoder {
-//! #     fn encode(&self, _: &str, _: &[WalRow]) -> Result<Option<Segment>, String> { Ok(None) }
+//! #     fn encode(&self, _: &str, _: &[WalRow]) -> EncodeResult { Ok(None) }
 //! # }
 //! # let seed = SourceMeta { labels: Default::default(), metadata: Default::default(), clock_anchor_wall_ns: 0 };
 //! # let rows: Vec<WalRow> = vec![];
@@ -125,6 +125,8 @@
 
 /// The container: schema, catalog, and every statement that touches SQL.
 pub mod db;
+/// What can go wrong.
+pub mod error;
 /// Resolving an archive to segment bytes, live tail included.
 pub mod read;
 /// Combining, trimming and time-bounding archives without decoding a segment.
@@ -133,6 +135,8 @@ pub mod rewrite;
 pub mod seal;
 /// Segments, and the encoder boundary.
 pub mod segment;
+
+pub use error::{Error, ReadOnly, Result};
 /// The writer thread.
 ///
 /// Behind the `write` feature: it spawns a thread, and `std::thread::spawn`

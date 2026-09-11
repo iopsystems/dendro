@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::db::{Db, Evicted, SegmentMeta, SourceMeta, WalRow};
+use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
 /// Which streams a retention pass touches; `None` is the whole source.
@@ -50,7 +51,7 @@ enum Msg {
     /// as a hang. The reply channel is the same shape `Sync` already uses.
     AddSource {
         seed: Box<SourceMeta>,
-        reply: SyncSender<Result<i64, String>>,
+        reply: SyncSender<Result<i64>>,
     },
     /// One tick's WAL rows for EVERY source in the archive, across all
     /// their streams — one transaction, and therefore one fsync at
@@ -78,7 +79,7 @@ enum Msg {
         source_id: i64,
         cutoff_ts: u64,
         streams: Option<StreamFilter>,
-        reply: SyncSender<Result<Evicted, String>>,
+        reply: SyncSender<Result<Evicted>>,
     },
     /// One source's last clock observation; marks *that* source complete.
     ///
@@ -115,7 +116,7 @@ enum Msg {
 /// sources has one thread and many handles, and a handle cannot join what it
 /// does not own — so the thread stores its error here on the way out and every
 /// handle reads it, keeping per-tick errors as specific as they were.
-type ErrorSlot = Arc<Mutex<Option<String>>>;
+type ErrorSlot = Arc<Mutex<Option<Arc<Error>>>>;
 
 /// Reclaim at most this many pages per retention pass — sized to fit inside a
 /// tick. The point of a cap at all is that a shrunken working set drains back
@@ -139,7 +140,7 @@ pub struct Archive {
     /// The master sender. Kept only to clone per-source handles from, and
     /// dropped by `join` so the writer's channel can actually close.
     tx: Option<SyncSender<Msg>>,
-    thread: Option<JoinHandle<Result<(), String>>>,
+    thread: Option<JoinHandle<Result<()>>>,
     path: PathBuf,
     err: ErrorSlot,
 }
@@ -154,7 +155,7 @@ impl Archive {
     /// an early-killed source is just a source whose `complete` is 0.
     ///
     /// The archive holds no sources yet; add each with `add_source`.
-    pub fn create(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Result<Self, String> {
+    pub fn create(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Result<Self> {
         Self::create_checkpointing_every(path, encoder, CHECKPOINT_INTERVAL)
     }
 
@@ -168,7 +169,7 @@ impl Archive {
         path: &Path,
         encoder: Box<dyn SegmentEncoder + Send>,
         checkpoint_every: Duration,
-    ) -> Result<Self, String> {
+    ) -> Result<Self> {
         let db = Db::create(path)?;
 
         // Bound 1: the hand-off blocks while the writer is busy,
@@ -196,7 +197,9 @@ impl Archive {
                 // The closure was dropped with the failed spawn, and the
                 // connection with it, so the file is closed and ours to remove.
                 Db::remove_archive(path);
-                return Err(format!("failed to spawn the archive writer thread: {e}"));
+                return Err(Error::Message(format!(
+                    "failed to spawn the archive writer thread: {e}"
+                )));
             }
         };
 
@@ -214,11 +217,11 @@ impl Archive {
     /// label-tagged `sources` list — and they are independent: each has its
     /// own segment sequences, its own clock-offset series, and its own
     /// `complete` flag.
-    pub fn add_source(&mut self, seed: SourceMeta) -> Result<SourceWriter, String> {
+    pub fn add_source(&mut self, seed: SourceMeta) -> Result<SourceWriter> {
         // Derived before the seed is sent, since the seed moves.
         let stagger_key = crate::seal::source_stagger_key(&seed.labels);
         let Some(tx) = self.tx.as_ref() else {
-            return Err("the archive writer thread has already been joined".to_string());
+            return Err("the archive writer thread has already been joined".into());
         };
         let (reply_tx, reply_rx) = sync_channel(0);
         if tx
@@ -259,7 +262,7 @@ impl Archive {
     /// distinction is load-bearing: the guarantee lives in `Msg::Shutdown`, not
     /// in the drop order, and removing it would turn every "must drop first"
     /// note in this file into a real deadlock.
-    pub fn join(&mut self) -> Result<(), String> {
+    pub fn join(&mut self) -> Result<()> {
         // Tell the writer to stop before releasing our own sender. A handle
         // that outlived its archive still holds a clone, so waiting for the
         // channel to close on its own could wait forever; `Shutdown` ends the
@@ -275,12 +278,12 @@ impl Archive {
             // itself panic.
             Some(handle) => handle
                 .join()
-                .unwrap_or_else(|_| Err("the archive writer thread panicked".to_string())),
+                .unwrap_or_else(|_| Err("the archive writer thread panicked".into())),
             None => Ok(()),
         }
     }
 
-    fn take_error(&mut self) -> String {
+    fn take_error(&mut self) -> Error {
         take_writer_error(&self.err)
     }
 
@@ -299,7 +302,7 @@ impl Archive {
     ///
     /// An empty batch does not send: it still checks the writer is alive, so a
     /// tick where nothing advanced cannot mask a dead writer.
-    pub fn wal_tick(&mut self, ticks: Vec<(i64, Vec<WalRow>)>) -> Result<(), String> {
+    pub fn wal_tick(&mut self, ticks: Vec<(i64, Vec<WalRow>)>) -> Result<()> {
         let ticks: Vec<(i64, Vec<WalRow>)> = ticks
             .into_iter()
             .filter(|(_, rows)| !rows.is_empty())
@@ -308,7 +311,7 @@ impl Archive {
             return self.check_alive();
         }
         let Some(tx) = self.tx.as_ref() else {
-            return Err("the archive writer thread has already been joined".to_string());
+            return Err("the archive writer thread has already been joined".into());
         };
         if tx.send(Msg::Wal { ticks }).is_ok() {
             return Ok(());
@@ -339,9 +342,9 @@ impl Archive {
     /// Mirrors `SourceWriter::check_alive`: the shared error slot is the
     /// only signal available, since the archive cannot ask a thread it owns
     /// whether it has finished without joining it.
-    fn check_alive(&mut self) -> Result<(), String> {
+    fn check_alive(&mut self) -> Result<()> {
         match self.err.lock() {
-            Ok(guard) if guard.is_some() => Err(guard.clone().unwrap_or_default()),
+            Ok(guard) if guard.is_some() => Err(Error::Writer(guard.clone().expect("is_some"))),
             _ => Ok(()),
         }
     }
@@ -361,11 +364,7 @@ impl Archive {
     /// thread, so anything that reads the file straight afterwards has to join
     /// too.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn finalize_single(
-        mut self,
-        writer: SourceWriter,
-        clock_offset: (u64, i64),
-    ) -> Result<(), String> {
+    pub fn finalize_single(mut self, writer: SourceWriter, clock_offset: (u64, i64)) -> Result<()> {
         let queued = writer.finalize(clock_offset);
         let joined = self.join();
         queued.and(joined)
@@ -377,7 +376,7 @@ impl Archive {
         path: &Path,
         encoder: Box<dyn SegmentEncoder + Send>,
         seed: SourceMeta,
-    ) -> Result<(Self, SourceWriter), String> {
+    ) -> Result<(Self, SourceWriter)> {
         let mut archive = Self::create(path, encoder)?;
         let writer = archive.add_source(seed)?;
         Ok((archive, writer))
@@ -442,7 +441,7 @@ impl SourceWriter {
     /// An archive with several sources should stage each one and commit the
     /// tick once, through [`Archive::wal_tick`]: one transaction instead of
     /// one per source.
-    pub fn wal(&mut self, rows: Vec<WalRow>) -> Result<(), String> {
+    pub fn wal(&mut self, rows: Vec<WalRow>) -> Result<()> {
         if rows.is_empty() {
             return self.check_alive();
         }
@@ -454,7 +453,7 @@ impl SourceWriter {
     /// Hand one seal batch (= one transaction) to the writer, as the streams
     /// to seal. Blocks while the channel is full: that is the intended
     /// backpressure signal.
-    pub fn seal(&mut self, batch: Vec<String>) -> Result<(), String> {
+    pub fn seal(&mut self, batch: Vec<String>) -> Result<()> {
         if batch.is_empty() {
             return self.check_alive();
         }
@@ -475,7 +474,7 @@ impl SourceWriter {
     ///
     /// Fire-and-forget, like `wal` and `seal`: a failure surfaces on the next
     /// hand-off, which is the convention the whole writer follows.
-    pub fn evict_before(&mut self, cutoff_ts: u64) -> Result<Evicted, String> {
+    pub fn evict_before(&mut self, cutoff_ts: u64) -> Result<Evicted> {
         self.evict(cutoff_ts, None)
     }
 
@@ -487,11 +486,7 @@ impl SourceWriter {
     /// the one to use: reaching the `Db` method directly means a second writing
     /// connection to a file this thread already owns, which stalls on SQLite's
     /// write lock for `busy_timeout` and then fails.
-    pub fn evict_streams_before(
-        &mut self,
-        cutoff_ts: u64,
-        keep: StreamFilter,
-    ) -> Result<Evicted, String> {
+    pub fn evict_streams_before(&mut self, cutoff_ts: u64, keep: StreamFilter) -> Result<Evicted> {
         self.evict(cutoff_ts, Some(keep))
     }
 
@@ -501,7 +496,7 @@ impl SourceWriter {
     /// append path, and a caller running one wants to know what it did — that
     /// is the difference between "the window moved" and "nothing was old enough
     /// yet", and a size-bounded policy needs it to decide whether to cut again.
-    fn evict(&mut self, cutoff_ts: u64, streams: Option<StreamFilter>) -> Result<Evicted, String> {
+    fn evict(&mut self, cutoff_ts: u64, streams: Option<StreamFilter>) -> Result<Evicted> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::Evict {
             source_id: self.source_id,
@@ -537,7 +532,7 @@ impl SourceWriter {
     /// inherent to an asynchronous writer and harmless. Tests do assert it, and
     /// without a barrier they race the writer. Give this a `cfg`-free home the
     /// moment a real caller needs to see its own last tick.
-    pub fn sync(&mut self) -> Result<(), String> {
+    pub fn sync(&mut self) -> Result<()> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::Sync(tx))?;
         // A closed reply channel means the writer exited before it reached this
@@ -553,18 +548,30 @@ impl SourceWriter {
     /// Consumes the handle, which is what releases its sender: the writer
     /// thread ends when the last handle and the archive's master sender are
     /// gone, so a handle kept alive past its finalize would stall the join.
-    pub fn finalize(mut self, clock_offset: (u64, i64)) -> Result<(), String> {
+    /// **Synchronous**, unlike the per-tick hand-offs. It used to queue and
+    /// return `Ok(())` with nothing committed, so the only way to learn that
+    /// the final transaction had failed was `Archive::join`, which is easy to
+    /// omit because `Drop` looks like it handles things — and `Drop` cannot
+    /// return an error, so it turns the failure into a log line. A caller that
+    /// skipped the join got a silent downgrade from "finished archive" to
+    /// "recovery artifact".
+    ///
+    /// A barrier costs nothing here: this is the last thing a source does.
+    pub fn finalize(mut self, clock_offset: (u64, i64)) -> Result<()> {
         self.send(Msg::Finalize {
             source_id: self.source_id,
             clock_offset,
-        })
+        })?;
+        // The handle still holds its sender until this returns, so the writer
+        // cannot exit on the last-handle rule before answering.
+        self.sync()
     }
 
     /// Report a writer that has already failed, on a hand-off that sends
     /// nothing. Without it, writer health would only be polled when there is
     /// something to write, and a source whose writer died would go on
     /// reporting success for every empty tick in between.
-    fn check_alive(&mut self) -> Result<(), String> {
+    fn check_alive(&mut self) -> Result<()> {
         // The shared error slot is the only signal available here: the thread
         // belongs to the archive, so this cannot ask whether it has finished,
         // and it deliberately does not send — a probe message would be a write
@@ -573,12 +580,12 @@ impl SourceWriter {
         // invisible here, which cannot happen today because the only clean
         // exit is `Shutdown`, sent last.
         match self.err.lock() {
-            Ok(guard) if guard.is_some() => Err(guard.clone().unwrap_or_default()),
+            Ok(guard) if guard.is_some() => Err(Error::Writer(guard.clone().expect("is_some"))),
             _ => Ok(()),
         }
     }
 
-    fn send(&mut self, msg: Msg) -> Result<(), String> {
+    fn send(&mut self, msg: Msg) -> Result<()> {
         if self.tx.send(msg).is_ok() {
             return Ok(());
         }
@@ -592,13 +599,11 @@ impl SourceWriter {
 
 /// Read the writer thread's stored failure, or a generic one if it exited
 /// without source anything (a clean exit that a handle nonetheless outlived).
-fn take_writer_error(slot: &ErrorSlot) -> String {
-    slot.lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_else(|| {
-            "the archive writer thread exited before the source finished".to_string()
-        })
+fn take_writer_error(slot: &ErrorSlot) -> Error {
+    match slot.lock().ok().and_then(|guard| guard.clone()) {
+        Some(e) => Error::Writer(e),
+        None => Error::WriterGone,
+    }
 }
 
 /// An encoded segment waiting to be inserted.
@@ -618,18 +623,26 @@ fn writer_thread(
     err_slot: ErrorSlot,
     checkpoint_every: Duration,
     encoder: Box<dyn SegmentEncoder + Send>,
-) -> Result<(), String> {
+) -> Result<()> {
     // `rx` is BORROWED by the loop, not moved into it, so the receiver outlives
     // the error store below. That ordering is the whole point: a handle's send
     // fails the instant the receiver drops, and if the slot were still empty at
     // that moment the handle would report a generic "writer exited" instead of
     // the writer's own error. Holding `rx` here means the channel is still open
     // while the slot is written, so any send that fails afterwards finds it.
-    let result = writer_loop(&rx, &mut db, checkpoint_every, encoder.as_ref());
-    if let Err(ref e) = result {
-        *err_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
+    match writer_loop(&rx, &mut db, checkpoint_every, encoder.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Shared, not stringified: every handle reports this same failure,
+            // and flattening it to text here threw away the variant a caller
+            // wants to branch on. `Error` is not `Clone` (nor is
+            // `rusqlite::Error`), so the slot holds an `Arc` and the thread's
+            // own return borrows the same one.
+            let shared = Arc::new(e);
+            *err_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&shared));
+            Err(Error::Writer(shared))
+        }
     }
-    result
 }
 
 /// How stale a plain copy of a live archive is allowed to be.
@@ -660,7 +673,7 @@ fn writer_loop(
     db: &mut Db,
     checkpoint_every: Duration,
     encoder: &(dyn SegmentEncoder + Send),
-) -> Result<(), String> {
+) -> Result<()> {
     // Next segment sequence number, per (source, stream). Keyed by both
     // because `seq` is scoped to a source's stream in the `segments` table:
     // two sources of the same host have the same stream names and each
@@ -812,7 +825,7 @@ fn writer_loop(
 /// there: without it this would run every pass for no gain, and without the
 /// reclaim a buffer that shrank would keep its high-water size forever.
 #[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
-pub fn reclaim_if_fragmented(db: &Db) -> Result<(), String> {
+pub fn reclaim_if_fragmented(db: &Db) -> Result<()> {
     if should_reclaim(
         db.pragma_u32("freelist_count")?,
         db.pragma_u32("page_count")?,
@@ -849,7 +862,7 @@ pub fn should_reclaim(free_pages: u32, pages: u32) -> bool {
 /// pass so a reclaim cannot overrun a tick, and there is no next tick here.
 /// `u32::MAX` is "as many as the free list holds" — `incremental_vacuum` stops
 /// when it runs out.
-fn reclaim_all(db: &Db) -> Result<(), String> {
+fn reclaim_all(db: &Db) -> Result<()> {
     db.incremental_vacuum(u32::MAX)
 }
 
@@ -862,7 +875,7 @@ fn seal_batch(
     next_seq: &mut BTreeMap<(i64, String), u64>,
     batch: Vec<String>,
     encoder: &(dyn SegmentEncoder + Send),
-) -> Result<(), String> {
+) -> Result<()> {
     // Read and encode BEFORE the transaction opens. Both are proportional to
     // segment size and would hold the write lock for their whole duration.
     //
@@ -907,7 +920,10 @@ fn seal_batch(
         let (last_ts, wall_offset) = (last.ts, last.wall_offset);
         let Some(tail) = encoder
             .encode(&stream, &rows)
-            .map_err(|e| format!("failed to encode a {stream} segment: {e}"))?
+            .map_err(|source| Error::Encoder {
+                stream: stream.clone(),
+                source,
+            })?
         else {
             continue;
         };
@@ -927,15 +943,17 @@ fn seal_batch(
             || tail.first_ts < first_in
             || tail.last_ts > last_ts
         {
-            return Err(format!(
-                "the encoder returned a segment for {stream} that does not \
-                 describe the rows it was given: it claims {} row(s) over \
-                 [{}, {}], from {} row(s) over [{first_in}, {last_ts}]",
-                tail.rows,
-                tail.first_ts,
-                tail.last_ts,
-                rows.len()
-            ));
+            return Err(Error::EncoderContract {
+                stream: stream.clone(),
+                detail: format!(
+                    "it claims {} row(s) over [{}, {}], from {} row(s) over \
+                     [{first_in}, {last_ts}]",
+                    tail.rows,
+                    tail.first_ts,
+                    tail.last_ts,
+                    rows.len()
+                ),
+            });
         }
         // `>=`, so a later stream wins a tie. From the SEGMENT's last row: an
         // observation paired with a timestamp no segment covers is one a reader

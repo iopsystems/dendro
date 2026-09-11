@@ -13,14 +13,14 @@ use std::collections::BTreeMap;
 
 use dendro::db::{Db, SegmentMeta, SourceMeta, WalRow};
 use dendro::read;
-use dendro::segment::{Segment, SegmentEncoder};
+use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
 /// Reports the timestamps it was handed, so a test can see exactly which rows
 /// reached the reader.
 struct Tags;
 
 impl SegmentEncoder for Tags {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -161,7 +161,7 @@ struct AppendsWhileEncoding {
 }
 
 impl SegmentEncoder for AppendsWhileEncoding {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
         if stream == "a" && !self.fired.replace(true) {
             let mut other = Db::open(&self.path).unwrap();
             other
@@ -246,7 +246,7 @@ fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
     /// a record to complete would.
     struct DropsLast;
     impl SegmentEncoder for DropsLast {
-        fn encode(&self, stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
             if rows.len() < 2 {
                 return Ok(None);
             }
@@ -305,7 +305,7 @@ fn an_encoder_cannot_invent_coverage() {
 
     struct Liar;
     impl SegmentEncoder for Liar {
-        fn encode(&self, _stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+        fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
             if rows.is_empty() {
                 return Ok(None);
             }
@@ -333,9 +333,11 @@ fn an_encoder_cannot_invent_coverage() {
     let err = src
         .sync()
         .expect_err("a segment describing rows it was not given must be refused");
+    // Through `root()`: the failure happened on the writer thread, so it
+    // reaches every handle wrapped in `Error::Writer`.
     assert!(
-        err.contains("does not describe the rows it was given"),
-        "got: {err}"
+        matches!(err.root(), dendro::Error::EncoderContract { .. }),
+        "got: {err:?}"
     );
 }
 

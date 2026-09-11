@@ -11,6 +11,7 @@
 //! streaming writer, so the surface is wider than today's callers use.
 #![allow(dead_code)]
 
+use crate::error::{Error, ReadOnly, Result};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -90,7 +91,7 @@ const SCHEMA_VERSION: i64 = 4;
 const LEGACY_SCHEMA_VERSION: i64 = 3;
 
 /// One source's identity: everything known when the source starts.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceMeta {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
@@ -100,6 +101,7 @@ pub struct SourceMeta {
 }
 
 /// A row of the `sources` table.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceRow {
     pub id: i64,
     pub meta: SourceMeta,
@@ -112,6 +114,7 @@ pub struct SourceRow {
 /// The catalog facts about one sealed segment. The segment's own bytes are an
 /// opaque parquet BLOB the database never looks inside — this is everything
 /// SQLite is asked to know about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
     pub rows: u64,
     pub first_ts: u64,
@@ -119,6 +122,7 @@ pub struct SegmentMeta {
 }
 
 /// A row of the `segments` table for one `(source, stream)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentRow {
     pub seq: u64,
     pub meta: SegmentMeta,
@@ -133,6 +137,7 @@ pub struct SegmentRow {
 /// therefore as small as the caller can make it — the usual shape is values
 /// only, with anything that repeats unchanged re-anchored once per segment
 /// rather than carried every time.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalRow {
     pub stream: String,
     pub ts: u64,
@@ -152,6 +157,7 @@ pub struct Evicted {
 /// How many rows a table holds and what time span they cover, answered from
 /// catalog columns alone — no segment or WAL payload is read. `first_ts` and
 /// `last_ts` are `None` when `rows` is 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub rows: u64,
     pub first_ts: Option<u64>,
@@ -181,14 +187,13 @@ pub const MAX_TIMESTAMP: u64 = i64::MAX as u64;
 /// A timestamp on its way INTO the archive. Rejected rather than clamped: a
 /// stored value that silently became something else is corruption, and the
 /// caller is the only one who can say what it meant.
-fn stored_ts(v: u64, what: &str) -> Result<i64, String> {
+fn stored_ts(v: u64, what: &'static str) -> Result<i64> {
     if v > MAX_TIMESTAMP {
-        return Err(format!(
-            "{what} is {v}, above the largest timestamp this container can \
-             store ({MAX_TIMESTAMP}). SQLite integers are signed, so a larger \
-             value would compare as negative in every ordering and range the \
-             catalog runs."
-        ));
+        return Err(Error::TimestampOutOfRange {
+            what,
+            value: v,
+            max: MAX_TIMESTAMP,
+        });
     }
     Ok(v as i64)
 }
@@ -221,7 +226,7 @@ impl Db {
     /// Fails if `path` already exists: an archive is valid from creation, so there
     /// is no `.partial` staging file standing between a new source and a
     /// previous one.
-    pub fn create(path: &Path) -> Result<Self, String> {
+    pub fn create(path: &Path) -> Result<Self> {
         Self::create_with_page_size(path, PAGE_SIZE)
     }
 
@@ -236,9 +241,9 @@ impl Db {
     /// (`auto_vacuum`, `journal_mode=WAL`) — those bound a long-lived file's
     /// footprint and durability, neither of which a transient in-memory image
     /// serialized straight to bytes has any use for.
-    pub fn create_in_memory() -> Result<Self, String> {
+    pub fn create_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
-            .map_err(|e| format!("failed to open an in-memory database: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to open an in-memory database: {e}")))?;
         let db = Db {
             conn,
             legacy: false,
@@ -250,24 +255,24 @@ impl Db {
         db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
         db.conn
             .execute_batch(SCHEMA_SQL)
-            .map_err(|e| format!("failed to create archive schema: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to create archive schema: {e}")))?;
         db.conn
             .execute(
                 "INSERT INTO schema_version(version) VALUES (?1)",
                 [SCHEMA_VERSION],
             )
-            .map_err(|e| format!("failed to record archive schema version: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to record archive schema version: {e}")))?;
         Ok(db)
     }
 
     /// Serialize the whole database to bytes — the inverse of
     /// [`open_bytes`](Self::open_bytes). Used to hand a report archive built in
     /// memory back to a caller (a browser download) without a filesystem.
-    pub fn serialize(&self) -> Result<Vec<u8>, String> {
+    pub fn serialize(&self) -> Result<Vec<u8>> {
         let data = self
             .conn
             .serialize(rusqlite::MAIN_DB)
-            .map_err(|e| format!("failed to serialize the archive: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to serialize the archive: {e}")))?;
         Ok(data.to_vec())
     }
 
@@ -313,7 +318,7 @@ impl Db {
     /// even if the `page_size` pragma is never issued or is issued too late.
     /// Only `create` (and that test) should call this — the page size is not a
     /// caller's choice.
-    fn create_with_page_size(path: &Path, page_size: u32) -> Result<Self, String> {
+    fn create_with_page_size(path: &Path, page_size: u32) -> Result<Self> {
         // Claim the path atomically rather than testing `exists()` — this is
         // also what stops SQLite from silently adopting a file that appeared
         // between the check and the open. A zero-length file is a valid empty
@@ -322,7 +327,7 @@ impl Db {
             .write(true)
             .create_new(true)
             .open(path)
-            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+            .map_err(|e| Error::Message(format!("failed to create {}: {e}", path.display())))?;
 
         // From here the file is OURS, and a failure must not leave it behind:
         // the writer refuses to overwrite an existing archive, so a half-created
@@ -341,12 +346,12 @@ impl Db {
     /// Everything `create_with_page_size` does after claiming the path. Split
     /// out so a failure in any of it has one cleanup site rather than one per
     /// `?`.
-    fn init_created(path: &Path, page_size: u32) -> Result<Self, String> {
+    fn init_created(path: &Path, page_size: u32) -> Result<Self> {
         // No `SQLITE_OPEN_CREATE`: the file above is the only one this may
         // adopt. No `SQLITE_OPEN_URI` either, so a path that happens to begin
         // with `file:` stays a filename.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
         let db = Db {
             conn,
             legacy: false,
@@ -383,23 +388,23 @@ impl Db {
 
         db.conn
             .execute_batch(SCHEMA_SQL)
-            .map_err(|e| format!("failed to create archive schema: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to create archive schema: {e}")))?;
         db.conn
             .execute(
                 "INSERT INTO schema_version(version) VALUES (?1)",
                 [SCHEMA_VERSION],
             )
-            .map_err(|e| format!("failed to record archive schema version: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to record archive schema version: {e}")))?;
 
         Ok(db)
     }
 
     /// Open an existing archive, reapplying the per-connection pragmas.
-    pub fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self> {
         // No `SQLITE_OPEN_CREATE`: opening an archive that is not there is an
         // error, not an empty new source.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
         let mut db = Db {
             conn,
             legacy: false,
@@ -442,12 +447,12 @@ impl Db {
     /// un-checkpointed commits is read as far as the sidecar can be read, and
     /// the sidecar is not folded back in. That is the trade — a reader that
     /// leaves its subject alone cannot also tidy it up.
-    pub fn open_read_only(path: &Path) -> Result<Self, String> {
+    pub fn open_read_only(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
-        .map_err(|e| format!("failed to open {} read-only: {e}", path.display()))?;
+        .map_err(|e| Error::Message(format!("failed to open {} read-only: {e}", path.display())))?;
         let mut db = Db {
             conn,
             legacy: false,
@@ -487,7 +492,7 @@ impl Db {
     /// never has — and it is not where an archive's own liveness lives: unsealed
     /// rows are rows of the `wal` TABLE, inside this image, and
     /// `materialize_wal_tail` reads them like any other.
-    pub fn open_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+    pub fn open_bytes(bytes: Vec<u8>) -> Result<Self> {
         const HEADER: &[u8] = b"SQLite format 3\0";
         const JOURNAL_MODE_ROLLBACK: u8 = 1;
         // Byte 19 is the read version; a value above 2 means a format this
@@ -497,7 +502,7 @@ impl Db {
 
         let mut bytes = bytes;
         if bytes.len() < 20 || !bytes.starts_with(HEADER) {
-            return Err("not a dendro archive (SQLite)".to_string());
+            return Err("not a dendro archive (SQLite)".into());
         }
         if bytes[18] == FILE_FORMAT_WAL && bytes[19] == FILE_FORMAT_WAL {
             bytes[18] = JOURNAL_MODE_ROLLBACK;
@@ -505,7 +510,7 @@ impl Db {
         }
 
         let mut conn = Connection::open_in_memory()
-            .map_err(|e| format!("failed to open an in-memory database: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to open an in-memory database: {e}")))?;
         // `deserialize_read_exact` copies from the reader into SQLite's own
         // allocation, so the caller's `Vec` is dropped here rather than leaked
         // for the connection's lifetime.
@@ -513,7 +518,7 @@ impl Db {
         // Read-only: nothing here writes, and SQLite then never has to grow
         // its own copy of the image.
         conn.deserialize_read_exact(rusqlite::MAIN_DB, &mut bytes.as_slice(), len, true)
-            .map_err(|e| format!("failed to read the archive: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to read the archive: {e}")))?;
         let mut db = Db {
             conn,
             legacy: false,
@@ -538,16 +543,16 @@ impl Db {
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n > 0)
-            .map_err(|e| format!("failed to inspect the archive: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to inspect the archive: {e}")))?;
         if !has_catalog {
-            return Err(
+            return Err(Error::Message(
                 "not a dendro archive, or a copy taken while it was still being \
                         written — an archive's most recent pages live in a `-wal` sidecar \
                         that a single copied file does not carry. Take the copy with \
                         `Db::vacuum_into`, which reads through the sidecar \
                         without stopping the writer"
                     .to_string(),
-            );
+            ));
         }
         db.adopt_schema()?;
         Ok(db)
@@ -560,24 +565,27 @@ impl Db {
     /// refused rather than guessed at: the catalog is the only thing standing
     /// between a caller and a pile of opaque BLOBs, so reading it under the
     /// wrong shape yields wrong data rather than an error.
-    fn adopt_schema(&mut self) -> Result<(), String> {
+    fn adopt_schema(&mut self) -> Result<()> {
         let version: i64 = self
             .conn
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .map_err(|e| format!("failed to read the archive schema version: {e}"))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to read the archive schema version: {e}"))
+            })?;
         match version {
             SCHEMA_VERSION => Ok(()),
             LEGACY_SCHEMA_VERSION => {
-                self.conn
-                    .execute_batch(LEGACY_VIEWS_SQL)
-                    .map_err(|e| format!("failed to open a v{version} archive: {e}"))?;
+                self.conn.execute_batch(LEGACY_VIEWS_SQL).map_err(|e| {
+                    Error::Message(format!("failed to open a v{version} archive: {e}"))
+                })?;
                 self.legacy = true;
                 Ok(())
             }
-            other => Err(format!(
-                "unsupported archive schema version {other}: this build writes \
-                 v{SCHEMA_VERSION} and reads v{LEGACY_SCHEMA_VERSION}"
-            )),
+            other => Err(Error::UnsupportedSchema {
+                found: other,
+                writes: SCHEMA_VERSION,
+                reads: LEGACY_SCHEMA_VERSION,
+            }),
         }
     }
 
@@ -587,19 +595,12 @@ impl Db {
     /// through one. Catching it here turns `cannot modify segments because it
     /// is a view` — which reads like a bug in this crate — into a sentence that
     /// names the file and the way forward.
-    fn writable(&self) -> Result<(), String> {
+    fn writable(&self) -> Result<()> {
         if self.read_only {
-            return Err(
-                "this archive was opened read-only; reopen it with `Db::open` to modify it"
-                    .to_string(),
-            );
+            return Err(Error::ReadOnly(ReadOnly::Handle));
         }
         if self.legacy {
-            return Err(format!(
-                "this archive is schema v{LEGACY_SCHEMA_VERSION}, which is \
-                 readable but not writable by this build; copy it forward with \
-                 an upgrade to v{SCHEMA_VERSION} first"
-            ));
+            return Err(Error::ReadOnly(ReadOnly::LegacySchema));
         }
         Ok(())
     }
@@ -616,7 +617,7 @@ impl Db {
     /// Best-effort is the right contract: the caller is bounding how STALE a
     /// copy of the archive can be, not demanding an exact one.
     /// [`vacuum_into`](Self::vacuum_into) is the exact one.
-    pub fn checkpoint_passive(&self) -> Result<(), String> {
+    pub fn checkpoint_passive(&self) -> Result<()> {
         // `execute_batch`, not `pragma_query`: rusqlite QUOTES the pragma name
         // it is given, so `pragma_query(None, "wal_checkpoint(PASSIVE)", ..)`
         // asks for a pragma literally named `wal_checkpoint(PASSIVE)`. SQLite
@@ -626,7 +627,7 @@ impl Db {
         // cadence that silently never ran.
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(|e| format!("failed to checkpoint the WAL: {e}"))
+            .map_err(|e| Error::Message(format!("failed to checkpoint the WAL: {e}")))
     }
 
     /// The pragmas that live on the connection, not in the file. Applied by
@@ -637,12 +638,20 @@ impl Db {
     /// `READER_CACHE_SIZE_KIB` and `WRITER_CACHE_SIZE_KIB`. Everything else here
     /// is a property of the file's durability contract and is identical on
     /// every connection.
-    fn apply_connection_pragmas(&self, cache_size_kib: i32) -> Result<(), String> {
+    fn apply_connection_pragmas(&self, cache_size_kib: i32) -> Result<()> {
         // FULL, not NORMAL: it survives power loss, not merely process death,
         // and on the combined workload it is no worse at any percentile that
         // threatens the tick budget — the tail is checkpoint and prune work,
         // not fsync.
         self.set_pragma("synchronous", "FULL")?;
+        // Enforced, not decorative. SQLite ignores REFERENCES clauses unless
+        // this is on, per connection — so the `wal` and `segments` foreign keys
+        // were documentation until now. What they buy: `wal_tick` takes a bare
+        // `i64` source id, and an off-by-one in the zip that builds it used to
+        // commit a whole endpoint's rows under an id no source row has. They
+        // were durable, invisible to every read, and unrecoverable. Now they
+        // are an error.
+        self.set_pragma("foreign_keys", "ON")?;
         // Derived from the file's OWN page size rather than the constant, which
         // is what "denominated in bytes" has to mean: the cap then holds at
         // 4 MiB for any file this ever opens, not just ones written at
@@ -667,39 +676,41 @@ impl Db {
 
     /// `PRAGMA journal_mode = WAL`. Separate because, unlike the others, it
     /// answers with a row, which `pragma_update` rejects.
-    fn set_journal_mode_wal(&self) -> Result<(), String> {
+    fn set_journal_mode_wal(&self) -> Result<()> {
         let mode: String = self
             .conn
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-            .map_err(|e| format!("failed to set journal_mode=WAL: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to set journal_mode=WAL: {e}")))?;
         if !mode.eq_ignore_ascii_case("wal") {
-            return Err(format!("journal_mode is {mode}, expected wal"));
+            return Err(Error::Message(format!(
+                "journal_mode is {mode}, expected wal"
+            )));
         }
         Ok(())
     }
 
-    fn set_pragma<V: rusqlite::ToSql>(&self, name: &str, value: V) -> Result<(), String> {
+    fn set_pragma<V: rusqlite::ToSql>(&self, name: &str, value: V) -> Result<()> {
         self.conn
             .pragma_update(None, name, value)
-            .map_err(|e| format!("failed to set pragma {name}: {e}"))
+            .map_err(|e| Error::Message(format!("failed to set pragma {name}: {e}")))
     }
 
     /// Start a source, returning its id.
-    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64, String> {
+    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64> {
         self.writable()?;
         insert_source_sql(&self.conn, meta)
     }
 
     /// Every source in the file, in insertion order. An archive may hold
     /// several (multi-host, or an A/B pair).
-    pub fn read_sources(&self) -> Result<Vec<SourceRow>, String> {
+    pub fn read_sources(&self) -> Result<Vec<SourceRow>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, labels, metadata, complete, clock_anchor_wall_ns \
                  FROM sources ORDER BY id",
             )
-            .map_err(|e| format!("failed to query sources: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query sources: {e}")))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -710,19 +721,21 @@ impl Db {
                     row.get::<_, i64>(4)?,
                 ))
             })
-            .map_err(|e| format!("failed to query sources: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query sources: {e}")))?;
 
         let mut out = Vec::new();
         for row in rows {
             let (id, labels, metadata, complete, anchor) =
-                row.map_err(|e| format!("failed to read source: {e}"))?;
+                row.map_err(|e| Error::Message(format!("failed to read source: {e}")))?;
             out.push(SourceRow {
                 id,
                 meta: SourceMeta {
-                    labels: serde_json::from_str(&labels)
-                        .map_err(|e| format!("source {id} has invalid labels: {e}"))?,
-                    metadata: serde_json::from_str(&metadata)
-                        .map_err(|e| format!("source {id} has invalid metadata: {e}"))?,
+                    labels: serde_json::from_str(&labels).map_err(|e| {
+                        Error::Message(format!("source {id} has invalid labels: {e}"))
+                    })?,
+                    metadata: serde_json::from_str(&metadata).map_err(|e| {
+                        Error::Message(format!("source {id} has invalid metadata: {e}"))
+                    })?,
                     // Round-trips through INTEGER; wall-clock nanoseconds stay
                     // inside i64 until the year 2262.
                     clock_anchor_wall_ns: anchor as u64,
@@ -759,23 +772,20 @@ impl Db {
         self.commits.get()
     }
 
-    pub fn transaction<T>(
-        &mut self,
-        f: impl FnOnce(&Tx<'_>) -> Result<T, String>,
-    ) -> Result<T, String> {
+    pub fn transaction<T>(&mut self, f: impl FnOnce(&Tx<'_>) -> Result<T>) -> Result<T> {
         self.writable()?;
         let tx = Tx {
             tx: self
                 .conn
                 .transaction()
-                .map_err(|e| format!("failed to begin transaction: {e}"))?,
+                .map_err(|e| Error::Message(format!("failed to begin transaction: {e}")))?,
         };
         // `?` drops `tx` on the error path, and `Transaction`'s drop behavior
         // is rollback — so a failure partway through leaves nothing behind.
         let out = f(&tx)?;
         tx.tx
             .commit()
-            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to commit transaction: {e}")))?;
         #[cfg(any(test, feature = "test-support"))]
         self.commits.set(self.commits.get() + 1);
         Ok(out)
@@ -790,7 +800,7 @@ impl Db {
         seq: u64,
         meta: &SegmentMeta,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.writable()?;
         insert_segment_sql(&self.conn, source_id, stream, seq, meta, bytes)
     }
@@ -820,14 +830,16 @@ impl Db {
         &self,
         source_id: i64,
         stream: &str,
-    ) -> Result<Vec<(u64, SegmentMeta)>, String> {
+    ) -> Result<Vec<(u64, SegmentMeta)>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT seq, rows, first_ts, last_ts FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
-            .map_err(|e| format!("failed to query segment meta for {stream}: {e}"))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to query segment meta for {stream}: {e}"))
+            })?;
         let rows = stmt
             .query_map(rusqlite::params![source_id, stream], |r| {
                 Ok((
@@ -839,9 +851,11 @@ impl Db {
                     },
                 ))
             })
-            .map_err(|e| format!("failed to read segment meta for {stream}: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to read segment meta for {stream}: {e}"))
+            .map_err(|e| {
+                Error::Message(format!("failed to read segment meta for {stream}: {e}"))
+            })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Message(format!("failed to read segment meta for {stream}: {e}")))
     }
 
     /// One segment's payload, by sequence number — for the reader's name probe,
@@ -851,17 +865,21 @@ impl Db {
         source_id: i64,
         stream: &str,
         seq: u64,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT bytes FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
             )
-            .map_err(|e| format!("failed to query segment bytes for {stream}: {e}"))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to query segment bytes for {stream}: {e}"))
+            })?;
         let mut rows = stmt
             .query(rusqlite::params![source_id, stream, seq as i64])
-            .map_err(|e| format!("failed to read segment bytes for {stream}: {e}"))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to read segment bytes for {stream}: {e}"))
+            })?;
         match rows.next() {
             Ok(Some(r)) => {
                 Ok(Some(r.get(0).map_err(|e| {
@@ -869,18 +887,20 @@ impl Db {
                 })?))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(format!("failed to read segment bytes for {stream}: {e}")),
+            Err(e) => Err(Error::Message(format!(
+                "failed to read segment bytes for {stream}: {e}"
+            ))),
         }
     }
 
-    pub fn read_segments(&self, source_id: i64, stream: &str) -> Result<Vec<SegmentRow>, String> {
+    pub fn read_segments(&self, source_id: i64, stream: &str) -> Result<Vec<SegmentRow>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT seq, rows, first_ts, last_ts, bytes FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
-            .map_err(|e| format!("failed to query segments for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
         Self::collect_segments(&mut stmt, rusqlite::params![source_id, stream], stream)
     }
 
@@ -890,7 +910,7 @@ impl Db {
         stmt: &mut rusqlite::Statement<'_>,
         params: &[&dyn rusqlite::ToSql],
         stream: &str,
-    ) -> Result<Vec<SegmentRow>, String> {
+    ) -> Result<Vec<SegmentRow>> {
         let rows = stmt
             .query_map(params, |row| {
                 Ok((
@@ -901,12 +921,13 @@ impl Db {
                     row.get::<_, Vec<u8>>(4)?,
                 ))
             })
-            .map_err(|e| format!("failed to query segments for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (seq, n_rows, first_ts, last_ts, bytes) =
-                row.map_err(|e| format!("failed to read segment row for {stream}: {e}"))?;
+            let (seq, n_rows, first_ts, last_ts, bytes) = row.map_err(|e| {
+                Error::Message(format!("failed to read segment row for {stream}: {e}"))
+            })?;
             out.push(SegmentRow {
                 // Round-trips through INTEGER, same as elsewhere in this
                 // file: these stay inside i64 for any source anyone will
@@ -940,7 +961,7 @@ impl Db {
         stream: &str,
         start: u64,
         end: u64,
-    ) -> Result<Vec<SegmentRow>, String> {
+    ) -> Result<Vec<SegmentRow>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -948,7 +969,7 @@ impl Db {
                  WHERE source_id = ?1 AND stream = ?2 \
                    AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
             )
-            .map_err(|e| format!("failed to query segments for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
         // `ts_bound`, not a cast: `u64::MAX as i64` is -1, which would silently
         // select nothing at all for an unbounded upper edge.
         let params = rusqlite::params![source_id, stream, ts_bound(start), ts_bound(end),];
@@ -967,10 +988,7 @@ impl Db {
     /// `f` gets `&Self`, so it may call any reader here; it must not write
     /// through this handle, which is why this is not exposed as a general
     /// transaction.
-    pub fn read_snapshot<T>(
-        &self,
-        f: impl FnOnce(&Self) -> Result<T, String>,
-    ) -> Result<T, String> {
+    pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         // Re-entrant: a caller already inside a snapshot keeps that one rather
         // than failing on SQLite's "cannot start a transaction within a
         // transaction". `read_archive` wraps a whole source and then calls
@@ -982,7 +1000,7 @@ impl Db {
         }
         self.conn
             .execute_batch("BEGIN DEFERRED")
-            .map_err(|e| format!("failed to open a read snapshot: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to open a read snapshot: {e}")))?;
         let out = f(self);
         // Read-only either way, so the outcome of ending it cannot change what
         // was read; the snapshot simply has to be released.
@@ -995,7 +1013,7 @@ impl Db {
     /// Sum of `rows` across every segment for `(source_id, stream)`. Does
     /// not include WAL rows — callers combining sealed and unsealed row
     /// counts must add `live_wal().len()` themselves.
-    pub fn total_rows(&self, source_id: i64, stream: &str) -> Result<u64, String> {
+    pub fn total_rows(&self, source_id: i64, stream: &str) -> Result<u64> {
         let total: i64 = self
             .conn
             .query_row(
@@ -1003,7 +1021,7 @@ impl Db {
                 rusqlite::params![source_id, stream],
                 |row| row.get(0),
             )
-            .map_err(|e| format!("failed to sum rows for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to sum rows for {stream}: {e}")))?;
         Ok(total as u64)
     }
 
@@ -1011,17 +1029,17 @@ impl Db {
     /// alphabetically. A stream with only unsealed WAL rows and no sealed
     /// segment yet will NOT appear here — use `all_streams` for "every
     /// stream this source has ever seen".
-    pub fn streams(&self, source_id: i64) -> Result<Vec<String>, String> {
+    pub fn streams(&self, source_id: i64) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT stream FROM segments WHERE source_id = ?1 ORDER BY stream")
-            .map_err(|e| format!("failed to query streams: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query streams: {e}")))?;
         let rows = stmt
             .query_map([source_id], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("failed to query streams: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query streams: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| format!("failed to read stream name: {e}"))?);
+            out.push(row.map_err(|e| Error::Message(format!("failed to read stream name: {e}")))?);
         }
         Ok(out)
     }
@@ -1035,7 +1053,7 @@ impl Db {
     /// this module is the only place that knows the schema well enough to
     /// look at both tables. Recovery/inventory callers should call this, not
     /// `streams()`, when they need to know which tables exist at all.
-    pub fn all_streams(&self, source_id: i64) -> Result<Vec<String>, String> {
+    pub fn all_streams(&self, source_id: i64) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1044,15 +1062,15 @@ impl Db {
                  SELECT stream FROM wal WHERE source_id = ?1 \
                  ORDER BY stream",
             )
-            .map_err(|e| format!("failed to query all_streams: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query all_streams: {e}")))?;
         // `?1` is the SAME parameter both times it appears (SQLite numbers
         // parameters, not occurrences), so this binds once, not twice.
         let rows = stmt
             .query_map([source_id], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("failed to query all_streams: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query all_streams: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| format!("failed to read stream name: {e}"))?);
+            out.push(row.map_err(|e| Error::Message(format!("failed to read stream name: {e}")))?);
         }
         Ok(out)
     }
@@ -1072,7 +1090,7 @@ impl Db {
     /// through. `&mut self` makes "don't open a nested transaction while one
     /// is outstanding" a compile error for that caller instead of a runtime
     /// one. Reads stay on `&self`.
-    pub fn insert_wal_rows(&mut self, source_id: i64, rows: &[WalRow]) -> Result<(), String> {
+    pub fn insert_wal_rows(&mut self, source_id: i64, rows: &[WalRow]) -> Result<()> {
         self.writable()?;
         self.transaction(|tx| tx.insert_wal_rows(source_id, rows))
     }
@@ -1087,7 +1105,7 @@ impl Db {
     /// atomic across sources: a crash cannot leave one endpoint's row for
     /// tick N present and another's missing, which is the state a reader
     /// comparing two arms would have to interpret.
-    pub fn insert_wal_rows_batch(&mut self, ticks: &[(i64, Vec<WalRow>)]) -> Result<(), String> {
+    pub fn insert_wal_rows_batch(&mut self, ticks: &[(i64, Vec<WalRow>)]) -> Result<()> {
         self.writable()?;
         self.transaction(|tx| {
             for (source_id, rows) in ticks {
@@ -1100,14 +1118,14 @@ impl Db {
     /// Every WAL row for `(source_id, stream)`, sealed or not, oldest
     /// first. Recovery should use `live_wal` instead — this is the raw table,
     /// kept for inspection and for the WAL tests to compare against.
-    pub fn read_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>, String> {
+    pub fn read_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT stream, ts, wall_offset, row FROM wal \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY ts",
             )
-            .map_err(|e| format!("failed to query WAL for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query WAL for {stream}: {e}")))?;
         Self::collect_wal_rows(&mut stmt, source_id, stream)
     }
 
@@ -1136,14 +1154,14 @@ impl Db {
     ///
     /// This turns the prune into a pure background optimisation with no
     /// correctness role.
-    pub fn live_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>, String> {
+    pub fn live_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>> {
         let mut stmt = self
             .conn
             .prepare(&format!(
                 "SELECT stream, ts, wall_offset, row FROM wal \
                  WHERE {LIVE_WAL_PREDICATE} ORDER BY ts"
             ))
-            .map_err(|e| format!("failed to query live WAL for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query live WAL for {stream}: {e}")))?;
         Self::collect_wal_rows(&mut stmt, source_id, stream)
     }
 
@@ -1152,13 +1170,13 @@ impl Db {
     /// share `LIVE_WAL_PREDICATE`, so the depth cannot drift from the rows the
     /// reader replays); this is the aggregate form, for callers that want the
     /// number rather than the payload.
-    pub fn live_wal_span(&self, source_id: i64, stream: &str) -> Result<Span, String> {
+    pub fn live_wal_span(&self, source_id: i64, stream: &str) -> Result<Span> {
         self.query_span(
             &format!("SELECT COUNT(*), MIN(ts), MAX(ts) FROM wal WHERE {LIVE_WAL_PREDICATE}"),
             source_id,
             stream,
         )
-        .map_err(|e| format!("failed to measure the live WAL for {stream}: {e}"))
+        .map_err(|e| Error::Message(format!("failed to measure the live WAL for {stream}: {e}")))
     }
 
     /// A stream's sealed segments as the CATALOG sees them: how many segments,
@@ -1166,7 +1184,7 @@ impl Db {
     /// `parquet metadata` describes a 197 MB archive from this, and pulling
     /// `bytes` back only to discard it is exactly the cost the catalog exists to
     /// avoid.
-    pub fn segment_span(&self, source_id: i64, stream: &str) -> Result<(u64, Span), String> {
+    pub fn segment_span(&self, source_id: i64, stream: &str) -> Result<(u64, Span)> {
         let segments: i64 = self
             .conn
             .query_row(
@@ -1174,7 +1192,7 @@ impl Db {
                 rusqlite::params![source_id, stream],
                 |row| row.get(0),
             )
-            .map_err(|e| format!("failed to count segments for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to count segments for {stream}: {e}")))?;
         let span = self
             .query_span(
                 "SELECT COALESCE(SUM(rows), 0), MIN(first_ts), MAX(last_ts) FROM segments \
@@ -1182,7 +1200,9 @@ impl Db {
                 source_id,
                 stream,
             )
-            .map_err(|e| format!("failed to measure the segments of {stream}: {e}"))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to measure the segments of {stream}: {e}"))
+            })?;
         Ok((segments as u64, span))
     }
 
@@ -1205,7 +1225,7 @@ impl Db {
         stmt: &mut rusqlite::Statement<'_>,
         source_id: i64,
         stream: &str,
-    ) -> Result<Vec<WalRow>, String> {
+    ) -> Result<Vec<WalRow>> {
         let rows = stmt
             .query_map(rusqlite::params![source_id, stream], |row| {
                 Ok((
@@ -1215,11 +1235,11 @@ impl Db {
                     row.get::<_, Vec<u8>>(3)?,
                 ))
             })
-            .map_err(|e| format!("failed to query WAL rows for {stream}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query WAL rows for {stream}: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (stream, ts, wall_offset, data) =
-                row.map_err(|e| format!("failed to read WAL row for {stream}: {e}"))?;
+            let (stream, ts, wall_offset, data) = row
+                .map_err(|e| Error::Message(format!("failed to read WAL row for {stream}: {e}")))?;
             out.push(WalRow {
                 stream,
                 ts: ts as u64,
@@ -1240,14 +1260,14 @@ impl Db {
     /// that is why WAL rows are per-stream rather than whole snapshots — a
     /// slow-sealing table's prune must not touch, or be blocked by, any other
     /// stream's tail.
-    pub fn prune_wal(&self, source_id: i64, stream: &str, upto_ts: u64) -> Result<usize, String> {
+    pub fn prune_wal(&self, source_id: i64, stream: &str, upto_ts: u64) -> Result<usize> {
         self.writable()?;
         self.conn
             .execute(
                 "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
                 rusqlite::params![source_id, stream, ts_bound(upto_ts)],
             )
-            .map_err(|e| format!("failed to prune WAL for {stream}: {e}"))
+            .map_err(|e| Error::Message(format!("failed to prune WAL for {stream}: {e}")))
     }
 
     /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
@@ -1273,7 +1293,7 @@ impl Db {
     /// and it only stops it if the two land together: a straddling row has
     /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
     /// the segment delete un-shadows.
-    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: u64) -> Result<Evicted, String> {
+    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: u64) -> Result<Evicted> {
         self.writable()?;
         self.evict(
             source_id,
@@ -1304,7 +1324,7 @@ impl Db {
         source_id: i64,
         cutoff_ts: u64,
         evict: &dyn Fn(&str) -> bool,
-    ) -> Result<Evicted, String> {
+    ) -> Result<Evicted> {
         self.writable()?;
         let streams: Vec<String> = self
             .all_streams(source_id)?
@@ -1325,14 +1345,18 @@ impl Db {
                          WHERE source_id = ?1 AND stream = ?2 AND last_ts < ?3",
                         params,
                     )
-                    .map_err(|e| format!("failed to evict {stream} segments: {e}"))?;
+                    .map_err(|e| {
+                        Error::Message(format!("failed to evict {stream} segments: {e}"))
+                    })?;
                 total.wal_rows += tx
                     .tx
                     .execute(
                         "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
                         params,
                     )
-                    .map_err(|e| format!("failed to evict {stream} WAL rows: {e}"))?;
+                    .map_err(|e| {
+                        Error::Message(format!("failed to evict {stream} WAL rows: {e}"))
+                    })?;
             }
             Ok(total)
         })
@@ -1352,22 +1376,24 @@ impl Db {
     /// a reader would splice them back in as a tail, silently duplicating rows
     /// that were already sealed. Evicting by cutoff can only ever remove a
     /// prefix, which is why it is the shape this offers.
-    pub fn segment_sizes(&self, source_id: i64) -> Result<Vec<(u64, u64)>, String> {
+    pub fn segment_sizes(&self, source_id: i64) -> Result<Vec<(u64, u64)>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT last_ts, length(bytes) FROM segments \
                  WHERE source_id = ?1 ORDER BY last_ts",
             )
-            .map_err(|e| format!("failed to query segment sizes: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query segment sizes: {e}")))?;
         let rows = stmt
             .query_map([source_id], |row| {
                 Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
             })
-            .map_err(|e| format!("failed to query segment sizes: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query segment sizes: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| format!("failed to read a segment size: {e}"))?);
+            out.push(
+                row.map_err(|e| Error::Message(format!("failed to read a segment size: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -1379,7 +1405,7 @@ impl Db {
     /// [`incremental_vacuum`](Self::incremental_vacuum) hands them back. That
     /// is the number a size cap wants, since it is the number the filesystem
     /// sees. It does not include the `-wal` sidecar.
-    pub fn archive_bytes(&self) -> Result<u64, String> {
+    pub fn archive_bytes(&self) -> Result<u64> {
         let pages = self.pragma_u32("page_count")? as u64;
         let size = self.pragma_u32("page_size")? as u64;
         Ok(pages * size)
@@ -1391,17 +1417,17 @@ impl Db {
         segments_sql: &str,
         wal_sql: &str,
         cutoff_ts: u64,
-    ) -> Result<Evicted, String> {
+    ) -> Result<Evicted> {
         self.transaction(|tx| {
             let params = rusqlite::params![source_id, ts_bound(cutoff_ts)];
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
-                .map_err(|e| format!("failed to evict segments: {e}"))?;
+                .map_err(|e| Error::Message(format!("failed to evict segments: {e}")))?;
             let wal_rows = tx
                 .tx
                 .execute(wal_sql, params)
-                .map_err(|e| format!("failed to evict WAL rows: {e}"))?;
+                .map_err(|e| Error::Message(format!("failed to evict WAL rows: {e}")))?;
             // The clock-offset series is per SOURCE, so it is cut by the same
             // cutoff whichever streams the pass named. Without this the series
             // is the one part of a rolling buffer that grows without bound: one
@@ -1413,7 +1439,7 @@ impl Db {
                     "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < ?2",
                     rusqlite::params![source_id, ts_bound(cutoff_ts)],
                 )
-                .map_err(|e| format!("failed to evict clock offsets: {e}"))?;
+                .map_err(|e| Error::Message(format!("failed to evict clock offsets: {e}")))?;
             Ok(Evicted { segments, wal_rows })
         })
     }
@@ -1433,7 +1459,7 @@ impl Db {
     /// `pages` says. That is not a slow reclaim, it is no reclaim at all: at
     /// one page per retention pass a rolling buffer would never work off a
     /// spike.
-    pub fn incremental_vacuum(&self, pages: u32) -> Result<(), String> {
+    pub fn incremental_vacuum(&self, pages: u32) -> Result<()> {
         self.writable()?;
         let fail = |e| format!("failed to reclaim {pages} pages: {e}");
         let mut stmt = self
@@ -1457,13 +1483,13 @@ impl Db {
     /// A plain file copy is NOT an equivalent: in WAL mode the main database
     /// file lags every commit since the last checkpoint, so copying it alone
     /// silently loses the most recent ticks.
-    pub fn vacuum_into(&self, dest: &Path) -> Result<(), String> {
+    pub fn vacuum_into(&self, dest: &Path) -> Result<()> {
         let dest = dest
             .to_str()
             .ok_or_else(|| format!("dump destination {} is not valid UTF-8", dest.display()))?;
         self.conn
             .execute("VACUUM INTO ?1", [dest])
-            .map_err(|e| format!("failed to write the dump to {dest}: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to write the dump to {dest}: {e}")))?;
         Ok(())
     }
 
@@ -1471,7 +1497,7 @@ impl Db {
     /// together — from catalog columns alone. `None` when the source holds
     /// no rows at all, which for a rolling buffer means "nothing within the
     /// lookback".
-    pub fn source_time_span(&self, source_id: i64) -> Result<(Option<u64>, Option<u64>), String> {
+    pub fn source_time_span(&self, source_id: i64) -> Result<(Option<u64>, Option<u64>)> {
         self.conn
             .query_row(
                 "SELECT MIN(first_ts), MAX(last_ts) FROM ( \
@@ -1486,13 +1512,13 @@ impl Db {
                     ))
                 },
             )
-            .map_err(|e| format!("failed to measure source {source_id}: {e}"))
+            .map_err(|e| Error::Message(format!("failed to measure source {source_id}: {e}")))
     }
 
     /// Mark a source cleanly finalized, outside any batch. The dump uses
     /// it: a copy taken at time T is a finished artifact even though the
     /// buffer it came from is still running.
-    pub fn mark_complete(&mut self, source_id: i64) -> Result<(), String> {
+    pub fn mark_complete(&mut self, source_id: i64) -> Result<()> {
         self.writable()?;
         self.transaction(|tx| tx.mark_complete(source_id))
     }
@@ -1505,18 +1531,18 @@ impl Db {
     /// table added here without being handled there would vanish silently
     /// from every rewritten archive.
     #[cfg(test)]
-    pub fn user_table_names(&self) -> Result<Vec<String>, String> {
+    pub fn user_table_names(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
             )
-            .map_err(|e| format!("failed to list tables: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to list tables: {e}")))?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("failed to list tables: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to list tables: {e}"))
+            .map_err(|e| Error::Message(format!("failed to list tables: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Message(format!("failed to list tables: {e}")))
     }
 
     /// Replace one source's metadata map.
@@ -1529,58 +1555,60 @@ impl Db {
         &self,
         source_id: i64,
         metadata: &BTreeMap<String, String>,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.writable()?;
         let encoded = serde_json::to_string(metadata)
-            .map_err(|e| format!("failed to encode source metadata: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to encode source metadata: {e}")))?;
         let changed = self
             .conn
             .execute(
                 "UPDATE sources SET metadata = ?1 WHERE id = ?2",
                 rusqlite::params![encoded, source_id],
             )
-            .map_err(|e| format!("failed to update source metadata: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to update source metadata: {e}")))?;
         if changed == 0 {
-            return Err(format!("no source with id {source_id}"));
+            return Err(Error::Message(format!("no source with id {source_id}")));
         }
         Ok(())
     }
 
-    pub fn pragma_u32(&self, name: &str) -> Result<u32, String> {
+    pub fn pragma_u32(&self, name: &str) -> Result<u32> {
         let value = self.pragma_i64(name)?;
-        u32::try_from(value).map_err(|_| format!("pragma {name} is {value}, not a u32"))
+        u32::try_from(value)
+            .map_err(|_| Error::Message(format!("pragma {name} is {value}, not a u32")))
     }
 
     /// Signed, because `cache_size` is negative when denominated in kibibytes.
-    pub fn pragma_i64(&self, name: &str) -> Result<i64, String> {
+    pub fn pragma_i64(&self, name: &str) -> Result<i64> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
-            .map_err(|e| format!("failed to read pragma {name}: {e}"))
+            .map_err(|e| Error::Message(format!("failed to read pragma {name}: {e}")))
     }
 
     /// The source's `(ts, offset_ns)` clock observations, oldest first.
-    pub fn read_clock_offsets(&self, source_id: i64) -> Result<Vec<(u64, i64)>, String> {
+    pub fn read_clock_offsets(&self, source_id: i64) -> Result<Vec<(u64, i64)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT ts, offset_ns FROM clock_offsets WHERE source_id = ?1 ORDER BY ts")
-            .map_err(|e| format!("failed to query clock offsets: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query clock offsets: {e}")))?;
         let rows = stmt
             .query_map([source_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
-            .map_err(|e| format!("failed to query clock offsets: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to query clock offsets: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (ts, offset) = row.map_err(|e| format!("failed to read clock offset: {e}"))?;
+            let (ts, offset) =
+                row.map_err(|e| Error::Message(format!("failed to read clock offset: {e}")))?;
             out.push((ts as u64, offset));
         }
         Ok(out)
     }
 
-    pub fn pragma_string(&self, name: &str) -> Result<String, String> {
+    pub fn pragma_string(&self, name: &str) -> Result<String> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
-            .map_err(|e| format!("failed to read pragma {name}: {e}"))
+            .map_err(|e| Error::Message(format!("failed to read pragma {name}: {e}")))
     }
 }
 
@@ -1602,7 +1630,7 @@ impl Tx<'_> {
     /// recorded: the ranged dump writes a source row and every segment it
     /// selected, and either the whole file is that source or there is no
     /// file at all.
-    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64, String> {
+    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64> {
         insert_source_sql(&self.tx, meta)
     }
 
@@ -1619,19 +1647,19 @@ impl Tx<'_> {
         seq: u64,
         meta: &SegmentMeta,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes)
     }
 
     /// Insert every WAL row for one tick — one stream each, typically.
-    pub fn insert_wal_rows(&self, source_id: i64, rows: &[WalRow]) -> Result<(), String> {
+    pub fn insert_wal_rows(&self, source_id: i64, rows: &[WalRow]) -> Result<()> {
         let mut stmt = self
             .tx
             .prepare(
                 "INSERT INTO wal(source_id, stream, ts, wall_offset, row) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )
-            .map_err(|e| format!("failed to prepare WAL insert: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to prepare WAL insert: {e}")))?;
         for r in rows {
             stmt.execute(rusqlite::params![
                 source_id,
@@ -1640,18 +1668,15 @@ impl Tx<'_> {
                 r.wall_offset,
                 r.row,
             ])
-            .map_err(|e| format!("failed to insert WAL row for {}: {e}", r.stream))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to insert WAL row for {}: {e}", r.stream))
+            })?;
         }
         Ok(())
     }
 
     /// Append one `(ts, offset_ns)` clock observation for the source.
-    pub fn insert_clock_offset(
-        &self,
-        source_id: i64,
-        ts: u64,
-        offset_ns: i64,
-    ) -> Result<(), String> {
+    pub fn insert_clock_offset(&self, source_id: i64, ts: u64, offset_ns: i64) -> Result<()> {
         self.tx
             .execute(
                 "INSERT OR IGNORE INTO clock_offsets(source_id, ts, offset_ns) \
@@ -1662,28 +1687,30 @@ impl Tx<'_> {
                     offset_ns
                 ],
             )
-            .map_err(|e| format!("failed to insert clock offset: {e}"))?;
+            .map_err(|e| Error::Message(format!("failed to insert clock offset: {e}")))?;
         Ok(())
     }
 
     /// Mark the source cleanly finalized. This is what replaced the
     /// `.partial` filename convention: the file is valid from creation, so
     /// "was it finished" is a queryable property instead of a name.
-    pub fn mark_complete(&self, source_id: i64) -> Result<(), String> {
+    pub fn mark_complete(&self, source_id: i64) -> Result<()> {
         self.tx
             .execute("UPDATE sources SET complete = 1 WHERE id = ?1", [source_id])
-            .map_err(|e| format!("failed to mark source {source_id} complete: {e}"))?;
+            .map_err(|e| {
+                Error::Message(format!("failed to mark source {source_id} complete: {e}"))
+            })?;
         Ok(())
     }
 }
 
 /// Shared by `Db::insert_source` (its own commit) and
 /// `Tx::insert_source` (part of a batch).
-fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64, String> {
+fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64> {
     let labels = serde_json::to_string(&meta.labels)
-        .map_err(|e| format!("failed to encode source labels: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to encode source labels: {e}")))?;
     let metadata = serde_json::to_string(&meta.metadata)
-        .map_err(|e| format!("failed to encode source metadata: {e}"))?;
+        .map_err(|e| Error::Message(format!("failed to encode source metadata: {e}")))?;
     conn.execute(
         "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns) \
          VALUES (?1, ?2, 0, ?3)",
@@ -1693,7 +1720,7 @@ fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64, String
             stored_ts(meta.clock_anchor_wall_ns, "a source clock anchor")?
         ],
     )
-    .map_err(|e| format!("failed to insert source: {e}"))?;
+    .map_err(|e| Error::Message(format!("failed to insert source: {e}")))?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -1707,7 +1734,7 @@ fn insert_segment_sql(
     seq: u64,
     meta: &SegmentMeta,
     bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<()> {
     conn.execute(
         "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1721,7 +1748,7 @@ fn insert_segment_sql(
             bytes,
         ],
     )
-    .map_err(|e| format!("failed to insert segment {stream}#{seq}: {e}"))?;
+    .map_err(|e| Error::Message(format!("failed to insert segment {stream}#{seq}: {e}")))?;
     Ok(())
 }
 
@@ -1775,7 +1802,7 @@ CREATE TABLE segments(
 -- sitting unused; keep it maintained.
 CREATE INDEX segments_by_time ON segments(source_id, stream, last_ts);
 CREATE TABLE wal(
-  source_id INTEGER NOT NULL,
+  source_id INTEGER NOT NULL REFERENCES sources(id),
   stream TEXT NOT NULL,
   ts INTEGER NOT NULL,
   wall_offset INTEGER NOT NULL,
@@ -1790,7 +1817,7 @@ CREATE TABLE wal(
 -- `insert_clock_offset`, which is `INSERT OR IGNORE` so the first observation
 -- at a timestamp wins.
 CREATE TABLE clock_offsets(
-  source_id INTEGER NOT NULL,
+  source_id INTEGER NOT NULL REFERENCES sources(id),
   ts INTEGER NOT NULL,
   offset_ns INTEGER NOT NULL,
   PRIMARY KEY (source_id, ts)
@@ -2200,7 +2227,10 @@ mod tests {
                 }],
             )
             .expect_err("a WAL row above MAX_TIMESTAMP must not be accepted");
-        assert!(err.contains("above the largest timestamp"), "got: {err}");
+        assert!(
+            matches!(err, Error::TimestampOutOfRange { .. }),
+            "got: {err:?}"
+        );
 
         let err = db
             .insert_segment(
@@ -2215,7 +2245,10 @@ mod tests {
                 b"x",
             )
             .expect_err("a segment span above MAX_TIMESTAMP must not be accepted");
-        assert!(err.contains("above the largest timestamp"), "got: {err}");
+        assert!(
+            matches!(err, Error::TimestampOutOfRange { .. }),
+            "got: {err:?}"
+        );
 
         // The boundary itself is fine, and round-trips.
         db.insert_wal_rows(
@@ -2229,6 +2262,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.read_wal(id, "s").unwrap()[0].ts, MAX_TIMESTAMP);
+    }
+
+    /// A row addressed to a source that does not exist is refused.
+    ///
+    /// `Archive::wal_tick` takes a bare `i64` source id, built by zipping
+    /// endpoints to ids. An off-by-one there used to commit an entire
+    /// endpoint's rows under an id no source row has: durable, invisible to
+    /// every read, and unrecoverable. The `REFERENCES` clause was in the schema
+    /// the whole time and did nothing, because SQLite ignores foreign keys
+    /// unless the connection asks for them.
+    #[test]
+    fn a_row_for_a_source_that_does_not_exist_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let real = db
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 0,
+            })
+            .unwrap();
+
+        let err = db
+            .insert_wal_rows(
+                real + 1,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts: 1,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .expect_err("a WAL row must not name a source that does not exist");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "got: {err}"
+        );
+
+        assert!(
+            db.insert_segment(
+                real + 1,
+                "s",
+                0,
+                &SegmentMeta {
+                    rows: 1,
+                    first_ts: 0,
+                    last_ts: 1,
+                },
+                b"x",
+            )
+            .is_err(),
+            "and neither may a segment"
+        );
     }
 
     /// A read-only handle reads everything and refuses to write.
@@ -2294,7 +2380,10 @@ mod tests {
                 }],
             )
             .expect_err("a read-only handle must refuse a write");
-        assert!(err.contains("opened read-only"), "got: {err}");
+        assert!(
+            matches!(err, Error::ReadOnly(ReadOnly::Handle)),
+            "got: {err:?}"
+        );
         assert!(
             db.evict_before(sources[0].id, 100).is_err(),
             "retention is a write too"
@@ -2556,7 +2645,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(already_exists.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(
-            err.contains(&already_exists.to_string()),
+            err.to_string().contains(&already_exists.to_string()),
             "{err:?} should carry the AlreadyExists error from create_new"
         );
     }
@@ -2903,7 +2992,10 @@ mod tests {
             )
             .expect_err("a PRIMARY KEY collision must fail the whole call");
         assert!(
-            err.to_lowercase().contains("unique") || err.to_lowercase().contains("constraint"),
+            {
+                let text = err.to_string().to_lowercase();
+                text.contains("unique") || text.contains("constraint")
+            },
             "{err:?} should name the PK collision, not some other failure"
         );
 
@@ -2960,7 +3052,10 @@ mod tests {
             })
             .expect_err("a PRIMARY KEY collision must fail the whole batch");
         assert!(
-            err.to_lowercase().contains("unique") || err.to_lowercase().contains("constraint"),
+            {
+                let text = err.to_string().to_lowercase();
+                text.contains("unique") || text.contains("constraint")
+            },
             "{err:?} should name the PK collision, not some other failure"
         );
         assert_eq!(

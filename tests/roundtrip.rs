@@ -20,7 +20,7 @@ use arrow::record_batch::RecordBatch;
 use dendro::db::{Db, SourceMeta, WalRow};
 use dendro::read;
 use dendro::rewrite::{self, ColumnFilter, CopySpec};
-use dendro::segment::{encode_batch, Segment, SegmentEncoder};
+use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Archive;
 
 /// A row is a little-endian `i64` and a UTF-8 note. Two columns, one of them a
@@ -52,7 +52,7 @@ impl Reading {
 struct ReadingEncoder;
 
 impl SegmentEncoder for ReadingEncoder {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> Result<Option<Segment>, String> {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }

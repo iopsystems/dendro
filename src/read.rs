@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::Db;
+use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
 /// One source's contents, resolved to bytes.
@@ -35,7 +36,7 @@ pub struct SourceSegments {
 ///   segment and appended as the NEWEST segment. [`Db::live_wal`]'s watermark
 ///   (`ts > MAX(last_ts)` of that stream's own segments) is what guarantees the
 ///   seam has no duplicate row, so nothing here has to de-duplicate.
-pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>, String> {
+pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>> {
     db.read_snapshot(|db| read_archive_snapshotted(db, encoder))
 }
 
@@ -47,10 +48,7 @@ pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceS
 /// and the watermark it installed shadows the same rows in the second. Across
 /// streams, it is that two streams answer from different instants, which makes
 /// a single archive internally inconsistent for anything that joins them.
-fn read_archive_snapshotted(
-    db: &Db,
-    encoder: &dyn SegmentEncoder,
-) -> Result<Vec<SourceSegments>, String> {
+fn read_archive_snapshotted(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>> {
     let mut out = Vec::new();
     for src in db.read_sources()? {
         let mut streams = Vec::new();
@@ -88,7 +86,7 @@ pub fn stream_segments(
     source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
-) -> Result<Vec<Vec<u8>>, String> {
+) -> Result<Vec<Vec<u8>>> {
     db.read_snapshot(|db| stream_segments_snapshotted(db, source_id, stream, encoder))
 }
 
@@ -107,13 +105,20 @@ fn stream_segments_snapshotted(
     source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
-) -> Result<Vec<Vec<u8>>, String> {
+) -> Result<Vec<Vec<u8>>> {
     let mut segments: Vec<Vec<u8>> = db
         .read_segments(source_id, stream)?
         .into_iter()
         .map(|s| s.bytes)
         .collect();
-    if let Some(tail) = encoder.encode(stream, &db.live_wal(source_id, stream)?)? {
+    let live = db.live_wal(source_id, stream)?;
+    if let Some(tail) = encoder
+        .encode(stream, &live)
+        .map_err(|source| Error::Encoder {
+            stream: stream.to_string(),
+            source,
+        })?
+    {
         segments.push(tail.bytes);
     }
     Ok(segments)
@@ -150,7 +155,7 @@ pub enum SegmentSource {
 impl SegmentSource {
     /// Every segment of this stream, materialized. Call it when the stream is
     /// actually read.
-    pub fn all(&self, encoder: &dyn SegmentEncoder) -> Result<Vec<Vec<u8>>, String> {
+    pub fn all(&self, encoder: &dyn SegmentEncoder) -> Result<Vec<Vec<u8>>> {
         match self {
             SegmentSource::Bytes(b) => Ok(b.clone()),
             SegmentSource::Db {
