@@ -258,7 +258,6 @@ pub fn project_segment_columns(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::db::Db;
 
     /// Every table in the schema is either copied by
