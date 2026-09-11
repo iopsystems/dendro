@@ -9,7 +9,7 @@ format was extracted from, on a production fleet.
 The alternative is to seal often enough that losing an open batch does not
 matter. That trade does not hold up.
 
-Under a segment-only container, a `kill -9` 120 seconds into a fleet recording
+Under a segment-only container, a `kill -9` 120 seconds into a fleet source
 left **16 of 26 streams with nothing at all** — not truncated, empty. They had
 not reached their first seal. The streams that lost everything were the quiet
 ones, because a quiet stream takes longest to fill a segment. The data most
@@ -58,7 +58,7 @@ a caller bytes it can open with any parquet reader.
 
 ## Why the encoder is the caller's
 
-dendro stores a row as an opaque BLOB keyed by `(recording, stream, ts)`. What
+dendro stores a row as an opaque BLOB keyed by `(source, stream, ts)`. What
 those bytes mean, and what columns they become, is a `SegmentEncoder`.
 
 This is not abstraction for its own sake. It is where the container stops being
@@ -104,11 +104,11 @@ answer different questions:
 - **The size-based autocheckpoint (4 MiB)** bounds the sidecar's disk
   footprint.
 - **The time-based checkpoint (`CHECKPOINT_INTERVAL`, 10s)** bounds how much of
-  the recording a copy can be missing.
+  the source a copy can be missing.
 
-Both are needed. A quiet recording takes hours to accumulate 4 MiB, and that is
+Both are needed. A quiet source takes hours to accumulate 4 MiB, and that is
 exactly the case where a copy is silently useless. Before the time-based
-checkpoint existed, a copy taken from a 2000-append recording was measured
+checkpoint existed, a copy taken from a 2000-append source was measured
 missing **123 appends (~2 minutes at a 1s interval)**, with a sidecar larger
 than the archive itself.
 
@@ -126,7 +126,7 @@ rolling buffer of genuinely bounded size work:
   inflate the file permanently. Measured free in steady state (8.230 vs 8.807
   ms per cycle).
 - **A capped reclaim** (`RECLAIM_PAGES_PER_PASS`), so pages drain back to the
-  filesystem gradually instead of a full `VACUUM` stalling the recording for
+  filesystem gradually instead of a full `VACUUM` stalling the source for
   seconds. It fires only when the free list has grown past a fraction of the
   file — i.e. only when the working set genuinely shrank.
 
@@ -140,7 +140,7 @@ append cadence reads as a hang rather than an error.
 The channel is bounded at 1. The hand-off blocking while the writer is busy is
 the intended backpressure signal: a disk that cannot keep up should slow the
 caller's append loop, not grow a buffer. One slot for the whole archive rather
-than one per recording, because the writer is a single thread against a single
+than one per source, because the writer is a single thread against a single
 write lock — a deeper queue would only move the wait.
 
 ## Segment encoding choices
@@ -166,8 +166,8 @@ Neither choice affects read speed. Query time tracks segment *count*, which is
 
 | version | written by | notes |
 |---|---|---|
-| 4 | dendro | Current. Stream column named `stream`. |
-| 3 | rezolus `.rez` | Read-only, through per-connection compatibility views. Its stream column is named `sampler`. |
+| 4 | dendro | Current. |
+| 3 | rezolus `.rez` | Read-only, through per-connection compatibility views. Names `sources` as `recordings`, `source_id` as `recording_id`, and `stream` as `sampler`. |
 
 v3 archives open through TEMP views, which SQLite resolves before the main
 schema — so every statement in `db.rs` can name `stream` unconditionally.

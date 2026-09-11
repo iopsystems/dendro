@@ -17,22 +17,35 @@
 //!
 //! # Vocabulary
 //!
-//! These words mean one thing each, throughout the crate and its docs:
+//! Four things nest, and they are the whole model:
+//!
+//! **archive → stream → segment → row**
 //!
 //! | term | meaning |
 //! |---|---|
 //! | **archive** | The file. One SQLite database, holding everything below. |
-//! | **recording** | A labelled timeline inside an archive. An archive may hold several — two hosts, two arms of an experiment — each independent. |
-//! | **stream** | A named sequence of rows inside a recording. Streams are independent: each accumulates, seals and expires on its own schedule. |
-//! | **row** | One timestamped payload appended to a stream. Opaque to dendro. |
+//! | **stream** | A named sequence of rows. Streams are independent: each accumulates, seals and expires on its own schedule. A stream runs the length of the archive. |
+//! | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
+//! | **row** | One timestamped payload. Opaque to dendro. |
+//!
+//! Plus five that are not containers:
+//!
+//! | term | meaning |
+//! |---|---|
+//! | **source** | The namespace a stream belongs to: one producer, one clock domain, one label set. `cpu` from `host=web-01` and `cpu` from `host=web-02` are two streams in two sources. Most archives have exactly one; several when you record two hosts or two arms into one file. |
 //! | **WAL** | The write-ahead log rows land in. Durable and readable immediately; not a staging area you have to flush before the data counts. |
 //! | **seal** | Turning a stream's accumulated WAL rows into a segment. |
-//! | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. |
 //! | **tail** | The live WAL rows past a stream's newest segment, materialized on read. |
-//! | **catalog** | The SQLite tables describing recordings, streams and segments — what makes retention and range reads indexed lookups rather than scans. |
+//! | **catalog** | The SQLite tables describing sources, streams and segments — what makes retention and range reads indexed lookups rather than scans. |
 //! | **encoder** | The caller's [`SegmentEncoder`]. The only thing that knows what a row means. |
 //!
-//! Note what is NOT in that list: nothing about metrics, samples, series or
+//! **A source is a namespace, not a box.** It is what makes a stream name
+//! unambiguous and what gives its rows a shared wall-clock anchor — row
+//! timestamps are `anchor + monotonic elapsed`, so one source is one clock. It
+//! is deliberately not a rung on the ladder above: nothing is stored "in" a
+//! source that is not in one of its streams.
+//!
+//! Note what is NOT in either list: nothing about metrics, samples, series or
 //! observations. dendro came out of a telemetry agent and is a good fit for
 //! telemetry, but the container does not know that and should not learn it.
 //!
@@ -63,18 +76,18 @@
 //! ```no_run
 //! # #[cfg(feature = "write")]
 //! # fn demo() -> Result<(), String> {
-//! # use dendro::{db::{RecordingMeta, WalRow}, segment::{Segment, SegmentEncoder}, writer::Archive};
+//! # use dendro::{db::{SourceMeta, WalRow}, segment::{Segment, SegmentEncoder}, writer::Archive};
 //! # struct MyEncoder;
 //! # impl SegmentEncoder for MyEncoder {
 //! #     fn encode(&self, _: &str, _: &[WalRow]) -> Result<Option<Segment>, String> { Ok(None) }
 //! # }
-//! # let seed = RecordingMeta { labels: Default::default(), metadata: Default::default(), clock_anchor_wall_ns: 0 };
+//! # let seed = SourceMeta { labels: Default::default(), metadata: Default::default(), clock_anchor_wall_ns: 0 };
 //! # let rows: Vec<WalRow> = vec![];
 //! let mut archive = Archive::create("out.dendro".as_ref(), Box::new(MyEncoder))?;
-//! let mut recording = archive.add_recording(seed)?;
-//! recording.wal(rows)?;                            // durable, and readable now
-//! recording.seal(vec!["temps".to_string()])?;      // -> one parquet segment
-//! recording.finalize((0, 0))?;
+//! let mut source = archive.add_source(seed)?;
+//! source.wal(rows)?;                            // durable, and readable now
+//! source.seal(vec!["temps".to_string()])?;      // -> one parquet segment
+//! source.finalize((0, 0))?;
 //! archive.join()?;
 //! # Ok(())
 //! # }

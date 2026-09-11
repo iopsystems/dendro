@@ -34,7 +34,7 @@ pub struct Segment {
 /// Turns a stream's WAL rows into one parquet segment.
 ///
 /// **This is the whole schema boundary.** dendro stores a WAL row as an opaque
-/// BLOB keyed by `(recording, stream, ts)`; what those bytes mean, and what
+/// BLOB keyed by `(source, stream, ts)`; what those bytes mean, and what
 /// columns they become, is entirely the caller's. Both the writer thread (when
 /// it seals) and any independent reader (materializing a live tail out of an
 /// archive another process is appending to) call this, so an implementation

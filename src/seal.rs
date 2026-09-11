@@ -3,8 +3,8 @@
 //!
 //! [`SealPolicy`] answers "is this open segment due?" and [`SegmentAccount`]
 //! maintains the byte and row counts that question is asked against. Both are
-//! properties of *segmenting a recording* rather than of the container it
-//! lands in, so a plain recording and a rolling buffer use exactly the same
+//! properties of *segmenting a source* rather than of the container it
+//! lands in, so a plain source and a rolling buffer use exactly the same
 //! ones.
 //!
 //! The caller decides when to ACT on the answer — dendro never seals behind
@@ -19,14 +19,14 @@ use std::time::{Duration, Instant};
 /// 50% bounds the startup cost to one short segment per stream.
 pub const STAGGER_BUCKETS: u64 = 64;
 
-/// The stagger identity of a writer that can only ever hold one recording.
+/// The stagger identity of a writer that can only ever hold one source.
 ///
-/// With one recording there is never a second one to desync against, so every
+/// With one source there is never a second one to desync against, so every
 /// stream can share an identity and the stagger reduces to spreading streams
 /// within it. Named rather than spelled `""` at each call site so the reason
 /// travels with the value.
 #[cfg_attr(not(test), allow(dead_code))]
-pub const SINGLE_RECORDING_KEY: &str = "";
+pub const SINGLE_SOURCE_KEY: &str = "";
 
 /// When an open segment is due to be sealed. Byte-first: the byte cap is the
 /// one that bounds both the builder's memory footprint and the encoder's input,
@@ -112,22 +112,22 @@ impl SegmentAccount {
     /// **All three caps, not just rows and age.** The byte cap is the one that
     /// splits the *wide* tables (see `SealPolicy`), so leaving it unstaggered
     /// left exactly those tables with no phase offset at all. Within one
-    /// recording that was survivable — different streams fill at different
-    /// rates, so they drift anyway — but two recordings of the SAME producer
+    /// source that was survivable — different streams fill at different
+    /// rates, so they drift anyway — but two sources of the SAME producer
     /// carry identical data, so a byte-bound table reached the cap on the same
     /// row in both and they sealed in permanent lockstep. Measured before the
     /// fix: `cpu_usage` 49/49 segment boundaries coincident across two
-    /// recordings, against 1/6 for the row-bound tables.
+    /// sources, against 1/6 for the row-bound tables.
     ///
     /// This is a *phase offset*, not a period change. Every row-capped table
     /// otherwise advances exactly one row per tick starting from row 0, so they
     /// all reach `max_rows` in permanent lockstep and seal as one large batch
     /// forever. Co-seals, not large individual segments, are what put a seal
     /// over the tick budget. Shortening only the first segment desyncs the
-    /// tables for the life of the recording while leaving steady-state segment
+    /// tables for the life of the source while leaving steady-state segment
     /// size and count untouched — `rotate` restores the full policy.
-    pub fn open_first(stream: &str, recording_key: &str, policy: &SealPolicy) -> Self {
-        let bucket = stagger_bucket(stream, recording_key);
+    pub fn open_first(stream: &str, source_key: &str, policy: &SealPolicy) -> Self {
+        let bucket = stagger_bucket(stream, source_key);
         // Divide before multiplying: `max_rows` is `usize::MAX` in several
         // callers, and `max_rows * bucket` would overflow.
         let row_offset = (policy.max_rows / (2 * STAGGER_BUCKETS as usize)) * bucket as usize;
@@ -197,24 +197,24 @@ impl SegmentAccount {
     }
 }
 
-/// FNV-1a over the stream name AND the recording's identity, reduced to a
+/// FNV-1a over the stream name AND the source's identity, reduced to a
 /// stagger bucket.
 ///
 /// Hand-written rather than `DefaultHasher` on purpose: the offset must be
 /// identical across runs, builds and Rust versions, and `DefaultHasher` is
 /// SipHash with an explicitly unstable algorithm and no seed guarantee.
 /// Randomizing the initial deadline would desync just as well, but a stable
-/// offset keeps a recording's segment boundaries reproducible.
+/// offset keeps a source's segment boundaries reproducible.
 ///
-/// **`recording_key` is why this is not just the stream name.** An archive can
-/// hold several recordings, and two producers have *identical* stream
-/// sets — so keying on the stream alone would give every table in recording B
-/// the same bucket as its namesake in A. The two recordings would then seal in
+/// **`source_key` is why this is not just the stream name.** An archive can
+/// hold several sources, and two producers have *identical* stream
+/// sets — so keying on the stream alone would give every table in source B
+/// the same bucket as its namesake in A. The two sources would then seal in
 /// permanent lockstep, doubling the co-seal batch size exactly when the archive
-/// holds twice the tables: the stagger still working within a recording and
+/// holds twice the tables: the stagger still working within a source and
 /// silently defeated across them.
 ///
-/// The key is the recording's canonical label set, not its `recordings` row id.
+/// The key is the source's canonical label set, not its `sources` row id.
 /// An autoincrement id would make the bucket — and so where every segment
 /// boundary falls — depend on the order endpoints were listed on the command
 /// line, and the same two producers recorded with the flags swapped would segment
@@ -223,11 +223,11 @@ impl SegmentAccount {
 /// multi-host archive, and an A/B on a *single* host separates only on `arm`,
 /// which a node name alone would miss.
 ///
-/// Two recordings with genuinely identical label sets still collide. That is
+/// Two sources with genuinely identical label sets still collide. That is
 /// the degenerate case — the operator gave two endpoints nothing to tell them
 /// apart — and the answer is to warn rather than to fold in the id and
 /// reintroduce order-dependence.
-pub fn stagger_bucket(stream: &str, recording_key: &str) -> u64 {
+pub fn stagger_bucket(stream: &str, source_key: &str) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3; // FNV-1a 64-bit prime
 
     // Absorb one byte, twice: the byte itself, then the two bits the final
@@ -251,12 +251,12 @@ pub fn stagger_bucket(stream: &str, recording_key: &str) -> u64 {
     // absorbed byte XORs 0x20 through the whole chain and a second flip
     // cancels it. Two label sets differing by an EVEN number of bit-5 flips
     // share every bucket. In printable ASCII bit 5 is the case bit, so this
-    // needs two recordings whose labels differ only by capitalisation.
+    // needs two sources whose labels differ only by capitalisation.
     //
     // **Closing it costs more than it buys, because the spread and the alias
     // are the same property.** The low-bit structure that makes this hash
     // spread a real stream set PERFECTLY is exactly the affine structure the
-    // alias exploits. Measured over 500 recording keys, as colliding
+    // alias exploits. Measured over 500 source keys, as colliding
     // stream-pairs normalised by what a uniform random assignment would give
     // (0 = perfect, 1.0 = random):
     //
@@ -286,13 +286,13 @@ pub fn stagger_bucket(stream: &str, recording_key: &str) -> u64 {
     // A separator no label byte can supply, so `a=1,b=2` and `a=1,b=2` reached
     // from different splits cannot alias.
     absorb(&mut h, 0xff);
-    for b in recording_key.as_bytes() {
+    for b in source_key.as_bytes() {
         absorb(&mut h, *b as u64);
     }
     h % STAGGER_BUCKETS
 }
 
-/// Whether two recording keys draw the SAME stagger bucket for EVERY stream.
+/// Whether two source keys draw the SAME stagger bucket for EVERY stream.
 ///
 /// Not a string comparison — an exact statement about
 /// [`stagger_bucket`](stagger_bucket)'s algebra. The absorb is affine in each
@@ -326,11 +326,11 @@ pub fn staggers_identically(a: &str, b: &str) -> bool {
     bit5_flips.is_multiple_of(2)
 }
 
-/// A recording's stagger identity: its label set, canonically rendered.
+/// A source's stagger identity: its label set, canonically rendered.
 ///
 /// `BTreeMap` already fixes the order, so this is just a rendering — but it is
 /// done in one place so the writer and any test agree on the exact bytes.
-pub fn recording_stagger_key(labels: &std::collections::BTreeMap<String, String>) -> String {
+pub fn source_stagger_key(labels: &std::collections::BTreeMap<String, String>) -> String {
     let mut out = String::new();
     for (k, v) in labels {
         if !out.is_empty() {
@@ -349,7 +349,7 @@ mod tests {
 
     /// The offset must be reproducible across runs, builds and Rust versions,
     /// which is why it is a hand-written FNV-1a and not `DefaultHasher`. The
-    /// literals pin the constants: if the hash changes, every recording's
+    /// literals pin the constants: if the hash changes, every source's
     /// segment boundaries move.
     /// The realistic stream set, for spread and aliasing checks alike.
     const STREAMS: [&str; 26] = [
@@ -423,7 +423,7 @@ mod tests {
     ///
     /// Colliding stream-pairs, normalised by what a uniform random assignment
     /// would give: 0 = every table its own bucket, 1.0 = random. This hash
-    /// spreads a 12-stream recording PERFECTLY and a 26-stream one better
+    /// spreads a 12-stream source PERFECTLY and a 26-stream one better
     /// than random — which is the reason bit-5 aliasing is warned about rather
     /// than hashed away, since every candidate that closed it measured at or
     /// worse than random here.
@@ -442,7 +442,7 @@ mod tests {
             pairs / expected
         }
 
-        // Over many recordings, not one: the bucket a stream draws depends on
+        // Over many sources, not one: the bucket a stream draws depends on
         // both, and a hash that spread well for a single key would say nothing.
         for i in 0..200 {
             let key = format!("host=web-{i:03}\u{1}source=weather");
@@ -460,10 +460,10 @@ mod tests {
 
     #[test]
     fn stagger_is_deterministic() {
-        assert_eq!(stagger_bucket("cpu_usage", SINGLE_RECORDING_KEY), 32);
-        assert_eq!(stagger_bucket("scheduler", SINGLE_RECORDING_KEY), 19);
+        assert_eq!(stagger_bucket("cpu_usage", SINGLE_SOURCE_KEY), 32);
+        assert_eq!(stagger_bucket("scheduler", SINGLE_SOURCE_KEY), 19);
         assert!(
-            (0..STAGGER_BUCKETS).contains(&stagger_bucket("anything_at_all", SINGLE_RECORDING_KEY))
+            (0..STAGGER_BUCKETS).contains(&stagger_bucket("anything_at_all", SINGLE_SOURCE_KEY))
         );
     }
 
@@ -472,13 +472,13 @@ mod tests {
     ///
     /// Plain FNV-1a reduced mod 64 depends only on each byte's low six bits,
     /// so two hostnames agreeing byte-for-byte modulo 0x40 drew the same
-    /// bucket for EVERY stream — complete lockstep between two recordings
+    /// bucket for EVERY stream — complete lockstep between two sources
     /// that look nothing alike. The pairs are ordinary: `-`/`m`, `.`/`n`,
     /// digits against `p`-`y`.
     #[test]
     fn hosts_that_alias_in_the_low_bits_still_desync() {
         let key = |host: &str| {
-            recording_stagger_key(
+            source_stagger_key(
                 &[
                     ("host".to_string(), host.to_string()),
                     ("source".to_string(), "weather".to_string()),
@@ -521,18 +521,18 @@ mod tests {
     /// The reason the key widened past the stream name.
     ///
     /// Two producers have identical stream sets. Keyed on the stream
-    /// alone, every table in one recording drew its namesake's bucket in the
+    /// alone, every table in one source drew its namesake's bucket in the
     /// other, so both sealed in permanent lockstep — doubling the co-seal batch
     /// exactly when the archive holds twice the tables. This is the assertion
-    /// that fails if the recording key is ever dropped from the hash.
+    /// that fails if the source key is ever dropped from the hash.
     #[test]
-    fn two_recordings_do_not_share_a_streams_bucket() {
-        let a = recording_stagger_key(
+    fn two_sources_do_not_share_a_streams_bucket() {
+        let a = source_stagger_key(
             &[("host".to_string(), "alpha".to_string())]
                 .into_iter()
                 .collect(),
         );
-        let b = recording_stagger_key(
+        let b = source_stagger_key(
             &[("host".to_string(), "beta".to_string())]
                 .into_iter()
                 .collect(),
@@ -546,7 +546,7 @@ mod tests {
             .count();
         assert_eq!(
             collisions, 0,
-            "identical stream sets must not draw identical buckets across recordings"
+            "identical stream sets must not draw identical buckets across sources"
         );
     }
 
@@ -554,19 +554,19 @@ mod tests {
     ///
     /// This is the one the measurement caught. The byte cap splits the *wide*
     /// tables, so leaving it on the shared policy left exactly those tables
-    /// with no phase offset: two recordings of one producer carry identical data,
+    /// with no phase offset: two sources of one producer carry identical data,
     /// reach the cap on the same row, and seal together forever. Measured
     /// before the fix, `cpu_usage` had 49 of 49 segment boundaries coincident
-    /// across two recordings; after, 1 of 5.
+    /// across two sources; after, 1 of 5.
     #[test]
-    fn the_byte_cap_is_staggered_across_recordings() {
+    fn the_byte_cap_is_staggered_across_sources() {
         let policy = SealPolicy {
             max_bytes: 8 * 1024 * 1024,
             max_rows: 900,
             max_age: Duration::from_secs(300),
         };
         let key = |host: &str| {
-            recording_stagger_key(
+            source_stagger_key(
                 &[("host".to_string(), host.to_string())]
                     .into_iter()
                     .collect(),
@@ -600,7 +600,7 @@ mod tests {
         }
         assert!(
             split.is_some(),
-            "both recordings' byte-bound tables sealed on the same row — the byte \
+            "both sources' byte-bound tables sealed on the same row — the byte \
              cap escaped the stagger"
         );
 
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn same_host_different_arms_still_desync() {
         let base = |arm: &str| {
-            recording_stagger_key(
+            source_stagger_key(
                 &[
                     ("host".to_string(), "alpha".to_string()),
                     ("arm".to_string(), arm.to_string()),
@@ -635,18 +635,18 @@ mod tests {
         );
     }
 
-    /// The bucket follows a recording's labels, not its position.
+    /// The bucket follows a source's labels, not its position.
     ///
     /// This is deliberately NOT written as "compute the pair in both orders
     /// and compare". `stagger_bucket` takes two `&str` and no index, and
-    /// `recording_stagger_key` takes a `BTreeMap` that is sorted before it is
+    /// `source_stagger_key` takes a `BTreeMap` that is sorted before it is
     /// called — so any such assertion reduces to `[f(a), f(b)] == [f(a),
     /// f(b))]`, two calls to a pure function compared with themselves. It
     /// cannot fail for any implementation, which is exactly what was wrong
     /// with the version this replaces.
     ///
     /// Order-independence is real, but it is a property of the *layer above*:
-    /// the recording id — the thing that would have made segmentation depend
+    /// the source id — the thing that would have made segmentation depend
     /// on endpoint order — never reaches this function, which is the design
     /// decision itself. `stagger_key_follows_the_labels_not_the_open_order`
     /// in `rez_v3_writer` pins it where the id exists. What is left to assert
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn the_two_arms_of_an_ab_land_in_different_buckets() {
         let key = |arm: &str| {
-            recording_stagger_key(
+            source_stagger_key(
                 &[
                     ("host".to_string(), "alpha".to_string()),
                     ("arm".to_string(), arm.to_string()),

@@ -43,7 +43,7 @@ pub struct CopySpec<'a> {
     /// under a coarser unit than the stream key — one an operator names, that
     /// owns several streams — and dropping that unit has to drop all of them.
     pub keep_streams: Option<&'a dyn Fn(&str) -> bool>,
-    /// Extra metadata merged into each copied recording's own, overwriting on
+    /// Extra metadata merged into each copied source's own, overwriting on
     /// key collision. `annotate` embeds KPIs this way; the others pass `None`.
     pub metadata_extra: Option<&'a BTreeMap<String, String>>,
     /// When set, project each copied segment's parquet down to the columns
@@ -55,7 +55,7 @@ pub struct CopySpec<'a> {
 }
 
 impl CopySpec<'_> {
-    /// Every recording, every table, every row, metadata untouched.
+    /// Every source, every table, every row, metadata untouched.
     pub fn everything() -> Self {
         CopySpec {
             start: 0,
@@ -67,39 +67,39 @@ impl CopySpec<'_> {
     }
 }
 
-/// Copy every recording in `src` into the open destination transaction,
-/// returning how many recordings were copied.
+/// Copy every source in `src` into the open destination transaction,
+/// returning how many sources were copied.
 ///
 /// The destination transaction is the caller's so that `combine` can fold
 /// several sources into one atomic write: either the combined archive has all
 /// of its inputs or it does not exist.
 ///
-/// Each copied recording keeps its source's `complete` flag. That flag answers
+/// Each copied source keeps its source's `complete` flag. That flag answers
 /// "may data after the last row be missing", which is a property of the DATA
-/// and survives being copied — a recording recovered from a checkpoint rather
+/// and survives being copied — a source recovered from a checkpoint rather
 /// than cleanly finalized is still truncated after a combine or a filter, and
 /// claiming otherwise would hide the loss. Missing beats wrong.
 ///
 /// The one caller that overrides it is a ranged dump, which marks its copy
 /// complete afterwards for a specific reason: the buffer it copied is
-/// perpetually mid-recording and would otherwise never produce a snapshot that
+/// perpetually mid-source and would otherwise never produce a snapshot that
 /// did not warn.
-pub fn copy_recordings_into(
+pub fn copy_sources_into(
     src: &Db,
     tx: &Tx<'_>,
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
 ) -> Result<usize, String> {
-    let recordings = src.read_recordings()?;
+    let sources = src.read_sources()?;
     let mut copied = 0usize;
-    for rec in &recordings {
+    for rec in &sources {
         let mut meta = rec.meta.clone();
         if let Some(extra) = spec.metadata_extra {
             for (k, v) in extra {
                 meta.metadata.insert(k.clone(), v.clone());
             }
         }
-        let id = tx.insert_recording(&meta)?;
+        let id = tx.insert_source(&meta)?;
         if rec.complete {
             tx.mark_complete(id)?;
         }
@@ -139,7 +139,7 @@ pub fn copy_recordings_into(
             // The unsealed tail is the newest data in the archive and the only
             // data a quiet table may have at all, so it is never optional —
             // only out of range. An archive still being written (a rolling buffer
-            // buffer, or a recording combined mid-flight) keeps real rows here
+            // buffer, or a source combined mid-flight) keeps real rows here
             // that no segment holds yet.
             let tail = src.live_wal(rec.id, &table)?;
             let (Some(first), Some(last)) = (tail.first(), tail.last()) else {
@@ -178,7 +178,7 @@ pub fn copy_recordings_into(
             }
         }
 
-        // Drift observations are part of the recording's identity and cost
+        // Drift observations are part of the source's identity and cost
         // nothing to carry; they are already only a handful of rows per seal.
         for (ts, offset) in src.read_clock_offsets(rec.id)? {
             tx.insert_clock_offset(id, ts, offset)?;
@@ -261,7 +261,7 @@ mod tests {
     use crate::db::Db;
 
     /// Every table in the schema is either copied by
-    /// [`copy_recordings_into`] or deliberately not carried, and this
+    /// [`copy_sources_into`] or deliberately not carried, and this
     /// test is what makes that a decision rather than an oversight.
     ///
     /// The weakness of copying instead of deleting is exactly here: a delete
@@ -272,11 +272,11 @@ mod tests {
     /// error and no symptom until someone queries for what is missing.
     ///
     /// So: adding a table here fails this test. Either copy it in
-    /// [`copy_recordings_into`] or add it to `NOT_CARRIED` with the reason.
+    /// [`copy_sources_into`] or add it to `NOT_CARRIED` with the reason.
     #[test]
     fn every_schema_table_is_either_copied_or_deliberately_dropped() {
-        /// Carried across by [`copy_recordings_into`].
-        const COPIED: &[&str] = &["recordings", "segments", "wal", "clock_offsets"];
+        /// Carried across by [`copy_sources_into`].
+        const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets"];
         /// Not carried, and correct not to be.
         const NOT_CARRIED: &[&str] = &[
             // Written by `Db::create` for the destination itself; copying
@@ -299,7 +299,7 @@ mod tests {
 
         assert_eq!(
             actual, expected,
-            "the schema changed. [`copy_recordings_into`] copies a fixed set of tables, so a \
+            "the schema changed. [`copy_sources_into`] copies a fixed set of tables, so a \
              new one is silently dropped from every combined/filtered/dumped archive until it \
              is handled. Copy it, or list it in NOT_CARRIED with the reason."
         );

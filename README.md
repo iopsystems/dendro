@@ -15,7 +15,7 @@ The usual workarounds both cost something real:
   do their job. You lose the compression parquet exists for and gain a
   directory listing problem.
 - **Accept the loss.** Fine until the interesting data is the data you lost. A
-  process killed 120 seconds into a recording loses everything that had not
+  process killed 120 seconds into a run loses everything that had not
   sealed yet, and the quietest streams — the ones with the longest open batches
   — lose the most.
 
@@ -34,7 +34,7 @@ So:
 - segments stay as large as you want them, because liveness no longer depends
   on sealing often.
 
-An archive is one file: a SQLite database whose catalog describes recordings,
+An archive is one file: a SQLite database whose catalog describes sources,
 streams and segments, and whose segments are parquet BLOBs it never looks
 inside. That buys real transactions — a seal is one commit — instead of the
 staging files, renames and manifest-ordering protocols a directory-shaped
@@ -58,38 +58,53 @@ opinion about your query engine either — reads hand back parquet bytes.
 
 ## Vocabulary
 
+Four things nest, and they are the whole model:
+
+**archive → stream → segment → row**
+
 | term | meaning |
 |---|---|
 | **archive** | The file. One SQLite database. |
-| **recording** | A labelled timeline inside an archive. An archive may hold several — two hosts, two arms of an experiment — each independent. |
-| **stream** | A named sequence of rows inside a recording. Streams accumulate, seal and expire independently. |
-| **row** | One timestamped payload appended to a stream. Opaque to dendro. |
+| **stream** | A named sequence of rows. Streams accumulate, seal and expire independently, and a stream runs the length of the archive. |
+| **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
+| **row** | One timestamped payload. Opaque to dendro. |
+
+Plus five that are not containers:
+
+| term | meaning |
+|---|---|
+| **source** | The namespace a stream belongs to: one producer, one clock domain, one label set. `cpu` from `host=web-01` and `cpu` from `host=web-02` are two streams in two sources. Most archives have one; several when you record two hosts or two arms into one file. |
 | **WAL** | The write-ahead log rows land in. Durable and readable immediately. |
 | **seal** | Turning a stream's accumulated WAL rows into a segment. |
-| **segment** | An immutable parquet blob holding one sealed run of a stream's rows. |
 | **tail** | The live WAL rows past a stream's newest segment, materialized on read. |
-| **catalog** | The SQLite tables describing recordings, streams and segments. |
+| **catalog** | The SQLite tables describing sources, streams and segments. |
 | **encoder** | Your `SegmentEncoder`. The only thing that knows what a row means. |
+
+A source is a *namespace*, not a box. It is what makes a stream name
+unambiguous, and what gives its rows a shared wall-clock anchor — timestamps are
+`anchor + monotonic elapsed`, so one source is one clock. Nothing is stored "in"
+a source that is not in one of its streams, which is why it is not a rung on the
+ladder above.
 
 ## Quick start
 
 ```rust
-use dendro::db::{Db, RecordingMeta, WalRow};
+use dendro::db::{Db, SourceMeta, WalRow};
 use dendro::read;
 use dendro::writer::Archive;
 
 // Writing.
 let mut archive = Archive::create(path, Box::new(MyEncoder))?;
-let mut recording = archive.add_recording(seed)?;
-recording.wal(rows)?;                        // durable, and readable now
-recording.seal(vec!["temps".to_string()])?;  // -> one parquet segment
-recording.finalize((last_ts, 0))?;
+let mut source = archive.add_source(seed)?;
+source.wal(rows)?;                        // durable, and readable now
+source.seal(vec!["temps".to_string()])?;  // -> one parquet segment
+source.finalize((last_ts, 0))?;
 archive.join()?;
 
 // Reading — including while someone else is still writing.
 let db = Db::open(path)?;
-for rec in read::read_archive(&db, &MyEncoder)? {
-    for (stream, segments) in rec.streams {
+for src in read::read_archive(&db, &MyEncoder)? {
+    for (stream, segments) in src.streams {
         // `segments` is parquet bytes, oldest first, live tail last.
     }
 }

@@ -12,18 +12,18 @@ use std::sync::Arc;
 use crate::db::Db;
 use crate::segment::SegmentEncoder;
 
-/// One recording's contents, resolved to bytes.
-pub struct RecordingSegments {
+/// One source's contents, resolved to bytes.
+pub struct SourceSegments {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
-    /// False when the recording was never cleanly finalized, so data after the
+    /// False when the source was never cleanly finalized, so data after the
     /// last row may be missing. Survives a copy: it describes the DATA.
     pub complete: bool,
     /// Each stream's parquet segments, oldest first, live tail last.
     pub streams: Vec<(String, Vec<Vec<u8>>)>,
 }
 
-/// Every recording in the archive at `path`.
+/// Every source in the archive at `path`.
 ///
 /// Two things differ from a mechanical transcription of the catalog:
 ///
@@ -35,15 +35,12 @@ pub struct RecordingSegments {
 ///   segment and appended as the NEWEST segment. [`Db::live_wal`]'s watermark
 ///   (`ts > MAX(last_ts)` of that stream's own segments) is what guarantees the
 ///   seam has no duplicate row, so nothing here has to de-duplicate.
-pub fn read_archive(
-    db: &Db,
-    encoder: &dyn SegmentEncoder,
-) -> Result<Vec<RecordingSegments>, String> {
+pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>, String> {
     let mut out = Vec::new();
-    for rec in db.read_recordings()? {
+    for src in db.read_sources()? {
         let mut streams = Vec::new();
-        for stream in db.all_streams(rec.id)? {
-            let segments = stream_segments(db, rec.id, &stream, encoder)?;
+        for stream in db.all_streams(src.id)? {
+            let segments = stream_segments(db, src.id, &stream, encoder)?;
             // Only reachable if a stream's every WAL row was pruned without its
             // segment landing — which the seal ordering rules out. A stream
             // with no bytes has nothing to open, so skip rather than hand the
@@ -53,10 +50,10 @@ pub fn read_archive(
             }
             streams.push((stream, segments));
         }
-        out.push(RecordingSegments {
-            labels: rec.meta.labels,
-            metadata: rec.meta.metadata,
-            complete: rec.complete,
+        out.push(SourceSegments {
+            labels: src.meta.labels,
+            metadata: src.meta.metadata,
+            complete: src.complete,
             streams,
         });
     }
@@ -73,16 +70,16 @@ pub fn read_archive(
 /// would splice those rows in a second time.
 pub fn stream_segments(
     db: &Db,
-    recording_id: i64,
+    source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
 ) -> Result<Vec<Vec<u8>>, String> {
     let mut segments: Vec<Vec<u8>> = db
-        .read_segments(recording_id, stream)?
+        .read_segments(source_id, stream)?
         .into_iter()
         .map(|s| s.bytes)
         .collect();
-    if let Some(tail) = encoder.encode(stream, &db.live_wal(recording_id, stream)?)? {
+    if let Some(tail) = encoder.encode(stream, &db.live_wal(source_id, stream)?)? {
         segments.push(tail.bytes);
     }
     Ok(segments)
@@ -97,7 +94,7 @@ pub enum SegmentSource {
     Bytes(Vec<Vec<u8>>),
     Db {
         path: PathBuf,
-        recording_id: i64,
+        source_id: i64,
         stream: String,
     },
     /// A catalog that exists only in memory, shared by every stream of the
@@ -111,7 +108,7 @@ pub enum SegmentSource {
     /// read from several threads on the native probe path.
     SharedDb {
         db: Arc<std::sync::Mutex<Db>>,
-        recording_id: i64,
+        source_id: i64,
         stream: String,
     },
 }
@@ -124,22 +121,22 @@ impl SegmentSource {
             SegmentSource::Bytes(b) => Ok(b.clone()),
             SegmentSource::Db {
                 path,
-                recording_id,
+                source_id,
                 stream,
             } => {
                 let db = Db::open(path)?;
-                stream_segments(&db, *recording_id, stream, encoder)
+                stream_segments(&db, *source_id, stream, encoder)
             }
             SegmentSource::SharedDb {
                 db,
-                recording_id,
+                source_id,
                 stream,
             } => {
                 // A poisoned lock means another thread panicked mid-read. The
                 // catalog is read-only here, so nothing is half-written and the
                 // data is still good.
                 let db = db.lock().unwrap_or_else(|e| e.into_inner());
-                stream_segments(&db, *recording_id, stream, encoder)
+                stream_segments(&db, *source_id, stream, encoder)
             }
         }
     }

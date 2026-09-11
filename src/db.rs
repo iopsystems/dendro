@@ -4,7 +4,7 @@
 //! DESIGN.md § "Why parquet blobs inside a database".
 //!
 //! This is the ONLY module that knows SQL. Everything above it speaks in
-//! recordings, segments, and WAL rows.
+//! sources, segments, and WAL rows.
 //!
 //! The container is built before its writers: the `segments`, `wal`, and
 //! `clock_offsets` tables exist here, but their accessors arrive with the
@@ -32,7 +32,7 @@ pub const PAGE_SIZE: u32 = 4096;
 /// future page size.
 ///
 /// This bounds the sidecar's SIZE. It does not bound its AGE, and the two come
-/// apart badly: a recording slow enough to take an hour to accumulate 4 MiB
+/// apart badly: a source slow enough to take an hour to accumulate 4 MiB
 /// leaves the archive an hour behind the sidecar, and a plain copy of it an
 /// hour short. [`crate::writer::CHECKPOINT_INTERVAL`] is the age bound.
 const WAL_AUTOCHECKPOINT_BYTES: u32 = 4 * 1024 * 1024;
@@ -46,7 +46,7 @@ const READER_CACHE_SIZE_KIB: i32 = -262_144;
 /// 16 MiB of page cache for a connection that only WRITES.
 ///
 /// **Split from the reader's cache because a writer cannot use it.** The
-/// reader's figure buys segment-read throughput; a recording writer inserts
+/// reader's figure buys segment-read throughput; a source writer inserts
 /// opaque BLOBs and never reads one back, so the only pages it benefits from
 /// caching are catalog b-trees, which are kilobytes.
 ///
@@ -89,21 +89,21 @@ const SCHEMA_VERSION: i64 = 4;
 /// converted. Writing to one is refused: see [`Db::writable`].
 const LEGACY_SCHEMA_VERSION: i64 = 3;
 
-/// One recording's identity: everything known when the recording starts.
+/// One source's identity: everything known when the source starts.
 #[derive(Clone)]
-pub struct RecordingMeta {
+pub struct SourceMeta {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
-    /// Wall-clock reading (ns since epoch) at recording start. Row timestamps
+    /// Wall-clock reading (ns since epoch) at source start. Row timestamps
     /// are `anchor + monotonic elapsed`, so this pins the timeline to wall time.
     pub clock_anchor_wall_ns: u64,
 }
 
-/// A row of the `recordings` table.
-pub struct RecordingRow {
+/// A row of the `sources` table.
+pub struct SourceRow {
     pub id: i64,
-    pub meta: RecordingMeta,
-    /// Whether the recording was cleanly finalized. This is what replaced the
+    pub meta: SourceMeta,
+    /// Whether the source was cleanly finalized. This is what replaced the
     /// `.partial` filename convention: an archive is a valid file from creation,
     /// so "was it finished" has to be a queryable property.
     pub complete: bool,
@@ -118,7 +118,7 @@ pub struct SegmentMeta {
     pub last_ts: u64,
 }
 
-/// A row of the `segments` table for one `(recording, stream)`.
+/// A row of the `segments` table for one `(source, stream)`.
 pub struct SegmentRow {
     pub seq: u64,
     pub meta: SegmentMeta,
@@ -126,7 +126,7 @@ pub struct SegmentRow {
 }
 
 /// A row of the `wal` table: one timestamped payload on one stream, keyed by
-/// `(recording_id, stream, ts)`.
+/// `(source_id, stream, ts)`.
 ///
 /// `row` is opaque. dendro stores and returns it; only the caller's
 /// [`SegmentEncoder`](crate::segment::SegmentEncoder) decodes it. A row is
@@ -160,13 +160,13 @@ pub struct Span {
 
 /// The recovery rule, as a `WHERE` clause: a WAL row is live iff its `ts` is
 /// past the watermark of the sealed segments **for its own stream in its own
-/// recording**. Written once and shared by `live_wal` and `live_wal_span` so a
+/// source**. Written once and shared by `live_wal` and `live_wal_span` so a
 /// reported WAL depth can never disagree with the rows the reader will replay.
 /// See [`Db::live_wal`] for why the rule is what it is.
-const LIVE_WAL_PREDICATE: &str = "recording_id = ?1 AND stream = ?2 \
+const LIVE_WAL_PREDICATE: &str = "source_id = ?1 AND stream = ?2 \
      AND ts > COALESCE( \
            (SELECT MAX(last_ts) FROM segments \
-            WHERE recording_id = ?1 AND stream = ?2), \
+            WHERE source_id = ?1 AND stream = ?2), \
            0)";
 
 /// An open handle on a dendro archive.
@@ -185,7 +185,7 @@ impl Db {
     /// on a database that does not yet exist, then installing the schema.
     ///
     /// Fails if `path` already exists: an archive is valid from creation, so there
-    /// is no `.partial` staging file standing between a new recording and a
+    /// is no `.partial` staging file standing between a new source and a
     /// previous one.
     pub fn create(path: &Path) -> Result<Self, String> {
         Self::create_with_page_size(path, PAGE_SIZE)
@@ -361,7 +361,7 @@ impl Db {
     /// Open an existing archive, reapplying the per-connection pragmas.
     pub fn open(path: &Path) -> Result<Self, String> {
         // No `SQLITE_OPEN_CREATE`: opening an archive that is not there is an
-        // error, not an empty new recording.
+        // error, not an empty new source.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
         let mut db = Db {
@@ -442,17 +442,17 @@ impl Db {
         };
         db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
 
-        // An archive always has a `recordings` table. Its absence has one
+        // An archive always has a `sources` table. Its absence has one
         // overwhelmingly likely cause worth naming: the bytes are a plain copy
         // of an archive a writer still held. SQLite commits into a `-wal`
         // SIDECAR, a second file that a single blob does not carry, so such a
         // copy can be a valid SQLite database with none of the archive in it.
-        // Left as bare "no such table: recordings", that reads like a corrupt
+        // Left as bare "no such table: sources", that reads like a corrupt
         // file rather than a copy taken the wrong way.
         let has_catalog: bool = db
             .conn
             .query_row(
-                "select count(*) from sqlite_master where type = 'table' and name = 'recordings'",
+                "select count(*) from sqlite_master where type = 'table' and name = 'sources'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -597,22 +597,22 @@ impl Db {
             .map_err(|e| format!("failed to set pragma {name}: {e}"))
     }
 
-    /// Start a recording, returning its id.
-    pub fn insert_recording(&self, meta: &RecordingMeta) -> Result<i64, String> {
+    /// Start a source, returning its id.
+    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64, String> {
         self.writable()?;
-        insert_recording_sql(&self.conn, meta)
+        insert_source_sql(&self.conn, meta)
     }
 
-    /// Every recording in the file, in insertion order. An archive may hold
+    /// Every source in the file, in insertion order. An archive may hold
     /// several (multi-host, or an A/B pair).
-    pub fn read_recordings(&self) -> Result<Vec<RecordingRow>, String> {
+    pub fn read_sources(&self) -> Result<Vec<SourceRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, labels, metadata, complete, clock_anchor_wall_ns \
-                 FROM recordings ORDER BY id",
+                 FROM sources ORDER BY id",
             )
-            .map_err(|e| format!("failed to query recordings: {e}"))?;
+            .map_err(|e| format!("failed to query sources: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -623,19 +623,19 @@ impl Db {
                     row.get::<_, i64>(4)?,
                 ))
             })
-            .map_err(|e| format!("failed to query recordings: {e}"))?;
+            .map_err(|e| format!("failed to query sources: {e}"))?;
 
         let mut out = Vec::new();
         for row in rows {
             let (id, labels, metadata, complete, anchor) =
-                row.map_err(|e| format!("failed to read recording: {e}"))?;
-            out.push(RecordingRow {
+                row.map_err(|e| format!("failed to read source: {e}"))?;
+            out.push(SourceRow {
                 id,
-                meta: RecordingMeta {
+                meta: SourceMeta {
                     labels: serde_json::from_str(&labels)
-                        .map_err(|e| format!("recording {id} has invalid labels: {e}"))?,
+                        .map_err(|e| format!("source {id} has invalid labels: {e}"))?,
                     metadata: serde_json::from_str(&metadata)
-                        .map_err(|e| format!("recording {id} has invalid metadata: {e}"))?,
+                        .map_err(|e| format!("source {id} has invalid metadata: {e}"))?,
                     // Round-trips through INTEGER; wall-clock nanoseconds stay
                     // inside i64 until the year 2262.
                     clock_anchor_wall_ns: anchor as u64,
@@ -698,24 +698,24 @@ impl Db {
     /// own. Batch writers should use `transaction` instead.
     pub fn insert_segment(
         &self,
-        recording_id: i64,
+        source_id: i64,
         stream: &str,
         seq: u64,
         meta: &SegmentMeta,
         bytes: &[u8],
     ) -> Result<(), String> {
         self.writable()?;
-        insert_segment_sql(&self.conn, recording_id, stream, seq, meta, bytes)
+        insert_segment_sql(&self.conn, source_id, stream, seq, meta, bytes)
     }
 
-    /// Every segment for `(recording_id, stream)`, in `seq` order.
+    /// Every segment for `(source_id, stream)`, in `seq` order.
     ///
     /// The `ORDER BY seq` is load-bearing, not cosmetic: the reader splices
     /// segment bytes together assuming they arrive in sequence order, and SQL
     /// makes no ordering guarantee without it. Confirmed with
     /// `EXPLAIN QUERY PLAN`: dropping the clause does NOT fall back to
     /// insertion order or to the primary key — the planner instead picks the
-    /// `segments_by_time` index for the `(recording_id, stream)` equality
+    /// `segments_by_time` index for the `(source_id, stream)` equality
     /// filter, which is ordered by `last_ts`, not `seq`, and is not even
     /// covering (it still fetches `bytes` per row from the table). `last_ts`
     /// happens to track `seq` in the common case (segments seal in order),
@@ -731,18 +731,18 @@ impl Db {
     /// queries.
     pub fn read_segment_meta(
         &self,
-        recording_id: i64,
+        source_id: i64,
         stream: &str,
     ) -> Result<Vec<(u64, SegmentMeta)>, String> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT seq, rows, first_ts, last_ts FROM segments \
-                 WHERE recording_id = ?1 AND stream = ?2 ORDER BY seq",
+                 WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
             .map_err(|e| format!("failed to query segment meta for {stream}: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params![recording_id, stream], |r| {
+            .query_map(rusqlite::params![source_id, stream], |r| {
                 Ok((
                     r.get::<_, i64>(0)? as u64,
                     SegmentMeta {
@@ -761,7 +761,7 @@ impl Db {
     /// which needs a single segment's schema and none of the rest.
     pub fn read_segment_bytes(
         &self,
-        recording_id: i64,
+        source_id: i64,
         stream: &str,
         seq: u64,
     ) -> Result<Option<Vec<u8>>, String> {
@@ -769,11 +769,11 @@ impl Db {
             .conn
             .prepare(
                 "SELECT bytes FROM segments \
-                 WHERE recording_id = ?1 AND stream = ?2 AND seq = ?3",
+                 WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
             )
             .map_err(|e| format!("failed to query segment bytes for {stream}: {e}"))?;
         let mut rows = stmt
-            .query(rusqlite::params![recording_id, stream, seq as i64])
+            .query(rusqlite::params![source_id, stream, seq as i64])
             .map_err(|e| format!("failed to read segment bytes for {stream}: {e}"))?;
         match rows.next() {
             Ok(Some(r)) => {
@@ -786,19 +786,15 @@ impl Db {
         }
     }
 
-    pub fn read_segments(
-        &self,
-        recording_id: i64,
-        stream: &str,
-    ) -> Result<Vec<SegmentRow>, String> {
+    pub fn read_segments(&self, source_id: i64, stream: &str) -> Result<Vec<SegmentRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT seq, rows, first_ts, last_ts, bytes FROM segments \
-                 WHERE recording_id = ?1 AND stream = ?2 ORDER BY seq",
+                 WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
             .map_err(|e| format!("failed to query segments for {stream}: {e}"))?;
-        Self::collect_segments(&mut stmt, rusqlite::params![recording_id, stream], stream)
+        Self::collect_segments(&mut stmt, rusqlite::params![source_id, stream], stream)
     }
 
     /// Shared row-materialization for the two segment queries, which differ
@@ -826,7 +822,7 @@ impl Db {
                 row.map_err(|e| format!("failed to read segment row for {stream}: {e}"))?;
             out.push(SegmentRow {
                 // Round-trips through INTEGER, same as elsewhere in this
-                // file: these stay inside i64 for any recording anyone will
+                // file: these stay inside i64 for any source anyone will
                 // ever make.
                 seq: seq as u64,
                 meta: SegmentMeta {
@@ -840,11 +836,11 @@ impl Db {
         Ok(out)
     }
 
-    /// Every segment for `(recording_id, stream)` that OVERLAPS `[start, end]`
+    /// Every segment for `(source_id, stream)` that OVERLAPS `[start, end]`
     /// — `last_ts >= start AND first_ts <= end` — in `seq` order.
     ///
     /// This is the ranged dump's selection, and it is a range scan rather than
-    /// a table walk: `segments_by_time` is `(recording_id, stream, last_ts)`,
+    /// a table walk: `segments_by_time` is `(source_id, stream, last_ts)`,
     /// so the `last_ts >= start` half is served by the index.
     ///
     /// **Whole segments, always.** A segment is an immutable parquet BLOB, so
@@ -853,7 +849,7 @@ impl Db {
     /// for at each edge and should report the span it actually got.
     pub fn segments_overlapping(
         &self,
-        recording_id: i64,
+        source_id: i64,
         stream: &str,
         start: u64,
         end: u64,
@@ -862,14 +858,14 @@ impl Db {
             .conn
             .prepare(
                 "SELECT seq, rows, first_ts, last_ts, bytes FROM segments \
-                 WHERE recording_id = ?1 AND stream = ?2 \
+                 WHERE source_id = ?1 AND stream = ?2 \
                    AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
             )
             .map_err(|e| format!("failed to query segments for {stream}: {e}"))?;
         // Clamped, not cast: `u64::MAX as i64` is -1, which would silently
         // select nothing at all for an unbounded upper edge.
         let params = rusqlite::params![
-            recording_id,
+            source_id,
             stream,
             start.min(i64::MAX as u64) as i64,
             end.min(i64::MAX as u64) as i64,
@@ -905,32 +901,32 @@ impl Db {
         out
     }
 
-    /// Sum of `rows` across every segment for `(recording_id, stream)`. Does
+    /// Sum of `rows` across every segment for `(source_id, stream)`. Does
     /// not include WAL rows — callers combining sealed and unsealed row
     /// counts must add `live_wal().len()` themselves.
-    pub fn total_rows(&self, recording_id: i64, stream: &str) -> Result<u64, String> {
+    pub fn total_rows(&self, source_id: i64, stream: &str) -> Result<u64, String> {
         let total: i64 = self
             .conn
             .query_row(
-                "SELECT COALESCE(SUM(rows), 0) FROM segments WHERE recording_id = ?1 AND stream = ?2",
-                rusqlite::params![recording_id, stream],
+                "SELECT COALESCE(SUM(rows), 0) FROM segments WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, stream],
                 |row| row.get(0),
             )
             .map_err(|e| format!("failed to sum rows for {stream}: {e}"))?;
         Ok(total as u64)
     }
 
-    /// Every distinct stream with at least one segment for `recording_id`,
+    /// Every distinct stream with at least one segment for `source_id`,
     /// alphabetically. A stream with only unsealed WAL rows and no sealed
     /// segment yet will NOT appear here — use `all_streams` for "every
-    /// stream this recording has ever seen".
-    pub fn streams(&self, recording_id: i64) -> Result<Vec<String>, String> {
+    /// stream this source has ever seen".
+    pub fn streams(&self, source_id: i64) -> Result<Vec<String>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT stream FROM segments WHERE recording_id = ?1 ORDER BY stream")
+            .prepare("SELECT DISTINCT stream FROM segments WHERE source_id = ?1 ORDER BY stream")
             .map_err(|e| format!("failed to query streams: {e}"))?;
         let rows = stmt
-            .query_map([recording_id], |row| row.get::<_, String>(0))
+            .query_map([source_id], |row| row.get::<_, String>(0))
             .map_err(|e| format!("failed to query streams: {e}"))?;
         let mut out = Vec::new();
         for row in rows {
@@ -939,7 +935,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Every distinct stream this recording has ever seen, alphabetically —
+    /// Every distinct stream this source has ever seen, alphabetically —
     /// the union of `segments.stream` and `wal.stream`. This is what
     /// closes the gap `streams()` deliberately leaves open: a stream that
     /// has never sealed a segment (a quiet table, still inside its first
@@ -948,20 +944,20 @@ impl Db {
     /// this module is the only place that knows the schema well enough to
     /// look at both tables. Recovery/inventory callers should call this, not
     /// `streams()`, when they need to know which tables exist at all.
-    pub fn all_streams(&self, recording_id: i64) -> Result<Vec<String>, String> {
+    pub fn all_streams(&self, source_id: i64) -> Result<Vec<String>, String> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT stream FROM segments WHERE recording_id = ?1 \
+                "SELECT stream FROM segments WHERE source_id = ?1 \
                  UNION \
-                 SELECT stream FROM wal WHERE recording_id = ?1 \
+                 SELECT stream FROM wal WHERE source_id = ?1 \
                  ORDER BY stream",
             )
             .map_err(|e| format!("failed to query all_streams: {e}"))?;
         // `?1` is the SAME parameter both times it appears (SQLite numbers
         // parameters, not occurrences), so this binds once, not twice.
         let rows = stmt
-            .query_map([recording_id], |row| row.get::<_, String>(0))
+            .query_map([source_id], |row| row.get::<_, String>(0))
             .map_err(|e| format!("failed to query all_streams: {e}"))?;
         let mut out = Vec::new();
         for row in rows {
@@ -985,43 +981,43 @@ impl Db {
     /// through. `&mut self` makes "don't open a nested transaction while one
     /// is outstanding" a compile error for that caller instead of a runtime
     /// one. Reads stay on `&self`.
-    pub fn insert_wal_rows(&mut self, recording_id: i64, rows: &[WalRow]) -> Result<(), String> {
+    pub fn insert_wal_rows(&mut self, source_id: i64, rows: &[WalRow]) -> Result<(), String> {
         self.writable()?;
-        self.transaction(|tx| tx.insert_wal_rows(recording_id, rows))
+        self.transaction(|tx| tx.insert_wal_rows(source_id, rows))
     }
 
-    /// One tick's rows for several recordings, in ONE transaction.
+    /// One tick's rows for several sources, in ONE transaction.
     ///
     /// **The transaction count is the point, not the row count.** At
     /// `synchronous=FULL` every commit is an fsync, and the send that carries
     /// this is a blocking hand-off from inside the append — so a commit
-    /// per recording made the tick's cost scale linearly with endpoint count.
+    /// per source made the tick's cost scale linearly with endpoint count.
     /// Committing the tick once makes it constant. It also makes the tick
-    /// atomic across recordings: a crash cannot leave one endpoint's row for
+    /// atomic across sources: a crash cannot leave one endpoint's row for
     /// tick N present and another's missing, which is the state a reader
     /// comparing two arms would have to interpret.
     pub fn insert_wal_rows_batch(&mut self, ticks: &[(i64, Vec<WalRow>)]) -> Result<(), String> {
         self.writable()?;
         self.transaction(|tx| {
-            for (recording_id, rows) in ticks {
-                tx.insert_wal_rows(*recording_id, rows)?;
+            for (source_id, rows) in ticks {
+                tx.insert_wal_rows(*source_id, rows)?;
             }
             Ok(())
         })
     }
 
-    /// Every WAL row for `(recording_id, stream)`, sealed or not, oldest
+    /// Every WAL row for `(source_id, stream)`, sealed or not, oldest
     /// first. Recovery should use `live_wal` instead — this is the raw table,
     /// kept for inspection and for the WAL tests to compare against.
-    pub fn read_wal(&self, recording_id: i64, stream: &str) -> Result<Vec<WalRow>, String> {
+    pub fn read_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT stream, ts, wall_offset, row FROM wal \
-                 WHERE recording_id = ?1 AND stream = ?2 ORDER BY ts",
+                 WHERE source_id = ?1 AND stream = ?2 ORDER BY ts",
             )
             .map_err(|e| format!("failed to query WAL for {stream}: {e}"))?;
-        Self::collect_wal_rows(&mut stmt, recording_id, stream)
+        Self::collect_wal_rows(&mut stmt, source_id, stream)
     }
 
     /// Rows not covered by any sealed segment — this filter IS the recovery
@@ -1049,7 +1045,7 @@ impl Db {
     ///
     /// This turns the prune into a pure background optimisation with no
     /// correctness role.
-    pub fn live_wal(&self, recording_id: i64, stream: &str) -> Result<Vec<WalRow>, String> {
+    pub fn live_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>, String> {
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -1057,7 +1053,7 @@ impl Db {
                  WHERE {LIVE_WAL_PREDICATE} ORDER BY ts"
             ))
             .map_err(|e| format!("failed to query live WAL for {stream}: {e}"))?;
-        Self::collect_wal_rows(&mut stmt, recording_id, stream)
+        Self::collect_wal_rows(&mut stmt, source_id, stream)
     }
 
     /// How many rows a stream's live WAL holds, and the span they cover —
@@ -1065,10 +1061,10 @@ impl Db {
     /// share `LIVE_WAL_PREDICATE`, so the depth cannot drift from the rows the
     /// reader replays); this is the aggregate form, for callers that want the
     /// number rather than the payload.
-    pub fn live_wal_span(&self, recording_id: i64, stream: &str) -> Result<Span, String> {
+    pub fn live_wal_span(&self, source_id: i64, stream: &str) -> Result<Span, String> {
         self.query_span(
             &format!("SELECT COUNT(*), MIN(ts), MAX(ts) FROM wal WHERE {LIVE_WAL_PREDICATE}"),
-            recording_id,
+            source_id,
             stream,
         )
         .map_err(|e| format!("failed to measure the live WAL for {stream}: {e}"))
@@ -1079,20 +1075,20 @@ impl Db {
     /// `parquet metadata` describes a 197 MB archive from this, and pulling
     /// `bytes` back only to discard it is exactly the cost the catalog exists to
     /// avoid.
-    pub fn segment_span(&self, recording_id: i64, stream: &str) -> Result<(u64, Span), String> {
+    pub fn segment_span(&self, source_id: i64, stream: &str) -> Result<(u64, Span), String> {
         let segments: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM segments WHERE recording_id = ?1 AND stream = ?2",
-                rusqlite::params![recording_id, stream],
+                "SELECT COUNT(*) FROM segments WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, stream],
                 |row| row.get(0),
             )
             .map_err(|e| format!("failed to count segments for {stream}: {e}"))?;
         let span = self
             .query_span(
                 "SELECT COALESCE(SUM(rows), 0), MIN(first_ts), MAX(last_ts) FROM segments \
-                 WHERE recording_id = ?1 AND stream = ?2",
-                recording_id,
+                 WHERE source_id = ?1 AND stream = ?2",
+                source_id,
                 stream,
             )
             .map_err(|e| format!("failed to measure the segments of {stream}: {e}"))?;
@@ -1100,10 +1096,10 @@ impl Db {
     }
 
     /// Shared shape of the two aggregate queries above: `(rows, MIN(ts),
-    /// MAX(ts))`, bound to `(recording_id, stream)`.
-    fn query_span(&self, sql: &str, recording_id: i64, stream: &str) -> rusqlite::Result<Span> {
+    /// MAX(ts))`, bound to `(source_id, stream)`.
+    fn query_span(&self, sql: &str, source_id: i64, stream: &str) -> rusqlite::Result<Span> {
         self.conn
-            .query_row(sql, rusqlite::params![recording_id, stream], |row| {
+            .query_row(sql, rusqlite::params![source_id, stream], |row| {
                 Ok(Span {
                     rows: row.get::<_, i64>(0)? as u64,
                     first_ts: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
@@ -1116,11 +1112,11 @@ impl Db {
     /// only in the `WHERE` clause of the prepared statement.
     fn collect_wal_rows(
         stmt: &mut rusqlite::Statement<'_>,
-        recording_id: i64,
+        source_id: i64,
         stream: &str,
     ) -> Result<Vec<WalRow>, String> {
         let rows = stmt
-            .query_map(rusqlite::params![recording_id, stream], |row| {
+            .query_map(rusqlite::params![source_id, stream], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -1143,7 +1139,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Delete WAL rows at or below `upto_ts` for `(recording_id, stream)`.
+    /// Delete WAL rows at or below `upto_ts` for `(source_id, stream)`.
     /// Runs OUTSIDE the seal transaction — see `live_wal` for why that is
     /// safe and has no correctness role. Returns the number of rows deleted,
     /// so callers/tests can assert idempotency (a second prune of the same
@@ -1153,17 +1149,12 @@ impl Db {
     /// that is why WAL rows are per-stream rather than whole snapshots — a
     /// slow-sealing table's prune must not touch, or be blocked by, any other
     /// stream's tail.
-    pub fn prune_wal(
-        &self,
-        recording_id: i64,
-        stream: &str,
-        upto_ts: u64,
-    ) -> Result<usize, String> {
+    pub fn prune_wal(&self, source_id: i64, stream: &str, upto_ts: u64) -> Result<usize, String> {
         self.writable()?;
         self.conn
             .execute(
-                "DELETE FROM wal WHERE recording_id = ?1 AND stream = ?2 AND ts <= ?3",
-                rusqlite::params![recording_id, stream, upto_ts as i64],
+                "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
+                rusqlite::params![source_id, stream, upto_ts as i64],
             )
             .map_err(|e| format!("failed to prune WAL for {stream}: {e}"))
     }
@@ -1180,7 +1171,7 @@ impl Db {
     /// would mean rewriting an immutable parquet BLOB, which is exactly what
     /// this container refuses to do.
     ///
-    /// `segments_by_time` (`recording_id, stream, last_ts`) makes the segment
+    /// `segments_by_time` (`source_id, stream, last_ts`) makes the segment
     /// delete an indexed lookup rather than a scan; that index exists for this
     /// statement.
     ///
@@ -1191,25 +1182,25 @@ impl Db {
     /// and it only stops it if the two land together: a straddling row has
     /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
     /// the segment delete un-shadows.
-    pub fn evict_before(&mut self, recording_id: i64, cutoff_ts: u64) -> Result<Evicted, String> {
+    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: u64) -> Result<Evicted, String> {
         self.writable()?;
         self.evict(
-            recording_id,
-            "DELETE FROM segments WHERE recording_id = ?1 AND last_ts < ?2",
-            "DELETE FROM wal WHERE recording_id = ?1 AND ts < ?2",
+            source_id,
+            "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
+            "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
             cutoff_ts,
         )
     }
 
     fn evict(
         &mut self,
-        recording_id: i64,
+        source_id: i64,
         segments_sql: &str,
         wal_sql: &str,
         cutoff_ts: u64,
     ) -> Result<Evicted, String> {
         self.transaction(|tx| {
-            let params = rusqlite::params![recording_id, cutoff_ts as i64];
+            let params = rusqlite::params![source_id, cutoff_ts as i64];
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
@@ -1271,21 +1262,18 @@ impl Db {
         Ok(())
     }
 
-    /// The whole recording's time span — every stream, segments and WAL
-    /// together — from catalog columns alone. `None` when the recording holds
+    /// The whole source's time span — every stream, segments and WAL
+    /// together — from catalog columns alone. `None` when the source holds
     /// no rows at all, which for a rolling buffer means "nothing within the
     /// lookback".
-    pub fn recording_time_span(
-        &self,
-        recording_id: i64,
-    ) -> Result<(Option<u64>, Option<u64>), String> {
+    pub fn source_time_span(&self, source_id: i64) -> Result<(Option<u64>, Option<u64>), String> {
         self.conn
             .query_row(
                 "SELECT MIN(first_ts), MAX(last_ts) FROM ( \
-                   SELECT first_ts, last_ts FROM segments WHERE recording_id = ?1 \
+                   SELECT first_ts, last_ts FROM segments WHERE source_id = ?1 \
                    UNION ALL \
-                   SELECT ts, ts FROM wal WHERE recording_id = ?1)",
-                [recording_id],
+                   SELECT ts, ts FROM wal WHERE source_id = ?1)",
+                [source_id],
                 |row| {
                     Ok((
                         row.get::<_, Option<i64>>(0)?.map(|v| v as u64),
@@ -1293,15 +1281,15 @@ impl Db {
                     ))
                 },
             )
-            .map_err(|e| format!("failed to measure recording {recording_id}: {e}"))
+            .map_err(|e| format!("failed to measure source {source_id}: {e}"))
     }
 
-    /// Mark a recording cleanly finalized, outside any batch. The dump uses
+    /// Mark a source cleanly finalized, outside any batch. The dump uses
     /// it: a copy taken at time T is a finished artifact even though the
     /// buffer it came from is still running.
-    pub fn mark_complete(&mut self, recording_id: i64) -> Result<(), String> {
+    pub fn mark_complete(&mut self, source_id: i64) -> Result<(), String> {
         self.writable()?;
-        self.transaction(|tx| tx.mark_complete(recording_id))
+        self.transaction(|tx| tx.mark_complete(source_id))
     }
 
     /// Every user table in this database, by name — SQLite's own internal
@@ -1326,29 +1314,29 @@ impl Db {
             .map_err(|e| format!("failed to list tables: {e}"))
     }
 
-    /// Replace one recording's metadata map.
+    /// Replace one source's metadata map.
     ///
     /// In place rather than through a copy because metadata is a catalog
     /// column: `annotate` changes it and nothing else, and rewriting an
     /// archive's every segment BLOB to edit one JSON string would make a
-    /// cheap operation cost the size of the recording.
-    pub fn update_recording_metadata(
+    /// cheap operation cost the size of the source.
+    pub fn update_source_metadata(
         &self,
-        recording_id: i64,
+        source_id: i64,
         metadata: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         self.writable()?;
         let encoded = serde_json::to_string(metadata)
-            .map_err(|e| format!("failed to encode recording metadata: {e}"))?;
+            .map_err(|e| format!("failed to encode source metadata: {e}"))?;
         let changed = self
             .conn
             .execute(
-                "UPDATE recordings SET metadata = ?1 WHERE id = ?2",
-                rusqlite::params![encoded, recording_id],
+                "UPDATE sources SET metadata = ?1 WHERE id = ?2",
+                rusqlite::params![encoded, source_id],
             )
-            .map_err(|e| format!("failed to update recording metadata: {e}"))?;
+            .map_err(|e| format!("failed to update source metadata: {e}"))?;
         if changed == 0 {
-            return Err(format!("no recording with id {recording_id}"));
+            return Err(format!("no source with id {source_id}"));
         }
         Ok(())
     }
@@ -1365,14 +1353,14 @@ impl Db {
             .map_err(|e| format!("failed to read pragma {name}: {e}"))
     }
 
-    /// The recording's `(ts, offset_ns)` clock observations, oldest first.
-    pub fn read_clock_offsets(&self, recording_id: i64) -> Result<Vec<(u64, i64)>, String> {
+    /// The source's `(ts, offset_ns)` clock observations, oldest first.
+    pub fn read_clock_offsets(&self, source_id: i64) -> Result<Vec<(u64, i64)>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT ts, offset_ns FROM clock_offsets WHERE recording_id = ?1 ORDER BY ts")
+            .prepare("SELECT ts, offset_ns FROM clock_offsets WHERE source_id = ?1 ORDER BY ts")
             .map_err(|e| format!("failed to query clock offsets: {e}"))?;
         let rows = stmt
-            .query_map([recording_id], |row| {
+            .query_map([source_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|e| format!("failed to query clock offsets: {e}"))?;
@@ -1403,14 +1391,14 @@ pub struct Tx<'a> {
 }
 
 impl Tx<'_> {
-    /// Start a recording, returning its id.
+    /// Start a source, returning its id.
     ///
     /// In a transaction because an archive can be *assembled* as well as
-    /// recorded: the ranged dump writes a recording row and every segment it
-    /// selected, and either the whole file is that recording or there is no
+    /// recorded: the ranged dump writes a source row and every segment it
+    /// selected, and either the whole file is that source or there is no
     /// file at all.
-    pub fn insert_recording(&self, meta: &RecordingMeta) -> Result<i64, String> {
-        insert_recording_sql(&self.tx, meta)
+    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64, String> {
+        insert_source_sql(&self.tx, meta)
     }
 
     /// Insert one sealed segment's bytes and catalog facts.
@@ -1421,27 +1409,27 @@ impl Tx<'_> {
     /// whole buffer, so the simpler API is also the faster one here.
     pub fn insert_segment(
         &self,
-        recording_id: i64,
+        source_id: i64,
         stream: &str,
         seq: u64,
         meta: &SegmentMeta,
         bytes: &[u8],
     ) -> Result<(), String> {
-        insert_segment_sql(&self.tx, recording_id, stream, seq, meta, bytes)
+        insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes)
     }
 
     /// Insert every WAL row for one tick — one stream each, typically.
-    pub fn insert_wal_rows(&self, recording_id: i64, rows: &[WalRow]) -> Result<(), String> {
+    pub fn insert_wal_rows(&self, source_id: i64, rows: &[WalRow]) -> Result<(), String> {
         let mut stmt = self
             .tx
             .prepare(
-                "INSERT INTO wal(recording_id, stream, ts, wall_offset, row) \
+                "INSERT INTO wal(source_id, stream, ts, wall_offset, row) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .map_err(|e| format!("failed to prepare WAL insert: {e}"))?;
         for r in rows {
             stmt.execute(rusqlite::params![
-                recording_id,
+                source_id,
                 r.stream,
                 r.ts as i64,
                 r.wall_offset,
@@ -1452,49 +1440,46 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Append one `(ts, offset_ns)` clock observation for the recording.
+    /// Append one `(ts, offset_ns)` clock observation for the source.
     pub fn insert_clock_offset(
         &self,
-        recording_id: i64,
+        source_id: i64,
         ts: u64,
         offset_ns: i64,
     ) -> Result<(), String> {
         self.tx
             .execute(
-                "INSERT INTO clock_offsets(recording_id, ts, offset_ns) VALUES (?1, ?2, ?3)",
-                rusqlite::params![recording_id, ts as i64, offset_ns],
+                "INSERT INTO clock_offsets(source_id, ts, offset_ns) VALUES (?1, ?2, ?3)",
+                rusqlite::params![source_id, ts as i64, offset_ns],
             )
             .map_err(|e| format!("failed to insert clock offset: {e}"))?;
         Ok(())
     }
 
-    /// Mark the recording cleanly finalized. This is what replaced the
+    /// Mark the source cleanly finalized. This is what replaced the
     /// `.partial` filename convention: the file is valid from creation, so
     /// "was it finished" is a queryable property instead of a name.
-    pub fn mark_complete(&self, recording_id: i64) -> Result<(), String> {
+    pub fn mark_complete(&self, source_id: i64) -> Result<(), String> {
         self.tx
-            .execute(
-                "UPDATE recordings SET complete = 1 WHERE id = ?1",
-                [recording_id],
-            )
-            .map_err(|e| format!("failed to mark recording {recording_id} complete: {e}"))?;
+            .execute("UPDATE sources SET complete = 1 WHERE id = ?1", [source_id])
+            .map_err(|e| format!("failed to mark source {source_id} complete: {e}"))?;
         Ok(())
     }
 }
 
-/// Shared by `Db::insert_recording` (its own commit) and
-/// `Tx::insert_recording` (part of a batch).
-fn insert_recording_sql(conn: &Connection, meta: &RecordingMeta) -> Result<i64, String> {
+/// Shared by `Db::insert_source` (its own commit) and
+/// `Tx::insert_source` (part of a batch).
+fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64, String> {
     let labels = serde_json::to_string(&meta.labels)
-        .map_err(|e| format!("failed to encode recording labels: {e}"))?;
+        .map_err(|e| format!("failed to encode source labels: {e}"))?;
     let metadata = serde_json::to_string(&meta.metadata)
-        .map_err(|e| format!("failed to encode recording metadata: {e}"))?;
+        .map_err(|e| format!("failed to encode source metadata: {e}"))?;
     conn.execute(
-        "INSERT INTO recordings(labels, metadata, complete, clock_anchor_wall_ns) \
+        "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns) \
          VALUES (?1, ?2, 0, ?3)",
         rusqlite::params![labels, metadata, meta.clock_anchor_wall_ns as i64],
     )
-    .map_err(|e| format!("failed to insert recording: {e}"))?;
+    .map_err(|e| format!("failed to insert source: {e}"))?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -1503,17 +1488,17 @@ fn insert_recording_sql(conn: &Connection, meta: &RecordingMeta) -> Result<i64, 
 /// `Connection`, so both reach the same statement.
 fn insert_segment_sql(
     conn: &Connection,
-    recording_id: i64,
+    source_id: i64,
     stream: &str,
     seq: u64,
     meta: &SegmentMeta,
     bytes: &[u8],
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO segments(recording_id, stream, seq, rows, first_ts, last_ts, bytes) \
+        "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
-            recording_id,
+            source_id,
             stream,
             seq as i64,
             meta.rows as i64,
@@ -1539,15 +1524,19 @@ fn insert_segment_sql(
 /// which is the behaviour we want but not the message; [`Db::writable`] catches
 /// it first and says what to do instead.
 const LEGACY_VIEWS_SQL: &str = "\
-CREATE TEMP VIEW segments AS SELECT recording_id, sampler AS stream, seq, rows, \
-first_ts, last_ts, bytes FROM main.segments;
-CREATE TEMP VIEW wal AS SELECT recording_id, sampler AS stream, ts, wall_offset, \
-row FROM main.wal;";
+CREATE TEMP VIEW sources AS SELECT id, labels, metadata, complete, \
+clock_anchor_wall_ns FROM main.recordings;
+CREATE TEMP VIEW segments AS SELECT recording_id AS source_id, sampler AS stream, \
+seq, rows, first_ts, last_ts, bytes FROM main.segments;
+CREATE TEMP VIEW wal AS SELECT recording_id AS source_id, sampler AS stream, ts, \
+wall_offset, row FROM main.wal;
+CREATE TEMP VIEW clock_offsets AS SELECT recording_id AS source_id, ts, offset_ns \
+FROM main.clock_offsets;";
 
 /// The catalog. Segment and WAL payloads are opaque BLOBs; everything the
 /// container needs to answer questions about them is a column.
 const SCHEMA_SQL: &str = "
-CREATE TABLE recordings(
+CREATE TABLE sources(
   id INTEGER PRIMARY KEY,
   labels TEXT NOT NULL,               -- JSON
   metadata TEXT NOT NULL,             -- JSON
@@ -1555,32 +1544,32 @@ CREATE TABLE recordings(
   clock_anchor_wall_ns INTEGER NOT NULL
 );
 CREATE TABLE segments(
-  recording_id INTEGER NOT NULL REFERENCES recordings(id),
+  source_id INTEGER NOT NULL REFERENCES sources(id),
   stream TEXT NOT NULL,
   seq INTEGER NOT NULL,
   rows INTEGER NOT NULL,
   first_ts INTEGER NOT NULL,
   last_ts INTEGER NOT NULL,
   bytes BLOB NOT NULL,
-  PRIMARY KEY (recording_id, stream, seq)
+  PRIMARY KEY (source_id, stream, seq)
 );
 -- The catalog half of the design: it makes retention
 -- (`WHERE last_ts < cutoff`) and range reads indexed lookups rather than
 -- scans. `live_wal`'s subquery (`SELECT MAX(last_ts) FROM segments WHERE
--- recording_id = ? AND stream = ?`) already uses it — confirmed by
+-- source_id = ? AND stream = ?`) already uses it — confirmed by
 -- `EXPLAIN QUERY PLAN` during review — so this is not a speculative index
 -- sitting unused; keep it maintained.
-CREATE INDEX segments_by_time ON segments(recording_id, stream, last_ts);
+CREATE INDEX segments_by_time ON segments(source_id, stream, last_ts);
 CREATE TABLE wal(
-  recording_id INTEGER NOT NULL,
+  source_id INTEGER NOT NULL,
   stream TEXT NOT NULL,
   ts INTEGER NOT NULL,
   wall_offset INTEGER NOT NULL,
   row BLOB NOT NULL,
-  PRIMARY KEY (recording_id, stream, ts)
+  PRIMARY KEY (source_id, stream, ts)
 );
 CREATE TABLE clock_offsets(
-  recording_id INTEGER NOT NULL,
+  source_id INTEGER NOT NULL,
   ts INTEGER NOT NULL,
   offset_ns INTEGER NOT NULL
 );
@@ -1724,11 +1713,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_round_trips_a_recording() {
+    fn schema_round_trips_a_source() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
-            .insert_recording(&RecordingMeta {
+            .insert_source(&SourceMeta {
                 labels: [("host".to_string(), "h1".to_string())]
                     .into_iter()
                     .collect(),
@@ -1738,13 +1727,13 @@ mod tests {
                 clock_anchor_wall_ns: 1_700_000_000_000_000_000,
             })
             .unwrap();
-        let got = db.read_recordings().unwrap();
+        let got = db.read_sources().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, id);
         assert_eq!(got[0].meta.labels["host"], "h1");
         assert_eq!(got[0].meta.metadata["source"], "weather");
         assert_eq!(got[0].meta.clock_anchor_wall_ns, 1_700_000_000_000_000_000);
-        assert!(!got[0].complete, "a fresh recording is not complete");
+        assert!(!got[0].complete, "a fresh source is not complete");
     }
 
     #[test]
@@ -1764,7 +1753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
-            .insert_recording(&RecordingMeta {
+            .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
                 clock_anchor_wall_ns: 0,
@@ -1811,7 +1800,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
-            .insert_recording(&RecordingMeta {
+            .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
                 clock_anchor_wall_ns: 0,
@@ -1850,7 +1839,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
-            .insert_recording(&RecordingMeta {
+            .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
                 clock_anchor_wall_ns: 0,
@@ -1878,7 +1867,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
-            .insert_recording(&RecordingMeta {
+            .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
                 clock_anchor_wall_ns: 0,
@@ -1913,21 +1902,21 @@ mod tests {
     }
 
     #[test]
-    fn segments_are_scoped_per_recording() {
-        // An archive can hold several recordings (multi-host / A-B). Reading one
-        // recording's segments must never see another recording's rows for a
+    fn segments_are_scoped_per_source() {
+        // An archive can hold several sources (multi-host / A-B). Reading one
+        // source's segments must never see another source's rows for a
         // stream of the same name.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(&dir.path().join("t.dendro")).unwrap();
-        let meta = |labels: &str| RecordingMeta {
+        let meta = |labels: &str| SourceMeta {
             labels: [("host".to_string(), labels.to_string())]
                 .into_iter()
                 .collect(),
             metadata: BTreeMap::new(),
             clock_anchor_wall_ns: 0,
         };
-        let r1 = db.insert_recording(&meta("h1")).unwrap();
-        let r2 = db.insert_recording(&meta("h2")).unwrap();
+        let r1 = db.insert_source(&meta("h1")).unwrap();
+        let r2 = db.insert_source(&meta("h2")).unwrap();
 
         let sm = SegmentMeta {
             rows: 1,
@@ -1954,7 +1943,7 @@ mod tests {
     #[test]
     fn create_refuses_an_existing_file() {
         // An archive is valid from creation, so there is no .partial to protect a
-        // previous recording — create must not clobber one.
+        // previous source — create must not clobber one.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.dendro");
         drop(Db::create(&path).unwrap());
@@ -1980,12 +1969,12 @@ mod tests {
         );
     }
 
-    /// Shared setup for the WAL tests: a fresh archive with one recording.
+    /// Shared setup for the WAL tests: a fresh archive with one source.
     fn wal_test_db() -> (tempfile::TempDir, Db, i64) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
-            .insert_recording(&RecordingMeta {
+            .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
                 clock_anchor_wall_ns: 0,
@@ -2065,33 +2054,33 @@ mod tests {
     }
 
     #[test]
-    fn live_wal_watermark_is_scoped_to_its_own_stream_and_recording() {
+    fn live_wal_watermark_is_scoped_to_its_own_stream_and_source() {
         // The keystone query has TWO filters inside the watermark subquery
-        // (`stream = ?2` and `recording_id = ?1`), and either one being
+        // (`stream = ?2` and `source_id = ?1`), and either one being
         // dropped is invisible to the tests above: both are single-stream,
-        // single-recording, and the multi-stream / multi-recording tests
+        // single-source, and the multi-stream / multi-source tests
         // elsewhere have no segments at all, so the subquery returns NULL
         // everywhere it could otherwise discriminate.
         //
-        // Two recordings x two streams, seal a segment for (r1, cpu_usage)
+        // Two sources x two streams, seal a segment for (r1, cpu_usage)
         // ONLY. If the subquery's `stream` filter is missing, cpu_usage's
         // watermark leaks into blockio's live_wal within r1. If the
-        // `recording_id` filter is missing, it leaks into r2's cpu_usage
+        // `source_id` filter is missing, it leaks into r2's cpu_usage
         // too. Either leak would silently truncate a quiet stream's — or a
-        // second recording's — live WAL using a watermark that has nothing
+        // second source's — live WAL using a watermark that has nothing
         // to do with it: exactly the failure mode this design exists to
         // rule out.
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
-        let meta = |host: &str| RecordingMeta {
+        let meta = |host: &str| SourceMeta {
             labels: [("host".to_string(), host.to_string())]
                 .into_iter()
                 .collect(),
             metadata: BTreeMap::new(),
             clock_anchor_wall_ns: 0,
         };
-        let r1 = db.insert_recording(&meta("h1")).unwrap();
-        let r2 = db.insert_recording(&meta("h2")).unwrap();
+        let r1 = db.insert_source(&meta("h1")).unwrap();
+        let r2 = db.insert_source(&meta("h2")).unwrap();
 
         // Seal (r1, cpu_usage) up to ts=30 — a high watermark, so a leaked
         // filter would visibly truncate whichever WAL it leaked into.
@@ -2308,7 +2297,7 @@ mod tests {
         // are gone too.
         //
         // Two different streams share ts=10 with a THIRD row that collides
-        // with the first on the primary key `(recording_id, stream, ts)` —
+        // with the first on the primary key `(source_id, stream, ts)` —
         // that collision is what fails the batch.
         let (_dir, mut db, rid) = wal_test_db();
         let err = db
@@ -2374,7 +2363,7 @@ mod tests {
             .transaction(|tx| {
                 tx.insert_segment(rid, "cpu_usage", 1, &meta(20, 29), b"cpu-1")?;
                 tx.insert_segment(rid, "blockio", 1, &meta(20, 29), b"blk-1")?;
-                // Duplicate primary key (recording, stream, seq): fails.
+                // Duplicate primary key (source, stream, seq): fails.
                 tx.insert_segment(rid, "cpu_usage", 1, &meta(20, 29), b"dup")
             })
             .expect_err("a PRIMARY KEY collision must fail the whole batch");
@@ -2395,20 +2384,20 @@ mod tests {
     }
 
     #[test]
-    fn wal_rows_are_scoped_per_recording() {
-        // Same as segments: an archive can hold several recordings, and reading
+    fn wal_rows_are_scoped_per_source() {
+        // Same as segments: an archive can hold several sources, and reading
         // one must not see another's WAL rows for a same-named stream.
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
-        let meta = |host: &str| RecordingMeta {
+        let meta = |host: &str| SourceMeta {
             labels: [("host".to_string(), host.to_string())]
                 .into_iter()
                 .collect(),
             metadata: BTreeMap::new(),
             clock_anchor_wall_ns: 0,
         };
-        let r1 = db.insert_recording(&meta("h1")).unwrap();
-        let r2 = db.insert_recording(&meta("h2")).unwrap();
+        let r1 = db.insert_source(&meta("h1")).unwrap();
+        let r2 = db.insert_source(&meta("h2")).unwrap();
 
         db.insert_wal_rows(r1, &[wal_row("cpu_usage", 10)]).unwrap();
         db.insert_wal_rows(r2, &[wal_row("cpu_usage", 20)]).unwrap();
@@ -2421,7 +2410,7 @@ mod tests {
         assert_eq!(got2.len(), 1);
         assert_eq!(got2[0].ts, 20);
 
-        // live_wal must also stay scoped: neither recording has sealed
+        // live_wal must also stay scoped: neither source has sealed
         // anything, so each sees only its own row.
         let live1 = db.live_wal(r1, "cpu_usage").unwrap();
         assert_eq!(live1.len(), 1);

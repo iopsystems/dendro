@@ -1,5 +1,6 @@
-//! Opening a `rezolus` `.rez` v3 archive, whose stream column is named
-//! `sampler`.
+//! Opening a `rezolus` `.rez` v3 archive, which names the same things
+//! differently: `recordings` for `sources`, `recording_id` for `source_id`,
+//! and `sampler` for `stream`.
 //!
 //! The fixture is built here with raw SQL rather than checked in as a binary,
 //! so the schema this crate promises to read is written down in a form a
@@ -12,8 +13,13 @@ use dendro::db::{Db, WalRow};
 use dendro::read;
 use dendro::segment::{Segment, SegmentEncoder};
 
-/// The v3 schema, verbatim: identical to v4 but for `segments.sampler` and
-/// `wal.sampler`, which v4 calls `stream`.
+/// The v3 schema, verbatim. Identical to v4 in shape; only the names differ,
+/// and this const is the record of exactly which ones — if it and
+/// `LEGACY_VIEWS_SQL` ever disagree, that is the bug this file exists to catch.
+///
+/// Deliberately NOT built by calling into this crate: a fixture that shares
+/// code with the thing under test cannot detect the thing under test being
+/// renamed out from under it.
 const V3_SCHEMA: &str = "
 CREATE TABLE recordings(
   id INTEGER PRIMARY KEY,
@@ -101,10 +107,10 @@ fn a_legacy_v3_archive_reads() {
     write_v3_fixture(&path);
 
     let db = Db::open(&path).expect("a v3 archive should open");
-    let recordings = read::read_archive(&db, &CountingEncoder).expect("read");
-    assert_eq!(recordings.len(), 1);
+    let sources = read::read_archive(&db, &CountingEncoder).expect("read");
+    assert_eq!(sources.len(), 1);
 
-    let rec = &recordings[0];
+    let rec = &sources[0];
     assert_eq!(
         rec.labels,
         BTreeMap::from([("source".to_string(), "weather".to_string())])

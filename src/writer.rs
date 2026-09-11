@@ -19,7 +19,7 @@
 //!
 //! Contract: PANIC-FREE — every fallible op returns `Err`. A caller that
 //! installs a panic hook exiting the process before unwinding would otherwise
-//! never reach the send-error path here: the recording would skip finalize and
+//! never reach the send-error path here: the source would skip finalize and
 //! the thread would never be joined.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,47 +31,44 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::db::{Db, RecordingMeta, SegmentMeta, WalRow};
+use crate::db::{Db, SegmentMeta, SourceMeta, WalRow};
 use crate::segment::SegmentEncoder;
 
 enum Msg {
-    /// Insert a `recordings` row and hand its id back.
+    /// Insert a `sources` row and hand its id back.
     ///
     /// Goes through the channel rather than being done by the caller because
     /// the writer thread OWNS the connection — the whole design rests on there
     /// being exactly one writing connection, since a second stalls on SQLite's
     /// write lock for `busy_timeout` before failing, which against a tick reads
     /// as a hang. The reply channel is the same shape `Sync` already uses.
-    AddRecording {
-        seed: Box<RecordingMeta>,
+    AddSource {
+        seed: Box<SourceMeta>,
         reply: SyncSender<Result<i64, String>>,
     },
-    /// One tick's WAL rows for EVERY recording in the archive, across all
+    /// One tick's WAL rows for EVERY source in the archive, across all
     /// their streams — one transaction, and therefore one fsync at
     /// `synchronous=FULL`.
     ///
-    /// Per tick rather than per recording, because the cost is paid on the
+    /// Per tick rather than per source, because the cost is paid on the
     /// append loop: `wal`/`wal_tick` is a blocking send on a bound-1 channel
-    /// from inside the tick, and a commit per recording made that cost scale
+    /// from inside the tick, and a commit per source made that cost scale
     /// linearly with endpoint count. `seal_batch` already refused the same
     /// trade ("12 implicit commits would be 12 fsyncs at `synchronous=FULL`
-    /// against a ~46 ms tick"); this carries the argument across recordings.
+    /// against a ~46 ms tick"); this carries the argument across sources.
     Wal { ticks: Vec<(i64, Vec<WalRow>)> },
-    /// One seal batch for one recording = one transaction.
-    Seal {
-        recording_id: i64,
-        batch: Vec<String>,
-    },
+    /// One seal batch for one source = one transaction.
+    Seal { source_id: i64, batch: Vec<String> },
     /// Retention: drop everything wholly older than `cutoff_ts`, then trickle
     /// freed pages back if the free list has grown. Only a caller with a retention policy sends this.
-    Evict { recording_id: i64, cutoff_ts: u64 },
-    /// One recording's last clock observation; marks *that* recording complete.
+    Evict { source_id: i64, cutoff_ts: u64 },
+    /// One source's last clock observation; marks *that* source complete.
     ///
-    /// Does NOT stop the writer: an archive may hold several recordings and the
+    /// Does NOT stop the writer: an archive may hold several sources and the
     /// others may still be running. The thread exits when every handle has been
     /// dropped and the channel closes — see `writer_thread`.
     Finalize {
-        recording_id: i64,
+        source_id: i64,
         clock_offset: (u64, i64),
     },
     /// Stop the writer, whatever else is still holding a sender.
@@ -83,7 +80,7 @@ enum Msg {
     /// receiver gone on its next send — the failure path it already has.
     Shutdown,
     /// Reply once everything queued ahead of this has been committed. Carries
-    /// no data and changes nothing — see [`RecordingWriter::sync`].
+    /// no data and changes nothing — see [`SourceWriter::sync`].
     #[cfg(any(test, feature = "test-support"))]
     Sync(SyncSender<()>),
     /// Answer with how many transactions the writer's connection has
@@ -96,9 +93,9 @@ enum Msg {
 
 /// Where the writer thread leaves its failure so a *handle* can report it.
 ///
-/// With one recording per archive the handle owned the thread, so a send
+/// With one source per archive the handle owned the thread, so a send
 /// failure could join and surface the real error. An archive with several
-/// recordings has one thread and many handles, and a handle cannot join what it
+/// sources has one thread and many handles, and a handle cannot join what it
 /// does not own — so the thread stores its error here on the way out and every
 /// handle reads it, keeping per-tick errors as specific as they were.
 type ErrorSlot = Arc<Mutex<Option<String>>>;
@@ -106,7 +103,7 @@ type ErrorSlot = Arc<Mutex<Option<String>>>;
 /// Reclaim at most this many pages per retention pass — sized to fit inside a
 /// tick. The point of a cap at all is that a shrunken working set drains back
 /// to the filesystem gradually; a full `VACUUM` would return the same space in
-/// one step and stall the recording for seconds doing it.
+/// one step and stall the source for seconds doing it.
 pub const RECLAIM_PAGES_PER_PASS: u32 = 100;
 
 /// Reclaim only once the free list exceeds this fraction of the file, as a
@@ -122,7 +119,7 @@ pub const RECLAIM_FREELIST_DIVISOR: u32 = 10;
 /// Handle to the writer thread. Every fallible hand-off reports the writer's
 /// stored error, in the required order: send-failure → join → report.
 pub struct Archive {
-    /// The master sender. Kept only to clone per-recording handles from, and
+    /// The master sender. Kept only to clone per-source handles from, and
     /// dropped by `join` so the writer's channel can actually close.
     tx: Option<SyncSender<Msg>>,
     thread: Option<JoinHandle<Result<(), String>>>,
@@ -137,9 +134,9 @@ impl Archive {
     /// there is no `.partial`, no rename at the end, and nothing to move
     /// aside at the start (`Db::create` refuses an existing file
     /// atomically). That property is what retires the whole staging dance —
-    /// an early-killed recording is just a recording whose `complete` is 0.
+    /// an early-killed source is just a source whose `complete` is 0.
     ///
-    /// The archive holds no recordings yet; add each with `add_recording`.
+    /// The archive holds no sources yet; add each with `add_source`.
     pub fn create(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Result<Self, String> {
         Self::create_checkpointing_every(path, encoder, CHECKPOINT_INTERVAL)
     }
@@ -159,15 +156,15 @@ impl Archive {
 
         // Bound 1: the hand-off blocks while the writer is busy,
         // which is the intended backpressure signal. One slot for the archive
-        // rather than per recording, deliberately — the writer is a single
+        // rather than per source, deliberately — the writer is a single
         // thread against a single write lock, so a deeper queue would only
-        // move the wait, and one recording falling behind SHOULD apply
+        // move the wait, and one source falling behind SHOULD apply
         // backpressure to the shared append loop rather than growing a buffer.
         let (tx, rx) = sync_channel(1);
         let err: ErrorSlot = Arc::new(Mutex::new(None));
         let thread_err = Arc::clone(&err);
         // A spawn failure removes the file, sidecars included. It leaves a
-        // VALID empty recording at the caller's chosen path — which used to be
+        // VALID empty source at the caller's chosen path — which used to be
         // the argument for keeping it — but valid is not the same as useful:
         // it holds nothing, and the writer refuses to overwrite an existing
         // archive, so leaving it turns the operator's retry into "the file
@@ -194,21 +191,21 @@ impl Archive {
         })
     }
 
-    /// Open one recording in this archive and return its writer handle.
+    /// Open one source in this archive and return its writer handle.
     ///
     /// Several may be open at once — that is the point of the container's
-    /// label-tagged `recordings` list — and they are independent: each has its
+    /// label-tagged `sources` list — and they are independent: each has its
     /// own segment sequences, its own clock-offset series, and its own
     /// `complete` flag.
-    pub fn add_recording(&mut self, seed: RecordingMeta) -> Result<RecordingWriter, String> {
+    pub fn add_source(&mut self, seed: SourceMeta) -> Result<SourceWriter, String> {
         // Derived before the seed is sent, since the seed moves.
-        let stagger_key = crate::seal::recording_stagger_key(&seed.labels);
+        let stagger_key = crate::seal::source_stagger_key(&seed.labels);
         let Some(tx) = self.tx.as_ref() else {
             return Err("the archive writer thread has already been joined".to_string());
         };
         let (reply_tx, reply_rx) = sync_channel(0);
         if tx
-            .send(Msg::AddRecording {
+            .send(Msg::AddSource {
                 seed: Box::new(seed),
                 reply: reply_tx,
             })
@@ -216,14 +213,14 @@ impl Archive {
         {
             return Err(self.take_error());
         }
-        let recording_id = match reply_rx.recv() {
+        let source_id = match reply_rx.recv() {
             Ok(inserted) => inserted?,
             // The writer died between accepting the message and replying.
             Err(_) => return Err(self.take_error()),
         };
-        Ok(RecordingWriter {
+        Ok(SourceWriter {
             tx: tx.clone(),
-            recording_id,
+            source_id,
             stagger_key,
             err: Arc::clone(&self.err),
             path: self.path.clone(),
@@ -270,18 +267,18 @@ impl Archive {
         take_writer_error(&self.err)
     }
 
-    /// Commit one tick's staged rows for EVERY recording, as one transaction.
+    /// Commit one tick's staged rows for EVERY source, as one transaction.
     ///
-    /// The multi-recording counterpart to [`RecordingWriter::wal`]. Each
-    /// recording's rows come from [`the caller::stage`]; this hands them
+    /// The multi-source counterpart to [`SourceWriter::wal`]. Each
+    /// source's rows come from [`the caller::stage`]; this hands them
     /// over together so the archive pays one commit — one fsync at
     /// `synchronous=FULL` — per tick rather than one per endpoint.
     ///
     /// **Why the cost is worth naming:** the hand-off is a blocking send on a
-    /// bound-1 channel from inside the append, so a per-recording commit
+    /// bound-1 channel from inside the append, so a per-source commit
     /// put a linear-in-endpoint-count fsync bill on the loop that has to keep
     /// up with the sampling interval. `seal_batch` already refused exactly this
-    /// trade within one recording; this is the same argument across them.
+    /// trade within one source; this is the same argument across them.
     ///
     /// An empty batch does not send: it still checks the writer is alive, so a
     /// tick where nothing advanced cannot mask a dead writer.
@@ -322,7 +319,7 @@ impl Archive {
 
     /// Whether the writer thread is still alive, without writing anything.
     ///
-    /// Mirrors `RecordingWriter::check_alive`: the shared error slot is the
+    /// Mirrors `SourceWriter::check_alive`: the shared error slot is the
     /// only signal available, since the archive cannot ask a thread it owns
     /// whether it has finished without joining it.
     fn check_alive(&mut self) -> Result<(), String> {
@@ -332,14 +329,14 @@ impl Archive {
         }
     }
 
-    /// Create an archive holding exactly one recording.
+    /// Create an archive holding exactly one source.
     ///
     /// The shape every caller had before archives could hold several, and
-    /// still what a rolling buffer and a single-producer recording want. Returns
+    /// still what a rolling buffer and a single-producer source want. Returns
     /// both halves because the archive owns the writer thread and must outlive
     /// the handle — `Shutdown` means a wrong order is an error rather than a
     /// hang, but the right order is still: finish with the handle, then join.
-    /// Finalize the one recording and join the writer, so the file is fully
+    /// Finalize the one source and join the writer, so the file is fully
     /// committed when this returns.
     ///
     /// The synchronous shape callers had before `finalize` was split: the
@@ -349,7 +346,7 @@ impl Archive {
     #[cfg(any(test, feature = "test-support"))]
     pub fn finalize_single(
         mut self,
-        writer: RecordingWriter,
+        writer: SourceWriter,
         clock_offset: (u64, i64),
     ) -> Result<(), String> {
         let queued = writer.finalize(clock_offset);
@@ -357,15 +354,15 @@ impl Archive {
         queued.and(joined)
     }
 
-    /// An archive holding exactly one recording, opened and ready to write.
+    /// An archive holding exactly one source, opened and ready to write.
     #[cfg(any(test, feature = "test-support"))]
     pub fn single(
         path: &Path,
         encoder: Box<dyn SegmentEncoder + Send>,
-        seed: RecordingMeta,
-    ) -> Result<(Self, RecordingWriter), String> {
+        seed: SourceMeta,
+    ) -> Result<(Self, SourceWriter), String> {
         let mut archive = Self::create(path, encoder)?;
-        let writer = archive.add_recording(seed)?;
+        let writer = archive.add_source(seed)?;
         Ok((archive, writer))
     }
 }
@@ -381,26 +378,26 @@ impl Drop for Archive {
     }
 }
 
-/// One recording's handle onto a shared archive writer.
+/// One source's handle onto a shared archive writer.
 ///
 /// Cheap and cloneable-in-spirit: it is a sender plus an id. Dropping it
-/// releases this recording's claim on the writer; the thread exits once every
+/// releases this source's claim on the writer; the thread exits once every
 /// handle *and* the archive's master sender are gone.
-pub struct RecordingWriter {
+pub struct SourceWriter {
     tx: SyncSender<Msg>,
-    recording_id: i64,
-    /// This recording's stagger identity — its canonical label set. Held here
-    /// so the seal policy can desync tables ACROSS recordings as well as
+    source_id: i64,
+    /// This source's stagger identity — its canonical label set. Held here
+    /// so the seal policy can desync tables ACROSS sources as well as
     /// within one; see `stagger_bucket`.
     stagger_key: String,
     err: ErrorSlot,
-    /// The archive this recording lives in. Carried per handle so a caller
-    /// holding only a recording can still name its file — one `PathBuf` per
-    /// recording, against an archive that holds at most a handful.
+    /// The archive this source lives in. Carried per handle so a caller
+    /// holding only a source can still name its file — one `PathBuf` per
+    /// source, against an archive that holds at most a handful.
     path: PathBuf,
 }
 
-impl RecordingWriter {
+impl SourceWriter {
     /// The archive being written — valid and readable while it is written.
     ///
     /// Reachable only through `the caller::path`, which no live caller
@@ -411,29 +408,29 @@ impl RecordingWriter {
         &self.path
     }
 
-    /// The `recordings` row this handle appends to.
-    pub fn recording_id(&self) -> i64 {
-        self.recording_id
+    /// The `sources` row this handle appends to.
+    pub fn source_id(&self) -> i64 {
+        self.source_id
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    /// This recording's stagger identity — see `stagger_bucket`.
+    /// This source's stagger identity — see `stagger_bucket`.
     pub fn stagger_key(&self) -> &str {
         &self.stagger_key
     }
 
-    /// Hand one tick's WAL rows to the writer, for THIS recording alone.
+    /// Hand one tick's WAL rows to the writer, for THIS source alone.
     ///
-    /// The single-recording spelling.
-    /// An archive with several recordings should stage each one and commit the
+    /// The single-source spelling.
+    /// An archive with several sources should stage each one and commit the
     /// tick once, through [`Archive::wal_tick`]: one transaction instead of
-    /// one per recording.
+    /// one per source.
     pub fn wal(&mut self, rows: Vec<WalRow>) -> Result<(), String> {
         if rows.is_empty() {
             return self.check_alive();
         }
         self.send(Msg::Wal {
-            ticks: vec![(self.recording_id, rows)],
+            ticks: vec![(self.source_id, rows)],
         })
     }
 
@@ -445,7 +442,7 @@ impl RecordingWriter {
             return self.check_alive();
         }
         self.send(Msg::Seal {
-            recording_id: self.recording_id,
+            source_id: self.source_id,
             batch,
         })
     }
@@ -463,7 +460,7 @@ impl RecordingWriter {
     /// hand-off, which is the convention the whole writer follows.
     pub fn evict_before(&mut self, cutoff_ts: u64) -> Result<(), String> {
         self.send(Msg::Evict {
-            recording_id: self.recording_id,
+            source_id: self.source_id,
             cutoff_ts,
         })
     }
@@ -480,8 +477,8 @@ impl RecordingWriter {
     /// Ordering is what makes this work rather than any locking: the channel is
     /// FIFO and the writer is single-threaded, so the reply cannot be sent
     /// until every earlier message has been fully handled. With several
-    /// recordings sharing one writer that is *stronger* than it was, not
-    /// weaker: the barrier covers the other recordings' queued work too.
+    /// sources sharing one writer that is *stronger* than it was, not
+    /// weaker: the barrier covers the other sources' queued work too.
     ///
     /// A dropped reply channel is treated as success — it means the writer
     /// exited, and its error surfaces through the usual hand-off path rather
@@ -501,21 +498,21 @@ impl RecordingWriter {
         Ok(())
     }
 
-    /// Record this recording's final clock offset and mark it complete.
+    /// Record this source's final clock offset and mark it complete.
     ///
     /// Consumes the handle, which is what releases its sender: the writer
     /// thread ends when the last handle and the archive's master sender are
     /// gone, so a handle kept alive past its finalize would stall the join.
     pub fn finalize(mut self, clock_offset: (u64, i64)) -> Result<(), String> {
         self.send(Msg::Finalize {
-            recording_id: self.recording_id,
+            source_id: self.source_id,
             clock_offset,
         })
     }
 
     /// Report a writer that has already failed, on a hand-off that sends
     /// nothing. Without it, writer health would only be polled when there is
-    /// something to write, and a recording whose writer died would go on
+    /// something to write, and a source whose writer died would go on
     /// reporting success for every empty tick in between.
     fn check_alive(&mut self) -> Result<(), String> {
         // The shared error slot is the only signal available here: the thread
@@ -538,19 +535,19 @@ impl RecordingWriter {
         // The receiver is gone, so the writer has exited (it exits its receive
         // loop on the first error). The thread stored its error on the way out
         // — see `ErrorSlot` — so report that rather than logging per-tick
-        // against a broken recording.
+        // against a broken source.
         Err(take_writer_error(&self.err))
     }
 }
 
 /// Read the writer thread's stored failure, or a generic one if it exited
-/// without recording anything (a clean exit that a handle nonetheless outlived).
+/// without source anything (a clean exit that a handle nonetheless outlived).
 fn take_writer_error(slot: &ErrorSlot) -> String {
     slot.lock()
         .ok()
         .and_then(|guard| guard.clone())
         .unwrap_or_else(|| {
-            "the archive writer thread exited before the recording finished".to_string()
+            "the archive writer thread exited before the source finished".to_string()
         })
 }
 
@@ -564,7 +561,7 @@ struct Encoded {
 
 /// The writer thread body. Every fallible operation returns `Err`; the loop
 /// exits on the first error so the failure surfaces on the next hand-off
-/// instead of accumulating against a broken recording.
+/// instead of accumulating against a broken source.
 fn writer_thread(
     rx: Receiver<Msg>,
     mut db: Db,
@@ -594,11 +591,11 @@ fn writer_thread(
 /// simply ends early, and nothing about it says so.
 ///
 /// [`crate::rez_sqlite`]'s autocheckpoint bounds how many BYTES can accumulate
-/// (4 MiB). It cannot bound how much TIME they represent: a busy recording
+/// (4 MiB). It cannot bound how much TIME they represent: a busy source
 /// crosses 4 MiB in seconds, a quiet one in hours, and the quiet one is the
 /// case where a copy is silently useless. Measured before this existed: 123
 /// ticks — about two minutes at a 1s interval — missing from a plain copy of a
-/// 2000-tick recording.
+/// 2000-tick source.
 ///
 /// 10s is chosen to be short against the window anyone reasons about (an
 /// incident, a benchmark run) and long against the work: a passive checkpoint
@@ -614,15 +611,15 @@ fn writer_loop(
     checkpoint_every: Duration,
     encoder: &(dyn SegmentEncoder + Send),
 ) -> Result<(), String> {
-    // Next segment sequence number, per (recording, stream). Keyed by both
-    // because `seq` is scoped to a recording's stream in the `segments` table:
-    // two recordings of the same host have the same stream names and each
+    // Next segment sequence number, per (source, stream). Keyed by both
+    // because `seq` is scoped to a source's stream in the `segments` table:
+    // two sources of the same host have the same stream names and each
     // needs its own sequence.
     let mut next_seq: BTreeMap<(i64, String), u64> = BTreeMap::new();
-    // Timestamps each recording's `clock_offsets` series already carries. Only
+    // Timestamps each source's `clock_offsets` series already carries. Only
     // finalize reads it, but it has to be maintained as batches seal.
     let mut observed: BTreeMap<i64, BTreeSet<u64>> = BTreeMap::new();
-    // How many recordings were opened, and how many closed cleanly. Reclaim at
+    // How many sources were opened, and how many closed cleanly. Reclaim at
     // exit only when they match: an unclean exit is the recovery artifact and
     // must not pay for a vacuum on the way down.
     let mut added: usize = 0;
@@ -634,7 +631,7 @@ fn writer_loop(
 
     loop {
         // `recv_timeout`, not `recv`: a writer with nothing to do still has to
-        // wake and checkpoint. A recording that has gone quiet is exactly when
+        // wake and checkpoint. A source that has gone quiet is exactly when
         // someone copies it.
         let waited = rx.recv_timeout(checkpoint_every.saturating_sub(last_checkpoint.elapsed()));
         if last_checkpoint.elapsed() >= checkpoint_every {
@@ -662,10 +659,10 @@ fn writer_loop(
             Ok(Msg::Sync(reply)) => {
                 let _ = reply.send(());
             }
-            Ok(Msg::AddRecording { seed, reply }) => {
-                let inserted = db.insert_recording(&seed);
+            Ok(Msg::AddSource { seed, reply }) => {
+                let inserted = db.insert_source(&seed);
                 // A failed insert is reported to the caller and does NOT kill
-                // the writer: an archive's other recordings are still valid,
+                // the writer: an archive's other sources are still valid,
                 // and the caller decides whether to give up.
                 if inserted.is_ok() {
                     added += 1;
@@ -677,23 +674,20 @@ fn writer_loop(
             Ok(Msg::Commits(reply)) => {
                 let _ = reply.send(db.commits());
             }
-            Ok(Msg::Seal {
-                recording_id,
-                batch,
-            }) => {
-                if let Some(ts) = seal_batch(db, recording_id, &mut next_seq, batch, encoder)? {
-                    observed.entry(recording_id).or_default().insert(ts);
+            Ok(Msg::Seal { source_id, batch }) => {
+                if let Some(ts) = seal_batch(db, source_id, &mut next_seq, batch, encoder)? {
+                    observed.entry(source_id).or_default().insert(ts);
                 }
             }
             Ok(Msg::Evict {
-                recording_id,
+                source_id,
                 cutoff_ts,
             }) => {
-                db.evict_before(recording_id, cutoff_ts)?;
+                db.evict_before(source_id, cutoff_ts)?;
                 reclaim_if_fragmented(db)?;
             }
             Ok(Msg::Finalize {
-                recording_id,
+                source_id,
                 clock_offset,
             }) => {
                 // The loop's final tick observation joins the series only when
@@ -703,23 +697,23 @@ fn writer_loop(
                 // row-derived value wins because it is a projection of the
                 // `:wall_offset` column the segment itself carries. Same rule,
                 let novel = !observed
-                    .get(&recording_id)
+                    .get(&source_id)
                     .is_some_and(|o| o.contains(&clock_offset.0));
                 db.transaction(|tx| {
                     if novel {
-                        tx.insert_clock_offset(recording_id, clock_offset.0, clock_offset.1)?;
+                        tx.insert_clock_offset(source_id, clock_offset.0, clock_offset.1)?;
                     }
-                    tx.mark_complete(recording_id)
+                    tx.mark_complete(source_id)
                 })?;
                 finalized += 1;
                 // Deliberately NOT returning here, and not reclaiming yet. An
-                // archive may hold several recordings; this one is complete,
+                // archive may hold several sources; this one is complete,
                 // the others may still be writing. The reclaim is a
                 // whole-file operation and belongs at the end, once — see the
                 // loop's exit below.
             }
             // Asked to stop. Same accounting as the channel-close arm below:
-            // reclaim only if every recording opened was also finalized.
+            // reclaim only if every source opened was also finalized.
             Ok(Msg::Shutdown) => {
                 if added > 0 && finalized == added {
                     reclaim_all(db)?;
@@ -728,12 +722,12 @@ fn writer_loop(
             }
             // Every handle has been dropped, so no further work can arrive.
             //
-            // If all the recordings that were opened also finalized, this is a
+            // If all the sources that were opened also finalized, this is a
             // clean close and the free list is drained once, here — the place
-            // the single-recording writer did it inside its `Finalize` arm.
+            // the single-source writer did it inside its `Finalize` arm.
             // AFTER every `mark_complete`, deliberately: reclaiming space is an
             // optimization, and a crash partway through it must leave complete
-            // recordings that are merely larger than they needed to be, never
+            // sources that are merely larger than they needed to be, never
             // incomplete ones that happen to be compact.
             //
             // Otherwise a handle was dropped without finalizing. Nothing to
@@ -776,13 +770,13 @@ pub fn should_reclaim(free_pages: u32, pages: u32) -> bool {
 
 /// Drain the whole free list back to the filesystem, in one go. Finalize only.
 ///
-/// **Without this a finished recording keeps every page its WAL pruning freed.**
+/// **Without this a finished source keeps every page its WAL pruning freed.**
 /// Pruning deletes rows continuously — that is how the WAL stays a tail rather
-/// than a second copy of the recording — and each deleted row's page lands on
+/// than a second copy of the source — and each deleted row's page lands on
 /// SQLite's free list, available for reuse but never returned to the
 /// filesystem. `reclaim_if_fragmented` is the trickle that returns them, but
 /// only the retention path calls it, so a `record` run reclaims nothing. The
-/// sparser the recording, the larger the share of the file that is dead.
+/// sparser the source, the larger the share of the file that is dead.
 ///
 /// Unguarded, unlike the retention path. `should_reclaim` exists to keep a
 /// *recurring* per-tick cost off a file that would not benefit; this runs once,
@@ -802,7 +796,7 @@ fn reclaim_all(db: &Db) -> Result<(), String> {
 /// outside it. Returns the timestamp of the observation recorded, if any.
 fn seal_batch(
     db: &mut Db,
-    recording_id: i64,
+    source_id: i64,
     next_seq: &mut BTreeMap<(i64, String), u64>,
     batch: Vec<String>,
     encoder: &(dyn SegmentEncoder + Send),
@@ -823,11 +817,11 @@ fn seal_batch(
     // `:wall_offset` column it summarizes.
     let mut observation: Option<(u64, i64)> = None;
     for stream in batch {
-        let rows = db.live_wal(recording_id, &stream)?;
+        let rows = db.live_wal(source_id, &stream)?;
         let Some(last) = rows.last() else {
             // No live rows: nothing to catalog and nothing to prune. The ingest
             // side never seals an empty segment, and a stream whose rows were
-            // already sealed is not an error worth failing the recording over.
+            // already sealed is not an error worth failing the source over.
             continue;
         };
         // `last_ts`/`wall_offset`: always the raw WAL span's own last row,
@@ -847,10 +841,10 @@ fn seal_batch(
         }
         // Bumped before the commit, which is safe only because the writer
         // exits on its first error: no later batch ever reuses this map.
-        // Keyed by recording as well as stream: `segments.seq` is scoped to
-        // `(recording_id, stream)`, so two recordings of the same host must
+        // Keyed by source as well as stream: `segments.seq` is scoped to
+        // `(source_id, stream)`, so two sources of the same host must
         // not share a counter.
-        let seq = next_seq.entry((recording_id, stream.clone())).or_insert(0);
+        let seq = next_seq.entry((source_id, stream.clone())).or_insert(0);
         encoded.push(Encoded {
             stream,
             seq: *seq,
@@ -881,14 +875,14 @@ fn seal_batch(
     // commit, no extra fsync, and it lands iff the segments it was derived
     // from do. It is a `clock_offsets` ROW rather than something a reader has
     // to dig out of a segment, which is what keeps drift readable from the
-    // catalog alone — including on a recording that is killed before it ever
+    // catalog alone — including on a source that is killed before it ever
     // finalizes, where these are the only observations there will be.
     db.transaction(|tx| {
         for e in &encoded {
-            tx.insert_segment(recording_id, &e.stream, e.seq, &e.meta, &e.bytes)?;
+            tx.insert_segment(source_id, &e.stream, e.seq, &e.meta, &e.bytes)?;
         }
         if let Some((ts, offset)) = observation {
-            tx.insert_clock_offset(recording_id, ts, offset)?;
+            tx.insert_clock_offset(source_id, ts, offset)?;
         }
         Ok(())
     })?;
@@ -905,7 +899,7 @@ fn seal_batch(
     // stream ingested after the sealed span, and every other stream's rows,
     // stay live.
     for e in &encoded {
-        db.prune_wal(recording_id, &e.stream, e.meta.last_ts)?;
+        db.prune_wal(source_id, &e.stream, e.meta.last_ts)?;
     }
     Ok(observation.map(|(ts, _)| ts))
 }
