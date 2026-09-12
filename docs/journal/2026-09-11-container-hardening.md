@@ -311,12 +311,26 @@ out-of-order entry's first answer: make the silent case loud, and leave the
 policy where it lives. `tests/retention.rs` covers whole-source and
 per-stream accounting.
 
+**The small items (landed, one commit).** `Db`'s mutators
+(`insert_source`, `insert_segment`, `prune_wal`, `patch_source_metadata`,
+`update_source_metadata`, `checkpoint_passive`, `incremental_vacuum`) take
+`&mut self`, so a write inside `read_snapshot`'s `&Self` closure is a
+compile error rather than a documented request; `#![allow(dead_code)]` came
+off `db.rs` with nothing under it. `open_read_only` no longer passes
+`SQLITE_OPEN_URI`, matching the other opens. `source_time_span` counts live
+rows only, so a source's reported span cannot start before any row a reader
+can reach. `reclaim_all` at a clean close runs in `RECLAIM_PAGES_PER_PASS`
+passes under a two-second `RECLAIM_AT_CLOSE_BUDGET` and logs what it left
+for a later retention pass, instead of an unbounded vacuum inside `Drop`.
+`CopySpec::writer_props` lets a projection re-encode with the caller's own
+settings, defaulting to the archive's. `SealPolicy::default` says where its
+numbers came from and that they are a starting point.
+
 ## Deferred or Reopen Items
 
-- `Db`'s mutators taking `&self`, `SQLITE_OPEN_URI` on `open_read_only`
-  only, `source_time_span` counting shadowed rows, `reclaim_all` uncapped in
-  `Drop`, fixed writer props in `project_segment_columns`, fleet constants as
-  `SealPolicy` defaults: all small, all real, none blocking.
+Nothing from this effort. The three sibling entries — the encoder boundary,
+out-of-order appends, and segment compaction — remain open on their own
+terms, with the encoder version marker now taken off the first one's list.
 
 ## Appendix: Skills Invoked
 

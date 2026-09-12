@@ -5,11 +5,6 @@
 //!
 //! This is the ONLY module that knows SQL. Everything above it speaks in
 //! sources, segments, and WAL rows.
-//!
-//! The container is built before its writers: the `segments`, `wal`, and
-//! `clock_offsets` tables exist here, but their accessors arrive with the
-//! streaming writer, so the surface is wider than today's callers use.
-#![allow(dead_code)]
 
 use crate::error::{Error, ReadOnly, Result};
 use std::collections::BTreeMap;
@@ -439,7 +434,7 @@ impl Db {
         // with `file:` stays a filename.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
-        let db = Db {
+        let mut db = Db {
             conn,
             legacy: false,
             read_only: false,
@@ -562,11 +557,12 @@ impl Db {
     /// the sidecar is not folded back in. That is the trade — a reader that
     /// leaves its subject alone cannot also tidy it up.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| Error::Message(format!("failed to open {} read-only: {e}", path.display())))?;
+        // No `SQLITE_OPEN_URI`, same as every other open here: a path is a
+        // path, and `file:` or `?` in a name must not change what is opened.
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+                Error::Message(format!("failed to open {} read-only: {e}", path.display()))
+            })?;
         let mut db = Db {
             conn,
             legacy: false,
@@ -804,7 +800,7 @@ impl Db {
     /// Best-effort is the right contract: the caller is bounding how STALE a
     /// copy of the archive can be, not demanding an exact one.
     /// [`vacuum_into`](Self::vacuum_into) is the exact one.
-    pub fn checkpoint_passive(&self) -> Result<()> {
+    pub fn checkpoint_passive(&mut self) -> Result<()> {
         // `execute_batch`, not `pragma_query`: rusqlite QUOTES the pragma name
         // it is given, so `pragma_query(None, "wal_checkpoint(PASSIVE)", ..)`
         // asks for a pragma literally named `wal_checkpoint(PASSIVE)`. SQLite
@@ -883,7 +879,7 @@ impl Db {
     }
 
     /// Start a source, returning its id.
-    pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64> {
+    pub fn insert_source(&mut self, meta: &SourceMeta) -> Result<i64> {
         self.writable()?;
         insert_source_sql(&self.conn, meta, None)
     }
@@ -1004,7 +1000,7 @@ impl Db {
     /// Insert one sealed segment's bytes and catalog facts, committing on its
     /// own. Batch writers should use `transaction` instead.
     pub fn insert_segment(
-        &self,
+        &mut self,
         source_id: i64,
         stream: &str,
         seq: u64,
@@ -1522,7 +1518,7 @@ impl Db {
     /// that is why WAL rows are per-stream rather than whole snapshots — a
     /// slow-sealing table's prune must not touch, or be blocked by, any other
     /// stream's tail.
-    pub fn prune_wal(&self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
+    pub fn prune_wal(&mut self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
         self.writable()?;
         self.conn
             .execute(
@@ -1779,7 +1775,7 @@ impl Db {
     /// `pages` says. That is not a slow reclaim, it is no reclaim at all: at
     /// one page per retention pass a rolling buffer would never work off a
     /// spike.
-    pub fn incremental_vacuum(&self, pages: u32) -> Result<()> {
+    pub fn incremental_vacuum(&mut self, pages: u32) -> Result<()> {
         self.writable()?;
         let fail = |e| format!("failed to reclaim {pages} pages: {e}");
         let mut stmt = self
@@ -1813,17 +1809,25 @@ impl Db {
         Ok(())
     }
 
-    /// The whole source's time span — every stream, segments and WAL
+    /// The whole source's time span — every stream, segments and live WAL
     /// together — from catalog columns alone. `None` when the source holds
     /// no rows at all, which for a rolling buffer means "nothing within the
     /// lookback".
+    ///
+    /// The span a READER sees: a WAL row at or below its stream's watermark
+    /// (already sealed, or appended out of order) is invisible to every read
+    /// path and is not counted here either, so the span cannot start before
+    /// any row a reader can reach.
     pub fn source_time_span(&self, source_id: i64) -> Result<(Option<i64>, Option<i64>)> {
         self.conn
             .query_row(
-                "SELECT MIN(first_ts), MAX(last_ts) FROM ( \
-                   SELECT first_ts, last_ts FROM segments WHERE source_id = ?1 \
-                   UNION ALL \
-                   SELECT ts, ts FROM wal WHERE source_id = ?1)",
+                &format!(
+                    "SELECT MIN(first_ts), MAX(last_ts) FROM ( \
+                       SELECT first_ts, last_ts FROM segments WHERE source_id = ?1 \
+                       UNION ALL \
+                       SELECT ts, ts FROM wal WHERE source_id = ?1 \
+                         AND ({LIVE_WAL_PREDICATE_FOR_ROW}))"
+                ),
                 [source_id],
                 |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
@@ -1918,7 +1922,7 @@ impl Db {
     /// recording, the writer thread, through
     /// [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata).
     pub fn patch_source_metadata(
-        &self,
+        &mut self,
         source_id: i64,
         patch: &BTreeMap<String, String>,
     ) -> Result<()> {
@@ -1930,7 +1934,7 @@ impl Db {
     }
 
     pub fn update_source_metadata(
-        &self,
+        &mut self,
         source_id: i64,
         metadata: &BTreeMap<String, String>,
     ) -> Result<()> {
@@ -2413,7 +2417,7 @@ mod tests {
     #[test]
     fn schema_round_trips_a_source() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: [("host".to_string(), "h1".to_string())]
@@ -2449,7 +2453,7 @@ mod tests {
         // with the correct order, so dropping `ORDER BY seq` would silently
         // pass. This fixture doesn't have that escape hatch.
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -2496,7 +2500,7 @@ mod tests {
     #[test]
     fn total_rows_sums_across_segments() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -2535,7 +2539,7 @@ mod tests {
     #[test]
     fn streams_lists_each_stream_once() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -2941,7 +2945,7 @@ mod tests {
     #[test]
     fn segment_sizes_are_oldest_first_and_measure_the_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3028,7 +3032,7 @@ mod tests {
         // source's segments must never see another source's rows for a
         // stream of the same name.
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let meta = |labels: &str| SourceMeta {
             labels: [("host".to_string(), labels.to_string())]
                 .into_iter()
@@ -3093,7 +3097,7 @@ mod tests {
     /// Shared setup for the WAL tests: a fresh archive with one source.
     fn wal_test_db() -> (tempfile::TempDir, Db, i64) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3258,7 +3262,7 @@ mod tests {
         // that pulled `bytes` back merely to discard it — fails or wastes the
         // whole archive's worth of I/O, and this fixture is what makes the
         // first of those visible.
-        let (_dir, db, rid) = wal_test_db();
+        let (_dir, mut db, rid) = wal_test_db();
         db.insert_segment(
             rid,
             "cpu_usage",

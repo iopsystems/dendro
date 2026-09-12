@@ -66,7 +66,7 @@ fn unsealed(path: &std::path::Path) -> i64 {
 /// On its own connection, so the reader's snapshot is what is under test rather
 /// than the borrow checker.
 fn seal_concurrently(path: &std::path::Path, id: i64) {
-    let other = Db::open(path).unwrap();
+    let mut other = Db::open(path).unwrap();
     other
         .insert_segment(
             id,

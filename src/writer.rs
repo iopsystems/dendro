@@ -153,6 +153,10 @@ pub const RECLAIM_PAGES_PER_PASS: u32 = 100;
 #[doc(hidden)]
 pub const RECLAIM_FREELIST_DIVISOR: u32 = 10;
 
+/// How long a clean close spends returning freed pages before giving up and
+/// leaving the rest to a later retention pass. See `reclaim_all`.
+pub const RECLAIM_AT_CLOSE_BUDGET: Duration = Duration::from_secs(2);
+
 /// Handle to the writer thread. Every fallible hand-off reports the writer's
 /// stored error, in the required order: send-failure → join → report.
 pub struct Archive {
@@ -965,7 +969,7 @@ fn commit_tick(
 /// Append a writer session to a source's `WRITER_SESSIONS` metadata — and,
 /// for a resume, a `writer_session` event under `EVENTS` at the new anchor.
 fn record_session(
-    db: &Db,
+    db: &mut Db,
     source_id: i64,
     clock_anchor_wall_ns: i64,
     resumed_after_ts: Option<Option<i64>>,
@@ -1352,7 +1356,7 @@ fn writer_loop(
 /// reclaim a buffer that shrank would keep its high-water size forever.
 #[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
 #[doc(hidden)]
-pub fn reclaim_if_fragmented(db: &Db) -> Result<()> {
+pub fn reclaim_if_fragmented(db: &mut Db) -> Result<()> {
     if should_reclaim(
         db.pragma_u32("freelist_count")?,
         db.pragma_u32("page_count")?,
@@ -1371,27 +1375,31 @@ pub fn should_reclaim(free_pages: u32, pages: u32) -> bool {
     free_pages.saturating_mul(RECLAIM_FREELIST_DIVISOR) > pages
 }
 
-/// Drain the whole free list back to the filesystem, in one go. Finalize only.
+/// Hand freed pages back to the filesystem at a clean close, in passes of
+/// [`RECLAIM_PAGES_PER_PASS`], until the free list is empty or
+/// [`RECLAIM_AT_CLOSE_BUDGET`] is spent.
 ///
-/// **Without this a finished source keeps every page its WAL pruning freed.**
-/// Pruning deletes rows continuously — that is how the WAL stays a tail rather
-/// than a second copy of the source — and each deleted row's page lands on
-/// SQLite's free list, available for reuse but never returned to the
-/// filesystem. `reclaim_if_fragmented` is the trickle that returns them, but
-/// only the retention path calls it, so a `record` run reclaims nothing. The
-/// sparser the source, the larger the share of the file that is dead.
-///
-/// Unguarded, unlike the retention path. `should_reclaim` exists to keep a
-/// *recurring* per-tick cost off a file that would not benefit; this runs once,
-/// at the end, on a file nobody is waiting to write to again, and on an already
-/// compact file it is a no-op costing one `freelist_count` lookup.
-///
-/// Uncapped, also unlike the retention path: `RECLAIM_PAGES_PER_PASS` bounds a
-/// pass so a reclaim cannot overrun a tick, and there is no next tick here.
-/// `u32::MAX` is "as many as the free list holds" — `incremental_vacuum` stops
-/// when it runs out.
-fn reclaim_all(db: &Db) -> Result<()> {
-    db.incremental_vacuum(u32::MAX)
+/// Bounded, unlike the `u32::MAX` this used to pass: it runs on the way out,
+/// inside `Drop` for a caller that never joined explicitly, and a rolling
+/// buffer that evicted heavily can hold a free list that takes seconds to
+/// return. Whatever is left is reclaimed by the next retention pass on the
+/// next open; nothing is lost by stopping early, only space not yet given
+/// back.
+fn reclaim_all(db: &mut Db) -> Result<()> {
+    let started = Instant::now();
+    while db.pragma_u32("freelist_count")? > 0 {
+        db.incremental_vacuum(RECLAIM_PAGES_PER_PASS)?;
+        if started.elapsed() >= RECLAIM_AT_CLOSE_BUDGET {
+            warn!(
+                "stopped reclaiming freed pages after {:?}; {} page(s) remain on the free list \
+                 and will be reclaimed by a later retention pass",
+                RECLAIM_AT_CLOSE_BUDGET,
+                db.pragma_u32("freelist_count")?
+            );
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Encode one batch's segments, insert them — with the batch's clock

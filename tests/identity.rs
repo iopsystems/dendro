@@ -200,7 +200,7 @@ fn a_pre_stamp_archive_still_opens_and_is_still_gated() {
 fn a_source_is_minted_a_v4_uuid_and_a_copy_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let src_path = dir.path().join("src.dendro");
-    let src = Db::create(&src_path).unwrap();
+    let mut src = Db::create(&src_path).unwrap();
     src.insert_source(&source("a")).unwrap();
     src.insert_source(&source("b")).unwrap();
     let ids: Vec<String> = src
@@ -242,7 +242,7 @@ fn a_source_is_minted_a_v4_uuid_and_a_copy_keeps_it() {
     // A different archive with different sources shares nothing, even with
     // identical labels — labels are a name, the uuid is the identity.
     let other_path = dir.path().join("other.dendro");
-    let other = Db::create(&other_path).unwrap();
+    let mut other = Db::create(&other_path).unwrap();
     other.insert_source(&source("a")).unwrap();
     assert!(shared_sources(&src, &other).unwrap().is_empty());
 }

@@ -53,9 +53,23 @@ pub struct CopySpec<'a> {
     /// touches segment bytes; see [`project_segment_columns`]. A stream left
     /// with no data column is dropped.
     pub keep_columns: Option<&'a dyn ColumnFilter>,
+    /// Writer properties for a projected segment (`keep_columns`), which is
+    /// re-encoded. `None` uses the archive's own
+    /// ([`segment::writer_props`](crate::segment::writer_props): LZ4, no
+    /// dictionary); a caller whose encoder writes with other settings should
+    /// pass them, or its projected segments come back encoded differently
+    /// from its sealed ones.
+    pub writer_props: Option<parquet::file::properties::WriterProperties>,
 }
 
 impl CopySpec<'_> {
+    /// The writer properties a projection re-encodes with.
+    fn props(&self) -> parquet::file::properties::WriterProperties {
+        self.writer_props
+            .clone()
+            .unwrap_or_else(crate::segment::writer_props)
+    }
+
     /// Every source, every table, every row, metadata untouched.
     ///
     /// `i64::MIN`, not `0`: a timestamp is signed, so zero is the epoch rather
@@ -70,6 +84,7 @@ impl CopySpec<'_> {
             keep_streams: None,
             metadata_extra: None,
             keep_columns: None,
+            writer_props: None,
         }
     }
 }
@@ -174,7 +189,9 @@ fn copy_sources_snapshotted(
                     // and windows are unchanged by a projection, so the
                     // segment's own `meta` is reused verbatim.
                     Some(keep) => {
-                        if let Some(projected) = project_segment_columns(&segment.bytes, keep)? {
+                        if let Some(projected) =
+                            project_segment_columns(&segment.bytes, keep, spec.props())?
+                        {
                             tx.insert_segment(id, &table, seq, &segment.meta, &projected)?;
                             seq += 1;
                         }
@@ -213,7 +230,8 @@ fn copy_sources_snapshotted(
                 };
                 match spec.keep_columns {
                     Some(keep) => {
-                        if let Some(projected) = project_segment_columns(&materialized.bytes, keep)?
+                        if let Some(projected) =
+                            project_segment_columns(&materialized.bytes, keep, spec.props())?
                         {
                             tx.insert_segment(id, &table, seq, &meta, &projected)?;
                         }
@@ -247,7 +265,11 @@ fn copy_sources_snapshotted(
 /// implementation that drops a column its own reader needs to place rows in
 /// time will produce a segment that opens and answers wrongly, so
 /// [`ColumnFilter::keep`] should accept those unconditionally.
-pub fn project_segment_columns(bytes: &[u8], keep: &dyn ColumnFilter) -> Result<Option<Vec<u8>>> {
+pub fn project_segment_columns(
+    bytes: &[u8],
+    keep: &dyn ColumnFilter,
+    props: parquet::file::properties::WriterProperties,
+) -> Result<Option<Vec<u8>>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::ArrowWriter;
 
@@ -278,12 +300,10 @@ pub fn project_segment_columns(bytes: &[u8], keep: &dyn ColumnFilter) -> Result<
 
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(
-            &mut buf,
-            projected_schema,
-            Some(crate::segment::writer_props()),
-        )
-        .map_err(|e| Error::Message(format!("failed to open a projected segment writer: {e}")))?;
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, projected_schema, Some(props)).map_err(|e| {
+                Error::Message(format!("failed to open a projected segment writer: {e}"))
+            })?;
         for batch in reader {
             let batch = batch
                 .map_err(|e| Error::Message(format!("failed to read a segment batch: {e}")))?;

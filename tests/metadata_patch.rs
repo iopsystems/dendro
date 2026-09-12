@@ -113,7 +113,7 @@ fn a_patch_that_cannot_land_does_not_stop_the_writer() {
     // is the writer's reaction, not the ordering.)
     w.sync().unwrap();
     {
-        let other = Db::open(&path).unwrap();
+        let mut other = Db::open(&path).unwrap();
         other.update_source_metadata(id, &BTreeMap::new()).unwrap();
         rusqlite::Connection::open(&path)
             .unwrap()

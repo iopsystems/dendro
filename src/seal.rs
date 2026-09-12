@@ -74,6 +74,13 @@ pub struct SealPolicy {
 ///
 /// `max_rows` is what bounds the finalize tail on thin tables, and it is nearly
 /// free precisely because it does not reach the wide ones.
+///
+/// **These numbers were measured on one workload** — a telemetry agent
+/// sealing a few dozen streams at a ~46 ms append cadence, on a production
+/// fleet — and are a starting point, not a property of the container. A
+/// caller appending at a very different cadence, or with rows of a very
+/// different size, should tune them for its own finalize latency, peak memory
+/// and kill-loss window.
 impl Default for SealPolicy {
     fn default() -> Self {
         Self {
