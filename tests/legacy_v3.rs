@@ -212,3 +212,21 @@ fn a_legacy_v3_archive_opens_read_only() {
     let recordings = read::read_archive(&db, &CountingEncoder).expect("read");
     assert_eq!(recordings[0].streams[0].1.len(), 2);
 }
+
+/// A legacy archive opens from bytes — the browser-upload path.
+///
+/// The catalog probe looks for a table by name to tell "not an archive" from
+/// "a copy taken mid-write". The rename to `sources` left it looking for a
+/// table a v3 file does not have, and the compat views are installed later, so
+/// every legacy upload was diagnosed as a truncated copy.
+#[test]
+fn a_legacy_v3_archive_opens_from_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.rez");
+    write_v3_fixture(&path);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let db = Db::open_bytes(bytes).expect("a v3 archive must open from bytes");
+    assert_eq!(db.all_streams(1).unwrap(), vec!["temps".to_string()]);
+    assert_eq!(db.read_sources().unwrap().len(), 1);
+}

@@ -534,7 +534,15 @@ impl Db {
         let has_catalog: bool = db
             .conn
             .query_row(
-                "select count(*) from sqlite_master where type = 'table' and name = 'sources'",
+                // BOTH names. `sources` is v4's; `recordings` is what a
+                // legacy archive calls the same table, and the compatibility
+                // views that paper over that are installed later, in
+                // `adopt_schema`. Probing for `sources` alone diagnosed every
+                // legacy upload as a truncated copy — a confident, specific,
+                // wrong answer, which is worse than the bare SQLite error this
+                // probe exists to replace.
+                "select count(*) from sqlite_master where type = 'table' \
+                 and name in ('sources', 'recordings')",
                 [],
                 |row| row.get::<_, i64>(0),
             )
