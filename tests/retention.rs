@@ -76,3 +76,92 @@ fn per_stream_eviction_cuts_clock_offsets_at_the_oldest_surviving_row() {
     assert!(db.all_streams(id).unwrap().is_empty());
     assert!(offsets(&db, id).is_empty());
 }
+
+/// Retention that deletes rows no segment held is data loss the caller's
+/// two policies caused between them, and it is reported, not hidden.
+#[test]
+fn eviction_reports_the_unsealed_rows_it_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.dendro");
+    let mut db = Db::create(&path).unwrap();
+    let id = db.insert_source(&source()).unwrap();
+    // `a`: sealed through 100, with a shadowed (pruned-later) row at 100
+    // still in the WAL, and live rows at 150 and 250.
+    segment(&db, id, "a", 0, 50, 100);
+    db.insert_wal_rows(
+        id,
+        &[
+            WalRow {
+                stream: "a".to_string(),
+                ts: 100,
+                wall_offset: 0,
+                row: vec![1],
+            },
+            WalRow {
+                stream: "a".to_string(),
+                ts: 150,
+                wall_offset: 0,
+                row: vec![1],
+            },
+            WalRow {
+                stream: "a".to_string(),
+                ts: 250,
+                wall_offset: 0,
+                row: vec![1],
+            },
+        ],
+    )
+    .unwrap();
+    // `b`: never sealed, live rows at 10 and 300.
+    db.insert_wal_rows(
+        id,
+        &[
+            WalRow {
+                stream: "b".to_string(),
+                ts: 10,
+                wall_offset: 0,
+                row: vec![1],
+            },
+            WalRow {
+                stream: "b".to_string(),
+                ts: 300,
+                wall_offset: 0,
+                row: vec![1],
+            },
+        ],
+    )
+    .unwrap();
+
+    let evicted = db.evict_before(id, 200).unwrap();
+    // Deleted: the segment; WAL rows 100 (shadowed), 150 (live!), 10 (live!).
+    assert_eq!(evicted.segments, 1);
+    assert_eq!(evicted.wal_rows, 3);
+    assert_eq!(
+        evicted.live_rows, 2,
+        "150 on `a` and 10 on `b` were in no segment"
+    );
+
+    // Per stream, the same accounting, per stream.
+    let mut db2 = Db::create(&dir.path().join("r2.dendro")).unwrap();
+    let id2 = db2.insert_source(&source()).unwrap();
+    db2.insert_wal_rows(
+        id2,
+        &[
+            WalRow {
+                stream: "b".to_string(),
+                ts: 10,
+                wall_offset: 0,
+                row: vec![1],
+            },
+            WalRow {
+                stream: "c".to_string(),
+                ts: 10,
+                wall_offset: 0,
+                row: vec![1],
+            },
+        ],
+    )
+    .unwrap();
+    let evicted = db2.evict_streams_before(id2, 200, &|s| s == "b").unwrap();
+    assert_eq!((evicted.wal_rows, evicted.live_rows), (1, 1));
+}

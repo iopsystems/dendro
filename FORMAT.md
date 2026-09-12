@@ -183,6 +183,14 @@ A row at or below the watermark is committed, occupies space, and is never
 read — the open [out-of-order appends](docs/journal/2026-09-11-out-of-order-appends.md)
 gap; producers must append monotonically per stream.
 
+**Retention and live rows.** Eviction deletes by timestamp and does not
+know which rows have been sealed. A live row older than the cutoff — one a
+stream has not sealed yet, because its seal cadence is slower than the
+lookback — is deleted too, and was in no segment. `Evicted::live_rows`
+counts them, and the writer logs it. The invariant is the caller's: seal at
+least as often as you evict (`SealPolicy::max_age` no longer than the
+lookback).
+
 ### 3.4 `clock_offsets`
 
 `(ts, offset_ns)` observations: at each seal batch the newest sealed row's

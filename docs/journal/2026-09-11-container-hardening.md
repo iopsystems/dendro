@@ -296,16 +296,23 @@ nothing is unchecked, so an unversioned encoder and a source from before
 the key behave as before. The one-line follow-on the encoder-boundary entry
 asked for, riding on item 4's primitive. `tests/encoder_version.rs`.
 
+**Retention versus encoder anchors (landed as loudness, not as a new
+rule).** The two designs named below — the encoder declaring its oldest
+self-sufficient row, or eviction never deleting live rows — each move a
+policy into the container that belongs to the caller: the first makes the
+encoder a party to retention, the second unbounds the WAL of a stream that
+never seals. What the container can honestly do is *say* when it happened.
+`Evicted::live_rows` counts the WAL rows an eviction deleted that were past
+their stream's watermark — rows no segment held, which an unclean kill would
+have kept and retention did not — counted before the segment delete lowers
+the watermark; the writer logs it with the invariant ("seal at least as
+often as you evict"), and `FORMAT.md` states it. Same philosophy as the
+out-of-order entry's first answer: make the silent case loud, and leave the
+policy where it lives. `tests/retention.rs` covers whole-source and
+per-stream accounting.
+
 ## Deferred or Reopen Items
 
-- **Encoder version marker.** One reserved key written at `add_source`,
-  compared on read, refused on mismatch. Reopen once item 4's primitive
-  exists; a one-line follow-on.
-- **Retention versus encoder anchors.** Eviction by timestamp can delete the
-  row a later row needs to decode; the dropped run is then pruned into
-  nothing. Options: the encoder declares its oldest self-sufficient row, or
-  eviction never deletes live WAL rows and reports the ones it kept. Reopen
-  with a caller whose lookback is shorter than its seal age.
 - `Db`'s mutators taking `&self`, `SQLITE_OPEN_URI` on `open_read_only`
   only, `source_time_span` counting shadowed rows, `reclaim_all` uncapped in
   `Drop`, fixed writer props in `project_segment_columns`, fleet constants as

@@ -229,6 +229,14 @@ pub struct WalRow {
 pub struct Evicted {
     pub segments: usize,
     pub wal_rows: usize,
+    /// How many of `wal_rows` were LIVE — past their stream's newest sealed
+    /// segment — when they were deleted. Those rows were in no segment: an
+    /// unclean kill would have kept them, and retention did not. It happens
+    /// when a stream's seal cadence is slower than the retention lookback,
+    /// and it is data loss the caller's own two policies caused, so it is
+    /// reported rather than hidden: a caller seeing this non-zero should
+    /// seal at least as often as it evicts.
+    pub live_rows: usize,
 }
 
 /// How many rows a table holds and what time span they cover, answered from
@@ -253,6 +261,14 @@ const LIVE_WAL_PREDICATE: &str = "source_id = ?1 AND stream = ?2 \
        OR NOT EXISTS (SELECT 1 FROM segments \
                       WHERE source_id = ?1 AND stream = ?2) \
      )";
+
+/// [`LIVE_WAL_PREDICATE`] for a query over `wal` that is not pinned to one
+/// stream: the watermark is looked up per row, for the row's own stream.
+const LIVE_WAL_PREDICATE_FOR_ROW: &str = "\
+       ts > (SELECT MAX(last_ts) FROM segments s \
+             WHERE s.source_id = wal.source_id AND s.stream = wal.stream) \
+       OR NOT EXISTS (SELECT 1 FROM segments s \
+                      WHERE s.source_id = wal.source_id AND s.stream = wal.stream)";
 
 /// How an archive's pages stand. See [`Db::page_stats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1582,12 +1598,20 @@ impl Db {
             .filter(|s| evict(s))
             .collect();
         self.transaction(|tx| {
-            let mut total = Evicted {
-                segments: 0,
-                wal_rows: 0,
-            };
+            let mut total = Evicted::default();
             for stream in &streams {
                 let params = rusqlite::params![source_id, stream, cutoff_ts];
+                // Before the segment delete, for the reason `evict` gives.
+                total.live_rows += tx
+                    .tx
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM wal WHERE {LIVE_WAL_PREDICATE} AND ts < ?3"),
+                        params,
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Error::sqlite(format!(
+                        "failed to count live {stream} rows before eviction"
+                    )))? as usize;
                 total.segments += tx
                     .tx
                     .execute(
@@ -1698,6 +1722,20 @@ impl Db {
     ) -> Result<Evicted> {
         self.transaction(|tx| {
             let params = rusqlite::params![source_id, cutoff_ts];
+            // Counted BEFORE the segment delete: removing a stream's segments
+            // lowers its watermark, and rows those segments already covered
+            // would count as live afterwards when they were not.
+            let live_rows: i64 = tx
+                .tx
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM wal WHERE source_id = ?1 AND ts < ?2 \
+                         AND ({LIVE_WAL_PREDICATE_FOR_ROW})"
+                    ),
+                    params,
+                    |row| row.get(0),
+                )
+                .map_err(Error::sqlite("failed to count live rows before eviction"))?;
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
@@ -1718,7 +1756,11 @@ impl Db {
                     rusqlite::params![source_id, cutoff_ts],
                 )
                 .map_err(Error::sqlite("failed to evict clock offsets"))?;
-            Ok(Evicted { segments, wal_rows })
+            Ok(Evicted {
+                segments,
+                wal_rows,
+                live_rows: live_rows as usize,
+            })
         })
     }
 

@@ -1246,6 +1246,16 @@ fn writer_loop(
                     Some(keep) => db.evict_streams_before(source_id, cutoff_ts, &*keep),
                     None => db.evict_before(source_id, cutoff_ts),
                 };
+                if let Ok(e) = &evicted {
+                    if e.live_rows > 0 {
+                        warn!(
+                            "retention on source {source_id} deleted {} row(s) no segment \
+                             held: the stream's seal cadence is slower than the lookback. \
+                             Seal at least as often as you evict",
+                            e.live_rows
+                        );
+                    }
+                }
                 let failed = evicted.is_err();
                 let _ = reply.send(evicted);
                 if failed {
