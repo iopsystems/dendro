@@ -191,3 +191,24 @@ fn an_unknown_schema_version_is_refused() {
         "the version found must be recoverable without parsing a sentence, got: {err:?}"
     );
 }
+
+/// A legacy archive opens through the read-only handle.
+///
+/// This is the path documented as the way to read a live buffer, an artifact
+/// you do not own, or read-only media — and a legacy `.rez` is exactly the file
+/// that arrives that way. `query_only = 1` refused the `CREATE TEMP VIEW` the
+/// compat path installs, so it failed on the one format it exists to serve.
+#[test]
+fn a_legacy_v3_archive_opens_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.rez");
+    write_v3_fixture(&path);
+
+    let db = Db::open_read_only(&path).expect("a v3 archive must open read-only");
+    assert_eq!(db.all_streams(1).unwrap(), vec!["temps".to_string()]);
+    assert_eq!(db.read_segments(1, "temps").unwrap().len(), 1);
+    assert_eq!(db.live_wal(1, "temps").unwrap().len(), 2);
+
+    let recordings = read::read_archive(&db, &CountingEncoder).expect("read");
+    assert_eq!(recordings[0].streams[0].1.len(), 2);
+}

@@ -450,8 +450,19 @@ impl Db {
         // themselves writes; `query_only` is what makes the refusal SQLite's
         // rather than ours, so a bug here fails loudly instead of mutating.
         db.set_pragma("cache_size", READER_CACHE_SIZE_KIB)?;
-        db.set_pragma("query_only", "1")?;
+        // ORDER MATTERS. `adopt_schema` installs the legacy compatibility views
+        // for an older archive, and `CREATE TEMP VIEW` is a write — to the temp
+        // schema, which `query_only` also covers. Setting it first refused
+        // every legacy archive with `attempt to write a readonly database`,
+        // which is the one format this path most exists to serve.
+        //
+        // Nothing is at risk in the gap: the connection is
+        // `SQLITE_OPEN_READ_ONLY`, so SQLite refuses writes to the archive
+        // itself regardless. `query_only` is here to cover the temp schema once
+        // we are done needing it, and to make a stray write fail as SQLite's
+        // error rather than ours.
         db.adopt_schema()?;
+        db.set_pragma("query_only", "1")?;
         Ok(db)
     }
 
