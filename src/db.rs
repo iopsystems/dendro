@@ -987,6 +987,16 @@ impl Db {
     /// written. `BEGIN DEFERRED` takes no locks until the first read and never
     /// blocks the writer in WAL mode — it just pins the snapshot.
     ///
+    /// **It does block CHECKPOINTING**, which is not the same thing. A held
+    /// snapshot pins the sidecar frames it can still see, so
+    /// [`checkpoint_passive`](Self::checkpoint_passive) moves nothing and
+    /// returns `Ok`, and both staleness bounds in DESIGN.md lapse for the
+    /// duration. Keep a snapshot for one answer, not for the life of a reader.
+    ///
+    /// `f` should not write through this handle. That is a contract, not a
+    /// guarantee: every mutator on `Db` takes `&self`, so nothing stops you,
+    /// and a write in here joins the snapshot's transaction.
+    ///
     /// `f` gets `&Self`, so it may call any reader here; it must not write
     /// through this handle, which is why this is not exposed as a general
     /// transaction.
@@ -1003,12 +1013,31 @@ impl Db {
         self.conn
             .execute_batch("BEGIN DEFERRED")
             .map_err(|e| Error::Message(format!("failed to open a read snapshot: {e}")))?;
+
+        /// Ends the snapshot however the closure leaves - including by
+        /// unwinding.
+        ///
+        /// Releasing it on the line after `f(self)` looked equivalent and was
+        /// not: a panic skips that line, leaves `BEGIN DEFERRED` open, and the
+        /// re-entrancy check above then reuses that stale snapshot for every
+        /// later read on this handle, silently and forever. The trait doc for
+        /// `SegmentEncoder` warns that a naive encoder panics inside the
+        /// reader, and `read::SegmentBytes::SharedDb` deliberately recovers
+        /// from lock poisoning - so one thread's panic could freeze every
+        /// later reader on that handle in time.
+        ///
+        /// Read-only either way, so how it ends cannot change what was read.
+        /// It only has to end.
+        struct EndSnapshot<'a>(&'a Connection);
+        impl Drop for EndSnapshot<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.execute_batch("ROLLBACK");
+            }
+        }
+
+        let guard = EndSnapshot(&self.conn);
         let out = f(self);
-        // Read-only either way, so the outcome of ending it cannot change what
-        // was read; the snapshot simply has to be released.
-        let _ = self
-            .conn
-            .execute_batch(if out.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        drop(guard);
         out
     }
 

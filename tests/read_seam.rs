@@ -735,3 +735,61 @@ fn a_clock_observation_comes_from_one_row() {
         "the segment ends at ts=20, so the observation is ts=20's own offset"
     );
 }
+
+/// A panic inside a read snapshot must not freeze the handle in time.
+///
+/// `BEGIN DEFERRED` was ended by a line after the closure, so an unwind skipped
+/// it and left the transaction open. The re-entrancy guard then saw a non-
+/// autocommit connection and reused that stale snapshot for every later read —
+/// silently, forever. The trait doc for `SegmentEncoder` explicitly warns that
+/// a naive encoder panics inside the reader, and `SegmentBytes::SharedDb`
+/// deliberately recovers from lock poisoning, so one thread's panic could pin
+/// every later reader on that handle.
+#[test]
+fn a_panic_inside_a_snapshot_does_not_leave_the_transaction_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let id = unsealed(&path);
+
+    let db = Db::open(&path).unwrap();
+    let before: Vec<i64> = db
+        .read_snapshot(|db| Ok(db.live_wal(id, "s")?.iter().map(|r| r.ts).collect()))
+        .unwrap();
+    assert_eq!(before, vec![1, 2, 3]);
+
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: dendro::Result<()> = db.read_snapshot(|db| {
+            db.read_segments(id, "s")?;
+            panic!("an encoder panicked mid-read");
+        });
+    }));
+    assert!(
+        caught.is_err(),
+        "the panic must propagate, not be swallowed"
+    );
+
+    // A row committed after the panic, from another connection.
+    {
+        let mut other = Db::open(&path).unwrap();
+        other
+            .insert_wal_rows(
+                id,
+                &[WalRow {
+                    stream: "s".to_string(),
+                    ts: 4,
+                    wall_offset: 0,
+                    row: vec![1],
+                }],
+            )
+            .unwrap();
+    }
+
+    let after: Vec<i64> = db
+        .read_snapshot(|db| Ok(db.live_wal(id, "s")?.iter().map(|r| r.ts).collect()))
+        .unwrap();
+    assert_eq!(
+        after,
+        vec![1, 2, 3, 4],
+        "the handle must see the world as it is now, not as it was when something panicked"
+    );
+}
