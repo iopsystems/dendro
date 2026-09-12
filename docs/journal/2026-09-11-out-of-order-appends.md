@@ -1,5 +1,5 @@
 ---
-status: open
+status: partly resolved
 opened: 2026-09-11
 updated: 2026-09-11
 ---
@@ -106,16 +106,58 @@ about storage, and the caller knows what a row means and when it arrives.
 
 ## Outcome
 
-Open. Nothing is implemented, and the current behavior is documented in the
-README as a limitation rather than left to be discovered.
+**(1) loudness is resolved; (2) backfill remains open.**
+
+The writer holds each stream's newest sealed row — seeded from the catalog
+by `Db::sealed_watermarks`, advanced by `seal_batch` after the commit that
+sets it, so a deferred seal raises nothing — and an append at or below it is
+**dropped rather than stored**, counted per source
+(`SourceWriter::dropped_out_of_order`, which a caller should assert is zero)
+and logged once per stream with both timestamps. Per row, not per tick: one
+late row among good ones costs only itself.
+
+Rejection at the call, which this entry preferred, is available only where
+the answer is already known without asking the writer thread — and that is
+exactly the resumed case, where `resume_source` hands the handle a floor and
+`wal` refuses against it synchronously with `Error::TimelineBackwards`. For
+a fresh source the watermark lives only on the writer thread, and an append
+is deliberately fire-and-forget: returning a verdict per call would make
+every tick a round trip through the bound-1 channel, which is the cost that
+channel exists to avoid. Hence drop-and-count there, reject-at-the-handle
+when resumed. The counter is the escape hatch this entry asked for, and it
+is also the assertion.
+
+One finding worth keeping, from writing the tests rather than the code: the
+restriction is **per `(source, stream)`** and nowhere else. A sibling stream
+of the same source, and any stream of another source, take the very
+timestamp the sealed stream just refused — each has its own watermark. So
+"append in order" is a per-stream contract, not an archive-wide clock, and
+the common shapes of backfill (a whole producer's history as another source;
+a metric family that did not exist before as another stream) need nothing
+from (2) at all. That materially narrows what backfill has left to solve,
+and is why the current behaviour is acceptable rather than merely
+documented.
 
 ## Deferred or Reopen Items
 
-- **(1) is not blocked on (2).** Making the drop loud is worth doing on its own
-  and does not commit to any answer for backfill.
-- **Reopen (2)** when a caller needs late samples and can say how late, in
-  seconds. The bound is what makes the first design option tractable and the
-  question answerable at all.
+- **Reopen (2)** when a caller needs late samples *within one stream* and can
+  say how late, in seconds. The bound is what makes the first design option
+  tractable and the question answerable at all. Everything else people mean
+  by backfill — another source, another stream — already works.
+- **The cheapest answer to (2) is probably not in this entry.** `combine`
+  unions sources rather than merging one source's timeline, so a backfill
+  recorded as its own source, carrying the same `producer_epoch`, is
+  expressible today and needs no container change; what it needs is a
+  consumer that merges two observations of one series, which is what the
+  epoch keys exist for. Worth pricing before touching the watermark.
+- **If the watermark must move**, the shape is to stop deciding liveness by
+  timestamp: give WAL rows a monotonic insert sequence and record on each
+  segment the highest one it consumed, so "already sealed" and "late" stop
+  being the same question. Segments then overlap in time, `read_segments` is
+  `ORDER BY seq`, and dendro hands back bytes it never decodes — so the
+  merge lands on the consumer or on
+  [compaction](2026-09-11-segment-compaction.md), which that makes a
+  prerequisite rather than an optimisation.
 - Related: [segment compaction](2026-09-11-segment-compaction.md) is the other
   gap between dendro and a time-series database's storage layer.
 

@@ -61,11 +61,16 @@ opinion about your query engine either — reads hand back parquet bytes.
 Worth knowing before you build on it. The first two are traps; the rest are
 boundaries.
 
-- **Out-of-order appends are accepted and never read.** A row whose timestamp is
-  at or below its stream's newest sealed segment is committed, occupies space
-  for the life of the archive, and is invisible to every read path — with no
-  error. dendro is built for producers that append monotonically. If yours can
-  deliver a late sample, this will lose it silently.
+- **Out-of-order appends are dropped, not stored.** A row whose timestamp is
+  at or below its stream's newest sealed segment cannot be read — the
+  watermark that keeps the seal seam free of duplicates shadows it — so the
+  writer drops it, counts it
+  (`SourceWriter::dropped_out_of_order`, worth asserting is zero) and logs
+  once per stream. A resumed source refuses such a row outright, at the call.
+  dendro is built for producers that append monotonically **per stream**:
+  the restriction is per `(source, stream)`, so a sibling stream or another
+  source takes the same timestamp happily, and backfilling either is not
+  out-of-order at all. Late samples *within* one stream are not supported.
   [Journal](docs/journal/2026-09-11-out-of-order-appends.md).
 - **Segments are never merged.** They are created by a seal and destroyed whole
   by eviction; nothing compacts them. Read cost tracks segment *count*, so an

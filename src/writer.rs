@@ -135,6 +135,15 @@ enum Msg {
 /// handle reads it, keeping per-tick errors as specific as they were.
 type ErrorSlot = Arc<Mutex<Option<Arc<Error>>>>;
 
+/// Rows dropped as out of order, per source. Shared with the writer thread,
+/// which is the only thing that can see the watermark — see
+/// [`SourceWriter::dropped_out_of_order`].
+///
+/// A map behind one lock rather than an atomic per source: it is touched only
+/// when a row is actually dropped, which for a well-behaved producer is
+/// never, and read only when a caller asks.
+type ShadowCounts = Arc<Mutex<BTreeMap<i64, u64>>>;
+
 /// Reclaim at most this many pages per retention pass — sized to fit inside a
 /// tick. The point of a cap at all is that a shrunken working set drains back
 /// to the filesystem gradually; a full `VACUUM` would return the same space in
@@ -166,6 +175,7 @@ pub struct Archive {
     thread: Option<JoinHandle<Result<()>>>,
     path: PathBuf,
     err: ErrorSlot,
+    shadowed: ShadowCounts,
 }
 
 impl Archive {
@@ -256,6 +266,8 @@ impl Archive {
         let (tx, rx) = sync_channel(1);
         let err: ErrorSlot = Arc::new(Mutex::new(None));
         let thread_err = Arc::clone(&err);
+        let shadowed: ShadowCounts = Arc::new(Mutex::new(BTreeMap::new()));
+        let thread_shadowed = Arc::clone(&shadowed);
         // A spawn failure removes the file, sidecars included. It leaves a
         // VALID empty source at the caller's chosen path — which used to be
         // the argument for keeping it — but valid is not the same as useful:
@@ -265,8 +277,16 @@ impl Archive {
         // fallout from the spawn failure that actually happened.
         let thread = match std::thread::Builder::new()
             .name("dendro-writer".to_string())
-            .spawn(move || writer_thread(rx, db, thread_err, checkpoint_every, encoder))
-        {
+            .spawn(move || {
+                writer_thread(
+                    rx,
+                    db,
+                    thread_err,
+                    thread_shadowed,
+                    checkpoint_every,
+                    encoder,
+                )
+            }) {
             Ok(thread) => thread,
             Err(e) => {
                 // The closure was dropped with the failed spawn, and the
@@ -286,6 +306,7 @@ impl Archive {
             thread: Some(thread),
             path: path.to_path_buf(),
             err,
+            shadowed,
         })
     }
 
@@ -323,6 +344,7 @@ impl Archive {
             err: Arc::clone(&self.err),
             path: self.path.clone(),
             floor_ts: None,
+            shadowed: Arc::clone(&self.shadowed),
         })
     }
 
@@ -374,6 +396,7 @@ impl Archive {
                 err: Arc::clone(&self.err),
                 path: self.path.clone(),
                 floor_ts: resumed.last_ts,
+                shadowed: Arc::clone(&self.shadowed),
             },
             resumed.last_ts,
         ))
@@ -563,6 +586,7 @@ pub struct SourceWriter {
     /// holding only a source can still name its file — one `PathBuf` per
     /// source, against an archive that holds at most a handful.
     path: PathBuf,
+    shadowed: ShadowCounts,
 }
 
 impl std::fmt::Debug for SourceWriter {
@@ -629,6 +653,30 @@ impl SourceWriter {
     /// handle resumed a source; every row must be stamped after it.
     pub fn floor_ts(&self) -> Option<i64> {
         self.floor_ts
+    }
+
+    /// How many of this source's appends have been dropped for arriving at
+    /// or below their stream's newest sealed row.
+    ///
+    /// **Assert this is zero.** Such a row cannot be read — the watermark
+    /// that keeps the seal seam free of duplicates shadows it exactly as it
+    /// shadows an already-sealed row — so the writer drops it rather than
+    /// spending space on it, and logs once per stream. A non-zero count is a
+    /// producer appending out of order, which this container does not
+    /// support within a stream; a different stream or a different source has
+    /// its own watermark and is not affected.
+    ///
+    /// Counted rather than returned because an append is deliberately
+    /// fire-and-forget: reporting per call would make every tick a
+    /// round-trip to the writer thread, which is the cost the bound-1
+    /// channel exists to avoid. Read it after a [`sync`](Self::sync) for a
+    /// count that includes everything handed over so far.
+    pub fn dropped_out_of_order(&self) -> u64 {
+        self.shadowed
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&self.source_id).copied())
+            .unwrap_or(0)
     }
 
     /// Hand one seal batch (= one transaction) to the writer, as the streams
@@ -859,11 +907,38 @@ struct WriterHealth {
     warned_collisions: BTreeSet<i64>,
     /// Likewise for a resumed source whose rows fall at or before its floor.
     warned_floors: BTreeSet<i64>,
+    /// Streams already warned about for an out-of-order append, so a
+    /// producer that is late every tick logs once rather than every tick.
+    warned_shadowed: BTreeSet<(i64, String)>,
 }
 
 impl WriterHealth {
     fn committed(&mut self) {
         self.consecutive_dropped = 0;
+    }
+
+    /// Record one row dropped for arriving at or below its stream's sealed
+    /// watermark: counted for the caller, and logged once per stream with
+    /// the numbers that explain it.
+    fn count_shadowed(
+        &mut self,
+        shadowed: &ShadowCounts,
+        source_id: i64,
+        stream: &str,
+        ts: i64,
+        watermark: i64,
+    ) {
+        if let Ok(mut counts) = shadowed.lock() {
+            *counts.entry(source_id).or_insert(0) += 1;
+        }
+        if self.warned_shadowed.insert((source_id, stream.to_string())) {
+            warn!(
+                "source {source_id}, stream {stream}: dropped an append at {ts}, which is at \
+                 or below the newest row already sealed there ({watermark}). Such a row is \
+                 invisible to every read path, so it is not stored. Append in order per \
+                 stream; later drops on this stream are counted, not logged"
+            );
+        }
     }
 
     /// A tick was dropped after retries. `Err` once that has happened
@@ -897,6 +972,8 @@ fn commit_tick(
     db: &mut Db,
     ticks: &[(i64, Vec<WalRow>)],
     floors: &BTreeMap<i64, i64>,
+    watermarks: &BTreeMap<i64, BTreeMap<String, i64>>,
+    shadowed: &ShadowCounts,
     health: &mut WriterHealth,
 ) -> Result<()> {
     // The writer's half of the resume floor (the handle checks `wal`; this
@@ -928,6 +1005,57 @@ fn commit_tick(
     } else {
         &kept
     };
+
+    // OUT OF ORDER. A row at or below its stream's newest SEALED row cannot
+    // be read: `live_wal`'s watermark is what keeps the seal seam free of
+    // duplicates, so it shadows this row exactly as it shadows one already
+    // sealed. Committing it would spend space, forever, on something no read
+    // path can reach.
+    //
+    // So it is dropped rather than stored — and said out loud, which is the
+    // part that was missing. A silent drop is a trap whatever the eventual
+    // answer for backfill is: the row was visible to `read_wal` and to
+    // nothing else, so it showed up for anyone debugging and for no one
+    // reading. See `docs/journal/2026-09-11-out-of-order-appends.md`.
+    //
+    // Dropped per ROW, not per tick, unlike the floor above: the floor says a
+    // whole session is misaligned, while one late row among a tick's good
+    // ones is that row's problem alone.
+    //
+    // The common tick costs one map lookup per row and nothing else — the
+    // rebuild below runs only once something has actually been shadowed.
+    let shadows = |source_id: i64, r: &WalRow| {
+        watermarks
+            .get(&source_id)
+            .and_then(|streams| streams.get(r.stream.as_str()))
+            .is_some_and(|w| r.ts <= *w)
+    };
+    let rebuilt: Vec<(i64, Vec<WalRow>)>;
+    let ticks: &[(i64, Vec<WalRow>)] = if ticks
+        .iter()
+        .any(|(source_id, rows)| rows.iter().any(|r| shadows(*source_id, r)))
+    {
+        let mut out: Vec<(i64, Vec<WalRow>)> = Vec::with_capacity(ticks.len());
+        for (source_id, rows) in ticks {
+            let mut keep: Vec<WalRow> = Vec::with_capacity(rows.len());
+            for r in rows {
+                if shadows(*source_id, r) {
+                    let w = watermarks[source_id][r.stream.as_str()];
+                    health.count_shadowed(shadowed, *source_id, &r.stream, r.ts, w);
+                } else {
+                    keep.push(r.clone());
+                }
+            }
+            if !keep.is_empty() {
+                out.push((*source_id, keep));
+            }
+        }
+        rebuilt = out;
+        &rebuilt
+    } else {
+        ticks
+    };
+
     if ticks.is_empty() {
         return Ok(());
     }
@@ -1068,6 +1196,7 @@ fn writer_thread(
     rx: Receiver<Msg>,
     mut db: Db,
     err_slot: ErrorSlot,
+    shadowed: ShadowCounts,
     checkpoint_every: Duration,
     encoder: Box<dyn SegmentEncoder + Send>,
 ) -> Result<()> {
@@ -1077,7 +1206,7 @@ fn writer_thread(
     // that moment the handle would report a generic "writer exited" instead of
     // the writer's own error. Holding `rx` here means the channel is still open
     // while the slot is written, so any send that fails afterwards finds it.
-    match writer_loop(&rx, &mut db, checkpoint_every, encoder.as_ref()) {
+    match writer_loop(&rx, &mut db, &shadowed, checkpoint_every, encoder.as_ref()) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Shared, not stringified: every handle reports this same failure,
@@ -1118,6 +1247,7 @@ pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 fn writer_loop(
     rx: &Receiver<Msg>,
     db: &mut Db,
+    shadowed: &ShadowCounts,
     checkpoint_every: Duration,
     encoder: &(dyn SegmentEncoder + Send),
 ) -> Result<()> {
@@ -1134,6 +1264,18 @@ fn writer_loop(
     // Per resumed source, the newest row its previous session left: rows at
     // or before it are refused. See `resume_source`.
     let mut floors: BTreeMap<i64, i64> = BTreeMap::new();
+    // Every stream's newest SEALED row — the watermark a reader compares
+    // against. Advanced by `seal_batch`, and held here rather than queried
+    // per append because an append is the hot path; see `commit_tick`.
+    //
+    // Seeded from the catalog, which on a reopened archive is defence in
+    // depth rather than the thing doing the work: a resumed source also
+    // carries a FLOOR (the newest row anywhere in it), the floor is at or
+    // above every one of its streams' watermarks, and the handle refuses
+    // against the floor synchronously. The seeding is what keeps this map
+    // true of the archive regardless, so the check here does not quietly
+    // depend on a resume having happened.
+    let mut watermarks: BTreeMap<i64, BTreeMap<String, i64>> = db.sealed_watermarks()?;
     // How many sources were opened, and how many closed cleanly. Reclaim at
     // exit only when they match: an unclean exit is the recovery artifact and
     // must not pay for a vacuum on the way down.
@@ -1212,7 +1354,9 @@ fn writer_loop(
                 }
                 let _ = reply.send(resumed);
             }
-            Ok(Msg::Wal { ticks }) => commit_tick(db, &ticks, &floors, &mut health)?,
+            Ok(Msg::Wal { ticks }) => {
+                commit_tick(db, &ticks, &floors, &watermarks, shadowed, &mut health)?
+            }
             #[cfg(any(test, feature = "test-support"))]
             Ok(Msg::Commits(reply)) => {
                 let _ = reply.send(db.commits());
@@ -1225,7 +1369,14 @@ fn writer_loop(
                 // Nothing has to be undone — `seq` is advanced only by a
                 // commit. An encoder failure is not retried: it will recur.
                 match with_retries("sealing a segment batch", || {
-                    seal_batch(db, source_id, &mut next_seq, batch.clone(), encoder)
+                    seal_batch(
+                        db,
+                        source_id,
+                        &mut next_seq,
+                        &mut watermarks,
+                        batch.clone(),
+                        encoder,
+                    )
                 }) {
                     Ok(()) => {}
                     Err(e) if e.is_retryable() => warn!(
@@ -1409,6 +1560,7 @@ fn seal_batch(
     db: &mut Db,
     source_id: i64,
     next_seq: &mut BTreeMap<(i64, String), u64>,
+    watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
     batch: Vec<String>,
     encoder: &(dyn SegmentEncoder + Send),
 ) -> Result<()> {
@@ -1524,6 +1676,13 @@ fn seal_batch(
     })?;
     for e in &encoded {
         next_seq.insert((source_id, e.stream.clone()), e.seq + 1);
+        // The watermark moves with the segment that set it, and only after
+        // the commit: a deferred batch has not raised anything yet, so an
+        // append it would have shadowed stays legal until the seal lands.
+        watermarks
+            .entry(source_id)
+            .or_default()
+            .insert(e.stream.clone(), e.meta.last_ts);
     }
 
     // OUTSIDE the transaction, deliberately: a quiet stream accumulates

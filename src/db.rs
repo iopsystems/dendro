@@ -1876,6 +1876,43 @@ impl Db {
     /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
     /// archive seeds its numbering from, so it continues each stream's
     /// sequence rather than colliding with it.
+    /// The newest SEALED row of every stream, as `source -> stream ->
+    /// last_ts`.
+    ///
+    /// The watermark [`LIVE_WAL_PREDICATE`] compares against, lifted out of
+    /// SQL so a writer can hold it in memory and check an append against it
+    /// without a query per row. A writer reopening an archive seeds from
+    /// this; one that created it starts empty, which is the same thing.
+    ///
+    /// Nested rather than keyed by a `(i64, String)` tuple because the
+    /// lookup is per row on the append path: a tuple key has to be built,
+    /// and building it allocates the stream name every time. Nested, the
+    /// inner `BTreeMap<String, _>` takes a `&str`.
+    pub fn sealed_watermarks(&self) -> Result<BTreeMap<i64, BTreeMap<String, i64>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_id, stream, MAX(last_ts) FROM segments \
+                 GROUP BY source_id, stream",
+            )
+            .map_err(Error::sqlite("failed to query sealed watermarks"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, i64>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(Error::sqlite("failed to query sealed watermarks"))?;
+        let mut out: BTreeMap<i64, BTreeMap<String, i64>> = BTreeMap::new();
+        for row in rows {
+            let ((source_id, stream), ts) =
+                row.map_err(Error::sqlite("failed to read a sealed watermark"))?;
+            out.entry(source_id).or_default().insert(stream, ts);
+        }
+        Ok(out)
+    }
+
     pub fn next_seqs(&self) -> Result<BTreeMap<(i64, String), u64>> {
         let mut stmt = self
             .conn
