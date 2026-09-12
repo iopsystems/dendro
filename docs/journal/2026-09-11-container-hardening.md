@@ -219,6 +219,29 @@ refused and the writer stays usable; a legacy archive cannot be reopened.
 Reading `Debug` off `Db`, `Archive` and `SourceWriter` was missing and is
 now implemented by hand.
 
+**6. One materialization (landed).** `segment::materialize(encoder, stream,
+rows)` is the one place an encoder runs and the one place its answer is
+checked: contiguity by counting, the span inside the input's span, no empty
+claim, a panic caught and returned as `Error::Encoder` (the guard moved
+here from the writer, so a reader gets the same protection). `seal_batch`,
+`copy_sources_into` and `read::stream_segments` all call it; the read path's
+own weaker check (`first_ts` and a row-count ceiling, which let a
+middle-dropping or over-claiming encoder through) is gone, and the seal's
+separately tracked upper bound went with it since the shared check covers
+it. `tests/materialize.rs`: the shared check refuses a hole, an over-claim
+and a panic, never calls the encoder on empty input, and the read path now
+refuses exactly what the seal refuses.
+
+**7. Per-stream retention bounds `clock_offsets` (landed).**
+`evict_streams_before` deletes offsets older than the oldest row the source
+still holds anywhere — segments and WAL, across every stream, in the same
+transaction — and older than the cutoff when nothing is left. Whole-source
+eviction already did the equivalent; a per-stream policy was the one
+rolling-buffer configuration whose offset series still grew forever.
+`tests/retention.rs` evicts one stream and checks the offsets the other
+stream's rows still need survive, then evicts the rest and checks the
+series empties.
+
 ## Outcome
 
 In progress.

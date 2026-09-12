@@ -1604,6 +1604,25 @@ impl Db {
                     )
                     .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
             }
+            // The clock-offset series is per SOURCE, and a per-stream pass
+            // has no single cutoff for it: the streams it left alone may
+            // still hold rows older than `cutoff_ts`. So it is cut at the
+            // oldest row the source still holds anywhere — segments and WAL
+            // together — and at `cutoff_ts` when nothing is left. Without
+            // this the series was the one part of a per-stream rolling buffer
+            // that grew without bound, exactly what whole-source eviction
+            // already closed.
+            tx.tx
+                .execute(
+                    "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < COALESCE( \
+                       (SELECT MIN(oldest) FROM ( \
+                          SELECT MIN(first_ts) AS oldest FROM segments WHERE source_id = ?1 \
+                          UNION ALL \
+                          SELECT MIN(ts) FROM wal WHERE source_id = ?1)), \
+                       ?2)",
+                    rusqlite::params![source_id, cutoff_ts],
+                )
+                .map_err(Error::sqlite("failed to evict clock offsets"))?;
             Ok(total)
         })
     }
