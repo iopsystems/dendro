@@ -179,9 +179,13 @@ A reader materializes a stream's live rows through the encoder into one
 in-memory segment and appends it after the sealed ones. A stream with no
 sealed segment and live rows is a stream, not an absence.
 
-A row at or below the watermark is committed, occupies space, and is never
-read — the open [out-of-order appends](docs/journal/2026-09-11-out-of-order-appends.md)
-gap; producers must append monotonically per stream.
+A row at or below the watermark can never be read, so a writer **drops** it
+rather than storing it, counts it, and logs once per stream; a resumed source
+refuses it at the call instead. Producers must append monotonically **per
+stream** — the watermark is per `(source, stream)`, so the same timestamp is
+fine on a sibling stream or on another source, and backfilling either is not
+out of order at all. Late samples *within* one stream remain unsupported; see
+[out-of-order appends](docs/journal/2026-09-11-out-of-order-appends.md).
 
 **Retention and live rows.** Eviction deletes by timestamp and does not
 know which rows have been sealed. A live row older than the cutoff — one a
