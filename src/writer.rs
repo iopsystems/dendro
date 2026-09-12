@@ -53,6 +53,14 @@ enum Msg {
         seed: Box<SourceMeta>,
         reply: SyncSender<Result<i64>>,
     },
+    /// Reopen an existing source for a new writer session: verify it, refuse
+    /// an anchor at or before its newest row, clear `complete`, record the
+    /// session, and hand back what the handle needs.
+    ResumeSource {
+        source_id: i64,
+        clock_anchor_wall_ns: i64,
+        reply: SyncSender<Result<Resumed>>,
+    },
     /// One tick's WAL rows for EVERY source in the archive, across all
     /// their streams — one transaction, and therefore one fsync at
     /// `synchronous=FULL`.
@@ -182,7 +190,29 @@ impl Archive {
         checkpoint_every: Duration,
     ) -> Result<Self> {
         let db = Db::create(path)?;
-        Self::spawn(db, path, encoder, checkpoint_every)
+        Self::spawn(db, path, encoder, checkpoint_every, true)
+    }
+
+    /// Reopen an existing archive to append to it.
+    ///
+    /// Opening changes nothing; a source is changed only by
+    /// [`resume_source`](Self::resume_source), which is what a caller that
+    /// wants to continue one calls next. Segment numbering continues from
+    /// what the file holds. There must be no other writer of this file, and a
+    /// legacy-schema archive is refused (it is readable, not writable).
+    pub fn open(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Result<Self> {
+        Self::open_checkpointing_every(path, encoder, CHECKPOINT_INTERVAL)
+    }
+
+    /// [`open`](Self::open) with the WAL checkpoint cadence chosen by the
+    /// caller.
+    pub fn open_checkpointing_every(
+        path: &Path,
+        encoder: Box<dyn SegmentEncoder + Send>,
+        checkpoint_every: Duration,
+    ) -> Result<Self> {
+        let db = Db::open_for_write(path)?;
+        Self::spawn(db, path, encoder, checkpoint_every, false)
     }
 
     /// [`create_checkpointing_every`](Self::create_checkpointing_every) with
@@ -200,14 +230,18 @@ impl Archive {
     ) -> Result<Self> {
         let db = Db::create(path)?;
         db.set_busy_timeout(busy_timeout)?;
-        Self::spawn(db, path, encoder, checkpoint_every)
+        Self::spawn(db, path, encoder, checkpoint_every, true)
     }
 
+    /// Start the writer thread over an open connection. `created` says
+    /// whether the file is ours to remove if the spawn fails: a file we just
+    /// created is; one we reopened is not.
     fn spawn(
         db: Db,
         path: &Path,
         encoder: Box<dyn SegmentEncoder + Send>,
         checkpoint_every: Duration,
+        created: bool,
     ) -> Result<Self> {
         // Bound 1: the hand-off blocks while the writer is busy,
         // which is the intended backpressure signal. One slot for the archive
@@ -232,8 +266,11 @@ impl Archive {
             Ok(thread) => thread,
             Err(e) => {
                 // The closure was dropped with the failed spawn, and the
-                // connection with it, so the file is closed and ours to remove.
-                Db::remove_archive(path);
+                // connection with it, so the file is closed and ours to remove
+                // — if we made it. A reopened archive is left as it was.
+                if created {
+                    Db::remove_archive(path);
+                }
                 return Err(Error::Message(format!(
                     "failed to spawn the archive writer thread: {e}"
                 )));
@@ -281,7 +318,61 @@ impl Archive {
             stagger_key,
             err: Arc::clone(&self.err),
             path: self.path.clone(),
+            floor_ts: None,
         })
+    }
+
+    /// Continue an existing source in a reopened archive, as a new writer
+    /// session.
+    ///
+    /// The source's `complete` flag is cleared, the session is recorded
+    /// ([`keys::WRITER_SESSIONS`](crate::keys::WRITER_SESSIONS), plus a
+    /// `writer_session` event under [`keys::EVENTS`](crate::keys::EVENTS) at
+    /// the new anchor), and the handle refuses any row stamped at or before
+    /// the newest row the previous session left — the returned `last_ts` —
+    /// so a clock that went backwards across the restart is
+    /// [`Error::TimelineBackwards`], not a silent collision or a timeline
+    /// that runs backwards. The anchor itself is checked the same way.
+    ///
+    /// `clock_anchor_wall_ns` is THIS session's anchor: the resuming process
+    /// has a fresh monotonic clock, so its rows are `anchor + elapsed` from a
+    /// new wall reading, not from the source's original anchor; rows keep
+    /// `timestamp + wall_offset = wall` either way, and the gap between
+    /// sessions is real time during which nothing was recorded.
+    pub fn resume_source(
+        &mut self,
+        source_id: i64,
+        clock_anchor_wall_ns: i64,
+    ) -> Result<(SourceWriter, Option<i64>)> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::WriterGone);
+        };
+        let (reply_tx, reply_rx) = sync_channel(0);
+        if tx
+            .send(Msg::ResumeSource {
+                source_id,
+                clock_anchor_wall_ns,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(self.take_error());
+        }
+        let resumed = match reply_rx.recv() {
+            Ok(resumed) => resumed?,
+            Err(_) => return Err(self.take_error()),
+        };
+        Ok((
+            SourceWriter {
+                tx: tx.clone(),
+                source_id,
+                stagger_key: crate::seal::source_stagger_key(&resumed.labels),
+                err: Arc::clone(&self.err),
+                path: self.path.clone(),
+                floor_ts: resumed.last_ts,
+            },
+            resumed.last_ts,
+        ))
     }
 
     /// The archive being written — valid and readable while it is written.
@@ -420,6 +511,15 @@ impl Archive {
     }
 }
 
+impl std::fmt::Debug for Archive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Archive")
+            .field("path", &self.path)
+            .field("joined", &self.thread.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for Archive {
     /// The writer must be joined on every path out — including the ones that
     /// skip an explicit join — so a dropped archive never leaves a detached
@@ -431,6 +531,14 @@ impl Drop for Archive {
     }
 }
 
+/// What the writer thread answers a `ResumeSource` with.
+struct Resumed {
+    labels: BTreeMap<String, String>,
+    /// The newest row timestamp the source holds, segments and WAL together;
+    /// `None` for a source with no rows.
+    last_ts: Option<i64>,
+}
+
 /// One source's handle onto a shared archive writer.
 ///
 /// Cheap and cloneable-in-spirit: it is a sender plus an id. Dropping it
@@ -439,6 +547,9 @@ impl Drop for Archive {
 pub struct SourceWriter {
     tx: SyncSender<Msg>,
     source_id: i64,
+    /// Set on a resumed source: every row this session commits must be
+    /// stamped after it. See [`Archive::resume_source`].
+    floor_ts: Option<i64>,
     /// This source's stagger identity — its canonical label set. Held here
     /// so the seal policy can desync tables ACROSS sources as well as
     /// within one; see `stagger_bucket`.
@@ -448,6 +559,16 @@ pub struct SourceWriter {
     /// holding only a source can still name its file — one `PathBuf` per
     /// source, against an archive that holds at most a handful.
     path: PathBuf,
+}
+
+impl std::fmt::Debug for SourceWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceWriter")
+            .field("source_id", &self.source_id)
+            .field("path", &self.path)
+            .field("floor_ts", &self.floor_ts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SourceWriter {
@@ -482,9 +603,28 @@ impl SourceWriter {
         if rows.is_empty() {
             return self.check_alive();
         }
+        // The handle's half of the floor: a resumed source refuses, here and
+        // now, a row at or before its previous session's newest. The writer
+        // thread enforces the same rule for rows that arrive through
+        // `Archive::wal_tick`, which has no handle to ask.
+        if let Some(floor) = self.floor_ts {
+            if let Some(r) = rows.iter().find(|r| r.ts <= floor) {
+                return Err(Error::TimelineBackwards {
+                    source_id: self.source_id,
+                    ts: r.ts,
+                    floor,
+                });
+            }
+        }
         self.send(Msg::Wal {
             ticks: vec![(self.source_id, rows)],
         })
+    }
+
+    /// The newest row timestamp a previous writer session left, when this
+    /// handle resumed a source; every row must be stamped after it.
+    pub fn floor_ts(&self) -> Option<i64> {
+        self.floor_ts
     }
 
     /// Hand one seal batch (= one transaction) to the writer, as the streams
@@ -713,6 +853,8 @@ struct WriterHealth {
     /// Sources already warned about for a colliding tick, so a producer that
     /// repeats a timestamp every tick does not log every tick.
     warned_collisions: BTreeSet<i64>,
+    /// Likewise for a resumed source whose rows fall at or before its floor.
+    warned_floors: BTreeSet<i64>,
 }
 
 impl WriterHealth {
@@ -747,7 +889,44 @@ impl WriterHealth {
 /// source loses its rows. Before this, the batched commit meant one source's
 /// bad tick failed every source in the archive, permanently, and told the
 /// culprit `Ok`.
-fn commit_tick(db: &mut Db, ticks: &[(i64, Vec<WalRow>)], health: &mut WriterHealth) -> Result<()> {
+fn commit_tick(
+    db: &mut Db,
+    ticks: &[(i64, Vec<WalRow>)],
+    floors: &BTreeMap<i64, i64>,
+    health: &mut WriterHealth,
+) -> Result<()> {
+    // The writer's half of the resume floor (the handle checks `wal`; this
+    // covers `wal_tick`, which has no handle to ask): a resumed source's rows
+    // at or before its previous session's newest are that source's problem,
+    // dropped and warned once, like a collision.
+    let mut kept: Vec<(i64, Vec<WalRow>)> = Vec::with_capacity(ticks.len());
+    for (source_id, rows) in ticks {
+        match floors.get(source_id) {
+            Some(floor) if rows.iter().any(|r| r.ts <= *floor) => {
+                if health.warned_floors.insert(*source_id) {
+                    let ts = rows.iter().map(|r| r.ts).min().unwrap_or(*floor);
+                    warn!(
+                        "{}; the tick was dropped, and later ones for this source are \
+                         not logged",
+                        Error::TimelineBackwards {
+                            source_id: *source_id,
+                            ts,
+                            floor: *floor
+                        }
+                    );
+                }
+            }
+            _ => kept.push((*source_id, rows.clone())),
+        }
+    }
+    let ticks: &[(i64, Vec<WalRow>)] = if kept.len() == ticks.len() {
+        ticks
+    } else {
+        &kept
+    };
+    if ticks.is_empty() {
+        return Ok(());
+    }
     match with_retries("committing a tick", || db.insert_wal_rows_batch(ticks)) {
         Ok(()) => {
             health.committed();
@@ -814,6 +993,85 @@ fn encode_guarded(
             })
         }
     }
+}
+
+/// Append a writer session to a source's `WRITER_SESSIONS` metadata — and,
+/// for a resume, a `writer_session` event under `EVENTS` at the new anchor.
+fn record_session(
+    db: &Db,
+    source_id: i64,
+    clock_anchor_wall_ns: i64,
+    resumed_after_ts: Option<Option<i64>>,
+) -> Result<()> {
+    use crate::keys;
+    let session = db.mint_uuid()?;
+    let metadata = db.source_metadata(source_id)?;
+    let mut sessions: Vec<serde_json::Value> = metadata
+        .get(keys::WRITER_SESSIONS)
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    let mut entry = serde_json::json!({
+        "session": session,
+        "clock_anchor_wall_ns": clock_anchor_wall_ns,
+    });
+    let mut patch = BTreeMap::new();
+    if let Some(after) = resumed_after_ts {
+        entry["resumed_after_ts"] = serde_json::json!(after);
+        // Appended to whatever events the caller already wrote, never a
+        // replacement: the array is shared with them.
+        let mut events: serde_json::Value = metadata
+            .get(keys::EVENTS)
+            .and_then(|v| serde_json::from_str(v).ok())
+            .unwrap_or_else(|| serde_json::json!({ "events": [] }));
+        if !events["events"].is_array() {
+            events["events"] = serde_json::json!([]);
+        }
+        events["events"]
+            .as_array_mut()
+            .expect("just ensured")
+            .push(serde_json::json!({
+                "timestamp": clock_anchor_wall_ns,
+                "description": "source resumed by a new writer session",
+                "kind": "writer_session",
+                "details": match after {
+                    Some(ts) => format!("previous session's last row at {ts}"),
+                    None => "previous session left no rows".to_string(),
+                },
+                "id": format!("writer_session:{session}"),
+            }));
+        patch.insert(keys::EVENTS.to_string(), events.to_string());
+    }
+    sessions.push(entry);
+    patch.insert(
+        keys::WRITER_SESSIONS.to_string(),
+        serde_json::Value::Array(sessions).to_string(),
+    );
+    db.patch_source_metadata(source_id, &patch)
+}
+
+/// The writer-thread half of [`Archive::resume_source`].
+fn resume_source(db: &mut Db, source_id: i64, clock_anchor_wall_ns: i64) -> Result<Resumed> {
+    let Some(src) = db.read_sources()?.into_iter().find(|s| s.id == source_id) else {
+        return Err(Error::Message(format!(
+            "no source with id {source_id} to resume"
+        )));
+    };
+    let (_, last_ts) = db.source_time_span(source_id)?;
+    if let Some(floor) = last_ts {
+        if clock_anchor_wall_ns <= floor {
+            return Err(Error::TimelineBackwards {
+                source_id,
+                ts: clock_anchor_wall_ns,
+                floor,
+            });
+        }
+    }
+    db.transaction(|tx| tx.mark_incomplete(source_id))?;
+    record_session(db, source_id, clock_anchor_wall_ns, Some(last_ts))?;
+    Ok(Resumed {
+        labels: src.meta.labels,
+        last_ts,
+    })
 }
 
 /// An encoded segment waiting to be inserted.
@@ -888,7 +1146,15 @@ fn writer_loop(
     // because `seq` is scoped to a source's stream in the `segments` table:
     // two sources of the same host have the same stream names and each
     // needs its own sequence.
-    let mut next_seq: BTreeMap<(i64, String), u64> = BTreeMap::new();
+    //
+    // Seeded from the file: empty on a freshly created archive, and on a
+    // reopened one each stream continues where the previous writer stopped,
+    // which is what keeps a resumed stream's `seq` from colliding with its
+    // own past.
+    let mut next_seq: BTreeMap<(i64, String), u64> = db.next_seqs()?;
+    // Per resumed source, the newest row its previous session left: rows at
+    // or before it are refused. See `resume_source`.
+    let mut floors: BTreeMap<i64, i64> = BTreeMap::new();
     // How many sources were opened, and how many closed cleanly. Reclaim at
     // exit only when they match: an unclean exit is the recovery artifact and
     // must not pay for a vacuum on the way down.
@@ -930,7 +1196,10 @@ fn writer_loop(
                 let _ = reply.send(());
             }
             Ok(Msg::AddSource { seed, reply }) => {
-                let inserted = db.insert_source(&seed);
+                let inserted = db.insert_source(&seed).and_then(|id| {
+                    record_session(db, id, seed.clock_anchor_wall_ns, None)?;
+                    Ok(id)
+                });
                 // A failed insert is reported to the caller and does NOT kill
                 // the writer: an archive's other sources are still valid,
                 // and the caller decides whether to give up.
@@ -939,7 +1208,25 @@ fn writer_loop(
                 }
                 let _ = reply.send(inserted);
             }
-            Ok(Msg::Wal { ticks }) => commit_tick(db, &ticks, &mut health)?,
+            Ok(Msg::ResumeSource {
+                source_id,
+                clock_anchor_wall_ns,
+                reply,
+            }) => {
+                let resumed = resume_source(db, source_id, clock_anchor_wall_ns);
+                if let Ok(Resumed {
+                    last_ts: Some(floor),
+                    ..
+                }) = &resumed
+                {
+                    floors.insert(source_id, *floor);
+                }
+                if resumed.is_ok() {
+                    added += 1;
+                }
+                let _ = reply.send(resumed);
+            }
+            Ok(Msg::Wal { ticks }) => commit_tick(db, &ticks, &floors, &mut health)?,
             #[cfg(any(test, feature = "test-support"))]
             Ok(Msg::Commits(reply)) => {
                 let _ = reply.send(db.commits());

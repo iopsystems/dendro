@@ -194,6 +194,31 @@ a patch is visible from a second connection after `sync` with no finalize,
 merges rather than replaces, and a patch to a deleted source leaves the
 writer answering the next hand-off.
 
+**5. Reopen for append (landed).** `Archive::open` spawns the writer over
+`Db::open_for_write` — the same gate as any open, the writer's page cache,
+and a legacy archive refused up front as `ReadOnly(LegacySchema)`. The loop
+seeds `next_seq` from `Db::next_seqs` (`MAX(seq)+1` per stream), so a
+resumed stream continues its sequence. `resume_source(id, anchor)` runs on
+the writer thread: it refuses an anchor at or before the source's newest
+row (`source_time_span`) as a new `Error::TimelineBackwards`, clears
+`complete` (`Tx::mark_incomplete`), appends a `writer_sessions` entry with
+the new anchor and `resumed_after_ts`, appends a `writer_session` event to
+whatever events the caller already had, and returns a handle carrying a
+floor. The floor is enforced twice: `SourceWriter::wal` refuses a row at or
+before it with the typed error, and `commit_tick` drops such rows arriving
+through `Archive::wal_tick` (which has no handle to ask) with one warning
+per source, like a collision. Every source now records its first session at
+insert, so `writer_sessions` has one entry for a source written in one go.
+The resuming process supplies its own wall reading as the anchor — its
+monotonic clock restarted — and rows keep `timestamp + wall_offset = wall`.
+`tests/resume.rs`: a finalized archive resumes and continues (`seq` 0..=3,
+four rows, both finalize offsets, `complete` down then up, two sessions and
+one event); a backwards anchor, a backwards `wal`, and a backwards
+`wal_tick` are all refused before anything is written; a missing source is
+refused and the writer stays usable; a legacy archive cannot be reopened.
+Reading `Debug` off `Db`, `Archive` and `SourceWriter` was missing and is
+now implemented by hand.
+
 ## Outcome
 
 In progress.

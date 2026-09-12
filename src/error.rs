@@ -33,6 +33,12 @@ pub enum Error {
     /// found, so a caller can tell "too new, upgrade dendro" from "too old".
     UnsupportedSchema { found: i64, writes: i64, reads: i64 },
 
+    /// A resumed source was handed rows at or before the newest row its
+    /// previous writer session left, or a resume anchor at or before it: the
+    /// wall clock went backwards across the restart, and writing would make
+    /// a timeline that runs backwards or collides with itself.
+    TimelineBackwards { source_id: i64, ts: i64, floor: i64 },
+
     /// The file is not a dendro archive: not SQLite, another application's
     /// database, or a copy taken from under a writer that carries no catalog.
     /// `what` names the file (or `<bytes>`), `reason` says which.
@@ -112,6 +118,16 @@ impl fmt::Display for Error {
                 f,
                 "unsupported archive schema version {found}: this build writes \
                  v{writes} and reads v{reads}"
+            ),
+            Error::TimelineBackwards {
+                source_id,
+                ts,
+                floor,
+            } => write!(
+                f,
+                "source {source_id}: timestamp {ts} is not after the newest row its previous \
+                 writer session left ({floor}); the clock went backwards across the restart, \
+                 and rows would collide or run backwards"
             ),
             Error::NotAnArchive { what, reason } => {
                 write!(f, "{what}: not a dendro archive: {reason}")

@@ -93,7 +93,10 @@ fn a_patch_lands_in_order_with_the_ticks_and_without_a_finalize() {
         after.get(keys::PRODUCER_EPOCHS).map(String::as_str),
         Some("[]")
     );
-    assert_eq!(after.len(), 3);
+    // The seed key, the two patched keys, and the writer session every
+    // source records at insert — and nothing else.
+    assert!(after.contains_key(keys::WRITER_SESSIONS));
+    assert_eq!(after.len(), 4);
 }
 
 /// Metadata is not the recording: a patch that cannot be applied is logged

@@ -480,6 +480,21 @@ impl Db {
 
     /// Open an existing archive, reapplying the per-connection pragmas.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_cache(path, READER_CACHE_SIZE_KIB)
+    }
+
+    /// Open an existing archive to APPEND to it — the writer's half of
+    /// [`open`](Self::open): same gate, the writer's (smaller) page cache,
+    /// and a refusal up front for a legacy archive, which cannot be written.
+    /// There must be exactly one writing connection to a file; this is for
+    /// the writer thread that will own it.
+    pub fn open_for_write(path: &Path) -> Result<Self> {
+        let db = Self::open_with_cache(path, WRITER_CACHE_SIZE_KIB)?;
+        db.writable()?;
+        Ok(db)
+    }
+
+    fn open_with_cache(path: &Path, cache_size_kib: i32) -> Result<Self> {
         // No `SQLITE_OPEN_CREATE`: opening an archive that is not there is an
         // error, not an empty new source.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -506,7 +521,7 @@ impl Db {
         // (a staged dump) take it too, deliberately: they are
         // short-lived, offline and bounded by the dump, so no long-running
         // process holds it.
-        db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
+        db.apply_connection_pragmas(cache_size_kib)?;
         Ok(db)
     }
 
@@ -1792,6 +1807,34 @@ impl Db {
     /// column: `annotate` changes it and nothing else, and rewriting an
     /// archive's every segment BLOB to edit one JSON string would make a
     /// cheap operation cost the size of the source.
+    /// The next `seq` for every stream that has sealed at least once:
+    /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
+    /// archive seeds its numbering from, so it continues each stream's
+    /// sequence rather than colliding with it.
+    pub fn next_seqs(&self) -> Result<BTreeMap<(i64, String), u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_id, stream, MAX(seq) + 1 FROM segments \
+                 GROUP BY source_id, stream",
+            )
+            .map_err(Error::sqlite("failed to query segment sequences"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, i64>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(Error::sqlite("failed to query segment sequences"))?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (key, next) = row.map_err(Error::sqlite("failed to read a segment sequence"))?;
+            out.insert(key, next);
+        }
+        Ok(out)
+    }
+
     /// One source's metadata map, as stored.
     pub fn source_metadata(&self, source_id: i64) -> Result<BTreeMap<String, String>> {
         let encoded: String = self
@@ -1975,6 +2018,22 @@ impl Tx<'_> {
     /// Mark the source cleanly finalized. This is what replaced the
     /// `.partial` filename convention: the file is valid from creation, so
     /// "was it finished" is a queryable property instead of a name.
+    /// The inverse of `mark_complete`, for a source a new writer session is
+    /// about to append to: it is no longer finished. `Err` if there is no
+    /// such source.
+    pub fn mark_incomplete(&self, source_id: i64) -> Result<()> {
+        let changed = self
+            .tx
+            .execute("UPDATE sources SET complete = 0 WHERE id = ?1", [source_id])
+            .map_err(Error::sqlite(format!(
+                "failed to reopen source {source_id}"
+            )))?;
+        if changed == 0 {
+            return Err(Error::Message(format!("no source with id {source_id}")));
+        }
+        Ok(())
+    }
+
     pub fn mark_complete(&self, source_id: i64) -> Result<()> {
         self.tx
             .execute("UPDATE sources SET complete = 1 WHERE id = ?1", [source_id])
