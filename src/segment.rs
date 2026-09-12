@@ -30,7 +30,16 @@ use crate::error::{Error, Result};
 /// next batch.
 ///
 /// The writer validates these against the rows it supplied - see
-/// `writer::seal_batch`. An encoder cannot invent coverage it was not given.
+/// `writer::seal_batch`. The check that matters is CONTIGUITY: the writer
+/// counts how many of the rows it handed over fall inside `[first_ts,
+/// last_ts]`, and requires that to equal `rows`. A hole anywhere inside the
+/// claimed span would be rows that end up in no segment and no WAL, because
+/// the prune deletes everything up to `last_ts`.
+///
+/// So an encoder may drop a LEADING or a TRAILING run - both narrow the span
+/// without holing it, and a trailing drop simply leaves those rows live for
+/// the next batch. It may not drop from the middle, and it may not claim rows
+/// its span does not hold.
 #[derive(Debug, PartialEq)]
 pub struct Segment {
     pub bytes: Vec<u8>,

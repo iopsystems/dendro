@@ -84,10 +84,12 @@
 //!   and a completely separate reader (materializing a tail out of an archive
 //!   another *process* is appending to) call it, and the reader has none of the
 //!   writer's in-memory state. Anything an encode needs must travel in the rows.
-//! * An encoder may drop a LEADING run of rows it cannot decode on their own —
-//!   a caller whose rows reference a schema anchor, say. That is why a
-//!   [`Segment`] reports its own row count and start rather than letting the
-//!   catalog assume the input's.
+//! * An encoder may drop a leading or trailing run of rows it cannot decode on
+//!   their own — a caller whose rows reference a schema anchor, say. It may not
+//!   drop from the MIDDLE: the prune deletes every WAL row up to the segment's
+//!   `last_ts`, so a hole inside that span is rows left in no segment and no
+//!   WAL. The writer checks this by counting, not by trusting, and refuses a
+//!   segment whose span does not hold exactly the rows it claims.
 //!
 //! # Shape of the API
 //!

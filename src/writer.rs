@@ -937,26 +937,41 @@ fn seal_batch(
             continue;
         };
         // The encoder is a trust boundary, so check what came back before it
-        // reaches the catalog. Every one of these is cheap and every one of
-        // them, unchecked, is silent: a segment claiming coverage it does not
-        // have makes the prune delete rows that are in no segment, and an
-        // inverted or invented span makes the segment invisible to every range
-        // query while still advancing the watermark.
+        // reaches the catalog — and check the thing that actually matters,
+        // which is not the endpoints.
         //
-        // The rule is that an encoder may drop rows but may not INVENT them:
-        // its span has to sit inside the span it was handed.
+        // The rule dendro needs is that the segment covers a CONTIGUOUS run of
+        // the rows it was given. The prune deletes every WAL row up to
+        // `last_ts`, so a hole anywhere inside the claimed span is a set of
+        // rows that end up in no segment and no WAL — durable, committed, and
+        // unreachable.
+        //
+        // A `(rows, first_ts, last_ts)` triple cannot express that on its own,
+        // which is why checking only that the span sits inside the input's span
+        // let a middle drop through. But the writer is holding the input, so it
+        // can just count: how many of the rows handed over fall inside the
+        // claimed span? If that is not exactly `tail.rows`, the segment has a
+        // hole in it, or claims rows it was never given.
+        //
+        // An encoder may still drop a LEADING or TRAILING run — both narrow the
+        // span without holing it, and a trailing drop simply leaves those rows
+        // live for the next batch.
         let first_in = rows.first().expect("checked non-empty above").ts;
+        let covered = rows
+            .iter()
+            .filter(|r| r.ts >= tail.first_ts && r.ts <= tail.last_ts)
+            .count() as u64;
         if tail.rows == 0
-            || tail.rows > rows.len() as u64
             || tail.first_ts > tail.last_ts
             || tail.first_ts < first_in
             || tail.last_ts > last_ts
+            || tail.rows != covered
         {
             return Err(Error::EncoderContract {
                 stream: stream.clone(),
                 detail: format!(
-                    "it claims {} row(s) over [{}, {}], from {} row(s) over \
-                     [{first_in}, {last_ts}]",
+                    "it claims {} row(s) over [{}, {}]; that span holds {covered} \
+                     of the {} row(s) it was given over [{first_in}, {last_ts}]",
                     tail.rows,
                     tail.first_ts,
                     tail.last_ts,

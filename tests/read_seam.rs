@@ -513,3 +513,114 @@ fn everything_copies_rows_from_before_the_epoch() {
         "a pre-epoch segment and a pre-epoch WAL tail must both survive"
     );
 }
+
+/// An encoder that drops a MIDDLE run must not cost the dropped rows.
+///
+/// The validation checked that the encoder's span sits inside the input's
+/// span — five predicates on `(rows, first_ts, last_ts)`. An encoder keeping
+/// the first and last row and dropping what is between satisfies all five, and
+/// the prune to `last_ts` then deletes every row. A triple of endpoints cannot
+/// express coverage, so no check on that triple can enforce it.
+#[test]
+#[cfg(feature = "write")]
+fn an_encoder_that_drops_a_middle_run_does_not_lose_the_rows() {
+    use dendro::writer::Archive;
+
+    /// Keeps the first and last row only — the shape that slipped through.
+    struct DropsMiddle;
+    impl SegmentEncoder for DropsMiddle {
+        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+            if rows.len() < 3 {
+                return Tags.encode(stream, rows);
+            }
+            let ends = [rows[0].clone(), rows[rows.len() - 1].clone()];
+            Tags.encode(stream, &ends)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Archive::create(&path, Box::new(DropsMiddle)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    for ts in 1..=4i64 {
+        src.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![1],
+        }])
+        .unwrap();
+    }
+    src.seal(vec!["s".to_string()]).unwrap();
+
+    // Either outcome is acceptable: refuse the segment, or catalog and prune
+    // only what it really covers. What is NOT acceptable is rows 2 and 3 being
+    // deleted from the WAL while living in no segment.
+    match src.sync() {
+        Err(e) => assert!(
+            matches!(e.root(), dendro::Error::EncoderContract { .. }),
+            "if it is refused, it must be refused as a contract breach: {e:?}"
+        ),
+        Ok(()) => {
+            let db = Db::open_read_only(&path).unwrap();
+            let live: Vec<i64> = db.live_wal(1, "s").unwrap().iter().map(|r| r.ts).collect();
+            let sealed: Vec<String> = db
+                .read_segments(1, "s")
+                .unwrap()
+                .iter()
+                .map(|s| String::from_utf8_lossy(&s.bytes).to_string())
+                .collect();
+            panic!("rows 2 and 3 are in no segment and no WAL. sealed={sealed:?} live={live:?}");
+        }
+    }
+}
+
+/// An encoder claiming more rows than its span holds is refused.
+///
+/// This shape duplicated rows rather than losing them: encode all N rows but
+/// understate `last_ts` by one, and that row is inside the segment AND still
+/// past the watermark, so the reader splices it twice and the next seal writes
+/// it again. The endpoint check could not see it — every endpoint was in
+/// range. Counting the input rows inside the claimed span can.
+#[test]
+#[cfg(feature = "write")]
+fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
+    use dendro::writer::Archive;
+
+    struct UnderstatesLast;
+    impl SegmentEncoder for UnderstatesLast {
+        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+            let Some(mut seg) = Tags.encode(stream, rows)? else {
+                return Ok(None);
+            };
+            if rows.len() > 1 {
+                // All the rows, but a span one row short of covering them.
+                seg.last_ts = rows[rows.len() - 2].ts;
+            }
+            Ok(Some(seg))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Archive::create(&path, Box::new(UnderstatesLast)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    for ts in 1..=3i64 {
+        src.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![1],
+        }])
+        .unwrap();
+    }
+    src.seal(vec!["s".to_string()]).unwrap();
+
+    let err = src
+        .sync()
+        .expect_err("a span that does not hold its rows is a breach");
+    assert!(
+        matches!(err.root(), dendro::Error::EncoderContract { .. }),
+        "got: {err:?}"
+    );
+}
