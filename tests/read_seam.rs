@@ -624,3 +624,64 @@ fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
         "got: {err:?}"
     );
 }
+
+/// A copy catalogs the tail it actually wrote, not the rows it was given.
+///
+/// `rewrite` kept taking `last_ts` from the raw input after `Segment` gained
+/// its own, behind the comment the contract was rewritten to repudiate — so a
+/// copied archive advertised coverage up to a timestamp its parquet does not
+/// hold, and every later `combine` propagated it.
+#[test]
+#[cfg(feature = "write")]
+fn a_copy_catalogs_the_tail_it_wrote() {
+    use dendro::db::SegmentMeta;
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+
+    /// Drops the newest row, the way an encoder waiting on a complete record
+    /// would.
+    struct DropsLast;
+    impl SegmentEncoder for DropsLast {
+        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+            if rows.len() < 2 {
+                return Ok(None);
+            }
+            Tags.encode(stream, &rows[..rows.len() - 1])
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let dst_path = dir.path().join("dst.dendro");
+
+    let mut src = Db::create(&src_path).unwrap();
+    let id = src.insert_source(&source()).unwrap();
+    for ts in 1..=3i64 {
+        src.insert_wal_rows(
+            id,
+            &[WalRow {
+                stream: "s".to_string(),
+                ts,
+                wall_offset: 0,
+                row: vec![1],
+            }],
+        )
+        .unwrap();
+    }
+
+    let mut dst = Db::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &DropsLast))
+        .unwrap();
+
+    let db = Db::open_read_only(&dst_path).unwrap();
+    let meta: Vec<SegmentMeta> = db
+        .read_segment_meta(1, "s")
+        .unwrap()
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect();
+    assert_eq!(
+        (meta[0].first_ts, meta[0].last_ts),
+        (1, 2),
+        "the catalog must describe the bytes, which stop at ts=2"
+    );
+}
