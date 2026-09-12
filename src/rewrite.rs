@@ -199,37 +199,8 @@ fn copy_sources_snapshotted(
             // else: every catalog fact below comes from what actually
             // materializes. Cataloguing the raw tail's span would claim rows
             // the bytes do not contain — at either end.
-            let materialized = encoder
-                .encode(&table, &tail)
-                .map_err(|e| Error::Message(format!("failed to seal the {table} tail: {e}")))?;
+            let materialized = crate::segment::materialize(encoder, &table, &tail)?;
             if let Some(materialized) = materialized {
-                // The same contiguity check the writer runs, for the same
-                // reason and against the same failure. This is the crate's
-                // second `encode` call site, and it used to perform no
-                // validation at all.
-                let first_in = tail.first().expect("non-empty tail").ts;
-                let covered = tail
-                    .iter()
-                    .filter(|r| r.ts >= materialized.first_ts && r.ts <= materialized.last_ts)
-                    .count() as u64;
-                if materialized.rows == 0
-                    || materialized.first_ts > materialized.last_ts
-                    || materialized.first_ts < first_in
-                    || materialized.last_ts > last.ts
-                    || materialized.rows != covered
-                {
-                    return Err(Error::EncoderContract {
-                        stream: table.clone(),
-                        detail: format!(
-                            "materializing the tail claimed {} row(s) over [{}, {}]; \
-                             that span holds {covered} of the {} row(s) it was given",
-                            materialized.rows,
-                            materialized.first_ts,
-                            materialized.last_ts,
-                            tail.len()
-                        ),
-                    });
-                }
                 let meta = SegmentMeta {
                     rows: materialized.rows,
                     first_ts: materialized.first_ts,

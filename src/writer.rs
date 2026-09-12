@@ -962,39 +962,6 @@ fn commit_tick(
     }
 }
 
-/// Run the caller's encoder on the writer thread, turning a panic into the
-/// encoder's error rather than a dead thread every handle reports as
-/// `WriterGone`. The PANIC-FREE contract at the top of this file covers
-/// dendro's own code; the encoder is the one piece of the caller's that runs
-/// here.
-fn encode_guarded(
-    encoder: &(dyn SegmentEncoder + Send),
-    stream: &str,
-    rows: &[WalRow],
-) -> Result<Option<crate::segment::Segment>> {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        encoder.encode(stream, rows)
-    }));
-    match outcome {
-        Ok(Ok(segment)) => Ok(segment),
-        Ok(Err(source)) => Err(Error::Encoder {
-            stream: stream.to_string(),
-            source,
-        }),
-        Err(payload) => {
-            let what = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            Err(Error::Encoder {
-                stream: stream.to_string(),
-                source: format!("the encoder panicked: {what}").into(),
-            })
-        }
-    }
-}
-
 /// Append a writer session to a source's `WRITER_SESSIONS` metadata — and,
 /// for a resume, a `writer_session` event under `EVENTS` at the new anchor.
 fn record_session(
@@ -1428,7 +1395,7 @@ fn seal_batch(
     let mut observation: Option<(i64, i64)> = None;
     for stream in batch {
         let rows = db.live_wal(source_id, &stream)?;
-        let Some(last) = rows.last() else {
+        if rows.is_empty() {
             // No live rows: nothing to catalog and nothing to prune. A stream
             // whose rows were all sealed already is not an error worth failing
             // the source over.
@@ -1445,60 +1412,12 @@ fn seal_batch(
                 );
             }
             continue;
-        };
-        // The raw span's last row. This is the UPPER BOUND the encoder's
-        // answer is checked against, not a catalog fact: it says how far the
-        // encoder was allowed to claim coverage, and nothing more. It used to
-        // be written into the catalog and used for the prune, on the reasoning
-        // that a dropped run is always a leading one — which is circular, since
-        // the prune is what destroyed the evidence when it was not.
-        let last_ts = last.ts;
-        let Some(tail) = encode_guarded(encoder, &stream, &rows)? else {
+        }
+        // One contract for the three encode sites — see `segment::materialize`
+        // for what it checks and why counting is the only check that works.
+        let Some(tail) = crate::segment::materialize(encoder, &stream, &rows)? else {
             continue;
         };
-        // The encoder is a trust boundary, so check what came back before it
-        // reaches the catalog — and check the thing that actually matters,
-        // which is not the endpoints.
-        //
-        // The rule dendro needs is that the segment covers a CONTIGUOUS run of
-        // the rows it was given. The prune deletes every WAL row up to
-        // `last_ts`, so a hole anywhere inside the claimed span is a set of
-        // rows that end up in no segment and no WAL — durable, committed, and
-        // unreachable.
-        //
-        // A `(rows, first_ts, last_ts)` triple cannot express that on its own,
-        // which is why checking only that the span sits inside the input's span
-        // let a middle drop through. But the writer is holding the input, so it
-        // can just count: how many of the rows handed over fall inside the
-        // claimed span? If that is not exactly `tail.rows`, the segment has a
-        // hole in it, or claims rows it was never given.
-        //
-        // An encoder may still drop a LEADING or TRAILING run — both narrow the
-        // span without holing it, and a trailing drop simply leaves those rows
-        // live for the next batch.
-        let first_in = rows.first().expect("checked non-empty above").ts;
-        let covered = rows
-            .iter()
-            .filter(|r| r.ts >= tail.first_ts && r.ts <= tail.last_ts)
-            .count() as u64;
-        if tail.rows == 0
-            || tail.first_ts > tail.last_ts
-            || tail.first_ts < first_in
-            || tail.last_ts > last_ts
-            || tail.rows != covered
-        {
-            return Err(Error::EncoderContract {
-                stream: stream.clone(),
-                detail: format!(
-                    "it claims {} row(s) over [{}, {}]; that span holds {covered} \
-                     of the {} row(s) it was given over [{first_in}, {last_ts}]",
-                    tail.rows,
-                    tail.first_ts,
-                    tail.last_ts,
-                    rows.len()
-                ),
-            });
-        }
         // The batch's clock observation: ONE row's `(ts, wall_offset)`, never
         // one row's timestamp against another's offset. The series is a
         // projection of the rows it summarizes, so an entry has to be a pair

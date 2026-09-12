@@ -10,10 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::Db;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::segment::SegmentEncoder;
 
 /// One source's contents, resolved to bytes.
+#[derive(Debug)]
 pub struct SourceSegments {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
@@ -112,34 +113,10 @@ fn stream_segments_snapshotted(
         .map(|s| s.bytes)
         .collect();
     let live = db.live_wal(source_id, stream)?;
-    if let Some(tail) = encoder
-        .encode(stream, &live)
-        .map_err(|source| Error::Encoder {
-            stream: stream.to_string(),
-            source,
-        })?
-    {
-        // Cross-checked against the span the catalog would have recorded. The
-        // writer validates the same thing when it seals; a reader materializing
-        // the same rows with the same encoder must agree, and if it does not,
-        // the encoder is not deterministic and the tail is not what the next
-        // seal will write. Cheap, and it was one line away from being skipped
-        // entirely — `tail.rows` and `tail.first_ts` were discarded here.
-        if let Some(first) = live.first() {
-            if tail.first_ts < first.ts || tail.rows > live.len() as u64 {
-                return Err(Error::EncoderContract {
-                    stream: stream.to_string(),
-                    detail: format!(
-                        "materializing the live tail claimed {} row(s) from {}, \
-                         starting at {} before the first live row {}",
-                        tail.rows,
-                        live.len(),
-                        tail.first_ts,
-                        first.ts
-                    ),
-                });
-            }
-        }
+    // The same contract the writer enforces when it seals, so a reader and
+    // the next seal agree about the tail. This used to check less than the
+    // writer, and an encoder the seal refused was materialized silently here.
+    if let Some(tail) = crate::segment::materialize(encoder, stream, &live)? {
         segments.push(tail.bytes);
     }
     Ok(segments)

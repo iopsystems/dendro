@@ -71,6 +71,84 @@ pub trait SegmentEncoder {
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
 }
 
+/// Run an encoder over a run of WAL rows and check what came back — the ONE
+/// place the encoder contract is enforced, for all three callers: the writer
+/// when it seals, a copy when it carries a live tail across, and a reader
+/// materializing a tail. They used to check three different things, and the
+/// reader's was the weakest, so an encoder the seal refused was materialized
+/// silently on read: the reader and the next seal disagreed about the tail.
+///
+/// The check is CONTIGUITY, by counting: the rows handed over that fall
+/// inside `[first_ts, last_ts]` must number exactly `rows`. A hole anywhere
+/// inside the claimed span would be rows that end up in no segment and no
+/// WAL, because the prune deletes everything up to `last_ts`. An encoder may
+/// still drop a LEADING or TRAILING run — both narrow the span without
+/// holing it. `first_ts`/`last_ts` must also lie inside the input's span,
+/// and a segment claiming no rows is refused (return `None` instead).
+///
+/// A panic inside the encoder is the encoder's failure and is returned as
+/// [`Error::Encoder`], not propagated: on the writer thread a propagating
+/// panic left every handle reporting `WriterGone`. `Ok(None)` for an empty
+/// input without calling the encoder at all.
+pub fn materialize(
+    encoder: &dyn SegmentEncoder,
+    stream: &str,
+    rows: &[WalRow],
+) -> Result<Option<Segment>> {
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return Ok(None);
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encoder.encode(stream, rows)
+    }));
+    let segment = match outcome {
+        Ok(Ok(Some(segment))) => segment,
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(source)) => {
+            return Err(Error::Encoder {
+                stream: stream.to_string(),
+                source,
+            })
+        }
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            return Err(Error::Encoder {
+                stream: stream.to_string(),
+                source: format!("the encoder panicked: {what}").into(),
+            });
+        }
+    };
+    let covered = rows
+        .iter()
+        .filter(|r| r.ts >= segment.first_ts && r.ts <= segment.last_ts)
+        .count() as u64;
+    if segment.rows == 0
+        || segment.first_ts > segment.last_ts
+        || segment.first_ts < first.ts
+        || segment.last_ts > last.ts
+        || segment.rows != covered
+    {
+        return Err(Error::EncoderContract {
+            stream: stream.to_string(),
+            detail: format!(
+                "it claims {} row(s) over [{}, {}]; that span holds {covered} of the {} \
+                 row(s) it was given over [{}, {}]",
+                segment.rows,
+                segment.first_ts,
+                segment.last_ts,
+                rows.len(),
+                first.ts,
+                last.ts
+            ),
+        });
+    }
+    Ok(Some(segment))
+}
+
 /// What an encoder returns.
 ///
 /// A boxed `std::error::Error` rather than this crate's own: the failure is the
