@@ -5,6 +5,7 @@ is authoritative for lifecycle status.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
+| 2026-09-11 | [Container hardening: failure classes, identity, sessions, and one materialization](2026-09-11-container-hardening.md) | in-progress |
 | 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | open |
 | 2026-09-11 | [Out-of-order appends are accepted and never read](2026-09-11-out-of-order-appends.md) | open |
 | 2026-09-11 | [One source's bad tick kills the writer for the whole archive](2026-09-11-writer-failure-blast-radius.md) | open |
