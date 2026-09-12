@@ -267,11 +267,26 @@ turning a text file into a SQLite error. The blast-radius entry is resolved
 by item 2; the encoder-boundary, out-of-order and compaction entries are
 untouched and still open.
 
+## Deferred items, worked
+
+Taken up after the eight items landed, in value order. Each is recorded
+here as it lands; the list below is what remained when the entry closed.
+
+**Lazy catalog read (landed).** `read::catalog` answers every catalog
+question — sources with their uuid, labels, metadata and completeness; per
+stream the segment count, the sealed span and the live span — in one
+snapshot with no BLOB read. `read::probe` fetches the one segment a schema
+needs (the first sealed one, or the materialized tail for a stream still
+inside its first seal period). `read::stream_range` reads a time window:
+whole segments at the edges, the tail trimmed to the range since it is
+materialized anyway. `SegmentBytes::at_path` and `::shared` construct the
+lazy handle that nothing in the crate produced before. This is the shape
+rezolus built above the crate to take a query from 572 to 23 ms; it now
+lives where the next consumer finds it. `read_archive` is unchanged as the
+simple whole answer. `tests/catalog.rs` covers each.
+
 ## Deferred or Reopen Items
 
-- **Lazy catalog read.** `read_archive` materializes every BLOB of every
-  stream; `SegmentBytes` exists and nothing produces one. Reopen with the
-  first consumer that opens an archive wider than it reads.
 - **Encoder version marker.** One reserved key written at `add_source`,
   compared on read, refused on mismatch. Reopen once item 4's primitive
   exists; a one-line follow-on.

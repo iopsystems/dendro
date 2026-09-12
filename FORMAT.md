@@ -223,7 +223,12 @@ The rules a reader must follow; `src/read.rs` is the reference.
 4. **Materialize through `segment::materialize`**, which runs the encoder
    and checks its answer against the rows it was given — the same check the
    writer runs at seal, so a reader and the next seal agree about the tail.
-5. **Prefer `Db::open_read_only`.** `Db::open` is a read-write connection,
+5. **Open lazily.** `read::catalog` answers every catalog question in one
+   snapshot with no BLOB read; `read::probe` fetches one segment for a
+   schema; `read::stream_range` reads a window; `SegmentBytes` fetches a
+   stream's payload only when it is read. Opening every stream to learn
+   its names was measured at 91% of a query's time on streams it never read.
+6. **Prefer `Db::open_read_only`.** `Db::open` is a read-write connection,
    and SQLite checkpoints the archive when the last such connection closes;
    a reader that must leave its subject alone, or that reads read-only
    media, uses the read-only open.

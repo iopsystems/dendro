@@ -164,6 +164,12 @@ extracted from.
   `archive_bytes` are what a size cap walks. Freed pages trickle back to the
   filesystem, which is what bounds a rolling buffer. dendro supplies the
   mechanism and never applies a policy of its own.
+- **A lazy read.** `read::catalog` answers what sources and streams exist
+  and what each spans in one snapshot without touching a segment;
+  `read::probe` fetches the one segment a schema needs; `read::stream_range`
+  reads a time window; and `SegmentBytes` fetches a stream's payload only
+  when it is actually read. `read::read_archive` is still the simple whole
+  answer.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.

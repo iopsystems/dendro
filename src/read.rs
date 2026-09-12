@@ -9,9 +9,162 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::db::Db;
+use crate::db::{Db, Span};
 use crate::error::Result;
 use crate::segment::SegmentEncoder;
+
+/// A stream as the catalog sees it: how much is sealed, how much is live,
+/// and the span the two cover. **No BLOB is read** to answer this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCatalog {
+    pub name: String,
+    /// How many sealed segments the stream has.
+    pub segments: u64,
+    /// The sealed segments' rows and span.
+    pub sealed: Span,
+    /// The live WAL tail's rows and span — rows past the newest segment,
+    /// which a reader materializes as one more.
+    pub live: Span,
+}
+
+impl StreamCatalog {
+    /// Rows a reader will see: sealed plus live.
+    pub fn rows(&self) -> u64 {
+        self.sealed.rows + self.live.rows
+    }
+
+    /// The span a reader will see, sealed and live together; `None` for a
+    /// stream with no rows.
+    pub fn span(&self) -> Option<(i64, i64)> {
+        let first = [self.sealed.first_ts, self.live.first_ts]
+            .into_iter()
+            .flatten()
+            .min()?;
+        let last = [self.sealed.last_ts, self.live.last_ts]
+            .into_iter()
+            .flatten()
+            .max()?;
+        Some((first, last))
+    }
+}
+
+/// A source as the catalog sees it, with every stream it currently holds.
+#[derive(Debug, Clone)]
+pub struct SourceCatalog {
+    pub id: i64,
+    pub uuid: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
+    pub complete: bool,
+    pub clock_anchor_wall_ns: i64,
+    pub streams: Vec<StreamCatalog>,
+}
+
+impl SourceCatalog {
+    /// The source's span across every stream; `None` when it holds no rows.
+    pub fn span(&self) -> Option<(i64, i64)> {
+        let spans: Vec<(i64, i64)> = self.streams.iter().filter_map(|s| s.span()).collect();
+        Some((
+            spans.iter().map(|s| s.0).min()?,
+            spans.iter().map(|s| s.1).max()?,
+        ))
+    }
+}
+
+/// Everything the catalog knows about the archive, in ONE snapshot and
+/// without reading a segment.
+///
+/// This is the open a lazy reader wants: which sources and streams exist,
+/// what each spans, how much is still live — enough to answer "what is in
+/// here" and "which streams could this query touch" before any payload is
+/// fetched. A reader that opened every stream to learn its names was
+/// measured at 91% of its query time on streams it never read; this, plus
+/// [`probe`] for the one segment a schema needs and [`SegmentBytes`] for
+/// the rest on demand, is the shape that fixed it.
+pub fn catalog(db: &Db) -> Result<Vec<SourceCatalog>> {
+    db.read_snapshot(|db| {
+        let mut out = Vec::new();
+        for src in db.read_sources()? {
+            let mut streams = Vec::new();
+            for name in db.all_streams(src.id)? {
+                let (segments, sealed) = db.segment_span(src.id, &name)?;
+                let live = db.live_wal_span(src.id, &name)?;
+                streams.push(StreamCatalog {
+                    name,
+                    segments,
+                    sealed,
+                    live,
+                });
+            }
+            out.push(SourceCatalog {
+                id: src.id,
+                uuid: src.uuid,
+                labels: src.meta.labels,
+                metadata: src.meta.metadata,
+                complete: src.complete,
+                clock_anchor_wall_ns: src.meta.clock_anchor_wall_ns,
+                streams,
+            });
+        }
+        Ok(out)
+    })
+}
+
+/// ONE segment of a stream, for a caller that needs to learn the stream's
+/// schema — the columns, the names — before deciding whether to read it.
+///
+/// The first sealed segment when there is one; otherwise the live tail,
+/// materialized, since a stream still inside its first seal period has
+/// nothing else and is exactly the stream a reader must not overlook.
+/// `None` for a stream with no rows. One snapshot, so the segment and the
+/// tail cannot come from different instants.
+pub fn probe(
+    db: &Db,
+    source_id: i64,
+    stream: &str,
+    encoder: &dyn SegmentEncoder,
+) -> Result<Option<Vec<u8>>> {
+    db.read_snapshot(|db| {
+        if let Some((seq, _)) = db.read_segment_meta(source_id, stream)?.first() {
+            return db.read_segment_bytes(source_id, stream, *seq);
+        }
+        let live = db.live_wal(source_id, stream)?;
+        Ok(crate::segment::materialize(encoder, stream, &live)?.map(|t| t.bytes))
+    })
+}
+
+/// A stream's segments overlapping `[start, end]`, oldest first, with the
+/// live tail trimmed to the range and spliced on as the newest.
+///
+/// Whole segments at the edges — a segment is an immutable BLOB and is not
+/// cut — so a caller gets a little more than it asked for at each end; the
+/// tail is rows, and IS trimmed, since it is materialized here anyway. One
+/// snapshot.
+pub fn stream_range(
+    db: &Db,
+    source_id: i64,
+    stream: &str,
+    start: i64,
+    end: i64,
+    encoder: &dyn SegmentEncoder,
+) -> Result<Vec<Vec<u8>>> {
+    db.read_snapshot(|db| {
+        let mut segments: Vec<Vec<u8>> = db
+            .segments_overlapping(source_id, stream, start, end)?
+            .into_iter()
+            .map(|s| s.bytes)
+            .collect();
+        let live: Vec<_> = db
+            .live_wal(source_id, stream)?
+            .into_iter()
+            .filter(|r| r.ts >= start && r.ts <= end)
+            .collect();
+        if let Some(tail) = crate::segment::materialize(encoder, stream, &live)? {
+            segments.push(tail.bytes);
+        }
+        Ok(segments)
+    })
+}
 
 /// One source's contents, resolved to bytes.
 #[derive(Debug)]
@@ -124,9 +277,11 @@ fn stream_segments_snapshotted(
 
 /// Where one stream's segment bytes come from, resolved lazily.
 ///
-/// **Nothing in this crate produces one.** It is here for a caller doing its
-/// own lazy resolution — typically one that needs a stream's names at open and
-/// its bytes only when that stream is actually read.
+/// The other half of [`catalog`]: a caller learns what streams exist and
+/// what they span from the catalog, probes the one segment a schema needs
+/// with [`probe`], and holds one of these per stream to fetch the rest only
+/// when that stream is actually read. [`at_path`](Self::at_path) and
+/// [`shared`](Self::shared) construct one.
 ///
 /// Named for the bytes rather than the origin because `source` already means
 /// something else here: one producer, one clock domain, one label set.
@@ -158,6 +313,26 @@ pub enum SegmentBytes {
 }
 
 impl SegmentBytes {
+    /// A stream whose bytes will be fetched from the archive at `path`,
+    /// through a read-only connection opened per fetch.
+    pub fn at_path(path: PathBuf, source_id: i64, stream: String) -> Self {
+        SegmentBytes::Db {
+            path,
+            source_id,
+            stream,
+        }
+    }
+
+    /// A stream whose bytes will be fetched through a shared, already-open
+    /// connection — for a byte-backed archive, which has no path to reopen.
+    pub fn shared(db: Arc<std::sync::Mutex<Db>>, source_id: i64, stream: String) -> Self {
+        SegmentBytes::SharedDb {
+            db,
+            source_id,
+            stream,
+        }
+    }
+
     /// Every segment of this stream, materialized. Call it when the stream is
     /// actually read.
     pub fn all(&self, encoder: &dyn SegmentEncoder) -> Result<Vec<Vec<u8>>> {
