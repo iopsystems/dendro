@@ -146,6 +146,46 @@
 //! [`SegmentEncoder`]: segment::SegmentEncoder
 //! [`Segment`]: segment::Segment
 
+/// Reserved `sources.metadata` keys.
+///
+/// The metadata map is the caller's, and dendro reads none of it. These are
+/// the keys with an agreed meaning across callers, so that a tool built on
+/// one producer's archives can read another's. dendro *writes* exactly one of
+/// them itself ([`WRITER_SESSIONS`], and an [`EVENTS`] entry alongside it
+/// when a source is resumed); the rest are conventions a producer follows
+/// through [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata),
+/// which is what lets them be written *during* a recording rather than only
+/// at finalize, which an unclean kill never reaches.
+pub mod keys {
+    /// The observed producer's current **counter epoch**: an opaque id the
+    /// producer regenerates whenever its cumulative counters start from zero
+    /// (for a process-scoped producer, once per process). Two sources with
+    /// equal epochs over overlapping time are two observations of ONE
+    /// monotonic series — mergeable, never summable; a change of epoch
+    /// mid-source is a counter reset a reader can see rather than infer from
+    /// a value going backwards. OpenTelemetry's `start_time_unix_nano` is the
+    /// precedent. Absent means unknown.
+    pub const PRODUCER_EPOCH: &str = "producer_epoch";
+    /// Every epoch the source observed, in order: a JSON array of
+    /// `{"epoch": <id>, "from_ts": <first row timestamp>}`. The current one is
+    /// its last element and is also under [`PRODUCER_EPOCH`].
+    pub const PRODUCER_EPOCHS: &str = "producer_epochs";
+    /// Every writer session that appended to the source, in order: a JSON
+    /// array of `{"session": <uuid>, "clock_anchor_wall_ns": <anchor>,
+    /// "resumed_after_ts": <ts>}` — the last field only on a session that
+    /// reopened the archive, naming the newest row the previous session
+    /// left. One entry means the source was written in one go. Written by
+    /// dendro.
+    pub const WRITER_SESSIONS: &str = "writer_sessions";
+    /// Timeline events: JSON `{"events": [ { "timestamp": <ts>,
+    /// "description": <text>, "kind": <tag>?, "details": <text>?, "id":
+    /// <stable id>? }, … ]}`. `kind` `producer_epoch` marks a counter reset;
+    /// `writer_session` marks a resume; `id` lets a merge de-duplicate. The
+    /// shape is open — a viewer's own event schema may carry more fields —
+    /// and dendro appends to the array rather than replacing it.
+    pub const EVENTS: &str = "events";
+}
+
 /// The container: schema, catalog, and every statement that touches SQL.
 pub mod db;
 /// What can go wrong.

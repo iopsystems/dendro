@@ -1792,6 +1792,39 @@ impl Db {
     /// column: `annotate` changes it and nothing else, and rewriting an
     /// archive's every segment BLOB to edit one JSON string would make a
     /// cheap operation cost the size of the source.
+    /// One source's metadata map, as stored.
+    pub fn source_metadata(&self, source_id: i64) -> Result<BTreeMap<String, String>> {
+        let encoded: String = self
+            .conn
+            .query_row(
+                "SELECT metadata FROM sources WHERE id = ?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to read the metadata of source {source_id}"
+            )))?;
+        serde_json::from_str(&encoded)
+            .map_err(|e| Error::Message(format!("source {source_id} has invalid metadata: {e}")))
+    }
+
+    /// Merge `patch` into a source's metadata: keys in the patch replace the
+    /// stored value, every other key is kept. A read-modify-write on this
+    /// connection, so it belongs to whoever owns the connection — during a
+    /// recording, the writer thread, through
+    /// [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata).
+    pub fn patch_source_metadata(
+        &self,
+        source_id: i64,
+        patch: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut metadata = self.source_metadata(source_id)?;
+        for (k, v) in patch {
+            metadata.insert(k.clone(), v.clone());
+        }
+        self.update_source_metadata(source_id, &metadata)
+    }
+
     pub fn update_source_metadata(
         &self,
         source_id: i64,

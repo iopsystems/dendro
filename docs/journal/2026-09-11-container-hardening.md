@@ -177,6 +177,23 @@ decision, since dendro has no combine of its own. `SCHEMA_VERSION` stays 4:
 a nullable column an old reader ignores is additive. Eight tests in
 `tests/identity.rs`, in the reader build too.
 
+**4. Metadata during a recording (landed).** `Msg::UpdateMetadata` carries
+a patch through the writer's channel, so it lands in order with the ticks
+around it and on the one writing connection; `Db::patch_source_metadata`
+is the read-modify-write (`source_metadata` is the read). A patch that
+cannot land — a lock that outlasts the retries, a source the writer cannot
+find — is logged and skipped, never fatal: metadata is not the recording,
+and a caller that must know follows with `sync` and reads it back.
+`dendro::keys` names the reserved keys as conventions: `producer_epoch`,
+`producer_epochs`, `writer_sessions`, `events`, with the OpenTelemetry
+`start_time_unix_nano` precedent for the epoch and the rule that dendro
+writes only `writer_sessions` (and an event beside it) itself — a producer
+that knows its counters reset writes the epoch keys through this primitive,
+and the container never has to learn what a row means to carry it. Tests:
+a patch is visible from a second connection after `sync` with no finalize,
+merges rather than replaces, and a patch to a deleted source leaves the
+writer answering the next hand-off.
+
 ## Outcome
 
 In progress.

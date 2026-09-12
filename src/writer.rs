@@ -81,6 +81,15 @@ enum Msg {
         streams: Option<StreamFilter>,
         reply: SyncSender<Result<Evicted>>,
     },
+    /// Merge keys into one source's metadata, in order with the ticks around
+    /// it. What a caller learns only from the rows themselves — a producer's
+    /// epoch changing, a discontinuity worth an event — lands here as it
+    /// happens rather than at finalize, which a kill never reaches. See
+    /// [`crate::keys`] for the conventions.
+    UpdateMetadata {
+        source_id: i64,
+        patch: BTreeMap<String, String>,
+    },
     /// One source's last clock observation; marks *that* source complete.
     ///
     /// Does NOT stop the writer: an archive may hold several sources and the
@@ -488,6 +497,24 @@ impl SourceWriter {
         self.send(Msg::Seal {
             source_id: self.source_id,
             batch,
+        })
+    }
+
+    /// Merge `patch` into this source's metadata, ordered with the ticks
+    /// around it and committed on its own. Fire-and-forget like `wal`.
+    ///
+    /// Metadata is not the recording: a patch that cannot be applied — a
+    /// lock that outlasts the retries, a source the writer cannot find — is
+    /// logged and skipped, never a reason to stop the writer. A caller that
+    /// must know it landed follows with [`sync`](Self::sync) and reads it
+    /// back.
+    pub fn update_metadata(&mut self, patch: BTreeMap<String, String>) -> Result<()> {
+        if patch.is_empty() {
+            return self.check_alive();
+        }
+        self.send(Msg::UpdateMetadata {
+            source_id: self.source_id,
+            patch,
         })
     }
 
@@ -963,6 +990,18 @@ fn writer_loop(
                 // not the recording's.
                 if let Err(e) = reclaim_if_fragmented(db) {
                     warn!("reclaiming freed pages after retention failed ({e}); skipped");
+                }
+            }
+            Ok(Msg::UpdateMetadata { source_id, patch }) => {
+                // Never fatal: metadata is not the recording, and the caller
+                // was told how to find out whether it landed.
+                if let Err(e) = with_retries("updating source metadata", || {
+                    db.patch_source_metadata(source_id, &patch)
+                }) {
+                    warn!(
+                        "metadata update for source {source_id} dropped ({e}); keys: {:?}",
+                        patch.keys().collect::<Vec<_>>()
+                    );
                 }
             }
             Ok(Msg::Finalize {
