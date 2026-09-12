@@ -116,7 +116,20 @@ commit path. Those controls are repeated here as each item lands.
 
 ## Design and Implementation
 
-Recorded per item as it lands, below the plan.
+Recorded per item as it lands.
+
+**1. Result codes (landed).** `Error::Sqlite` is now `{ context, source:
+rusqlite::Error }`; `Error::sqlite(context)` is the `map_err` adapter, and
+every SQLite call in `db.rs` uses it — 75 sites converted mechanically, the
+five serde and I/O sites left as `Message` because they never had a code.
+`sqlite_code()` looks through `Error::Writer` so a handle can classify the
+thread's failure without unwrapping; `is_retryable()` is
+BUSY/LOCKED/FULL/IOERR/NOMEM/INTERRUPT/SCHEMA and `is_constraint()` is
+CONSTRAINT (primary code, so the extended `_PRIMARYKEY` classifies too).
+Display keeps the old wording (`context: source`), so nothing matching on
+text broke. Not `thiserror`: the crate takes no dependency it can write in
+forty lines. Tests in `error.rs` cover the classification table, context
+wrapping, and the writer look-through.
 
 ## Outcome
 

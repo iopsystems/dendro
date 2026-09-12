@@ -228,7 +228,7 @@ impl Db {
     /// serialized straight to bytes has any use for.
     pub fn create_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
-            .map_err(|e| Error::Message(format!("failed to open an in-memory database: {e}")))?;
+            .map_err(Error::sqlite("failed to open an in-memory database"))?;
         let db = Db {
             conn,
             legacy: false,
@@ -240,13 +240,13 @@ impl Db {
         db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
         db.conn
             .execute_batch(SCHEMA_SQL)
-            .map_err(|e| Error::Message(format!("failed to create archive schema: {e}")))?;
+            .map_err(Error::sqlite("failed to create archive schema"))?;
         db.conn
             .execute(
                 "INSERT INTO schema_version(version) VALUES (?1)",
                 [SCHEMA_VERSION],
             )
-            .map_err(|e| Error::Message(format!("failed to record archive schema version: {e}")))?;
+            .map_err(Error::sqlite("failed to record archive schema version"))?;
         Ok(db)
     }
 
@@ -257,7 +257,7 @@ impl Db {
         let data = self
             .conn
             .serialize(rusqlite::MAIN_DB)
-            .map_err(|e| Error::Message(format!("failed to serialize the archive: {e}")))?;
+            .map_err(Error::sqlite("failed to serialize the archive"))?;
         Ok(data.to_vec())
     }
 
@@ -373,13 +373,13 @@ impl Db {
 
         db.conn
             .execute_batch(SCHEMA_SQL)
-            .map_err(|e| Error::Message(format!("failed to create archive schema: {e}")))?;
+            .map_err(Error::sqlite("failed to create archive schema"))?;
         db.conn
             .execute(
                 "INSERT INTO schema_version(version) VALUES (?1)",
                 [SCHEMA_VERSION],
             )
-            .map_err(|e| Error::Message(format!("failed to record archive schema version: {e}")))?;
+            .map_err(Error::sqlite("failed to record archive schema version"))?;
 
         Ok(db)
     }
@@ -506,7 +506,7 @@ impl Db {
         }
 
         let mut conn = Connection::open_in_memory()
-            .map_err(|e| Error::Message(format!("failed to open an in-memory database: {e}")))?;
+            .map_err(Error::sqlite("failed to open an in-memory database"))?;
         // `deserialize_read_exact` copies from the reader into SQLite's own
         // allocation, so the caller's `Vec` is dropped here rather than leaked
         // for the connection's lifetime.
@@ -514,7 +514,7 @@ impl Db {
         // Read-only: nothing here writes, and SQLite then never has to grow
         // its own copy of the image.
         conn.deserialize_read_exact(rusqlite::MAIN_DB, &mut bytes.as_slice(), len, true)
-            .map_err(|e| Error::Message(format!("failed to read the archive: {e}")))?;
+            .map_err(Error::sqlite("failed to read the archive"))?;
         let mut db = Db {
             conn,
             legacy: false,
@@ -547,7 +547,7 @@ impl Db {
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n > 0)
-            .map_err(|e| Error::Message(format!("failed to inspect the archive: {e}")))?;
+            .map_err(Error::sqlite("failed to inspect the archive"))?;
         if !has_catalog {
             return Err(Error::Message(
                 "not a dendro archive, or a copy taken while it was still being \
@@ -573,15 +573,15 @@ impl Db {
         let version: i64 = self
             .conn
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .map_err(|e| {
-                Error::Message(format!("failed to read the archive schema version: {e}"))
-            })?;
+            .map_err(Error::sqlite("failed to read the archive schema version"))?;
         match version {
             SCHEMA_VERSION => Ok(()),
             LEGACY_SCHEMA_VERSION => {
-                self.conn.execute_batch(LEGACY_VIEWS_SQL).map_err(|e| {
-                    Error::Message(format!("failed to open a v{version} archive: {e}"))
-                })?;
+                self.conn
+                    .execute_batch(LEGACY_VIEWS_SQL)
+                    .map_err(Error::sqlite(format!(
+                        "failed to open a v{version} archive"
+                    )))?;
                 self.legacy = true;
                 Ok(())
             }
@@ -631,7 +631,7 @@ impl Db {
         // cadence that silently never ran.
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(|e| Error::Message(format!("failed to checkpoint the WAL: {e}")))
+            .map_err(Error::sqlite("failed to checkpoint the WAL"))
     }
 
     /// The pragmas that live on the connection, not in the file. Applied by
@@ -684,7 +684,7 @@ impl Db {
         let mode: String = self
             .conn
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-            .map_err(|e| Error::Message(format!("failed to set journal_mode=WAL: {e}")))?;
+            .map_err(Error::sqlite("failed to set journal_mode=WAL"))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Message(format!(
                 "journal_mode is {mode}, expected wal"
@@ -696,7 +696,7 @@ impl Db {
     fn set_pragma<V: rusqlite::ToSql>(&self, name: &str, value: V) -> Result<()> {
         self.conn
             .pragma_update(None, name, value)
-            .map_err(|e| Error::Message(format!("failed to set pragma {name}: {e}")))
+            .map_err(Error::sqlite(format!("failed to set pragma {name}")))
     }
 
     /// Start a source, returning its id.
@@ -714,7 +714,7 @@ impl Db {
                 "SELECT id, labels, metadata, complete, clock_anchor_wall_ns \
                  FROM sources ORDER BY id",
             )
-            .map_err(|e| Error::Message(format!("failed to query sources: {e}")))?;
+            .map_err(Error::sqlite("failed to query sources"))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -725,12 +725,12 @@ impl Db {
                     row.get::<_, i64>(4)?,
                 ))
             })
-            .map_err(|e| Error::Message(format!("failed to query sources: {e}")))?;
+            .map_err(Error::sqlite("failed to query sources"))?;
 
         let mut out = Vec::new();
         for row in rows {
             let (id, labels, metadata, complete, anchor) =
-                row.map_err(|e| Error::Message(format!("failed to read source: {e}")))?;
+                row.map_err(Error::sqlite("failed to read source"))?;
             out.push(SourceRow {
                 id,
                 meta: SourceMeta {
@@ -782,14 +782,14 @@ impl Db {
             tx: self
                 .conn
                 .transaction()
-                .map_err(|e| Error::Message(format!("failed to begin transaction: {e}")))?,
+                .map_err(Error::sqlite("failed to begin transaction"))?,
         };
         // `?` drops `tx` on the error path, and `Transaction`'s drop behavior
         // is rollback — so a failure partway through leaves nothing behind.
         let out = f(&tx)?;
         tx.tx
             .commit()
-            .map_err(|e| Error::Message(format!("failed to commit transaction: {e}")))?;
+            .map_err(Error::sqlite("failed to commit transaction"))?;
         #[cfg(any(test, feature = "test-support"))]
         self.commits.set(self.commits.get() + 1);
         Ok(out)
@@ -841,9 +841,9 @@ impl Db {
                 "SELECT seq, rows, first_ts, last_ts FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
-            .map_err(|e| {
-                Error::Message(format!("failed to query segment meta for {stream}: {e}"))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to query segment meta for {stream}"
+            )))?;
         let rows = stmt
             .query_map(rusqlite::params![source_id, stream], |r| {
                 Ok((
@@ -855,11 +855,13 @@ impl Db {
                     },
                 ))
             })
-            .map_err(|e| {
-                Error::Message(format!("failed to read segment meta for {stream}: {e}"))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to read segment meta for {stream}"
+            )))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Message(format!("failed to read segment meta for {stream}: {e}")))
+            .map_err(Error::sqlite(format!(
+                "failed to read segment meta for {stream}"
+            )))
     }
 
     /// One segment's payload, by sequence number — for the reader's name probe,
@@ -876,14 +878,14 @@ impl Db {
                 "SELECT bytes FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
             )
-            .map_err(|e| {
-                Error::Message(format!("failed to query segment bytes for {stream}: {e}"))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to query segment bytes for {stream}"
+            )))?;
         let mut rows = stmt
             .query(rusqlite::params![source_id, stream, seq as i64])
-            .map_err(|e| {
-                Error::Message(format!("failed to read segment bytes for {stream}: {e}"))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to read segment bytes for {stream}"
+            )))?;
         match rows.next() {
             Ok(Some(r)) => {
                 Ok(Some(r.get(0).map_err(|e| {
@@ -891,9 +893,9 @@ impl Db {
                 })?))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(Error::Message(format!(
-                "failed to read segment bytes for {stream}: {e}"
-            ))),
+            Err(e) => Err(Error::sqlite(format!(
+                "failed to read segment bytes for {stream}"
+            ))(e)),
         }
     }
 
@@ -904,7 +906,9 @@ impl Db {
                 "SELECT seq, rows, first_ts, last_ts, bytes FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
-            .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!(
+                "failed to query segments for {stream}"
+            )))?;
         Self::collect_segments(&mut stmt, rusqlite::params![source_id, stream], stream)
     }
 
@@ -925,13 +929,15 @@ impl Db {
                     row.get::<_, Vec<u8>>(4)?,
                 ))
             })
-            .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!(
+                "failed to query segments for {stream}"
+            )))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (seq, n_rows, first_ts, last_ts, bytes) = row.map_err(|e| {
-                Error::Message(format!("failed to read segment row for {stream}: {e}"))
-            })?;
+            let (seq, n_rows, first_ts, last_ts, bytes) = row.map_err(Error::sqlite(format!(
+                "failed to read segment row for {stream}"
+            )))?;
             out.push(SegmentRow {
                 // Round-trips through INTEGER, same as elsewhere in this
                 // file: these stay inside i64 for any source anyone will
@@ -973,7 +979,9 @@ impl Db {
                  WHERE source_id = ?1 AND stream = ?2 \
                    AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
             )
-            .map_err(|e| Error::Message(format!("failed to query segments for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!(
+                "failed to query segments for {stream}"
+            )))?;
         let params = rusqlite::params![source_id, stream, start, end,];
         Self::collect_segments(&mut stmt, params, stream)
     }
@@ -1012,7 +1020,7 @@ impl Db {
         }
         self.conn
             .execute_batch("BEGIN DEFERRED")
-            .map_err(|e| Error::Message(format!("failed to open a read snapshot: {e}")))?;
+            .map_err(Error::sqlite("failed to open a read snapshot"))?;
 
         /// Ends the snapshot however the closure leaves - including by
         /// unwinding.
@@ -1052,7 +1060,7 @@ impl Db {
                 rusqlite::params![source_id, stream],
                 |row| row.get(0),
             )
-            .map_err(|e| Error::Message(format!("failed to sum rows for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!("failed to sum rows for {stream}")))?;
         Ok(total as u64)
     }
 
@@ -1064,13 +1072,13 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT stream FROM segments WHERE source_id = ?1 ORDER BY stream")
-            .map_err(|e| Error::Message(format!("failed to query streams: {e}")))?;
+            .map_err(Error::sqlite("failed to query streams"))?;
         let rows = stmt
             .query_map([source_id], |row| row.get::<_, String>(0))
-            .map_err(|e| Error::Message(format!("failed to query streams: {e}")))?;
+            .map_err(Error::sqlite("failed to query streams"))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| Error::Message(format!("failed to read stream name: {e}")))?);
+            out.push(row.map_err(Error::sqlite("failed to read stream name"))?);
         }
         Ok(out)
     }
@@ -1093,15 +1101,15 @@ impl Db {
                  SELECT stream FROM wal WHERE source_id = ?1 \
                  ORDER BY stream",
             )
-            .map_err(|e| Error::Message(format!("failed to query all_streams: {e}")))?;
+            .map_err(Error::sqlite("failed to query all_streams"))?;
         // `?1` is the SAME parameter both times it appears (SQLite numbers
         // parameters, not occurrences), so this binds once, not twice.
         let rows = stmt
             .query_map([source_id], |row| row.get::<_, String>(0))
-            .map_err(|e| Error::Message(format!("failed to query all_streams: {e}")))?;
+            .map_err(Error::sqlite("failed to query all_streams"))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| Error::Message(format!("failed to read stream name: {e}")))?);
+            out.push(row.map_err(Error::sqlite("failed to read stream name"))?);
         }
         Ok(out)
     }
@@ -1156,7 +1164,7 @@ impl Db {
                 "SELECT stream, ts, wall_offset, row FROM wal \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY ts",
             )
-            .map_err(|e| Error::Message(format!("failed to query WAL for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!("failed to query WAL for {stream}")))?;
         Self::collect_wal_rows(&mut stmt, source_id, stream)
     }
 
@@ -1200,7 +1208,9 @@ impl Db {
                 "SELECT stream, ts, wall_offset, row FROM wal \
                  WHERE {LIVE_WAL_PREDICATE} ORDER BY ts"
             ))
-            .map_err(|e| Error::Message(format!("failed to query live WAL for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!(
+                "failed to query live WAL for {stream}"
+            )))?;
         Self::collect_wal_rows(&mut stmt, source_id, stream)
     }
 
@@ -1215,7 +1225,9 @@ impl Db {
             source_id,
             stream,
         )
-        .map_err(|e| Error::Message(format!("failed to measure the live WAL for {stream}: {e}")))
+        .map_err(Error::sqlite(format!(
+            "failed to measure the live WAL for {stream}"
+        )))
     }
 
     /// A stream's sealed segments as the CATALOG sees them: how many segments,
@@ -1231,7 +1243,9 @@ impl Db {
                 rusqlite::params![source_id, stream],
                 |row| row.get(0),
             )
-            .map_err(|e| Error::Message(format!("failed to count segments for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!(
+                "failed to count segments for {stream}"
+            )))?;
         let span = self
             .query_span(
                 "SELECT COALESCE(SUM(rows), 0), MIN(first_ts), MAX(last_ts) FROM segments \
@@ -1239,9 +1253,9 @@ impl Db {
                 source_id,
                 stream,
             )
-            .map_err(|e| {
-                Error::Message(format!("failed to measure the segments of {stream}: {e}"))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to measure the segments of {stream}"
+            )))?;
         Ok((segments as u64, span))
     }
 
@@ -1274,11 +1288,14 @@ impl Db {
                     row.get::<_, Vec<u8>>(3)?,
                 ))
             })
-            .map_err(|e| Error::Message(format!("failed to query WAL rows for {stream}: {e}")))?;
+            .map_err(Error::sqlite(format!(
+                "failed to query WAL rows for {stream}"
+            )))?;
         let mut out = Vec::new();
         for row in rows {
-            let (stream, ts, wall_offset, data) = row
-                .map_err(|e| Error::Message(format!("failed to read WAL row for {stream}: {e}")))?;
+            let (stream, ts, wall_offset, data) = row.map_err(Error::sqlite(format!(
+                "failed to read WAL row for {stream}"
+            )))?;
             out.push(WalRow {
                 stream,
                 ts,
@@ -1306,7 +1323,7 @@ impl Db {
                 "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
                 rusqlite::params![source_id, stream, upto_ts],
             )
-            .map_err(|e| Error::Message(format!("failed to prune WAL for {stream}: {e}")))
+            .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")))
     }
 
     /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
@@ -1388,18 +1405,14 @@ impl Db {
                          WHERE source_id = ?1 AND stream = ?2 AND last_ts < ?3",
                         params,
                     )
-                    .map_err(|e| {
-                        Error::Message(format!("failed to evict {stream} segments: {e}"))
-                    })?;
+                    .map_err(Error::sqlite(format!("failed to evict {stream} segments")))?;
                 total.wal_rows += tx
                     .tx
                     .execute(
                         "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
                         params,
                     )
-                    .map_err(|e| {
-                        Error::Message(format!("failed to evict {stream} WAL rows: {e}"))
-                    })?;
+                    .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
             }
             Ok(total)
         })
@@ -1426,17 +1439,15 @@ impl Db {
                 "SELECT last_ts, length(bytes) FROM segments \
                  WHERE source_id = ?1 ORDER BY last_ts",
             )
-            .map_err(|e| Error::Message(format!("failed to query segment sizes: {e}")))?;
+            .map_err(Error::sqlite("failed to query segment sizes"))?;
         let rows = stmt
             .query_map([source_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64))
             })
-            .map_err(|e| Error::Message(format!("failed to query segment sizes: {e}")))?;
+            .map_err(Error::sqlite("failed to query segment sizes"))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(
-                row.map_err(|e| Error::Message(format!("failed to read a segment size: {e}")))?,
-            );
+            out.push(row.map_err(Error::sqlite("failed to read a segment size"))?);
         }
         Ok(out)
     }
@@ -1481,11 +1492,11 @@ impl Db {
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
-                .map_err(|e| Error::Message(format!("failed to evict segments: {e}")))?;
+                .map_err(Error::sqlite("failed to evict segments"))?;
             let wal_rows = tx
                 .tx
                 .execute(wal_sql, params)
-                .map_err(|e| Error::Message(format!("failed to evict WAL rows: {e}")))?;
+                .map_err(Error::sqlite("failed to evict WAL rows"))?;
             // The clock-offset series is per SOURCE, so it is cut by the same
             // cutoff whichever streams the pass named. Without this the series
             // is the one part of a rolling buffer that grows without bound: one
@@ -1497,7 +1508,7 @@ impl Db {
                     "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < ?2",
                     rusqlite::params![source_id, cutoff_ts],
                 )
-                .map_err(|e| Error::Message(format!("failed to evict clock offsets: {e}")))?;
+                .map_err(Error::sqlite("failed to evict clock offsets"))?;
             Ok(Evicted { segments, wal_rows })
         })
     }
@@ -1547,7 +1558,7 @@ impl Db {
             .ok_or_else(|| format!("dump destination {} is not valid UTF-8", dest.display()))?;
         self.conn
             .execute("VACUUM INTO ?1", [dest])
-            .map_err(|e| Error::Message(format!("failed to write the dump to {dest}: {e}")))?;
+            .map_err(Error::sqlite(format!("failed to write the dump to {dest}")))?;
         Ok(())
     }
 
@@ -1565,7 +1576,9 @@ impl Db {
                 [source_id],
                 |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
-            .map_err(|e| Error::Message(format!("failed to measure source {source_id}: {e}")))
+            .map_err(Error::sqlite(format!(
+                "failed to measure source {source_id}"
+            )))
     }
 
     /// Mark a source cleanly finalized, outside any batch. The dump uses
@@ -1590,12 +1603,12 @@ impl Db {
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
             )
-            .map_err(|e| Error::Message(format!("failed to list tables: {e}")))?;
+            .map_err(Error::sqlite("failed to list tables"))?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| Error::Message(format!("failed to list tables: {e}")))?;
+            .map_err(Error::sqlite("failed to list tables"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Message(format!("failed to list tables: {e}")))
+            .map_err(Error::sqlite("failed to list tables"))
     }
 
     /// Replace one source's metadata map.
@@ -1618,7 +1631,7 @@ impl Db {
                 "UPDATE sources SET metadata = ?1 WHERE id = ?2",
                 rusqlite::params![encoded, source_id],
             )
-            .map_err(|e| Error::Message(format!("failed to update source metadata: {e}")))?;
+            .map_err(Error::sqlite("failed to update source metadata"))?;
         if changed == 0 {
             return Err(Error::Message(format!("no source with id {source_id}")));
         }
@@ -1637,7 +1650,7 @@ impl Db {
     pub fn pragma_i64(&self, name: &str) -> Result<i64> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
-            .map_err(|e| Error::Message(format!("failed to read pragma {name}: {e}")))
+            .map_err(Error::sqlite(format!("failed to read pragma {name}")))
     }
 
     /// The source's `(ts, offset_ns)` clock observations, oldest first.
@@ -1645,16 +1658,15 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare("SELECT ts, offset_ns FROM clock_offsets WHERE source_id = ?1 ORDER BY ts")
-            .map_err(|e| Error::Message(format!("failed to query clock offsets: {e}")))?;
+            .map_err(Error::sqlite("failed to query clock offsets"))?;
         let rows = stmt
             .query_map([source_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
-            .map_err(|e| Error::Message(format!("failed to query clock offsets: {e}")))?;
+            .map_err(Error::sqlite("failed to query clock offsets"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (ts, offset) =
-                row.map_err(|e| Error::Message(format!("failed to read clock offset: {e}")))?;
+            let (ts, offset) = row.map_err(Error::sqlite("failed to read clock offset"))?;
             out.push((ts, offset));
         }
         Ok(out)
@@ -1664,7 +1676,7 @@ impl Db {
     pub fn pragma_string(&self, name: &str) -> Result<String> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
-            .map_err(|e| Error::Message(format!("failed to read pragma {name}: {e}")))
+            .map_err(Error::sqlite(format!("failed to read pragma {name}")))
     }
 }
 
@@ -1715,7 +1727,7 @@ impl Tx<'_> {
                 "INSERT INTO wal(source_id, stream, ts, wall_offset, row) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )
-            .map_err(|e| Error::Message(format!("failed to prepare WAL insert: {e}")))?;
+            .map_err(Error::sqlite("failed to prepare WAL insert"))?;
         for r in rows {
             stmt.execute(rusqlite::params![
                 source_id,
@@ -1724,9 +1736,10 @@ impl Tx<'_> {
                 r.wall_offset,
                 r.row,
             ])
-            .map_err(|e| {
-                Error::Message(format!("failed to insert WAL row for {}: {e}", r.stream))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to insert WAL row for {}",
+                r.stream
+            )))?;
         }
         Ok(())
     }
@@ -1739,7 +1752,7 @@ impl Tx<'_> {
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![source_id, ts, offset_ns],
             )
-            .map_err(|e| Error::Message(format!("failed to insert clock offset: {e}")))?;
+            .map_err(Error::sqlite("failed to insert clock offset"))?;
         Ok(())
     }
 
@@ -1749,9 +1762,9 @@ impl Tx<'_> {
     pub fn mark_complete(&self, source_id: i64) -> Result<()> {
         self.tx
             .execute("UPDATE sources SET complete = 1 WHERE id = ?1", [source_id])
-            .map_err(|e| {
-                Error::Message(format!("failed to mark source {source_id} complete: {e}"))
-            })?;
+            .map_err(Error::sqlite(format!(
+                "failed to mark source {source_id} complete"
+            )))?;
         Ok(())
     }
 }
@@ -1768,7 +1781,7 @@ fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64> {
          VALUES (?1, ?2, 0, ?3)",
         rusqlite::params![labels, metadata, meta.clock_anchor_wall_ns],
     )
-    .map_err(|e| Error::Message(format!("failed to insert source: {e}")))?;
+    .map_err(Error::sqlite("failed to insert source"))?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -1796,7 +1809,9 @@ fn insert_segment_sql(
             bytes,
         ],
     )
-    .map_err(|e| Error::Message(format!("failed to insert segment {stream}#{seq}: {e}")))?;
+    .map_err(Error::sqlite(format!(
+        "failed to insert segment {stream}#{seq}"
+    )))?;
     Ok(())
 }
 

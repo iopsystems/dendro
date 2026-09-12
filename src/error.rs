@@ -56,8 +56,15 @@ pub enum Error {
     /// the archive was joined.
     WriterGone,
 
-    /// SQLite said no.
-    Sqlite(rusqlite::Error),
+    /// SQLite said no. `context` names the statement that failed; `source`
+    /// keeps SQLite's own error, and with it the result code — which is what
+    /// lets a caller (the writer thread, mostly) tell a lock that will clear
+    /// from a constraint that will not from a corrupt file that is fatal. See
+    /// [`Error::is_retryable`] and [`Error::is_constraint`].
+    Sqlite {
+        context: String,
+        source: rusqlite::Error,
+    },
 
     /// Anything else, with the sentence that described it.
     ///
@@ -114,7 +121,8 @@ impl fmt::Display for Error {
                 f,
                 "the archive writer thread exited before the source finished"
             ),
-            Error::Sqlite(e) => write!(f, "{e}"),
+            Error::Sqlite { context, source } if context.is_empty() => write!(f, "{source}"),
+            Error::Sqlite { context, source } => write!(f, "{context}: {source}"),
             Error::Message(m) => write!(f, "{m}"),
         }
     }
@@ -125,7 +133,7 @@ impl std::error::Error for Error {
         match self {
             Error::Encoder { source, .. } => Some(&**source),
             Error::Writer(e) => Some(&**e),
-            Error::Sqlite(e) => Some(e),
+            Error::Sqlite { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -146,12 +154,65 @@ impl From<&str> for Error {
 }
 
 impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::Sqlite(e)
+    fn from(source: rusqlite::Error) -> Self {
+        Error::Sqlite {
+            context: String::new(),
+            source,
+        }
     }
 }
 
 impl Error {
+    /// `map_err` adapter for a SQLite call: `context` names what was being
+    /// done, and the result code travels with it.
+    pub fn sqlite(context: impl Into<String>) -> impl FnOnce(rusqlite::Error) -> Error {
+        let context = context.into();
+        move |source| Error::Sqlite { context, source }
+    }
+
+    /// SQLite's primary result code, when this error (or the writer failure
+    /// it wraps) is SQLite's. `None` for everything else, including a SQLite
+    /// error that rusqlite raised without a code.
+    pub fn sqlite_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self.root() {
+            Error::Sqlite {
+                source: rusqlite::Error::SqliteFailure(e, _),
+                ..
+            } => Some(e.code),
+            _ => None,
+        }
+    }
+
+    /// A condition that can clear on its own — another connection's lock, a
+    /// full disk, an interrupted call, memory pressure, a schema change under
+    /// a prepared statement — so a writer should try again before giving up
+    /// on the work.
+    pub fn is_retryable(&self) -> bool {
+        use rusqlite::ErrorCode::*;
+        matches!(
+            self.sqlite_code(),
+            Some(
+                DatabaseBusy
+                    | DatabaseLocked
+                    | DiskFull
+                    | SystemIoFailure
+                    | OutOfMemory
+                    | OperationInterrupted
+                    | SchemaChanged
+            )
+        )
+    }
+
+    /// A uniqueness or other constraint violation: the row is wrong, the
+    /// database is fine. For a tick batched across sources, that means one
+    /// source's rows are bad and the others' are not.
+    pub fn is_constraint(&self) -> bool {
+        matches!(
+            self.sqlite_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        )
+    }
+
     /// The underlying failure, looking through [`Error::Writer`].
     ///
     /// A failure on the writer thread reaches every handle wrapped, so matching
@@ -170,5 +231,82 @@ impl Error {
 impl From<Error> for String {
     fn from(e: Error) -> String {
         e.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn sqlite(code: i32) -> Error {
+        Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    }
+
+    /// The writer's whole recovery policy rests on this classification: what
+    /// to retry, what to isolate to one source, what to stop on.
+    #[test]
+    fn classifies_sqlite_result_codes() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_NOMEM,
+            rusqlite::ffi::SQLITE_INTERRUPT,
+            rusqlite::ffi::SQLITE_SCHEMA,
+        ] {
+            let e = sqlite(code);
+            assert!(e.is_retryable(), "{code}: {e}");
+            assert!(!e.is_constraint(), "{code}: {e}");
+        }
+        let constraint = sqlite(rusqlite::ffi::SQLITE_CONSTRAINT);
+        assert!(constraint.is_constraint() && !constraint.is_retryable());
+        // The extended code narrows it and the primary code still classifies.
+        let pk = sqlite(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY);
+        assert!(pk.is_constraint());
+        for code in [
+            rusqlite::ffi::SQLITE_CORRUPT,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_MISUSE,
+            rusqlite::ffi::SQLITE_NOTADB,
+        ] {
+            let e = sqlite(code);
+            assert!(!e.is_retryable() && !e.is_constraint(), "{code}: {e}");
+        }
+        // Not SQLite's at all: never retried.
+        assert!(!Error::Message("bad json".into()).is_retryable());
+        assert_eq!(Error::Message("x".into()).sqlite_code(), None);
+    }
+
+    /// Context wraps keep the code, and the writer's shared wrapper is looked
+    /// through — every handle sees the thread's failure wrapped, and must be
+    /// able to classify it without unwrapping by hand.
+    #[test]
+    fn context_and_writer_wrapping_keep_the_code() {
+        let wrapped = Error::sqlite("inserting a row")(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+        assert!(wrapped.is_retryable());
+        assert!(
+            wrapped.to_string().starts_with("inserting a row: "),
+            "{wrapped}"
+        );
+        assert!(wrapped.source().is_some(), "the SQLite error is the source");
+
+        let via_writer = Error::Writer(std::sync::Arc::new(wrapped));
+        assert!(via_writer.is_retryable());
+        assert_eq!(
+            via_writer.sqlite_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+
+        // A bare conversion has no context and prints SQLite's message alone.
+        let bare = sqlite(rusqlite::ffi::SQLITE_FULL);
+        assert!(!bare.to_string().starts_with(": "), "{bare}");
     }
 }
