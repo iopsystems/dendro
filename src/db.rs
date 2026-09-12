@@ -609,6 +609,17 @@ impl Db {
         Ok(())
     }
 
+    /// How long a write waits on another connection's lock before failing
+    /// with `SQLITE_BUSY`. rusqlite's default is 5 s. Exposed so a test can
+    /// make the writer's retry path reachable in milliseconds rather than
+    /// seconds; production keeps the default.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        self.conn
+            .busy_timeout(timeout)
+            .map_err(Error::sqlite("failed to set busy_timeout"))
+    }
+
     /// Copy what the `-wal` sidecar holds into the archive itself, best-effort.
     ///
     /// **PASSIVE, deliberately.** A passive checkpoint moves whatever frames it

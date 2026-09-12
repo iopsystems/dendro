@@ -1,5 +1,5 @@
 ---
-status: open
+status: resolved
 opened: 2026-09-11
 updated: 2026-09-11
 ---
@@ -89,8 +89,16 @@ preferred to pick a behaviour and explain it.
 
 ## Outcome
 
-Open. The retention and error-surfacing halves are fixed; the fail-stop policy
-is unchanged.
+Resolved by [container hardening](2026-09-11-container-hardening.md), item 2.
+The answer to "what isolated means when the transaction is shared" is: the
+tick stays one transaction on the happy path; on a constraint failure it is
+re-committed per source, and only the colliding source loses its rows, warned
+once. Transient SQLite conditions are retried on a bounded schedule, a seal
+that cannot commit is deferred rather than lost, and a run of thirty dropped
+ticks stops the writer — so "simply not failing" is still refused. The
+encoder-failure trigger is unchanged (fail-stop, now correctly attributed
+even when the encoder panics); quarantining a source whose encoder is broken
+remains open under [the encoder boundary](2026-09-11-encoder-boundary.md).
 
 ## Deferred or Reopen Items
 

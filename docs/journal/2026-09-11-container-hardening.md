@@ -131,6 +131,28 @@ text broke. Not `thiserror`: the crate takes no dependency it can write in
 forty lines. Tests in `error.rs` cover the classification table, context
 wrapping, and the writer look-through.
 
+**2. Writer policy (landed).** `with_retries` runs a container operation up
+to three more times on a retryable failure (10, 50, 250 ms — ~310 ms on the
+writer thread, so the bound-1 channel backpressures the append loop for that
+long). `commit_tick` replaces the bare `?`: a tick that still fails is
+dropped with a warning and thirty consecutive drops stop the writer with the
+last error; a tick that fails on a **constraint** is re-committed per source
+and only the colliding source's rows are dropped, warned once per source. A
+seal that still fails is deferred — its rows stay live and `seal_batch`
+re-reads them next time — and `seq` is now advanced only after the commit,
+so a retried batch reuses its numbers. A reclaim failure after a successful
+eviction is logged, not fatal. Finalize retries too. `encode_guarded` wraps
+the caller's encoder in `catch_unwind` so a panic is `Error::Encoder` with
+the panic's message rather than a dead thread every handle reports as
+`WriterGone`; encoder errors are still fail-stop, as the blast-radius entry
+argues they should be until a quarantine design exists. `tests/writer_policy.rs`
+has the three cases (a colliding source with a healthy neighbour; a held
+write lock against a 20 ms `busy_timeout`, for a tick and for a seal, with
+`seq` ending at 0; a panicking encoder). Negative control run before
+committing: all three fail on the previous single-`?` commit and unguarded
+encoder. `Archive::create_with_busy_timeout` and `Db::set_busy_timeout` are
+`test-support` hooks that make the lock path reachable in milliseconds.
+
 ## Outcome
 
 In progress.

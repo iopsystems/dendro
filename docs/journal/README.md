@@ -8,7 +8,7 @@ is authoritative for lifecycle status.
 | 2026-09-11 | [Container hardening: failure classes, identity, sessions, and one materialization](2026-09-11-container-hardening.md) | in-progress |
 | 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | open |
 | 2026-09-11 | [Out-of-order appends are accepted and never read](2026-09-11-out-of-order-appends.md) | open |
-| 2026-09-11 | [One source's bad tick kills the writer for the whole archive](2026-09-11-writer-failure-blast-radius.md) | open |
+| 2026-09-11 | [One source's bad tick kills the writer for the whole archive](2026-09-11-writer-failure-blast-radius.md) | resolved (container hardening, item 2) |
 | 2026-09-11 | [The encoder boundary does not yet earn the crate's generality claim](2026-09-11-encoder-boundary.md) | open |
 
 Every entry records a gap rather than work in progress: nothing is being built

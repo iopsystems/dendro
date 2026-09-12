@@ -22,7 +22,7 @@
 //! never reach the send-error path here: the source would skip finalize and
 //! the thread would never be joined.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -173,7 +173,33 @@ impl Archive {
         checkpoint_every: Duration,
     ) -> Result<Self> {
         let db = Db::create(path)?;
+        Self::spawn(db, path, encoder, checkpoint_every)
+    }
 
+    /// [`create_checkpointing_every`](Self::create_checkpointing_every) with
+    /// the writer connection's `busy_timeout` chosen by the caller.
+    ///
+    /// Exists so the writer's retry path is testable: with rusqlite's 5 s
+    /// default, a test that holds the write lock from a second connection
+    /// would wait five seconds per attempt to see the writer notice.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn create_with_busy_timeout(
+        path: &Path,
+        encoder: Box<dyn SegmentEncoder + Send>,
+        checkpoint_every: Duration,
+        busy_timeout: Duration,
+    ) -> Result<Self> {
+        let db = Db::create(path)?;
+        db.set_busy_timeout(busy_timeout)?;
+        Self::spawn(db, path, encoder, checkpoint_every)
+    }
+
+    fn spawn(
+        db: Db,
+        path: &Path,
+        encoder: Box<dyn SegmentEncoder + Send>,
+        checkpoint_every: Duration,
+    ) -> Result<Self> {
         // Bound 1: the hand-off blocks while the writer is busy,
         // which is the intended backpressure signal. One slot for the archive
         // rather than per source, deliberately — the writer is a single
@@ -613,6 +639,156 @@ fn take_writer_error(slot: &ErrorSlot) -> Error {
     }
 }
 
+/// Backoff between attempts at a container operation that failed with a
+/// condition that can clear on its own ([`Error::is_retryable`]): another
+/// connection's lock, a full disk, an interrupted call. Three attempts over
+/// ~310 ms, on the writer thread — which backpressures the append loop
+/// through the bound-1 channel for that long, a bounded cost against losing
+/// the tick.
+const RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+    Duration::from_millis(250),
+];
+
+/// How many consecutive ticks the writer may drop before it stops. A lock or
+/// a full disk that clears within a few seconds costs those ticks and nothing
+/// else; one that does not clear is a failure the caller must hear about
+/// rather than an archive that silently holds nothing. A writer that swallows
+/// errors to stay up is worse than one that stops.
+const MAX_CONSECUTIVE_DROPPED_TICKS: u32 = 30;
+
+/// Run `op`, retrying on a retryable failure per [`RETRY_BACKOFF`]. Any other
+/// failure — and a retryable one that outlasts the schedule — is returned as
+/// is, for the caller to classify.
+fn with_retries<T>(what: &str, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if e.is_retryable() && attempt < RETRY_BACKOFF.len() => {
+                warn!(
+                    "{what} failed ({e}); retrying in {:?}",
+                    RETRY_BACKOFF[attempt]
+                );
+                std::thread::sleep(RETRY_BACKOFF[attempt]);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// What the writer tracks to decide between "warn and carry on" and "stop".
+#[derive(Default)]
+struct WriterHealth {
+    consecutive_dropped: u32,
+    /// Sources already warned about for a colliding tick, so a producer that
+    /// repeats a timestamp every tick does not log every tick.
+    warned_collisions: BTreeSet<i64>,
+}
+
+impl WriterHealth {
+    fn committed(&mut self) {
+        self.consecutive_dropped = 0;
+    }
+
+    /// A tick was dropped after retries. `Err` once that has happened
+    /// [`MAX_CONSECUTIVE_DROPPED_TICKS`] times in a row.
+    fn dropped(&mut self, e: Error) -> Result<()> {
+        self.consecutive_dropped += 1;
+        warn!(
+            "a tick was dropped after retries ({e}); {} consecutive",
+            self.consecutive_dropped
+        );
+        if self.consecutive_dropped >= MAX_CONSECUTIVE_DROPPED_TICKS {
+            return Err(Error::Message(format!(
+                "the archive writer dropped {} consecutive ticks; last error: {e}",
+                self.consecutive_dropped
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Commit one tick's rows for every source in the archive.
+///
+/// The whole tick is one transaction on the happy path (one fsync). When that
+/// fails on a constraint — a source repeating a `(stream, ts)` it already
+/// committed, which the `wal` primary key refuses — the failure is ONE
+/// source's, so the tick is re-committed per source and only the colliding
+/// source loses its rows. Before this, the batched commit meant one source's
+/// bad tick failed every source in the archive, permanently, and told the
+/// culprit `Ok`.
+fn commit_tick(db: &mut Db, ticks: &[(i64, Vec<WalRow>)], health: &mut WriterHealth) -> Result<()> {
+    match with_retries("committing a tick", || db.insert_wal_rows_batch(ticks)) {
+        Ok(()) => {
+            health.committed();
+            Ok(())
+        }
+        Err(e) if e.is_constraint() => {
+            let mut any = false;
+            for (source_id, rows) in ticks {
+                match with_retries("committing a source's tick", || {
+                    db.insert_wal_rows(*source_id, rows)
+                }) {
+                    Ok(()) => any = true,
+                    Err(e) if e.is_constraint() => {
+                        if health.warned_collisions.insert(*source_id) {
+                            warn!(
+                                "source {source_id}: a tick was dropped because its rows \
+                                 collide with rows already committed ({e}); later collisions \
+                                 for this source are not logged"
+                            );
+                        }
+                    }
+                    Err(e) if e.is_retryable() => health.dropped(e)?,
+                    Err(e) => return Err(e),
+                }
+            }
+            if any {
+                health.committed();
+            }
+            Ok(())
+        }
+        Err(e) if e.is_retryable() => health.dropped(e),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run the caller's encoder on the writer thread, turning a panic into the
+/// encoder's error rather than a dead thread every handle reports as
+/// `WriterGone`. The PANIC-FREE contract at the top of this file covers
+/// dendro's own code; the encoder is the one piece of the caller's that runs
+/// here.
+fn encode_guarded(
+    encoder: &(dyn SegmentEncoder + Send),
+    stream: &str,
+    rows: &[WalRow],
+) -> Result<Option<crate::segment::Segment>> {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encoder.encode(stream, rows)
+    }));
+    match outcome {
+        Ok(Ok(segment)) => Ok(segment),
+        Ok(Err(source)) => Err(Error::Encoder {
+            stream: stream.to_string(),
+            source,
+        }),
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            Err(Error::Encoder {
+                stream: stream.to_string(),
+                source: format!("the encoder panicked: {what}").into(),
+            })
+        }
+    }
+}
+
 /// An encoded segment waiting to be inserted.
 struct Encoded {
     stream: String,
@@ -695,6 +871,7 @@ fn writer_loop(
     // checkpoint, including ones taken while idle — the guarantee is about
     // elapsed time, not about arriving messages.
     let mut last_checkpoint = Instant::now();
+    let mut health = WriterHealth::default();
 
     loop {
         // `recv_timeout`, not `recv`: a writer with nothing to do still has to
@@ -735,13 +912,29 @@ fn writer_loop(
                 }
                 let _ = reply.send(inserted);
             }
-            Ok(Msg::Wal { ticks }) => db.insert_wal_rows_batch(&ticks)?,
+            Ok(Msg::Wal { ticks }) => commit_tick(db, &ticks, &mut health)?,
             #[cfg(any(test, feature = "test-support"))]
             Ok(Msg::Commits(reply)) => {
                 let _ = reply.send(db.commits());
             }
             Ok(Msg::Seal { source_id, batch }) => {
-                seal_batch(db, source_id, &mut next_seq, batch, encoder)?;
+                // A seal that cannot commit is DEFERRED, not lost: its rows
+                // are still live in the WAL, `seal_batch` re-reads them on
+                // every attempt, and if the schedule runs out they stay live
+                // and go out with the next batch that seals those streams.
+                // Nothing has to be undone — `seq` is advanced only by a
+                // commit. An encoder failure is not retried: it will recur.
+                match with_retries("sealing a segment batch", || {
+                    seal_batch(db, source_id, &mut next_seq, batch.clone(), encoder)
+                }) {
+                    Ok(()) => {}
+                    Err(e) if e.is_retryable() => warn!(
+                        "seal of {} stream(s) for source {source_id} deferred ({e}); their \
+                         rows stay in the WAL and seal with the next batch",
+                        batch.len()
+                    ),
+                    Err(e) => return Err(e),
+                }
             }
             Ok(Msg::Evict {
                 source_id,
@@ -764,7 +957,13 @@ fn writer_loop(
                     // failing is not a reason to lose the recording.
                     continue;
                 }
-                reclaim_if_fragmented(db)?;
+                // Same rule for the reclaim that follows: the caller was just
+                // told retention succeeded, and it did. Handing pages back is
+                // an optimisation; a failure here is the next pass's problem,
+                // not the recording's.
+                if let Err(e) = reclaim_if_fragmented(db) {
+                    warn!("reclaiming freed pages after retention failed ({e}); skipped");
+                }
             }
             Ok(Msg::Finalize {
                 source_id,
@@ -783,9 +982,11 @@ fn writer_loop(
                 // consult — the set only covered the finalize path, so two seal
                 // batches landing on one `last_ts` still wrote conflicting
                 // rows, and it grew for the life of the writer.
-                db.transaction(|tx| {
-                    tx.insert_clock_offset(source_id, clock_offset.0, clock_offset.1)?;
-                    tx.mark_complete(source_id)
+                with_retries("finalizing a source", || {
+                    db.transaction(|tx| {
+                        tx.insert_clock_offset(source_id, clock_offset.0, clock_offset.1)?;
+                        tx.mark_complete(source_id)
+                    })
                 })?;
                 finalized += 1;
                 // Deliberately NOT returning here, and not reclaiming yet. An
@@ -926,13 +1127,7 @@ fn seal_batch(
         // that a dropped run is always a leading one — which is circular, since
         // the prune is what destroyed the evidence when it was not.
         let last_ts = last.ts;
-        let Some(tail) = encoder
-            .encode(&stream, &rows)
-            .map_err(|source| Error::Encoder {
-                stream: stream.clone(),
-                source,
-            })?
-        else {
+        let Some(tail) = encode_guarded(encoder, &stream, &rows)? else {
             continue;
         };
         // The encoder is a trust boundary, so check what came back before it
@@ -997,15 +1192,19 @@ fn seal_batch(
         if observation.is_none_or(|(seen, _)| segment_last.ts >= seen) {
             observation = Some((segment_last.ts, segment_last.wall_offset));
         }
-        // Bumped before the commit, which is safe only because the writer
-        // exits on its first error: no later batch ever reuses this map.
-        // Keyed by source as well as stream: `segments.seq` is scoped to
-        // `(source_id, stream)`, so two sources of the same host must
-        // not share a counter.
-        let seq = next_seq.entry((source_id, stream.clone())).or_insert(0);
+        // Read here, advanced only after the commit below succeeds: a batch
+        // that fails and is retried must reuse the same numbers, or the
+        // stream's sequence would carry a hole per failed attempt. Keyed by
+        // source as well as stream: `segments.seq` is scoped to
+        // `(source_id, stream)`, so two sources of the same host must not
+        // share a counter.
+        let seq = next_seq
+            .get(&(source_id, stream.clone()))
+            .copied()
+            .unwrap_or(0);
         encoded.push(Encoded {
             stream,
-            seq: *seq,
+            seq,
             meta: SegmentMeta {
                 // ALL THREE from `tail`, never from the input rows. An encoder
                 // may drop rows it cannot decode on their own, and those are
@@ -1024,7 +1223,6 @@ fn seal_batch(
             },
             bytes: tail.bytes,
         });
-        *seq += 1;
     }
 
     // ONE transaction for the whole batch. A real workload seals a dozen
@@ -1046,6 +1244,9 @@ fn seal_batch(
         }
         Ok(())
     })?;
+    for e in &encoded {
+        next_seq.insert((source_id, e.stream.clone()), e.seq + 1);
+    }
 
     // OUTSIDE the transaction, deliberately: a quiet stream accumulates
     // thousands of rows before it seals, so pruning inside the seal commit puts
