@@ -74,6 +74,25 @@ impl CopySpec<'_> {
     }
 }
 
+/// The uuids of sources present in BOTH archives — the same source, not two
+/// sources with the same labels. A caller assembling several archives into
+/// one asks this before copying: the same file given twice, or a copy
+/// alongside its original, would otherwise land twice and double every
+/// value it holds. Sources without a uuid (archives from before the column)
+/// are never reported; they are not known to be the same.
+pub fn shared_sources(a: &Db, b: &Db) -> Result<Vec<String>> {
+    let in_a: std::collections::BTreeSet<String> = a
+        .read_sources()?
+        .into_iter()
+        .filter_map(|s| s.uuid)
+        .collect();
+    Ok(b.read_sources()?
+        .into_iter()
+        .filter_map(|s| s.uuid)
+        .filter(|u| in_a.contains(u))
+        .collect())
+}
+
 /// Copy every source in `src` into the open destination transaction,
 /// returning how many sources were copied.
 ///
@@ -125,7 +144,9 @@ fn copy_sources_snapshotted(
                 meta.metadata.insert(k.clone(), v.clone());
             }
         }
-        let id = tx.insert_source(&meta)?;
+        // The copy IS the source — same identity, so a later assembly can
+        // tell "this again" from "another one with the same labels".
+        let id = tx.insert_source_with_uuid(&meta, rec.uuid.as_deref())?;
         if rec.complete {
             tx.mark_complete(id)?;
         }

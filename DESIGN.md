@@ -253,6 +253,23 @@ Neither choice affects read speed. Query time tracks segment *count*, which is
 | 4 | dendro | Current. |
 | 3 | rezolus `.rez` | Read-only, through per-connection compatibility views. Names `sources` as `recordings`, `source_id` as `recording_id`, and `stream` as `sampler`. |
 
+An archive is stamped in its SQLite header at creation: `application_id` is
+`0x6465_6e64` (`dend`) and `user_version` is the schema version, so `db::sniff`
+classifies a file from its first 100 bytes without opening it, and every open
+refuses a foreign SQLite database (or a file that is not SQLite at all) as
+`Error::NotAnArchive` *before* applying a single pragma. Archives written
+before the stamp carry `application_id = 0`; for those the `schema_version`
+table decides, as it always did — and a file with neither is named for what
+it almost always is, a copy taken from under a writer with its catalog still
+in the sidecar.
+
+Every source carries a `uuid`, minted at insert from SQLite's own
+`randomblob` (so the reader build needs no random source) and carried
+verbatim by every copy. Labels are a source's *name*; the uuid is its
+identity, and `rewrite::shared_sources` is how an assembly tells "the same
+source again" from "another source with the same labels". `NULL` in archives
+from before the column means unknown, never the same.
+
 v3 archives open through TEMP views, which SQLite resolves before the main
 schema — so every statement in `db.rs` can name `stream` unconditionally.
 Opening a v3 archive never modifies it, which matters when the file is a buffer

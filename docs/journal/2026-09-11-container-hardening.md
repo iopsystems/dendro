@@ -153,6 +153,30 @@ committing: all three fail on the previous single-`?` commit and unguarded
 encoder. `Archive::create_with_busy_timeout` and `Db::set_busy_timeout` are
 `test-support` hooks that make the lock path reachable in milliseconds.
 
+**3. Identity (landed).** `Db::create` stamps `application_id = 0x6465_6e64`
+(`dend`) and `user_version = SCHEMA_VERSION` into the header and then
+checkpoints once — found by the test, not foreseen: in WAL mode the stamp
+sat in the sidecar, so a `sniff` of a live archive read the pre-stamp header
+page. `db::sniff`/`sniff_bytes` classify a file from its first 100 bytes as
+`Stamped { version }`, `Unstamped` (the default id, which every pre-stamp
+archive carries — and any other unstamped SQLite database, which only an
+open can tell apart), or `NotAnArchive`. `adopt_schema` now runs before any
+pragma on all three opens (`open_read_only` set `cache_size` first, which
+turned a text file into a SQLite error rather than `NotAnArchive`; also
+found by the test), decides from the stamp, falls back to the
+`schema_version` table for id 0, names a catalog-less file for what it
+almost always is, and refuses another application's database — a new
+`Error::NotAnArchive { what, reason }`. Legacy v3 archives are unaffected:
+their id is 0 and their table says 3. `sources.uuid TEXT`, minted by
+`Db::mint_uuid` from `randomblob(16)`; `read_sources` probes the schema and
+reports `None` for older files and for the legacy views;
+`Tx::insert_source_with_uuid` carries it through `copy_sources_into`;
+`rewrite::shared_sources` names the uuids two archives have in common, so
+an assembler can refuse the same source twice — which is the caller's
+decision, since dendro has no combine of its own. `SCHEMA_VERSION` stays 4:
+a nullable column an old reader ignores is additive. Eight tests in
+`tests/identity.rs`, in the reader build too.
+
 ## Outcome
 
 In progress.

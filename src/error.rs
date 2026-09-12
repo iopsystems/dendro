@@ -33,6 +33,11 @@ pub enum Error {
     /// found, so a caller can tell "too new, upgrade dendro" from "too old".
     UnsupportedSchema { found: i64, writes: i64, reads: i64 },
 
+    /// The file is not a dendro archive: not SQLite, another application's
+    /// database, or a copy taken from under a writer that carries no catalog.
+    /// `what` names the file (or `<bytes>`), `reason` says which.
+    NotAnArchive { what: String, reason: String },
+
     /// The caller's [`SegmentEncoder`](crate::segment::SegmentEncoder) failed.
     /// Its own error is preserved rather than stringified, so a caller can
     /// downcast back to it.
@@ -108,6 +113,9 @@ impl fmt::Display for Error {
                 "unsupported archive schema version {found}: this build writes \
                  v{writes} and reads v{reads}"
             ),
+            Error::NotAnArchive { what, reason } => {
+                write!(f, "{what}: not a dendro archive: {reason}")
+            }
             Error::Encoder { stream, source } => {
                 write!(f, "failed to encode a {stream} segment: {source}")
             }

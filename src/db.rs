@@ -92,6 +92,76 @@ const SCHEMA_VERSION: i64 = 4;
 /// converted. Writing to one is refused: see [`Db::writable`].
 const LEGACY_SCHEMA_VERSION: i64 = 3;
 
+/// `PRAGMA application_id`, stamped into the SQLite file header at creation:
+/// the ASCII bytes `dend`. It is what makes an archive recognizable as one
+/// and not merely as a SQLite database — [`sniff_bytes`] reads it from the
+/// first 100 bytes without opening the file, and every open refuses a SQLite
+/// database that carries some other application's id.
+///
+/// Archives written before the stamp existed carry SQLite's default of `0`
+/// (every legacy v3 file, and v4 files from before this constant). Those
+/// still open: `adopt_schema` falls back to the `schema_version` table for
+/// them, which every archive has always had.
+pub const APPLICATION_ID: u32 = 0x6465_6e64;
+
+/// What the first 100 bytes of a file say about it. See [`sniff_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sniff {
+    /// A stamped archive; `version` is its `user_version`, which an open
+    /// still gates (a version this build does not read is refused there, by
+    /// name).
+    Stamped { version: i64 },
+    /// A SQLite file with the default id, which is what every archive
+    /// written before the stamp carries — and also what any other unstamped
+    /// SQLite database carries. Only an open can tell them apart.
+    Unstamped,
+    /// Not SQLite, or another application's SQLite database.
+    NotAnArchive,
+}
+
+/// Classify a file by its SQLite header alone: bytes `0..16` are the magic,
+/// the big-endian u32 at offset 68 is `application_id`, the one at offset 60
+/// is `user_version`. Needs at least the 100-byte header; fewer bytes is not
+/// an archive.
+pub fn sniff_bytes(bytes: &[u8]) -> Sniff {
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    const HEADER_LEN: usize = 100;
+    const USER_VERSION_OFFSET: usize = 60;
+    const APPLICATION_ID_OFFSET: usize = 68;
+    if bytes.len() < HEADER_LEN || &bytes[..MAGIC.len()] != MAGIC {
+        return Sniff::NotAnArchive;
+    }
+    let be = |at: usize| {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&bytes[at..at + 4]);
+        u32::from_be_bytes(b)
+    };
+    match be(APPLICATION_ID_OFFSET) {
+        APPLICATION_ID => Sniff::Stamped {
+            version: i64::from(be(USER_VERSION_OFFSET)),
+        },
+        0 => Sniff::Unstamped,
+        _ => Sniff::NotAnArchive,
+    }
+}
+
+/// [`sniff_bytes`] over the first 100 bytes of the file at `path`. A file
+/// shorter than a header is not an archive; an I/O error is an error.
+pub fn sniff(path: &Path) -> Result<Sniff> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
+    let mut header = [0u8; 100];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(sniff_bytes(&header)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(Sniff::NotAnArchive),
+        Err(e) => Err(Error::Message(format!(
+            "failed to read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// One source's identity: everything known when the source starts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceMeta {
@@ -107,6 +177,11 @@ pub struct SourceMeta {
 pub struct SourceRow {
     pub id: i64,
     pub meta: SourceMeta,
+    /// The source's identity across files: a v4 UUID minted when the row was
+    /// inserted and carried verbatim by every copy, so whether two archives
+    /// hold the same source is a comparison rather than a guess from labels.
+    /// `None` for an archive written before the column existed.
+    pub uuid: Option<String>,
     /// Whether the source was cleanly finalized. This is what replaced the
     /// `.partial` filename convention: an archive is a valid file from creation,
     /// so "was it finished" has to be a queryable property.
@@ -204,6 +279,16 @@ pub struct Db {
     commits: std::cell::Cell<u64>,
 }
 
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db")
+            .field("path", &self.conn.path())
+            .field("legacy", &self.legacy)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Db {
     /// Create a new archive at `path`, applying the pragmas that can only be set
     /// on a database that does not yet exist, then installing the schema.
@@ -247,6 +332,7 @@ impl Db {
                 [SCHEMA_VERSION],
             )
             .map_err(Error::sqlite("failed to record archive schema version"))?;
+        db.stamp_header()?;
         Ok(db)
     }
 
@@ -380,6 +466,14 @@ impl Db {
                 [SCHEMA_VERSION],
             )
             .map_err(Error::sqlite("failed to record archive schema version"))?;
+        db.stamp_header()?;
+        // Fold the stamp into the archive itself, now. In WAL mode every
+        // commit — the header stamp included — lives in the `-wal` sidecar
+        // until a checkpoint, so without this a `sniff` of a live archive
+        // reads the header page the file had before the stamp: unstamped.
+        // The whole point of the stamp is to be readable without opening the
+        // file, and a rolling buffer is sniffed while its writer holds it.
+        db.checkpoint_passive()?;
 
         Ok(db)
     }
@@ -397,6 +491,11 @@ impl Db {
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
+        // The gate FIRST. `apply_connection_pragmas` writes `synchronous` and
+        // friends, and a file that is not ours must be refused untouched —
+        // before this ordering, a foreign SQLite database had its pragmas
+        // rewritten and then failed on a missing table.
+        db.adopt_schema(&path.display().to_string())?;
         // `page_size`, `auto_vacuum` and `journal_mode` persist in the file;
         // these do not, and forgetting them silently downgrades durability
         // (synchronous falls back to NORMAL) on every subsequent write.
@@ -408,7 +507,6 @@ impl Db {
         // short-lived, offline and bounded by the dump, so no long-running
         // process holds it.
         db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
-        db.adopt_schema()?;
         Ok(db)
     }
 
@@ -445,12 +543,17 @@ impl Db {
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
-        // Only the pragmas that are pure connection state. `synchronous` and
-        // `wal_autocheckpoint` are durability knobs for a writer and are
-        // themselves writes; `query_only` is what makes the refusal SQLite's
-        // rather than ours, so a bug here fails loudly instead of mutating.
-        db.set_pragma("cache_size", READER_CACHE_SIZE_KIB)?;
-        // ORDER MATTERS. `adopt_schema` installs the legacy compatibility views
+        let what = path.display().to_string();
+        // ORDER MATTERS, twice over. The gate goes first of all: `cache_size`
+        // is harmless, but issuing any statement against a file that is not
+        // SQLite fails as SQLite's error, and a caller asking "is this an
+        // archive" deserves `NotAnArchive`, which only the gate produces.
+        //
+        // Then the read-only pragmas — only the ones that are pure connection
+        // state. `synchronous` and `wal_autocheckpoint` are durability knobs
+        // for a writer and are themselves writes; `query_only` is what makes
+        // the refusal SQLite's rather than ours, so a bug here fails loudly
+        // instead of mutating. And `adopt_schema` installs the legacy compatibility views
         // for an older archive, and `CREATE TEMP VIEW` is a write — to the temp
         // schema, which `query_only` also covers. Setting it first refused
         // every legacy archive with `attempt to write a readonly database`,
@@ -461,7 +564,8 @@ impl Db {
         // itself regardless. `query_only` is here to cover the temp schema once
         // we are done needing it, and to make a stray write fail as SQLite's
         // error rather than ours.
-        db.adopt_schema()?;
+        db.adopt_schema(&what)?;
+        db.set_pragma("cache_size", READER_CACHE_SIZE_KIB)?;
         db.set_pragma("query_only", "1")?;
         Ok(db)
     }
@@ -498,7 +602,10 @@ impl Db {
 
         let mut bytes = bytes;
         if bytes.len() < 20 || !bytes.starts_with(HEADER) {
-            return Err("not a dendro archive (SQLite)".into());
+            return Err(Error::NotAnArchive {
+                what: "<bytes>".to_string(),
+                reason: "not a SQLite database".to_string(),
+            });
         }
         if bytes[18] == FILE_FORMAT_WAL && bytes[19] == FILE_FORMAT_WAL {
             bytes[18] = JOURNAL_MODE_ROLLBACK;
@@ -522,58 +629,92 @@ impl Db {
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
         };
+        // The gate first, for the same reason as `open`; the catalog-less
+        // copy that used to be diagnosed here is diagnosed inside it.
+        db.adopt_schema("<bytes>")?;
         db.apply_connection_pragmas(READER_CACHE_SIZE_KIB)?;
-
-        // An archive always has a `sources` table. Its absence has one
-        // overwhelmingly likely cause worth naming: the bytes are a plain copy
-        // of an archive a writer still held. SQLite commits into a `-wal`
-        // SIDECAR, a second file that a single blob does not carry, so such a
-        // copy can be a valid SQLite database with none of the archive in it.
-        // Left as bare "no such table: sources", that reads like a corrupt
-        // file rather than a copy taken the wrong way.
-        let has_catalog: bool = db
-            .conn
-            .query_row(
-                // BOTH names. `sources` is v4's; `recordings` is what a
-                // legacy archive calls the same table, and the compatibility
-                // views that paper over that are installed later, in
-                // `adopt_schema`. Probing for `sources` alone diagnosed every
-                // legacy upload as a truncated copy — a confident, specific,
-                // wrong answer, which is worse than the bare SQLite error this
-                // probe exists to replace.
-                "select count(*) from sqlite_master where type = 'table' \
-                 and name in ('sources', 'recordings')",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)
-            .map_err(Error::sqlite("failed to inspect the archive"))?;
-        if !has_catalog {
-            return Err(Error::Message(
-                "not a dendro archive, or a copy taken while it was still being \
-                        written — an archive's most recent pages live in a `-wal` sidecar \
-                        that a single copied file does not carry. Take the copy with \
-                        `Db::vacuum_into`, which reads through the sidecar \
-                        without stopping the writer"
-                    .to_string(),
-            ));
-        }
-        db.adopt_schema()?;
         Ok(db)
     }
 
-    /// Read the file's schema version and make this connection able to query it.
+    /// Stamp the header: `application_id` says "this is a dendro archive",
+    /// `user_version` says which schema. Both are header fields, so
+    /// [`sniff_bytes`] reads them without opening the file and `VACUUM INTO`
+    /// carries them into every copy.
+    fn stamp_header(&self) -> Result<()> {
+        self.set_pragma("application_id", APPLICATION_ID)?;
+        self.set_pragma("user_version", SCHEMA_VERSION)
+    }
+
+    /// Refuse anything that is not an archive this build reads, then make
+    /// this connection able to query it.
     ///
-    /// A [`SCHEMA_VERSION`] file needs nothing. A [`LEGACY_SCHEMA_VERSION`] one
-    /// gets [`LEGACY_VIEWS_SQL`] and is marked read-only. Anything else is
-    /// refused rather than guessed at: the catalog is the only thing standing
-    /// between a caller and a pile of opaque BLOBs, so reading it under the
-    /// wrong shape yields wrong data rather than an error.
-    fn adopt_schema(&mut self) -> Result<()> {
-        let version: i64 = self
+    /// Decided from the header stamp, before any pragma that writes:
+    ///
+    /// * `application_id == APPLICATION_ID` — a stamped archive; its
+    ///   `user_version` is the schema version.
+    /// * `application_id == 0` — SQLite's default, which every archive
+    ///   written before the stamp carries. The `schema_version` TABLE decides
+    ///   instead. Its absence has one overwhelmingly likely cause worth
+    ///   naming: a plain copy of an archive a writer still held, whose pages
+    ///   are in a `-wal` sidecar the copy does not carry.
+    /// * anything else — some other application's SQLite database.
+    ///
+    /// A [`SCHEMA_VERSION`] file then needs nothing. A
+    /// [`LEGACY_SCHEMA_VERSION`] one gets [`LEGACY_VIEWS_SQL`] and is marked
+    /// read-only. Anything else is refused rather than guessed at: the
+    /// catalog is the only thing standing between a caller and a pile of
+    /// opaque BLOBs, so reading it under the wrong shape yields wrong data
+    /// rather than an error.
+    fn adopt_schema(&mut self, what: &str) -> Result<()> {
+        let not_an_archive = |reason: &str| Error::NotAnArchive {
+            what: what.to_string(),
+            reason: reason.to_string(),
+        };
+        let app = match self
             .conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .map_err(Error::sqlite("failed to read the archive schema version"))?;
+            .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))
+        {
+            Ok(v) => v,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::NotADatabase =>
+            {
+                return Err(not_an_archive("not a SQLite database"));
+            }
+            Err(e) => return Err(Error::sqlite("failed to read application_id")(e)),
+        };
+        let version: i64 = if app == i64::from(APPLICATION_ID) {
+            self.pragma_i64("user_version")?
+        } else if app == 0 {
+            let has_table = |name: &str| -> Result<bool> {
+                self.conn
+                    .query_row(
+                        "select count(*) from sqlite_master where type = 'table' and name = ?1",
+                        [name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|n| n > 0)
+                    .map_err(Error::sqlite("failed to inspect the archive"))
+            };
+            if !has_table("schema_version")? {
+                return Err(not_an_archive(
+                    "no catalog. Either this is not an archive, or it is a copy taken \
+                     while it was still being written — an archive's most recent pages \
+                     live in a `-wal` sidecar that a single copied file does not carry. \
+                     Take the copy with `Db::vacuum_into`, which reads through the \
+                     sidecar without stopping the writer",
+                ));
+            }
+            self.conn
+                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .map_err(Error::sqlite("failed to read the archive schema version"))?
+                .unwrap_or(0)
+        } else {
+            return Err(not_an_archive(&format!(
+                "a SQLite database of another application (id {app:#x})"
+            )));
+        };
         match version {
             SCHEMA_VERSION => Ok(()),
             LEGACY_SCHEMA_VERSION => {
@@ -713,18 +854,39 @@ impl Db {
     /// Start a source, returning its id.
     pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64> {
         self.writable()?;
-        insert_source_sql(&self.conn, meta)
+        insert_source_sql(&self.conn, meta, None)
+    }
+
+    /// A fresh random (version 4) UUID, in the canonical 8-4-4-4-12 form.
+    ///
+    /// From SQLite's own `randomblob`, deliberately: the reader build has no
+    /// random source of its own on wasm32, and this crate takes no dependency
+    /// it does not need. SQLite is already here, its PRNG is seeded from the
+    /// OS, and 16 random bytes with the version and variant bits set is all a
+    /// v4 UUID is. Public so a caller can name things the same way — a writer
+    /// session, say.
+    pub fn mint_uuid(&self) -> Result<String> {
+        mint_uuid(&self.conn)
     }
 
     /// Every source in the file, in insertion order. An archive may hold
     /// several (multi-host, or an A/B pair).
     pub fn read_sources(&self) -> Result<Vec<SourceRow>> {
+        // The `uuid` column arrived after the first archives were written,
+        // and a column a file does not have cannot be named in a SELECT
+        // without erroring. Ask the schema first — one `PRAGMA`, and it
+        // answers for the legacy views too, which have no such column.
+        let uuid_col = if has_column(&self.conn, "sources", "uuid")? {
+            "uuid"
+        } else {
+            "NULL"
+        };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, labels, metadata, complete, clock_anchor_wall_ns \
-                 FROM sources ORDER BY id",
-            )
+            .prepare(&format!(
+                "SELECT id, labels, metadata, complete, clock_anchor_wall_ns, {uuid_col} \
+                 FROM sources ORDER BY id"
+            ))
             .map_err(Error::sqlite("failed to query sources"))?;
         let rows = stmt
             .query_map([], |row| {
@@ -734,16 +896,18 @@ impl Db {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(Error::sqlite("failed to query sources"))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, labels, metadata, complete, anchor) =
+            let (id, labels, metadata, complete, anchor, uuid) =
                 row.map_err(Error::sqlite("failed to read source"))?;
             out.push(SourceRow {
                 id,
+                uuid,
                 meta: SourceMeta {
                     labels: serde_json::from_str(&labels).map_err(|e| {
                         Error::Message(format!("source {id} has invalid labels: {e}"))
@@ -1710,7 +1874,15 @@ impl Tx<'_> {
     /// selected, and either the whole file is that source or there is no
     /// file at all.
     pub fn insert_source(&self, meta: &SourceMeta) -> Result<i64> {
-        insert_source_sql(&self.tx, meta)
+        insert_source_sql(&self.tx, meta, None)
+    }
+
+    /// Insert a source that already has an identity — a copy. `None` (the
+    /// original predates the column) mints a fresh one, so two copies of such
+    /// a source are not claimed to be the same source; they are merely not
+    /// known to be different, which is what an absent id means.
+    pub fn insert_source_with_uuid(&self, meta: &SourceMeta, uuid: Option<&str>) -> Result<i64> {
+        insert_source_sql(&self.tx, meta, uuid)
     }
 
     /// Insert one sealed segment's bytes and catalog facts.
@@ -1782,18 +1954,63 @@ impl Tx<'_> {
 
 /// Shared by `Db::insert_source` (its own commit) and
 /// `Tx::insert_source` (part of a batch).
-fn insert_source_sql(conn: &Connection, meta: &SourceMeta) -> Result<i64> {
+fn insert_source_sql(conn: &Connection, meta: &SourceMeta, uuid: Option<&str>) -> Result<i64> {
     let labels = serde_json::to_string(&meta.labels)
         .map_err(|e| Error::Message(format!("failed to encode source labels: {e}")))?;
     let metadata = serde_json::to_string(&meta.metadata)
         .map_err(|e| Error::Message(format!("failed to encode source metadata: {e}")))?;
+    let uuid = match uuid {
+        Some(u) => u.to_string(),
+        None => mint_uuid(conn)?,
+    };
     conn.execute(
-        "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns) \
-         VALUES (?1, ?2, 0, ?3)",
-        rusqlite::params![labels, metadata, meta.clock_anchor_wall_ns],
+        "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns, uuid) \
+         VALUES (?1, ?2, 0, ?3, ?4)",
+        rusqlite::params![labels, metadata, meta.clock_anchor_wall_ns, uuid],
     )
     .map_err(Error::sqlite("failed to insert source"))?;
     Ok(conn.last_insert_rowid())
+}
+
+/// See [`Db::mint_uuid`].
+fn mint_uuid(conn: &Connection) -> Result<String> {
+    let mut b: Vec<u8> = conn
+        .query_row("SELECT randomblob(16)", [], |row| row.get(0))
+        .map_err(Error::sqlite("failed to mint a uuid"))?;
+    if b.len() != 16 {
+        return Err(Error::Message(format!(
+            "randomblob(16) returned {} bytes",
+            b.len()
+        )));
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// Whether `table` (or view) has a column named `column`, per this
+/// connection's schema.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(Error::sqlite(format!("failed to inspect {table}")))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(Error::sqlite(format!("failed to inspect {table}")))?;
+    for name in names {
+        if name.map_err(Error::sqlite(format!("failed to inspect {table}")))? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Shared by `Db::insert_segment` (its own commit) and
@@ -1856,7 +2073,12 @@ CREATE TABLE sources(
   labels TEXT NOT NULL,               -- JSON
   metadata TEXT NOT NULL,             -- JSON
   complete INTEGER NOT NULL DEFAULT 0,
-  clock_anchor_wall_ns INTEGER NOT NULL
+  clock_anchor_wall_ns INTEGER NOT NULL,
+  -- The source's identity across files: minted at insert, carried verbatim
+  -- by every copy, so whether two archives hold the same source is a
+  -- comparison rather than a guess from labels. NULL only in archives
+  -- written before the column existed; readers treat that as unknown.
+  uuid TEXT
 );
 CREATE TABLE segments(
   source_id INTEGER NOT NULL REFERENCES sources(id),
