@@ -370,6 +370,9 @@ fn retention_runs_through_the_writer_and_reports_what_it_removed() {
     }
     src.sync().unwrap();
 
+    // The predicate selects what is REMOVED. It was once named `keep` on this
+    // method, which inverted it — a caller following the doc deleted exactly
+    // what it meant to retain.
     let evicted = src
         .evict_streams_before(100, Box::new(|s: &str| s.starts_with("debug/")))
         .unwrap();

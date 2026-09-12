@@ -1316,12 +1316,16 @@ impl Db {
     /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
     /// accepts.
     ///
+    /// **`evict` selects what is REMOVED.** Note this is the opposite polarity
+    /// from [`CopySpec::keep_streams`](crate::rewrite::CopySpec), which selects
+    /// what survives — each matches the verb in its own name, and conflating
+    /// them deletes the data you meant to keep.
+    ///
     /// Retention is the caller's policy, the way sealing is: dendro knows what
     /// a cutoff means but not that debug counters are worth a day and the
-    /// metric they explain is worth a month. A predicate rather than a name
-    /// set, matching [`CopySpec::keep_streams`](crate::rewrite::CopySpec), so a
-    /// caller whose streams are grouped under some coarser unit can retain by
-    /// that unit.
+    /// metric they explain is worth a month. A predicate rather than a name set
+    /// so a caller whose streams are grouped under some coarser unit can
+    /// express retention by that unit.
     ///
     /// Still ONE transaction, for the reason
     /// [`evict_before`](Self::evict_before) gives — but note the scope is now

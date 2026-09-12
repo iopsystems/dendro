@@ -480,8 +480,13 @@ impl SourceWriter {
         self.evict(cutoff_ts, None)
     }
 
-    /// [`evict_before`](Self::evict_before), restricted to the streams `keep`
+    /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
     /// accepts.
+    ///
+    /// **The predicate selects what is REMOVED**, matching the verb in the
+    /// name. It was called `keep` here, which inverted it: a caller following
+    /// the doc deleted precisely the streams it meant to retain, silently and
+    /// irreversibly.
     ///
     /// The writer-side spelling of
     /// [`Db::evict_streams_before`](crate::db::Db::evict_streams_before), and
