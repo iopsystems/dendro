@@ -76,8 +76,9 @@ other two are boundaries.
   SQLite condition (a lock, a full disk) is retried and then dropped per tick,
   and a duplicate `(stream, ts)` costs only the colliding source its tick — but
   an encoder returning `Err` or panicking still exits the writer thread for the
-  whole archive, because it will recur. There is no way yet to reopen and
-  resume. [Journal](docs/journal/2026-09-11-writer-failure-blast-radius.md).
+  whole archive, because it will recur. An archive can be reopened and a
+  source resumed afterwards (`Archive::open`, `resume_source`).
+  [Journal](docs/journal/2026-09-11-writer-failure-blast-radius.md).
 - **There is no index over what is inside a row.** The catalog knows sources,
   streams and time — nothing about series or labels, because dendro does not
   know what a row means. Finding which segments contain a particular series
@@ -204,6 +205,8 @@ Extracted from [rezolus](https://github.com/iopsystems/rezolus), where it was
 the internal `.rez` v3 format. Archives written by that version still open
 read-only; see `LEGACY_SCHEMA_VERSION`.
 
-The design reasoning, including what was measured to arrive at it, is in
-[DESIGN.md](DESIGN.md). Known gaps and the reasoning behind leaving them open
+The format itself — container, catalog, the meaning of every column, the
+reserved metadata keys, writer sessions, and what bumps the schema version —
+is specified in [FORMAT.md](FORMAT.md). The design reasoning, including what
+was measured to arrive at it, is in [DESIGN.md](DESIGN.md). Known gaps and the reasoning behind leaving them open
 are in [docs/journal/](docs/journal/README.md).

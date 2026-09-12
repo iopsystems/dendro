@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: implemented
 opened: 2026-09-11
 updated: 2026-09-11
 ---
@@ -242,9 +242,30 @@ rolling-buffer configuration whose offset series still grew forever.
 stream's rows still need survive, then evicts the rest and checks the
 series empties.
 
+**8. The specification (landed).** `FORMAT.md`: the model, the container
+and its header stamp, the geometry, the one-file-or-three rule, the five
+catalog tables with the meaning of every column, the live-WAL predicate as
+the recovery rule, the reading rules, the anchored time model, the reserved
+metadata keys, writer sessions and reopening, and the compatibility rule —
+what bumps the schema version, what is additive, and what the format
+deliberately does not version (the encoder's bytes, which is the open
+encoder-boundary gap, named as such). Every claim was checked against the
+code before it was written. `README.md` points at it, and its known-gaps
+bullet no longer says an archive cannot be reopened.
+
 ## Outcome
 
-In progress.
+Implemented, all eight items, in eight commits on `main` between `add4471`
+and this one. Every item landed with the test named beside it; the three CI
+configurations stayed green throughout; the two writer-policy negative
+controls were run before committing (all three `tests/writer_policy.rs`
+cases fail on the previous single-`?` commit and unguarded encoder). Two
+findings came out of the tests rather than the review: in WAL mode the
+header stamp sat in the sidecar until a checkpoint, so `create` now
+checkpoints once; and `open_read_only` issued `cache_size` before the gate,
+turning a text file into a SQLite error. The blast-radius entry is resolved
+by item 2; the encoder-boundary, out-of-order and compaction entries are
+untouched and still open.
 
 ## Deferred or Reopen Items
 
