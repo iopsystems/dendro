@@ -158,17 +158,27 @@
 /// at finalize, which an unclean kill never reaches.
 pub mod keys {
     /// The observed producer's current **counter epoch**: an opaque id the
-    /// producer regenerates whenever its cumulative counters start from zero
-    /// (for a process-scoped producer, once per process). Two sources with
-    /// equal epochs over overlapping time are two observations of ONE
-    /// monotonic series — mergeable, never summable; a change of epoch
-    /// mid-source is a counter reset a reader can see rather than infer from
-    /// a value going backwards. OpenTelemetry's `start_time_unix_nano` is the
-    /// precedent. Absent means unknown.
+    /// producer regenerates whenever *all* of its cumulative counters start
+    /// from zero together — for a process-scoped producer, once per process.
+    /// Two sources with equal epochs over overlapping time are two
+    /// observations of ONE monotonic series: mergeable, never summable.
+    /// OpenTelemetry's `start_time_unix_nano` is the precedent. Absent means
+    /// unknown.
+    ///
+    /// **This is the source-wide level, and it does not cover a single
+    /// counter.** A counter that wrapped, or that the producer zeroed on
+    /// read, did not restart the process, so this key says nothing about it —
+    /// and from the values alone a wrap and a reset are identical, while
+    /// their arithmetic is not (`cur` versus `cur + (2^w - prev)`). Telling
+    /// those apart needs a generation per counter, which is row data and
+    /// therefore the encoder's, not the container's. See
+    /// `docs/journal/2026-09-12-generations-reset-versus-wrap.md`.
     pub const PRODUCER_EPOCH: &str = "producer_epoch";
     /// Every epoch the source observed, in order: a JSON array of
     /// `{"epoch": <id>, "from_ts": <first row timestamp>}`. The current one is
-    /// its last element and is also under [`PRODUCER_EPOCH`].
+    /// its last element and is also under [`PRODUCER_EPOCH`]. More than one
+    /// entry means the producer restarted mid-source, and every cumulative
+    /// counter in it reset at that timestamp.
     pub const PRODUCER_EPOCHS: &str = "producer_epochs";
     /// Every writer session that appended to the source, in order: a JSON
     /// array of `{"session": <uuid>, "clock_anchor_wall_ns": <anchor>,

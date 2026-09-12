@@ -5,6 +5,7 @@ is authoritative for lifecycle status.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
+| 2026-09-12 | [Generations: telling a counter reset from a counter wrap](2026-09-12-generations-reset-versus-wrap.md) | open |
 | 2026-09-11 | [Container hardening: failure classes, identity, sessions, and one materialization](2026-09-11-container-hardening.md) | implemented |
 | 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | open |
 | 2026-09-11 | [Out-of-order appends are accepted and never read](2026-09-11-out-of-order-appends.md) | open |

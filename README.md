@@ -58,8 +58,8 @@ opinion about your query engine either — reads hand back parquet bytes.
 
 ## Known gaps
 
-Three things worth knowing before you build on it. The first is a trap; the
-other two are boundaries.
+Worth knowing before you build on it. The first two are traps; the rest are
+boundaries.
 
 - **Out-of-order appends are accepted and never read.** A row whose timestamp is
   at or below its stream's newest sealed segment is committed, occupies space
@@ -79,6 +79,14 @@ other two are boundaries.
   whole archive, because it will recur. An archive can be reopened and a
   source resumed afterwards (`Archive::open`, `resume_source`).
   [Journal](docs/journal/2026-09-11-writer-failure-blast-radius.md).
+- **A counter reset and a counter wrap are indistinguishable.** Both are a
+  value that went down, and they need different arithmetic; every consumer
+  here assumes reset, which undercounts a wrap by up to the counter's full
+  width, every time. Telling them apart needs a generation per counter,
+  carried in the row by the producer — dendro reserves the source-wide
+  `producer_epoch` for restarts and can carry the rest opaquely, but cannot
+  see a counter to help.
+  [Journal](docs/journal/2026-09-12-generations-reset-versus-wrap.md).
 - **There is no index over what is inside a row.** The catalog knows sources,
   streams and time — nothing about series or labels, because dendro does not
   know what a row means. Finding which segments contain a particular series

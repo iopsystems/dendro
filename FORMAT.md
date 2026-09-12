@@ -266,8 +266,19 @@ with the ticks so it is on disk before any finalize.
 
 | Key | Value |
 |---|---|
-| `producer_epoch` | The producer's current **counter epoch**: an opaque id regenerated whenever its cumulative counters start from zero. Two sources with equal epochs over overlapping time observe **one** monotonic series — mergeable, never summable. A change mid-source is a counter reset a reader can see. Absent means unknown. |
+| `producer_epoch` | The producer's current **counter epoch**: an opaque id regenerated whenever *all* its cumulative counters start from zero together. Two sources with equal epochs over overlapping time observe **one** monotonic series — mergeable, never summable. A change mid-source is a restart, and every counter reset with it. Absent means unknown. |
 | `producer_epochs` | JSON array `[{"epoch": id, "from_ts": ts}, …]`, every epoch observed, in order; the last is the current one. |
+
+**What the source epoch does not cover.** A single counter that wrapped, or
+that the producer zeroed on read, did not restart the producer — so no
+source-level key says anything about it. From the values alone a wrap and a
+reset are identical (`cur < prev`, both), and their arithmetic is not: a
+reset contributes `cur`, a wrap of a `w`-bit counter contributes
+`cur + (2^w - prev)`. Distinguishing them needs a generation **per counter**,
+and a counter's width alongside it. Both are row payload, which is the
+encoder's and opaque to the archive — the container carries them and cannot
+read them. The design, and what each layer would owe, is in
+[the generations entry](docs/journal/2026-09-12-generations-reset-versus-wrap.md).
 | `writer_sessions` | JSON array `[{"session": uuid, "clock_anchor_wall_ns": n, "resumed_after_ts": ts?}, …]`, one per writer session that appended, in order; the last field only on a resume, naming the newest row the previous session left. One entry means the source was written in one go. |
 | `events` | JSON `{"events": [{"timestamp": ts, "description": text, "kind": tag?, "details": text?, "id": stable id?}, …]}`. `kind` `producer_epoch` marks a counter reset, `writer_session` a resume; `id` lets a merge de-duplicate. dendro appends to the array, never replaces it. |
 
