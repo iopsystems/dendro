@@ -57,9 +57,15 @@ pub struct CopySpec<'a> {
 
 impl CopySpec<'_> {
     /// Every source, every table, every row, metadata untouched.
+    ///
+    /// `i64::MIN`, not `0`: a timestamp is signed, so zero is the epoch rather
+    /// than the bottom of the range. `start: 0` meant "everything since 1970"
+    /// while claiming to mean everything, and silently produced an empty
+    /// destination — reporting success — for any archive holding pre-epoch
+    /// rows.
     pub fn everything() -> Self {
         CopySpec {
-            start: 0,
+            start: i64::MIN,
             end: i64::MAX,
             keep_streams: None,
             metadata_extra: None,

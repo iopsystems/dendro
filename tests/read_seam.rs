@@ -455,3 +455,58 @@ fn retention_bounds_the_clock_offset_series() {
         .collect();
     assert_eq!(left, vec![30], "observations older than the cutoff go too");
 }
+
+/// `CopySpec::everything()` means everything, including before 1970.
+///
+/// `start: 0` was the bottom of a `u64`. It is not the bottom of an `i64`, and
+/// the timestamp type changed underneath it — so "every source, every table,
+/// every row" silently meant "everything since the epoch", and a copy of an
+/// archive with pre-epoch rows produced an empty destination reporting success.
+#[test]
+#[cfg(feature = "write")]
+fn everything_copies_rows_from_before_the_epoch() {
+    use dendro::db::SegmentMeta;
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let dst_path = dir.path().join("dst.dendro");
+
+    let mut src = Db::create(&src_path).unwrap();
+    let id = src.insert_source(&source()).unwrap();
+    src.insert_segment(
+        id,
+        "old",
+        0,
+        &SegmentMeta {
+            rows: 2,
+            first_ts: -200,
+            last_ts: -100,
+        },
+        b"-200,-100",
+    )
+    .unwrap();
+    src.insert_wal_rows(
+        id,
+        &[WalRow {
+            stream: "tail".to_string(),
+            ts: -50,
+            wall_offset: 0,
+            row: vec![1],
+        }],
+    )
+    .unwrap();
+
+    let mut dst = Db::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Tags))
+        .unwrap();
+
+    let db = Db::open(&dst_path).unwrap();
+    let mut streams = db.all_streams(1).unwrap();
+    streams.sort();
+    assert_eq!(
+        streams,
+        vec!["old".to_string(), "tail".to_string()],
+        "a pre-epoch segment and a pre-epoch WAL tail must both survive"
+    );
+}
