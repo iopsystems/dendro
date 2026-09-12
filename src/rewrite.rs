@@ -138,6 +138,9 @@ fn copy_sources_snapshotted(
     let sources = src.read_sources()?;
     let mut copied = 0usize;
     for rec in &sources {
+        // The tail is re-encoded on the way across; a different encoder
+        // would write a segment the source's earlier ones do not match.
+        crate::segment::check_encoder(rec.id, &rec.meta.metadata, encoder)?;
         let mut meta = rec.meta.clone();
         if let Some(extra) = spec.metadata_extra {
             for (k, v) in extra {

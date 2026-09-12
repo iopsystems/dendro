@@ -125,6 +125,7 @@ pub fn probe(
     encoder: &dyn SegmentEncoder,
 ) -> Result<Option<Vec<u8>>> {
     db.read_snapshot(|db| {
+        check_encoder_of(db, source_id, encoder)?;
         if let Some((seq, _)) = db.read_segment_meta(source_id, stream)?.first() {
             return db.read_segment_bytes(source_id, stream, *seq);
         }
@@ -149,6 +150,7 @@ pub fn stream_range(
     encoder: &dyn SegmentEncoder,
 ) -> Result<Vec<Vec<u8>>> {
     db.read_snapshot(|db| {
+        check_encoder_of(db, source_id, encoder)?;
         let mut segments: Vec<Vec<u8>> = db
             .segments_overlapping(source_id, stream, start, end)?
             .into_iter()
@@ -205,6 +207,7 @@ pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceS
 fn read_archive_snapshotted(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>> {
     let mut out = Vec::new();
     for src in db.read_sources()? {
+        crate::segment::check_encoder(src.id, &src.meta.metadata, encoder)?;
         let mut streams = Vec::new();
         for stream in db.all_streams(src.id)? {
             let segments = stream_segments_snapshotted(db, src.id, &stream, encoder)?;
@@ -241,7 +244,19 @@ pub fn stream_segments(
     stream: &str,
     encoder: &dyn SegmentEncoder,
 ) -> Result<Vec<Vec<u8>>> {
-    db.read_snapshot(|db| stream_segments_snapshotted(db, source_id, stream, encoder))
+    db.read_snapshot(|db| {
+        check_encoder_of(db, source_id, encoder)?;
+        stream_segments_snapshotted(db, source_id, stream, encoder)
+    })
+}
+
+/// [`segment::check_encoder`](crate::segment::check_encoder) for a source
+/// named by id, inside the caller's snapshot.
+fn check_encoder_of(db: &Db, source_id: i64, encoder: &dyn SegmentEncoder) -> Result<()> {
+    if encoder.version().is_none() {
+        return Ok(());
+    }
+    crate::segment::check_encoder(source_id, &db.source_metadata(source_id)?, encoder)
 }
 
 /// [`stream_segments`] without opening a snapshot, for a caller that already

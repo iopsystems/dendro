@@ -184,6 +184,12 @@ pub mod keys {
     /// shape is open — a viewer's own event schema may carry more fields —
     /// and dendro appends to the array rather than replacing it.
     pub const EVENTS: &str = "events";
+    /// The version of the encoder that wrote the source's rows, as the
+    /// caller's [`SegmentEncoder::version`](crate::segment::SegmentEncoder::version)
+    /// reported it at `add_source`. A reader whose encoder reports a
+    /// different version is refused ([`Error::EncoderMismatch`](crate::Error));
+    /// an encoder that reports nothing is never checked. Written by dendro.
+    pub const ENCODER: &str = "encoder";
 }
 
 /// The container: schema, catalog, and every statement that touches SQL.

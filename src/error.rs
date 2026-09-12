@@ -33,6 +33,16 @@ pub enum Error {
     /// found, so a caller can tell "too new, upgrade dendro" from "too old".
     UnsupportedSchema { found: i64, writes: i64, reads: i64 },
 
+    /// The archive says its rows were written by one encoder version and the
+    /// caller is reading with another. The bytes are the encoder's, so
+    /// nothing else can say whether the two agree; refusing is the only
+    /// answer that is never silently wrong.
+    EncoderMismatch {
+        source_id: i64,
+        wrote: String,
+        reading: String,
+    },
+
     /// A resumed source was handed rows at or before the newest row its
     /// previous writer session left, or a resume anchor at or before it: the
     /// wall clock went backwards across the restart, and writing would make
@@ -118,6 +128,16 @@ impl fmt::Display for Error {
                 f,
                 "unsupported archive schema version {found}: this build writes \
                  v{writes} and reads v{reads}"
+            ),
+            Error::EncoderMismatch {
+                source_id,
+                wrote,
+                reading,
+            } => write!(
+                f,
+                "source {source_id} was written with encoder version {wrote:?} and is being \
+                 read with {reading:?}; the rows are the encoder's bytes, so a different \
+                 version may not decode them the same way"
             ),
             Error::TimelineBackwards {
                 source_id,

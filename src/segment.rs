@@ -69,6 +69,20 @@ pub struct Segment {
 /// seal path the reader is the writer thread. Return `Ok(None)`.
 pub trait SegmentEncoder {
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
+
+    /// A version string for this encoding, or `None` to opt out.
+    ///
+    /// The bytes in a row and the columns in a segment are this encoder's,
+    /// and the archive cannot tell whether a different build of it would
+    /// produce the same bytes from the same rows — which the seal seam
+    /// requires. So a writer records this under
+    /// [`keys::ENCODER`](crate::keys::ENCODER) at `add_source`, and every
+    /// read path compares it with the reading encoder's and refuses a
+    /// mismatch. Change it when the encoding changes; leave it alone when
+    /// only the implementation does.
+    fn version(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Run an encoder over a run of WAL rows and check what came back — the ONE
@@ -163,6 +177,30 @@ impl<T: SegmentEncoder + ?Sized> SegmentEncoder for &T {
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
         (**self).encode(stream, rows)
     }
+    fn version(&self) -> Option<&str> {
+        (**self).version()
+    }
+}
+
+/// Refuse a source written by a different encoder version than `encoder`
+/// reports. Either side reporting nothing is not a mismatch: an encoder
+/// that does not version itself, or a source from before the key, is
+/// simply unchecked.
+pub fn check_encoder(
+    source_id: i64,
+    metadata: &std::collections::BTreeMap<String, String>,
+    encoder: &dyn SegmentEncoder,
+) -> Result<()> {
+    if let (Some(wrote), Some(reading)) = (metadata.get(crate::keys::ENCODER), encoder.version()) {
+        if wrote != reading {
+            return Err(Error::EncoderMismatch {
+                source_id,
+                wrote: wrote.clone(),
+                reading: reading.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Encode one `RecordBatch` as a segment's parquet bytes, with the archive's

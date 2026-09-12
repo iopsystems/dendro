@@ -1017,12 +1017,20 @@ fn record_session(
 }
 
 /// The writer-thread half of [`Archive::resume_source`].
-fn resume_source(db: &mut Db, source_id: i64, clock_anchor_wall_ns: i64) -> Result<Resumed> {
+fn resume_source(
+    db: &mut Db,
+    source_id: i64,
+    clock_anchor_wall_ns: i64,
+    encoder: &(dyn SegmentEncoder + Send),
+) -> Result<Resumed> {
     let Some(src) = db.read_sources()?.into_iter().find(|s| s.id == source_id) else {
         return Err(Error::Message(format!(
             "no source with id {source_id} to resume"
         )));
     };
+    // A resuming writer must encode the way the previous one did, or the
+    // stream's later segments will not decode like its earlier ones.
+    crate::segment::check_encoder(source_id, &src.meta.metadata, encoder)?;
     let (_, last_ts) = db.source_time_span(source_id)?;
     if let Some(floor) = last_ts {
         if clock_anchor_wall_ns <= floor {
@@ -1165,6 +1173,13 @@ fn writer_loop(
             Ok(Msg::AddSource { seed, reply }) => {
                 let inserted = db.insert_source(&seed).and_then(|id| {
                     record_session(db, id, seed.clock_anchor_wall_ns, None)?;
+                    // The encoder that will write this source's rows, so a
+                    // reader can tell whether its own would decode them.
+                    if let Some(version) = encoder.version() {
+                        let mut patch = BTreeMap::new();
+                        patch.insert(crate::keys::ENCODER.to_string(), version.to_string());
+                        db.patch_source_metadata(id, &patch)?;
+                    }
                     Ok(id)
                 });
                 // A failed insert is reported to the caller and does NOT kill
@@ -1180,7 +1195,7 @@ fn writer_loop(
                 clock_anchor_wall_ns,
                 reply,
             }) => {
-                let resumed = resume_source(db, source_id, clock_anchor_wall_ns);
+                let resumed = resume_source(db, source_id, clock_anchor_wall_ns, encoder);
                 if let Ok(Resumed {
                     last_ts: Some(floor),
                     ..

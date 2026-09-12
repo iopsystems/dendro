@@ -285,6 +285,17 @@ rezolus built above the crate to take a query from 572 to 23 ms; it now
 lives where the next consumer finds it. `read_archive` is unchanged as the
 simple whole answer. `tests/catalog.rs` covers each.
 
+**Encoder version marker (landed).** `SegmentEncoder::version()` is a
+default method returning `None`; a writer records a `Some` under
+`keys::ENCODER` at `add_source`, and `segment::check_encoder` refuses a
+mismatch as `Error::EncoderMismatch { source_id, wrote, reading }` on every
+path that runs an encoder over the source's rows: `read_archive`,
+`stream_segments`, `probe`, `stream_range`, `resume_source`, and
+`copy_sources_into` (which re-encodes the tail). Either side reporting
+nothing is unchecked, so an unversioned encoder and a source from before
+the key behave as before. The one-line follow-on the encoder-boundary entry
+asked for, riding on item 4's primitive. `tests/encoder_version.rs`.
+
 ## Deferred or Reopen Items
 
 - **Encoder version marker.** One reserved key written at `add_source`,
