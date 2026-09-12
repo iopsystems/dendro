@@ -38,6 +38,14 @@ write = []
 # invisible to a crate that depends on dendro.
 test-support = ["write"]
 
+# A writer in its own process, so a test can SIGKILL it. Behind
+# `test-support` because that is what supplies `Archive::single`, and because
+# nothing ships it.
+[[bin]]
+name = "append-until-killed"
+path = "src/bin/append-until-killed.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 # Building a legacy-schema fixture by hand, in `tests/legacy_v3.rs`.
 rusqlite = { version = "0.40", features = ["bundled"] }

@@ -326,9 +326,27 @@ for a later retention pass, instead of an unbounded vacuum inside `Drop`.
 settings, defaulting to the archive's. `SealPolicy::default` says where its
 numbers came from and that they are a starting point.
 
+**The test gap (landed).** The crate's "kill" tests were all `drop`, which
+joins the writer and is by definition a clean close, so `DESIGN.md`'s
+recovery numbers were measured and never asserted. An unclean kill cannot be
+staged in-process, so `src/bin/append-until-killed.rs` (a `test-support`
+binary, not a tool) puts a writer in its own process: it appends, seals once
+partway, commits, prints `ready`, `mem::forget`s both handles so nothing can
+run `Drop`, and sleeps. `tests/unclean_kill.rs` SIGKILLs it and checks the
+three states a kill can leave — the archive with its sidecars (every
+committed append is there, sealed segment and live tail both, `complete`
+false, uuid intact); the archive ALONE, which is what a `cp` of a live
+recording gets (opens, stale not broken, never more than the full set); and
+a sidecar truncated mid-frame (recovered to its last intact frame rather
+than refused). A fourth test meets the recovery and resume paths, which
+nothing had exercised together: a killed source reopens, refuses an anchor
+at or before the row the kill left, continues its `seq`, and carries both
+sessions on record.
+
 ## Deferred or Reopen Items
 
-Nothing from this effort. The three sibling entries — the encoder boundary,
+Nothing from this effort; the test gap it left is closed above. The three
+sibling entries — the encoder boundary,
 out-of-order appends, and segment compaction — remain open on their own
 terms, with the encoder version marker now taken off the first one's list.
 
