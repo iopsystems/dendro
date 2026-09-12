@@ -894,11 +894,10 @@ fn seal_batch(
     // exactly the rows the seal decision was made about. Nothing has to be
     // snapshotted or passed along for that to hold.
     let mut encoded = Vec::with_capacity(batch.len());
-    // The batch's clock observation: the NEWEST sealed row's
-    // `(timestamp, wall_offset)`, paired with that same table's offset — never
-    // one table's timestamp against another's. Derived from the rows just
-    // sealed, so every entry in the series is a projection of the
-    // `:wall_offset` column it summarizes.
+    // The batch's clock observation: the newest SEALED row's own
+    // `(timestamp, wall_offset)` — one row, both halves. Derived from the rows
+    // actually sealed, so every entry in the series is a projection of a row
+    // that exists.
     let mut observation: Option<(i64, i64)> = None;
     for stream in batch {
         let rows = db.live_wal(source_id, &stream)?;
@@ -926,7 +925,7 @@ fn seal_batch(
         // be written into the catalog and used for the prune, on the reasoning
         // that a dropped run is always a leading one — which is circular, since
         // the prune is what destroyed the evidence when it was not.
-        let (last_ts, wall_offset) = (last.ts, last.wall_offset);
+        let last_ts = last.ts;
         let Some(tail) = encoder
             .encode(&stream, &rows)
             .map_err(|source| Error::Encoder {
@@ -979,11 +978,24 @@ fn seal_batch(
                 ),
             });
         }
-        // `>=`, so a later stream wins a tie. From the SEGMENT's last row: an
-        // observation paired with a timestamp no segment covers is one a reader
-        // cannot line up against anything.
-        if observation.is_none_or(|(seen, _)| tail.last_ts >= seen) {
-            observation = Some((tail.last_ts, wall_offset));
+        // The batch's clock observation: ONE row's `(ts, wall_offset)`, never
+        // one row's timestamp against another's offset. The series is a
+        // projection of the rows it summarizes, so an entry has to be a pair
+        // some single row actually carried.
+        //
+        // `tail.last_ts` names the segment's last row, which is the one worth
+        // recording — but the offset must come from THAT row, not from the raw
+        // input's last, which is a different row whenever the encoder dropped a
+        // trailing one. Pairing the two put the observation a whole tick out.
+        //
+        // `>=`, so a later stream wins a tie.
+        let segment_last = rows
+            .iter()
+            .rev()
+            .find(|r| r.ts == tail.last_ts)
+            .expect("the segment's last_ts is one of the rows, by the check above");
+        if observation.is_none_or(|(seen, _)| segment_last.ts >= seen) {
+            observation = Some((segment_last.ts, segment_last.wall_offset));
         }
         // Bumped before the commit, which is safe only because the writer
         // exits on its first error: no later batch ever reuses this map.

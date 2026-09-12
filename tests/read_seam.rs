@@ -685,3 +685,53 @@ fn a_copy_catalogs_the_tail_it_wrote() {
         "the catalog must describe the bytes, which stop at ts=2"
     );
 }
+
+/// A clock observation pairs a timestamp with ITS OWN row's offset.
+///
+/// The series is a projection of the rows it summarizes, so an entry must be a
+/// `(ts, wall_offset)` that some single row actually carried. Taking the
+/// timestamp from the segment and the offset from the raw input's last row
+/// paired two different rows whenever the encoder dropped a trailing one, and
+/// the observation was then off by a whole tick.
+#[test]
+#[cfg(feature = "write")]
+fn a_clock_observation_comes_from_one_row() {
+    use dendro::writer::Archive;
+
+    struct DropsLast;
+    impl SegmentEncoder for DropsLast {
+        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+            if rows.len() < 2 {
+                return Ok(None);
+            }
+            Tags.encode(stream, &rows[..rows.len() - 1])
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Archive::create(&path, Box::new(DropsLast)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    // ts=10 carries offset 10000; ts=20 carries 20000; ts=30 carries 30000.
+    for ts in [10i64, 20, 30] {
+        src.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: ts * 1000,
+            row: vec![1],
+        }])
+        .unwrap();
+    }
+    src.seal(vec!["s".to_string()]).unwrap();
+    src.sync().unwrap();
+
+    let db = Db::open_read_only(&path).unwrap();
+    let offsets = db.read_clock_offsets(1).unwrap();
+    assert_eq!(offsets.len(), 1);
+    let (ts, offset) = offsets[0];
+    assert_eq!(
+        (ts, offset),
+        (20, 20_000),
+        "the segment ends at ts=20, so the observation is ts=20's own offset"
+    );
+}
