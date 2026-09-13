@@ -88,6 +88,15 @@ boundaries.
   `producer_epoch` for restarts and can carry the rest opaquely, but cannot
   see a counter to help.
   [Journal](docs/journal/2026-09-12-generations-reset-versus-wrap.md).
+- **A column whose metadata changes stops compaction dead.** Segments merge
+  only where the columns they share are identical, metadata included, so a
+  caller that re-describes a column in place gets no merging at all — measured
+  at zero merges out of twenty segments, not merely fewer. Union-merging fixes
+  a column *set* that comes and goes; it deliberately does not fix this,
+  because a name whose metadata moved may be a different series, and fusing
+  two series into one column is undetectable afterwards. The fix is to keep
+  identity out of the column.
+  [Journal](docs/journal/2026-09-13-schema-churn-and-column-identity.md).
 - **dendro builds no index over what is inside a row** — it cannot, since it
   does not know what a row means. It now **stores** one: a segment carries an
   opaque `index` the archive never reads, so a caller that knows how to find
@@ -189,7 +198,10 @@ extracted from.
   between 400 segments and one, with the archive 2.37x larger —
   and `rewrite::compact` merges a stream's small segments back into large
   ones in place, reclaiming the space as it goes. An archive compacted is
-  the same artifact as one written coarse.
+  the same artifact as one written coarse. A run stops where a stream's
+  schema changes; `CompactSpec::unioning_fields` opts into merging across a
+  column *set* that grew or shrank, null-filling the rows that predate a
+  column.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.

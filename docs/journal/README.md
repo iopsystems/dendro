@@ -9,7 +9,8 @@ as ours or not ours, and links the entries that own each one.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
-| 2026-09-12 | [What a TSDB has that we do not, and which of it is ours to build](2026-09-12-what-a-tsdb-has-that-we-do-not.md) | implemented (4 of 5; compaction gated) |
+| 2026-09-13 | [Schema churn becomes segment churn, and where column identity should live](2026-09-13-schema-churn-and-column-identity.md) | partly resolved (column-set churn fixed; identity churn open) |
+| 2026-09-12 | [What a TSDB has that we do not, and which of it is ours to build](2026-09-12-what-a-tsdb-has-that-we-do-not.md) | implemented (all five) |
 | 2026-09-12 | [Generations: telling a counter reset from a counter wrap](2026-09-12-generations-reset-versus-wrap.md) | open |
 | 2026-09-11 | [Container hardening: failure classes, identity, sessions, and one materialization](2026-09-11-container-hardening.md) | implemented |
 | 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | implemented (18.6x read, 2.37x size) |

@@ -18,6 +18,35 @@ use crate::db::{Db, SegmentMeta, Tx};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
+/// What a merge does when two segments of one stream do not have the same
+/// schema — which a stream is allowed to do, and which a caller whose
+/// columns come and go does constantly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaPolicy {
+    /// Stop the run at the change. The default, and the only choice that is
+    /// safe without knowing what a column means.
+    #[default]
+    StopAtChange,
+    /// Merge on the **union** of the fields: a column present in only some of
+    /// the segments is written, and null for the rows of the segments that
+    /// lacked it.
+    ///
+    /// What this asserts, on the caller's behalf: that a column absent from a
+    /// segment means *no reading*, not *a different thing*. That is true of a
+    /// population that comes and goes — a cgroup that did not exist yet — and
+    /// it is why this is opt-in rather than the default.
+    ///
+    /// **It does not merge across a changed field.** A name that appears in
+    /// two segments with any difference at all — type, nullability, or
+    /// metadata — still stops the run, because a column whose metadata
+    /// changed may be a different series wearing the same name, and fusing
+    /// two series into one column is silent corruption rather than a policy
+    /// choice. A caller whose column identity lives in field metadata and
+    /// churns gets no more merging from this than from the default; the fix
+    /// there is to take identity out of the column, not to merge harder.
+    UnionFields,
+}
+
 /// What one compaction pass aims for. See [`compact`].
 pub struct CompactSpec {
     /// Merge adjacent segments until the next one would push the total past
@@ -29,16 +58,27 @@ pub struct CompactSpec {
     /// compacted segments come back encoded differently from its sealed
     /// ones.
     pub writer_props: Option<parquet::file::properties::WriterProperties>,
+    /// What to do when adjacent segments disagree about their schema. See
+    /// [`SchemaPolicy`].
+    pub schema: SchemaPolicy,
 }
 
 impl CompactSpec {
     /// Merge toward segments of `target_rows`, with the archive's own writer
-    /// properties.
+    /// properties, stopping a run at any schema change.
     pub fn to_rows(target_rows: u64) -> Self {
         CompactSpec {
             target_rows,
             writer_props: None,
+            schema: SchemaPolicy::StopAtChange,
         }
+    }
+
+    /// This spec, merging across segments whose column SETS differ. See
+    /// [`SchemaPolicy::UnionFields`] for what that asserts.
+    pub fn unioning_fields(mut self) -> Self {
+        self.schema = SchemaPolicy::UnionFields;
+        self
     }
 
     fn props(&self) -> parquet::file::properties::WriterProperties {
@@ -130,7 +170,8 @@ pub fn compact_stream(
                 None => break,
             }
         }
-        let (merged, merged_rows, consumed) = concat_parquet(&blobs, spec.props(), stream)?;
+        let (merged, merged_rows, consumed) =
+            concat_parquet(&blobs, spec.props(), spec.schema, stream)?;
         if consumed < 2 {
             // A schema change at the very front of the run.
             at += 1;
@@ -207,26 +248,95 @@ pub fn compact(db: &mut Db, spec: &CompactSpec) -> Result<Compacted> {
 fn concat_parquet(
     blobs: &[Vec<u8>],
     props: parquet::file::properties::WriterProperties,
+    policy: SchemaPolicy,
     stream: &str,
 ) -> Result<(Vec<u8>, u64, usize)> {
+    use arrow::array::new_null_array;
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
 
     let open = |b: &Vec<u8>| {
         ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(b.clone()))
             .map_err(|e| Error::Message(format!("failed to open a {stream} segment to merge: {e}")))
     };
     let first = open(&blobs[0])?;
-    let schema = first.schema().clone();
-    let mut consumed = 1usize;
-    while consumed < blobs.len() && open(&blobs[consumed])?.schema() == &schema {
-        consumed += 1;
-    }
+
+    // How far the run reaches, and what schema the merged segment gets.
+    //
+    // Under either policy a field that appears twice must be IDENTICAL —
+    // same type, same nullability, same metadata. The policies differ only
+    // on a field that appears in one segment and not another: stop there, or
+    // carry it and null-fill.
+    let (consumed, schema) = match policy {
+        SchemaPolicy::StopAtChange => {
+            let schema = first.schema().clone();
+            let mut consumed = 1usize;
+            while consumed < blobs.len() && open(&blobs[consumed])?.schema() == &schema {
+                consumed += 1;
+            }
+            (consumed, schema)
+        }
+        SchemaPolicy::UnionFields => {
+            let mut order: Vec<Field> = Vec::new();
+            let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+            let mut consumed = 0usize;
+            'segments: while consumed < blobs.len() {
+                let s = open(&blobs[consumed])?.schema().clone();
+                // Check the whole segment before taking any of it, so a
+                // conflict late in its field list does not leave the union
+                // half-extended.
+                for f in s.fields() {
+                    if let Some(i) = seen.get(f.name()) {
+                        if &order[*i] != f.as_ref() {
+                            break 'segments;
+                        }
+                    }
+                }
+                for f in s.fields() {
+                    if !seen.contains_key(f.name()) {
+                        seen.insert(f.name().clone(), order.len());
+                        order.push(f.as_ref().clone());
+                    }
+                }
+                consumed += 1;
+            }
+            if consumed == 0 {
+                // The first segment conflicts with nothing, so this is
+                // unreachable; fall back rather than assume it.
+                (1, first.schema().clone())
+            } else {
+                // A field the whole run carries keeps its nullability; one
+                // only some segments have must become nullable, because the
+                // rest contribute nulls for it.
+                let mut in_every: BTreeMap<String, usize> = BTreeMap::new();
+                for b in &blobs[..consumed] {
+                    for f in open(b)?.schema().fields() {
+                        *in_every.entry(f.name().clone()).or_insert(0) += 1;
+                    }
+                }
+                let fields: Vec<Field> = order
+                    .into_iter()
+                    .map(|f| {
+                        if in_every.get(f.name()) == Some(&consumed) {
+                            f
+                        } else {
+                            let md = f.metadata().clone();
+                            Field::new(f.name(), f.data_type().clone(), true).with_metadata(md)
+                        }
+                    })
+                    .collect();
+                (consumed, Arc::new(Schema::new(fields)))
+            }
+        }
+    };
 
     let mut buf: Vec<u8> = Vec::new();
     let mut rows = 0u64;
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
             .map_err(|e| Error::Message(format!("failed to open a merged {stream} writer: {e}")))?;
         for b in &blobs[..consumed] {
             for batch in open(b)?.build().map_err(|e| {
@@ -236,6 +346,25 @@ fn concat_parquet(
                     Error::Message(format!("failed to read a {stream} batch to merge: {e}"))
                 })?;
                 rows += batch.num_rows() as u64;
+                // Under `StopAtChange` every batch already has the merged
+                // schema and this is a move; under `UnionFields` a segment
+                // that lacked a column contributes nulls for it.
+                let batch = if batch.schema().fields() == schema.fields() {
+                    batch
+                } else {
+                    let n = batch.num_rows();
+                    let columns = schema
+                        .fields()
+                        .iter()
+                        .map(|f| match batch.schema().index_of(f.name()) {
+                            Ok(i) => batch.column(i).clone(),
+                            Err(_) => new_null_array(f.data_type(), n),
+                        })
+                        .collect();
+                    RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                        Error::Message(format!("failed to widen a {stream} batch: {e}"))
+                    })?
+                };
                 writer.write(&batch).map_err(|e| {
                     Error::Message(format!("failed to write a merged {stream} batch: {e}"))
                 })?;

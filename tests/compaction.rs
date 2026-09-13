@@ -336,3 +336,172 @@ fn compacting_one_stream_leaves_the_others_alone() {
     assert_eq!(db.read_segment_meta(1, "keep").unwrap().len(), 4);
     assert_eq!(db.read_segment_meta(1, "squash").unwrap().len(), 1);
 }
+
+/// An encoder whose column *identity* lives in field metadata, which is the
+/// shape that makes union-merging dangerous: two segments can agree on every
+/// column name and still be describing different series.
+struct Relabeling;
+
+impl SegmentEncoder for Relabeling {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let ts: Vec<i64> = rows.iter().map(|r| r.ts).collect();
+        // The tag rides in the row's first byte, so a caller can churn it.
+        let tag = rows[0].row[0].to_string();
+        let fields = vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("v0", DataType::Int64, false).with_metadata(
+                BTreeMap::from([("id".to_string(), tag)])
+                    .into_iter()
+                    .collect(),
+            ),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(ts.clone())),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.row[0] as i64).collect::<Vec<_>>(),
+            )),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| format!("{e}"))?;
+        Ok(Some(Segment {
+            bytes: encode_batch(schema, &batch)?,
+            rows: rows.len() as u64,
+            first_ts: ts[0],
+            last_ts: ts[ts.len() - 1],
+            index: None,
+        }))
+    }
+}
+
+/// The whole point of the opt-in policy: a caller whose population comes and
+/// goes gets its segments merged, on the union of the columns, with the rows
+/// that predate a column carrying null for it.
+#[test]
+fn unioning_merges_across_a_column_set_that_grew() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let (a, mut w) = Archive::single(&path, Box::new(Widening), meta()).unwrap();
+    for (ts, columns) in [(1, 2), (2, 2), (3, 5), (4, 5), (5, 2), (6, 2)] {
+        w.wal(vec![row(ts, columns)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (6, 0)).unwrap();
+
+    // The default still refuses, so this fixture is the churn case.
+    let mut db = Db::open(&path).unwrap();
+    let stopped = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
+    assert_eq!((stopped.before, stopped.after), (6, 3), "a run per shape");
+    drop(db);
+
+    // Union: one segment, every row, the wider column set.
+    let path2 = dir.path().join("d.dendro");
+    let (a, mut w) = Archive::single(&path2, Box::new(Widening), meta()).unwrap();
+    for (ts, columns) in [(1, 2), (2, 2), (3, 5), (4, 5), (5, 2), (6, 2)] {
+        w.wal(vec![row(ts, columns)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (6, 0)).unwrap();
+
+    let mut db = Db::open(&path2).unwrap();
+    let done = compact(&mut db, &CompactSpec::to_rows(100).unioning_fields()).unwrap();
+    assert_eq!((done.before, done.after, done.merges), (6, 1, 1));
+    assert!(db.verify(dendro::db::Depth::Full).unwrap().is_sound());
+    drop(db);
+
+    assert_eq!(timestamps(&path2), (1..=6).collect::<Vec<_>>());
+
+    // The merged segment: six rows, v0..v4, and null where a row predates a
+    // column rather than a zero standing in for a reading nobody took.
+    let db = Db::open_read_only(&path2).unwrap();
+    let seqs: Vec<u64> = db
+        .read_segment_meta(1, "s")
+        .unwrap()
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect();
+    assert_eq!(seqs.len(), 1);
+    let blob = db.read_segment_bytes(1, "s", seqs[0]).unwrap().unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(blob),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut seen = 0usize;
+    let mut nulls = 0usize;
+    for batch in reader {
+        let batch = batch.unwrap();
+        let schema = batch.schema();
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["timestamp", "v0", "v1", "v2", "v3", "v4"]
+        );
+        assert!(!schema.field(1).is_nullable(), "v0 is in every segment");
+        assert!(schema.field(3).is_nullable(), "v2 is not");
+        seen += batch.num_rows();
+        nulls += batch.column(3).null_count();
+    }
+    assert_eq!(seen, 6);
+    assert_eq!(nulls, 4, "the four two-column rows");
+}
+
+/// Unioning widens the column *set*. It does not reconcile a column that
+/// changed, because a name whose metadata moved may be a different series,
+/// and fusing two series into one column is corruption rather than a policy.
+#[test]
+fn unioning_still_stops_at_a_column_that_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let (a, mut w) = Archive::single(&path, Box::new(Relabeling), meta()).unwrap();
+    for ts in 1..=4i64 {
+        // The tag changes at ts 3: same column name, different series.
+        let tag = if ts < 3 { 7u8 } else { 9u8 };
+        w.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![tag],
+        }])
+        .unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (4, 0)).unwrap();
+
+    let mut db = Db::open(&path).unwrap();
+    let done = compact(&mut db, &CompactSpec::to_rows(100).unioning_fields()).unwrap();
+    assert_eq!(
+        (done.before, done.after),
+        (4, 2),
+        "one run per tag, even under union"
+    );
+    drop(db);
+
+    let db = Db::open_read_only(&path).unwrap();
+    let seqs: Vec<u64> = db
+        .read_segment_meta(1, "s")
+        .unwrap()
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect();
+    for (i, seq) in seqs.into_iter().enumerate() {
+        let blob = db.read_segment_bytes(1, "s", seq).unwrap().unwrap();
+        let schema = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(blob),
+        )
+        .unwrap()
+        .schema()
+        .clone();
+        assert_eq!(
+            schema.field(1).metadata().get("id").map(|s| s.as_str()),
+            Some(if i == 0 { "7" } else { "9" }),
+            "each merged segment keeps one tag, untouched"
+        );
+    }
+}

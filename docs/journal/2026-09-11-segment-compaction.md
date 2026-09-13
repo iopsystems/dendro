@@ -128,7 +128,11 @@ and is documented as the reason it is on `Tx` at all, unlike the WAL prune.
 
 **A run stops at a schema change**, rather than reconciling two shapes: a
 stream's schema may drift, and dendro concatenates parquet rather than
-understanding it. Segments either side of a change stay separate.
+understanding it. Segments either side of a change stay separate. That is
+still the default, and it proved far more expensive than this entry expected
+for a caller whose columns churn — see [schema churn and column
+identity](2026-09-13-schema-churn-and-column-identity.md), which measures it
+and adds an opt-in union policy for the half that is safe to merge.
 
 **The merged segment carries no index**, for the same reason a column
 projection carries none: the index described one input, and combining two
@@ -218,6 +222,11 @@ first working version returned no space at all.
 - ~~**Reopen** when a measured read is slower than the same data in fewer
   segments.~~ **Done**: 18.2× slower and 2.38× larger, reproducible, with
   the per-segment cost identified as footer parsing.
+- **A run stopping at a schema change turned out to be the dominant cost for
+  a churning caller**, not a corner: measured at zero merges out of twenty.
+  Half of it is now fixable through `CompactSpec::unioning_fields`; the other
+  half is not a compaction problem. See [schema churn and column
+  identity](2026-09-13-schema-churn-and-column-identity.md).
 - Related: this is one of the two gaps that decide whether dendro can sit under
   a time-series database. The other is
   [backfill](2026-09-11-out-of-order-appends.md). Retention, the third thing
