@@ -101,6 +101,9 @@ pub const APPLICATION_ID: u32 = 0x6465_6e64;
 
 /// What the first 100 bytes of a file say about it. See [`sniff_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub enum Sniff {
     /// A stamped archive; `version` is its `user_version`, which an open
     /// still gates (a version this build does not read is refused there, by
@@ -169,6 +172,9 @@ pub struct SourceMeta {
 
 /// A row of the `sources` table.
 #[derive(Clone, Debug, PartialEq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct SourceRow {
     pub id: i64,
     pub meta: SourceMeta,
@@ -195,6 +201,9 @@ pub struct SegmentMeta {
 
 /// A row of the `segments` table for one `(source, stream)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct SegmentRow {
     pub seq: u64,
     pub meta: SegmentMeta,
@@ -228,6 +237,9 @@ pub struct WalRow {
 /// can tell "the window moved" from "nothing was old enough yet" — and so a
 /// test can assert the WAL rows went with their segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct Evicted {
     pub segments: usize,
     pub wal_rows: usize,
@@ -245,6 +257,9 @@ pub struct Evicted {
 /// catalog columns alone — no segment or WAL payload is read. `first_ts` and
 /// `last_ts` are `None` when `rows` is 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct Span {
     pub rows: u64,
     pub first_ts: Option<i64>,
@@ -295,6 +310,9 @@ pub enum Depth {
 
 /// What [`Db::verify`] found. Empty `problems` is a sound archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct Report {
     pub sources: usize,
     pub streams: usize,
@@ -316,6 +334,9 @@ impl Report {
 
 /// One thing wrong with an archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub enum Problem {
     /// SQLite says the database itself is damaged; the string is its own
     /// wording, one per line it reported.
@@ -370,6 +391,9 @@ impl std::fmt::Display for Problem {
 
 /// How an archive's pages stand. See [`Db::page_stats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct PageStats {
     /// Pages in the file.
     pub pages: u32,

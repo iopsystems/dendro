@@ -96,7 +96,10 @@ pub enum Error {
 }
 
 /// Why a handle will not write.
+///
+/// Variants are added without a major version; match with a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReadOnly {
     /// Opened with [`Db::open_read_only`](crate::db::Db::open_read_only).
     Handle,

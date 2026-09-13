@@ -90,6 +90,9 @@ impl CompactSpec {
 
 /// What one compaction pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct Compacted {
     /// Sealed segments before the pass, across everything it looked at.
     pub before: usize,

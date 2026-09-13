@@ -16,6 +16,9 @@ use crate::segment::SegmentEncoder;
 /// A stream as the catalog sees it: how much is sealed, how much is live,
 /// and the span the two cover. **No BLOB is read** to answer this.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct StreamCatalog {
     pub name: String,
     /// How many sealed segments the stream has.
@@ -54,6 +57,9 @@ impl StreamCatalog {
 
 /// A source as the catalog sees it, with every stream it currently holds.
 #[derive(Debug, Clone)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct SourceCatalog {
     pub id: i64,
     pub uuid: Option<String>,
@@ -130,6 +136,9 @@ fn catalog_snapshotted(db: &Db) -> Result<Vec<SourceCatalog>> {
 /// itself and each did it differently. Those all remain, for a caller that
 /// wants one number; this is the answer to the question people actually ask.
 #[derive(Debug, Clone)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct Overview {
     /// The archive's size on disk, as SQLite accounts it. Excludes the
     /// `-wal` sidecar, which is not part of the artifact.
@@ -246,6 +255,9 @@ pub fn stream_range(
 
 /// One source's contents, resolved to bytes.
 #[derive(Debug)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
 pub struct SourceSegments {
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
