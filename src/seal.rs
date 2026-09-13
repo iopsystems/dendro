@@ -42,6 +42,26 @@ pub struct SealPolicy {
     pub max_bytes: usize,
     pub max_rows: usize,
     pub max_age: Duration,
+    /// Seal on a wall-clock boundary as well: no segment spans two multiples
+    /// of this, in **the same unit as your row timestamps** (dendro does not
+    /// mandate one; nanoseconds is the convention). `None`, the default,
+    /// leaves segment edges wherever the caps put them.
+    ///
+    /// Block-oriented stores align because it makes range pruning
+    /// predictable — a query for one bucket touches one segment — and it
+    /// makes two archives of the same window comparable segment for segment,
+    /// which the caps alone never give you, since they depend on how much
+    /// happened to arrive.
+    ///
+    /// Nothing here seals; dendro never does. This is advice, and there are
+    /// two ways to take it, which differ by one row: ask
+    /// [`SegmentAccount::starts_new_bucket`] before adding a row and seal
+    /// first, for exact edges; or just let [`SegmentAccount::is_due`] notice
+    /// afterwards, which is one call site instead of two and leaves the
+    /// boundary row at the end of the older segment.
+    ///
+    /// A non-positive value means no alignment, the same as `None`.
+    pub align: Option<i64>,
 }
 
 /// The two caps and the age bound.
@@ -89,6 +109,9 @@ impl Default for SealPolicy {
             // Not a free variable like the two caps: this bounds how much an
             // unclean kill loses, not seal cost. Trade it against segment count.
             max_age: Duration::from_secs(300),
+            // Off: it costs a short segment at every boundary, which is only
+            // worth paying when something downstream reads by bucket.
+            align: None,
         }
     }
 }
@@ -104,6 +127,12 @@ impl Default for SealPolicy {
 /// the alternative is two copies of a four-term predicate drifting apart in a
 /// way that only shows up as differently-shaped archives.
 pub struct SegmentAccount {
+    /// The aligned bucket the open segment's first row fell in, and the
+    /// bucket width — `None` when the caller asked for no alignment, or
+    /// before the first row. See [`SealPolicy::align`].
+    align: Option<i64>,
+    first_bucket: Option<i64>,
+    last_bucket: Option<i64>,
     rows: usize,
     approx_bytes: usize,
     /// Instant the current segment was opened (the age bound's origin).
@@ -152,14 +181,52 @@ impl SegmentAccount {
             // which would seal a one-row segment every tick forever.
             max_rows: policy.max_rows.saturating_sub(row_offset).max(1),
             max_age: policy.max_age.saturating_sub(age_offset),
+            // NOT staggered: the whole point of alignment is that every
+            // stream cuts at the same wall-clock instant, so offsetting it
+            // per stream would defeat it. The caps are staggered to spread
+            // the seal WORK; alignment is about where the edges land.
+            align: policy.align,
+            first_bucket: None,
+            last_bucket: None,
         }
     }
 
     /// Account one appended row. `bytes` is roughly the encoded size of that
-    /// row, which is exactly what the caller's own row accounting would have charged.
-    pub fn add_row(&mut self, bytes: usize) {
+    /// row, which is exactly what the caller's own row accounting would have
+    /// charged; `ts` is its timestamp, which is
+    /// what [`SealPolicy::align`] is measured against. A caller that wants no
+    /// alignment may pass any timestamp; it is only read when `align` is set.
+    pub fn add_row(&mut self, bytes: usize, ts: i64) {
         self.rows += 1;
         self.approx_bytes += bytes;
+        if let Some(bucket) = self.bucket_of(ts) {
+            self.first_bucket.get_or_insert(bucket);
+            self.last_bucket = Some(bucket);
+        }
+    }
+
+    /// Which aligned bucket a timestamp falls in, or `None` when the caller
+    /// asked for no alignment.
+    ///
+    /// `div_euclid`, not `/`: a timestamp may be negative (it is an `i64`,
+    /// and zero is 1970, not the bottom of the range), and truncating
+    /// division rounds toward zero, which would put `-1` and `1` in the same
+    /// bucket either side of the epoch.
+    fn bucket_of(&self, ts: i64) -> Option<i64> {
+        self.align.filter(|a| *a > 0).map(|a| ts.div_euclid(a))
+    }
+
+    /// Would a row at `ts` belong to a different aligned bucket than the ones
+    /// already in this open segment?
+    ///
+    /// Ask before adding it, and seal first, for segments whose edges land
+    /// exactly on the boundary. Always false when no alignment is set, and
+    /// for the first row of a segment, which starts whatever bucket it is in.
+    pub fn starts_new_bucket(&self, ts: i64) -> bool {
+        match (self.bucket_of(ts), self.first_bucket) {
+            (Some(next), Some(first)) => next != first,
+            _ => false,
+        }
     }
 
     /// Whether this open segment is past any seal threshold. An empty segment
@@ -173,7 +240,12 @@ impl SegmentAccount {
         self.rows > 0
             && (self.approx_bytes >= self.max_bytes
                 || self.rows >= self.max_rows
-                || now.duration_since(self.opened_at) >= self.max_age)
+                || now.duration_since(self.opened_at) >= self.max_age
+                // Already holding two buckets — the caller did not ask
+                // `starts_new_bucket` first, so the boundary row is in here.
+                // Sealing now still bounds the segment to two buckets rather
+                // than letting it run to a cap.
+                || self.first_bucket != self.last_bucket)
     }
 
     /// Reset onto a fresh segment after a seal, dropping the startup stagger:
@@ -182,6 +254,9 @@ impl SegmentAccount {
         self.rows = 0;
         self.approx_bytes = 0;
         self.opened_at = now;
+        self.align = policy.align;
+        self.first_bucket = None;
+        self.last_bucket = None;
         self.max_bytes = policy.max_bytes;
         self.max_rows = policy.max_rows;
         self.max_age = policy.max_age;
@@ -396,6 +471,72 @@ mod tests {
     /// shortcut that drifted from the function it describes would make the
     /// recorder warn about safe pairs, or stay silent on lockstep, and nothing
     /// else would notice. So it is checked against `stagger_bucket` itself.
+    /// Alignment is about where the edges land, and it is advice: nothing
+    /// here seals. A caller asking before it appends gets exact boundaries.
+    #[test]
+    fn alignment_cuts_on_the_bucket_a_row_belongs_to() {
+        let policy = SealPolicy {
+            max_bytes: usize::MAX,
+            max_rows: usize::MAX,
+            max_age: Duration::from_secs(3600),
+            align: Some(100),
+        };
+        let mut a = SegmentAccount::open_first("s", SINGLE_SOURCE_KEY, &policy);
+        // The first row starts whatever bucket it is in — never a boundary.
+        assert!(!a.starts_new_bucket(250));
+        a.add_row(1, 250);
+        assert!(!a.starts_new_bucket(299), "same bucket");
+        a.add_row(1, 299);
+        assert!(!a.is_due(Instant::now()), "one bucket, no cap reached");
+        assert!(a.starts_new_bucket(300), "300 opens the next bucket");
+
+        // A caller that asks first seals here and rotates: clean edges.
+        a.rotate(&policy, Instant::now());
+        a.add_row(1, 300);
+        assert!(!a.is_due(Instant::now()));
+
+        // A caller that does not ask lets the boundary row in, and `is_due`
+        // says so afterwards rather than letting the segment run to a cap.
+        let mut b = SegmentAccount::open_first("s", SINGLE_SOURCE_KEY, &policy);
+        b.add_row(1, 299);
+        b.add_row(1, 300);
+        assert!(b.is_due(Instant::now()), "two buckets in one segment");
+    }
+
+    /// Timestamps are signed, and truncating division would put the two rows
+    /// either side of the epoch in one bucket.
+    #[test]
+    fn alignment_buckets_negative_timestamps_correctly() {
+        let policy = SealPolicy {
+            max_bytes: usize::MAX,
+            max_rows: usize::MAX,
+            max_age: Duration::from_secs(3600),
+            align: Some(100),
+        };
+        let mut a = SegmentAccount::open_first("s", SINGLE_SOURCE_KEY, &policy);
+        a.add_row(1, -1);
+        assert!(a.starts_new_bucket(1), "-1 and 1 are not the same bucket");
+        assert!(!a.starts_new_bucket(-100), "-100..-1 is one bucket");
+    }
+
+    /// No alignment asked for: nothing about the caps changes, and the
+    /// timestamp passed to `add_row` is not consulted at all.
+    #[test]
+    fn without_alignment_timestamps_do_not_affect_sealing() {
+        let policy = SealPolicy {
+            max_bytes: usize::MAX,
+            max_rows: 4,
+            max_age: Duration::from_secs(3600),
+            align: None,
+        };
+        let mut a = SegmentAccount::open_first("s", SINGLE_SOURCE_KEY, &policy);
+        for ts in [0, 1_000_000, -5, 7] {
+            assert!(!a.starts_new_bucket(ts));
+            a.add_row(1, ts);
+        }
+        assert!(a.is_due(Instant::now()), "the row cap still applies");
+    }
+
     #[test]
     fn staggers_identically_agrees_with_the_hash() {
         let cases = [
@@ -572,6 +713,7 @@ mod tests {
             max_bytes: 8 * 1024 * 1024,
             max_rows: 900,
             max_age: Duration::from_secs(300),
+            align: None,
         };
         let key = |host: &str| {
             source_stagger_key(
@@ -592,8 +734,8 @@ mod tests {
         // byte-bound by construction.
         let mut split = None;
         for row in 1..=policy.max_rows {
-            a.add_row(64 * 1024);
-            b.add_row(64 * 1024);
+            a.add_row(64 * 1024, 0);
+            b.add_row(64 * 1024, 0);
             if a.is_due(now) != b.is_due(now) {
                 split = Some(row);
                 break;

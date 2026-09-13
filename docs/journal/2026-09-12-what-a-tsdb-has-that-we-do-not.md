@@ -164,6 +164,24 @@ What verify deliberately cannot say: nothing here opens a segment. The bytes
 are the encoder's, so a segment full of valid-but-wrong data reads as sound,
 and the report says so. `tests/verify.rs`.
 
+**4. Aligned segment boundaries (landed, smaller than billed).** Checking who
+drives sealing changed the shape of this one: `seal.rs` is advisory and
+dendro never calls it, so a caller that wants two-hour blocks could always
+have had them — it decides when to call `seal`. What was missing was only the
+arithmetic, so that is what was added rather than a mechanism.
+`SealPolicy::align` is a bucket width in the caller's own timestamp unit;
+`SegmentAccount::starts_new_bucket` answers before a row is appended, for
+exact edges; and `is_due` also fires once a segment is holding two buckets,
+so a caller that consults only the existing call site still gets bounded
+segments, one boundary row late. `add_row` grew a timestamp, which is the one
+breaking change and is a line per call site.
+
+Alignment is deliberately **not** staggered, unlike the three caps: the caps
+are spread per stream so the seal work does not land at once, while the whole
+value of alignment is that every stream cuts at the same instant. `div_euclid`
+rather than `/`, because timestamps are signed and truncation would put the
+rows either side of the epoch in one bucket — which has a test.
+
 ## Outcome
 
 In progress.
