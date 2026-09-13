@@ -44,6 +44,7 @@ impl SegmentEncoder for DropsMiddle {
             rows: 2,
             first_ts: rows[0].ts,
             last_ts: rows[rows.len() - 1].ts,
+            index: None,
         }))
     }
 }
@@ -60,6 +61,7 @@ impl SegmentEncoder for OverClaims {
             rows: rows.len() as u64 + 1,
             first_ts: rows[0].ts,
             last_ts: rows[rows.len() - 1].ts,
+            index: None,
         }))
     }
 }

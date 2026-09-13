@@ -92,11 +92,13 @@ boundaries.
   `producer_epoch` for restarts and can carry the rest opaquely, but cannot
   see a counter to help.
   [Journal](docs/journal/2026-09-12-generations-reset-versus-wrap.md).
-- **There is no index over what is inside a row.** The catalog knows sources,
-  streams and time — nothing about series or labels, because dendro does not
-  know what a row means. Finding which segments contain a particular series
-  means reading parquet footers. That is the boundary working as intended, but
-  it means a database built on dendro brings its own index.
+- **dendro builds no index over what is inside a row** — it cannot, since it
+  does not know what a row means. It now **stores** one: a segment carries an
+  opaque `index` the archive never reads, so a caller that knows how to find
+  its own series has somewhere to keep that knowledge and the archive is
+  still one file. Build it in your encoder; read it back with
+  `Db::read_segment_indexes` (sealed segments, no payload read) or
+  `read::stream_indexes` (including the live tail).
 
 Retention is not on that list: it is per stream, by time, with the size
 accounting a cap needs — see `evict_streams_before`, `segment_sizes` and
@@ -183,6 +185,10 @@ extracted from.
   reads a time window; and `SegmentBytes` fetches a stream's payload only
   when it is actually read. `read::read_archive` is still the simple whole
   answer.
+- **Somewhere for your index.** The catalog knows a segment's stream and its
+  time span. Anything finer — which series, which labels — is yours, and a
+  segment has an opaque slot to keep it in, so "which segments could hold X"
+  need not mean opening parquet footers.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.

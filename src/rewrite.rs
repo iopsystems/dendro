@@ -192,12 +192,24 @@ fn copy_sources_snapshotted(
                         if let Some(projected) =
                             project_segment_columns(&segment.bytes, keep, spec.props())?
                         {
+                            // A projection drops columns, so an index built
+                            // over the originals may describe columns the
+                            // copy no longer has. Dropped rather than
+                            // carried: a wrong index is worse than none, and
+                            // only the caller can rebuild it.
                             tx.insert_segment(id, &table, seq, &segment.meta, &projected)?;
                             seq += 1;
                         }
                     }
                     None => {
-                        tx.insert_segment(id, &table, seq, &segment.meta, &segment.bytes)?;
+                        tx.insert_segment_with_index(
+                            id,
+                            &table,
+                            seq,
+                            &segment.meta,
+                            &segment.bytes,
+                            segment.caller_index.as_deref(),
+                        )?;
                         seq += 1;
                     }
                 }
@@ -237,7 +249,14 @@ fn copy_sources_snapshotted(
                         }
                     }
                     None => {
-                        tx.insert_segment(id, &table, seq, &meta, &materialized.bytes)?;
+                        tx.insert_segment_with_index(
+                            id,
+                            &table,
+                            seq,
+                            &meta,
+                            &materialized.bytes,
+                            materialized.index.as_deref(),
+                        )?;
                     }
                 }
             }

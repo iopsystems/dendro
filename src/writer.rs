@@ -1187,6 +1187,7 @@ struct Encoded {
     seq: u64,
     meta: SegmentMeta,
     bytes: Vec<u8>,
+    caller_index: Option<Vec<u8>>,
 }
 
 /// The writer thread body. Every fallible operation returns `Err`; the loop
@@ -1652,6 +1653,7 @@ fn seal_batch(
                 last_ts: tail.last_ts,
             },
             bytes: tail.bytes,
+            caller_index: tail.index,
         });
     }
 
@@ -1667,7 +1669,14 @@ fn seal_batch(
     // finalizes, where these are the only observations there will be.
     db.transaction(|tx| {
         for e in &encoded {
-            tx.insert_segment(source_id, &e.stream, e.seq, &e.meta, &e.bytes)?;
+            tx.insert_segment_with_index(
+                source_id,
+                &e.stream,
+                e.seq,
+                &e.meta,
+                &e.bytes,
+                e.caller_index.as_deref(),
+            )?;
         }
         if let Some((ts, offset)) = observation {
             tx.insert_clock_offset(source_id, ts, offset)?;

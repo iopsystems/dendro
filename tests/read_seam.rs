@@ -30,6 +30,7 @@ impl SegmentEncoder for Tags {
             rows: rows.len() as u64,
             first_ts: rows[0].ts,
             last_ts: rows[rows.len() - 1].ts,
+            index: None,
         }))
     }
 }
@@ -314,6 +315,7 @@ fn an_encoder_cannot_invent_coverage() {
                 rows: 9_999,
                 first_ts: 0,
                 last_ts: i64::MAX,
+                index: None,
             }))
         }
     }

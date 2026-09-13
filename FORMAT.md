@@ -102,6 +102,7 @@ CREATE TABLE segments(
   first_ts INTEGER NOT NULL,
   last_ts INTEGER NOT NULL,
   bytes BLOB NOT NULL,                 -- one parquet file, opaque
+  caller_index BLOB,                   -- the caller's index, never read
   PRIMARY KEY (source_id, stream, seq)
 );
 CREATE INDEX segments_by_time ON segments(source_id, stream, last_ts);
@@ -156,7 +157,18 @@ ordered by `seq`; a reader splices them in `seq` order and tolerates gaps
 `MAX(seq) + 1`). `first_ts`/`last_ts` are the segment's own row timestamps —
 what the **encoder reported**, never the input's span — and are what
 retention and range reads consult; `rows` is the row count. A segment is
-immutable once inserted. `bytes` is one parquet file the crate never opens,
+immutable once inserted.
+
+**`caller_index`** is whatever the caller's encoder returned alongside the
+segment, stored verbatim and never interpreted — a name set, a bloom filter,
+per-column extremes, anything that answers "could this segment hold what I am
+looking for" without opening it. `NULL` where the caller wrote none, and in
+archives from before the column. A verbatim copy carries it; a **column
+projection drops it**, because an index built over the original columns may
+describe columns the copy no longer has, and a wrong index is worse than
+none.
+
+`bytes` is one parquet file the crate never opens,
 with one exception: `rewrite::project_segment_columns`, an opt-in column
 projection that re-encodes with `segment::writer_props`.
 
@@ -310,8 +322,8 @@ the rows changes shape; four things are guaranteed:
   to be correct, a change to the live-WAL rule, a change to what
   `first_ts`/`last_ts`/`rows` mean, a change to the time model. A reader
   refuses a version above its own.
-- **What does not.** A nullable column an old reader can ignore (`uuid` was
-  added this way); a new reserved metadata key (`producer_epoch`,
+- **What does not.** A nullable column an old reader can ignore (`uuid` and
+  `caller_index` were added this way); a new reserved metadata key (`producer_epoch`,
   `writer_sessions` were); a new event kind. Old copiers drop what they do
   not know, which degrades to "unknown", never to wrong.
 - **What the format does not version, and whose problem it is.** The row

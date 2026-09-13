@@ -199,6 +199,13 @@ pub struct SegmentRow {
     pub seq: u64,
     pub meta: SegmentMeta,
     pub bytes: Vec<u8>,
+    /// The caller's index over this segment, as it was written — see
+    /// [`Segment::index`](crate::segment::Segment::index). Carried here so a
+    /// copy can move it with the bytes it describes; a caller that only
+    /// wants indexes should use
+    /// [`read_segment_indexes`](Db::read_segment_indexes), which reads no
+    /// payload.
+    pub caller_index: Option<Vec<u8>>,
 }
 
 /// A row of the `wal` table: one timestamped payload on one stream, keyed by
@@ -1008,7 +1015,48 @@ impl Db {
         bytes: &[u8],
     ) -> Result<()> {
         self.writable()?;
-        insert_segment_sql(&self.conn, source_id, stream, seq, meta, bytes)
+        insert_segment_sql(&self.conn, source_id, stream, seq, meta, bytes, None)
+    }
+
+    /// [`insert_segment`](Self::insert_segment), carrying the caller's index
+    /// over the segment — see [`Segment::index`](crate::segment::Segment::index).
+    /// Separate rather than a sixth parameter because an index is opt-in and
+    /// most callers have none; `None` at every call site would be noise.
+    pub fn insert_segment_with_index(
+        &mut self,
+        source_id: i64,
+        stream: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+        caller_index: Option<&[u8]>,
+    ) -> Result<()> {
+        self.writable()?;
+        insert_segment_sql(
+            &self.conn,
+            source_id,
+            stream,
+            seq,
+            meta,
+            bytes,
+            caller_index,
+        )
+    }
+
+    /// Every segment index for `(source_id, stream)`, in `seq` order and
+    /// WITHOUT the payload — see [`Segment::index`](crate::segment::Segment::index).
+    ///
+    /// This is the cheap half of the index: it answers "could this stream
+    /// hold what I want" from the catalog, against segments that are already
+    /// sealed. It says nothing about the live tail, which has no segment
+    /// yet; [`read::stream_indexes`](crate::read::stream_indexes) covers
+    /// both at the cost of materializing it.
+    pub fn read_segment_indexes(
+        &self,
+        source_id: i64,
+        stream: &str,
+    ) -> Result<Vec<(u64, Option<Vec<u8>>)>> {
+        read_segment_indexes_sql(&self.conn, source_id, stream)
     }
 
     /// Every segment for `(source_id, stream)`, in `seq` order.
@@ -1105,7 +1153,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT seq, rows, first_ts, last_ts, bytes FROM segments \
+                "SELECT seq, rows, first_ts, last_ts, bytes, caller_index FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
             )
             .map_err(Error::sqlite(format!(
@@ -1129,6 +1177,7 @@ impl Db {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             })
             .map_err(Error::sqlite(format!(
@@ -1137,9 +1186,9 @@ impl Db {
 
         let mut out = Vec::new();
         for row in rows {
-            let (seq, n_rows, first_ts, last_ts, bytes) = row.map_err(Error::sqlite(format!(
-                "failed to read segment row for {stream}"
-            )))?;
+            let (seq, n_rows, first_ts, last_ts, bytes, caller_index) = row.map_err(
+                Error::sqlite(format!("failed to read segment row for {stream}")),
+            )?;
             out.push(SegmentRow {
                 // Round-trips through INTEGER, same as elsewhere in this
                 // file: these stay inside i64 for any source anyone will
@@ -1151,6 +1200,7 @@ impl Db {
                     last_ts,
                 },
                 bytes,
+                caller_index,
             });
         }
         Ok(out)
@@ -1177,7 +1227,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT seq, rows, first_ts, last_ts, bytes FROM segments \
+                "SELECT seq, rows, first_ts, last_ts, bytes, caller_index FROM segments \
                  WHERE source_id = ?1 AND stream = ?2 \
                    AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
             )
@@ -2077,7 +2127,20 @@ impl Tx<'_> {
         meta: &SegmentMeta,
         bytes: &[u8],
     ) -> Result<()> {
-        insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes)
+        insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes, None)
+    }
+
+    /// [`insert_segment`](Self::insert_segment), carrying the caller's index.
+    pub fn insert_segment_with_index(
+        &self,
+        source_id: i64,
+        stream: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+        caller_index: Option<&[u8]>,
+    ) -> Result<()> {
+        insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes, caller_index)
     }
 
     /// Insert every WAL row for one tick — one stream each, typically.
@@ -2210,6 +2273,43 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 /// Shared by `Db::insert_segment` (its own commit) and
 /// `Tx::insert_segment` (part of a batch): `Transaction` derefs to
 /// `Connection`, so both reach the same statement.
+/// Every segment index for one stream, in `seq` order, WITHOUT the payload.
+///
+/// The point of the column: answering "could this stream hold what I am
+/// looking for" should not mean reading the segment. `None` where the
+/// caller wrote no index, and for every segment of an archive written
+/// before the column existed.
+fn read_segment_indexes_sql(
+    conn: &Connection,
+    source_id: i64,
+    stream: &str,
+) -> Result<Vec<(u64, Option<Vec<u8>>)>> {
+    let column = if has_column(conn, "segments", "caller_index")? {
+        "caller_index"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT seq, {column} FROM segments \
+             WHERE source_id = ?1 AND stream = ?2 ORDER BY seq"
+        ))
+        .map_err(Error::sqlite(format!("failed to query {stream} indexes")))?;
+    let rows = stmt
+        .query_map(rusqlite::params![source_id, stream], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+            ))
+        })
+        .map_err(Error::sqlite(format!("failed to query {stream} indexes")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(Error::sqlite(format!("failed to read a {stream} index")))?);
+    }
+    Ok(out)
+}
+
 fn insert_segment_sql(
     conn: &Connection,
     source_id: i64,
@@ -2217,10 +2317,11 @@ fn insert_segment_sql(
     seq: u64,
     meta: &SegmentMeta,
     bytes: &[u8],
+    caller_index: Option<&[u8]>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes, \
+         caller_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             source_id,
             stream,
@@ -2229,6 +2330,7 @@ fn insert_segment_sql(
             meta.first_ts,
             meta.last_ts,
             bytes,
+            caller_index,
         ],
     )
     .map_err(Error::sqlite(format!(
@@ -2253,7 +2355,7 @@ const LEGACY_VIEWS_SQL: &str = "\
 CREATE TEMP VIEW sources AS SELECT id, labels, metadata, complete, \
 clock_anchor_wall_ns FROM main.recordings;
 CREATE TEMP VIEW segments AS SELECT recording_id AS source_id, sampler AS stream, \
-seq, rows, first_ts, last_ts, bytes FROM main.segments;
+seq, rows, first_ts, last_ts, bytes, NULL AS caller_index FROM main.segments;
 CREATE TEMP VIEW wal AS SELECT recording_id AS source_id, sampler AS stream, ts, \
 wall_offset, row FROM main.wal;
 CREATE TEMP VIEW clock_offsets AS SELECT recording_id AS source_id, ts, offset_ns \
@@ -2282,6 +2384,11 @@ CREATE TABLE segments(
   first_ts INTEGER NOT NULL,
   last_ts INTEGER NOT NULL,
   bytes BLOB NOT NULL,
+  -- The caller's index over this segment, stored and never read. The
+  -- catalog knows a segment's stream and span and nothing about its
+  -- contents; this is where a caller that needs more puts it, so that an
+  -- archive with an index is still one file. Named for whose it is.
+  caller_index BLOB,
   PRIMARY KEY (source_id, stream, seq)
 );
 -- The catalog half of the design: it makes retention

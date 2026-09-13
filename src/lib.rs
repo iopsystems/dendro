@@ -37,6 +37,7 @@
 //! | **seal** | Turning a stream's accumulated WAL rows into a segment. |
 //! | **tail** | The live WAL rows past a stream's newest segment, materialized on read. |
 //! | **catalog** | The SQLite tables describing sources, streams and segments — what makes retention and range reads indexed lookups rather than scans. |
+//! | **index** | The caller's, not dendro's: an opaque blob stored beside a segment ([`Segment::index`]) that the archive never reads. The catalog knows a segment's stream and span; anything finer lives here. |
 //! | **encoder** | The caller's [`SegmentEncoder`]. The only thing that knows what a row means. |
 //!
 //! **A source is a namespace, not a box.** It is what makes a stream name
@@ -143,6 +144,7 @@
 //! an artifact you do not own, or at read-only media, where `open` fails
 //! outright because its durability pragmas are themselves writes.
 //!
+//! [`Segment::index`]: segment::Segment::index
 //! [`SegmentEncoder`]: segment::SegmentEncoder
 //! [`Segment`]: segment::Segment
 

@@ -290,6 +290,36 @@ fn stream_segments_snapshotted(
     Ok(segments)
 }
 
+/// One stream's indexes, in the same order as
+/// [`stream_segments`] returns its segments: the sealed ones from the
+/// catalog, then the live tail's.
+///
+/// `Db::read_segment_indexes` is the cheaper half and answers for sealed
+/// segments alone. This one also materializes the tail, because a tail's
+/// index does not exist until its segment does — so use it when "what is in
+/// this stream right now" has to include data that has not sealed yet, and
+/// the catalog version when it does not.
+pub fn stream_indexes(
+    db: &Db,
+    source_id: i64,
+    stream: &str,
+    encoder: &dyn SegmentEncoder,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    db.read_snapshot(|db| {
+        check_encoder_of(db, source_id, encoder)?;
+        let mut out: Vec<Option<Vec<u8>>> = db
+            .read_segment_indexes(source_id, stream)?
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect();
+        let live = db.live_wal(source_id, stream)?;
+        if let Some(tail) = crate::segment::materialize(encoder, stream, &live)? {
+            out.push(tail.index);
+        }
+        Ok(out)
+    })
+}
+
 /// Where one stream's segment bytes come from, resolved lazily.
 ///
 /// The other half of [`catalog`]: a caller learns what streams exist and

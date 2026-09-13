@@ -120,6 +120,27 @@ them. See [generations](2026-09-12-generations-reset-versus-wrap.md).
 
 Recorded per item as it lands.
 
+**1. Somewhere for the caller's index (landed).** A segment carries an
+opaque `index: Option<Vec<u8>>` — returned by the encoder alongside the
+bytes, stored in a nullable `segments.caller_index` column, and never read by
+the archive. Read back two ways: `Db::read_segment_indexes` answers from the
+catalog for sealed segments without touching a payload, and
+`read::stream_indexes` also materializes the live tail, whose index does not
+exist until its segment does, and returns them in the order
+`read::stream_segments` returns the segments they describe.
+
+Three decisions worth keeping. The index rides on `Segment` rather than
+arriving through a separate trait method, so it is computed from the same
+rows as the bytes and a reader materializing a tail cannot drift from the
+writer that will seal it. `insert_segment` keeps its existing shape and
+`insert_segment_with_index` is the second spelling, because an index is
+opt-in and `None` at every call site would be noise. And a **column
+projection drops the index** rather than copying it: the copy has fewer
+columns than the index was built over, and only the caller can rebuild it.
+
+Additive and nullable, so `SCHEMA_VERSION` stays 4 and a legacy archive
+reads `NULL` through its compatibility view. `tests/caller_index.rs`.
+
 ## Outcome
 
 In progress.

@@ -49,6 +49,27 @@ pub struct Segment {
     pub first_ts: i64,
     /// The timestamp of the last row in `bytes`.
     pub last_ts: i64,
+    /// **The caller's index over this segment's contents, and the one field
+    /// here dendro never reads.**
+    ///
+    /// The archive knows a segment's stream and its time span, and nothing
+    /// about what is inside it — so "which segments hold series X" means
+    /// opening parquet footers, and a caller that builds an index to avoid
+    /// that has nowhere to keep it. A sidecar file would answer it and would
+    /// cost the single-file property the whole container is shaped around.
+    ///
+    /// So the archive stores these bytes beside the segment and hands them
+    /// back ([`Db::read_segment_indexes`](crate::db::Db::read_segment_indexes),
+    /// [`read::stream_indexes`](crate::read::stream_indexes)) without ever
+    /// interpreting them. A name set, a bloom filter, per-column min/max,
+    /// whatever answers your question — it is opaque either way, exactly as
+    /// a row is.
+    ///
+    /// `None` costs nothing and is the right answer for a caller that does
+    /// not need one. Compute it from the same rows as `bytes`: both the
+    /// writer and a reader materializing a live tail build a segment, and
+    /// they must agree about its index as much as about its bytes.
+    pub index: Option<Vec<u8>>,
 }
 
 /// Turns a stream's WAL rows into one parquet segment.

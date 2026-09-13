@@ -26,6 +26,7 @@ impl SegmentEncoder for Tags {
             rows: rows.len() as u64,
             first_ts: rows[0].ts,
             last_ts: rows[rows.len() - 1].ts,
+            index: None,
         }))
     }
 }
