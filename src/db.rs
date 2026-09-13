@@ -272,6 +272,102 @@ const LIVE_WAL_PREDICATE_FOR_ROW: &str = "\
        OR NOT EXISTS (SELECT 1 FROM segments s \
                       WHERE s.source_id = wal.source_id AND s.stream = wal.stream)";
 
+/// How hard [`Db::verify`] looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// SQLite's `quick_check`, foreign keys, and the catalog's own
+    /// invariants.
+    ///
+    /// `quick_check` still walks the whole database and still finds a
+    /// damaged page — what it skips is cross-checking each index entry
+    /// against the row it points at, and the `UNIQUE`/`NOT NULL` constraint
+    /// verification that goes with it. So this is the cheaper pass, not a
+    /// structural-only one, and for detecting bit-rot it is very nearly as
+    /// good.
+    Quick,
+    /// Everything `Quick` does, with `integrity_check` in place of
+    /// `quick_check`: the index-versus-table cross-check as well. The
+    /// archive carries one index (`segments_by_time`), so what this adds is
+    /// confidence that range reads and retention are looking at the same
+    /// segments the table holds.
+    Full,
+}
+
+/// What [`Db::verify`] found. Empty `problems` is a sound archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub sources: usize,
+    pub streams: usize,
+    pub segments: usize,
+    /// WAL rows the archive holds, whether or not a reader can see them.
+    pub wal_rows: usize,
+    pub problems: Vec<Problem>,
+}
+
+impl Report {
+    /// Nothing wrong was found. Note what that does and does not mean: a
+    /// [`Depth::Quick`] pass that finds nothing has not read the segment
+    /// payloads, and no pass at any depth opens a segment — what is *inside*
+    /// one is the encoder's, and only the caller can check it.
+    pub fn is_sound(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// One thing wrong with an archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// SQLite says the database itself is damaged; the string is its own
+    /// wording, one per line it reported.
+    Corrupt(String),
+    /// A row points at a source that is not there. Only reachable in an
+    /// archive written before foreign keys were enforced.
+    ForeignKey(String),
+    /// A segment whose catalog entry contradicts itself.
+    Segment {
+        source_id: i64,
+        stream: String,
+        seq: u64,
+        detail: String,
+    },
+    /// WAL rows that no read path can reach: at or below their stream's
+    /// sealed watermark, so the watermark shadows them exactly as it shadows
+    /// an already-sealed row. Space spent on nothing. A current writer drops
+    /// such an append; an archive written before it did carries them.
+    UnreadableWalRows {
+        source_id: i64,
+        stream: String,
+        rows: usize,
+    },
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Problem::Corrupt(m) => write!(f, "corrupt: {m}"),
+            Problem::ForeignKey(m) => write!(f, "dangling reference: {m}"),
+            Problem::Segment {
+                source_id,
+                stream,
+                seq,
+                detail,
+            } => write!(
+                f,
+                "source {source_id}, stream {stream}, segment {seq}: {detail}"
+            ),
+            Problem::UnreadableWalRows {
+                source_id,
+                stream,
+                rows,
+            } => write!(
+                f,
+                "source {source_id}, stream {stream}: {rows} WAL row(s) at or below the \
+                 sealed watermark, which no read path can reach"
+            ),
+        }
+    }
+}
+
 /// How an archive's pages stand. See [`Db::page_stats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageStats {
@@ -1922,6 +2018,141 @@ impl Db {
     /// column: `annotate` changes it and nothing else, and rewriting an
     /// archive's every segment BLOB to edit one JSON string would make a
     /// cheap operation cost the size of the source.
+    /// Check the archive over, and report what is wrong rather than failing
+    /// on the first thing.
+    ///
+    /// An archive is an artifact that travels — handed to a colleague,
+    /// uploaded, kept for a year — and "is this file sound" had no answer
+    /// short of reading all of it and seeing whether anything threw. This
+    /// answers it: SQLite's own integrity check, foreign keys, and the
+    /// catalog invariants the container is responsible for, collected into a
+    /// [`Report`] instead of an `Err`, because a caller wants the list.
+    ///
+    /// `Err` is still returned for a failure to *run* the check — a database
+    /// too damaged to query at all.
+    ///
+    /// **What it cannot tell you.** Nothing here opens a segment. The bytes
+    /// are the encoder's and the archive has no opinion about them, so a
+    /// segment full of valid-but-wrong data reads as sound. What either depth
+    /// verifies is that the database holding those bytes is intact, which is
+    /// a different and weaker claim than the payload being meaningful.
+    pub fn verify(&self, depth: Depth) -> Result<Report> {
+        let mut problems = Vec::new();
+
+        // SQLite first: if the pages are damaged, everything below is
+        // reading rubble and its findings would be noise.
+        let check = match depth {
+            Depth::Quick => "PRAGMA quick_check",
+            Depth::Full => "PRAGMA integrity_check",
+        };
+        let mut stmt = self
+            .conn
+            .prepare(check)
+            .map_err(Error::sqlite("failed to check the archive"))?;
+        let lines = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(Error::sqlite("failed to check the archive"))?;
+        for line in lines {
+            let line = line.map_err(Error::sqlite("failed to read a check result"))?;
+            // SQLite says exactly "ok" when it is happy.
+            if line != "ok" {
+                problems.push(Problem::Corrupt(line));
+            }
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(Error::sqlite("failed to check references"))?;
+        let violations = stmt
+            .query_map([], |row| {
+                Ok(format!(
+                    "{} row {:?} -> {}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            })
+            .map_err(Error::sqlite("failed to check references"))?;
+        for v in violations {
+            problems.push(Problem::ForeignKey(
+                v.map_err(Error::sqlite("failed to read a reference violation"))?,
+            ));
+        }
+
+        // The catalog's own invariants, in one snapshot so the counts and the
+        // findings describe the same instant.
+        let (sources, streams, segments, wal_rows) = self.read_snapshot(|db| {
+            let rows = db.read_sources()?;
+            let mut streams = 0usize;
+            let mut segments = 0usize;
+            let mut wal_rows = 0usize;
+            for src in &rows {
+                for stream in db.all_streams(src.id)? {
+                    streams += 1;
+                    for seg in db.read_segment_meta(src.id, &stream)? {
+                        segments += 1;
+                        let (seq, meta) = seg;
+                        let mut bad = Vec::new();
+                        if meta.first_ts > meta.last_ts {
+                            bad.push(format!(
+                                "spans [{}, {}], which runs backwards",
+                                meta.first_ts, meta.last_ts
+                            ));
+                        }
+                        if meta.rows == 0 {
+                            bad.push("claims no rows; such a segment should not exist".to_string());
+                        }
+                        for detail in bad {
+                            problems.push(Problem::Segment {
+                                source_id: src.id,
+                                stream: stream.clone(),
+                                seq,
+                                detail,
+                            });
+                        }
+                    }
+                    // Rows the watermark shadows: committed, charged for, and
+                    // reachable by nothing.
+                    let all = db.total_wal_rows(src.id, &stream)?;
+                    let live = db.live_wal_span(src.id, &stream)?.rows as usize;
+                    wal_rows += all;
+                    if all > live {
+                        problems.push(Problem::UnreadableWalRows {
+                            source_id: src.id,
+                            stream: stream.clone(),
+                            rows: all - live,
+                        });
+                    }
+                }
+            }
+            Ok((rows.len(), streams, segments, wal_rows))
+        })?;
+
+        Ok(Report {
+            sources,
+            streams,
+            segments,
+            wal_rows,
+            problems,
+        })
+    }
+
+    /// Every WAL row the archive holds for a stream, live or shadowed. The
+    /// denominator [`verify`](Self::verify) compares `live_wal_span` against.
+    pub fn total_wal_rows(&self, source_id: i64, stream: &str) -> Result<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM wal WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, stream],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+            .map_err(Error::sqlite(format!(
+                "failed to count WAL rows for {stream}"
+            )))
+    }
+
     /// The next `seq` for every stream that has sealed at least once:
     /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
     /// archive seeds its numbering from, so it continues each stream's

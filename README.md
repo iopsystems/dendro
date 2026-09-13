@@ -192,6 +192,10 @@ extracted from.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
+- **A soundness check.** `Db::verify` reports what is wrong with an archive
+  rather than failing on the first thing: SQLite's own integrity check,
+  dangling references, self-contradicting segments, and WAL rows no read path
+  can reach. It does not open a segment — the bytes are your encoder's.
 - **Exact copies of a live archive.** SQLite commits into a `-wal` sidecar, so
   `cp` on an archive someone is writing silently ends early. `Db::vacuum_into`
   reads through the sidecar without pausing the writer.

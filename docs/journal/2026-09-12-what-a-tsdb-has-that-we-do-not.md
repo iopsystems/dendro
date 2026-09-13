@@ -141,6 +141,29 @@ columns than the index was built over, and only the caller can rebuild it.
 Additive and nullable, so `SCHEMA_VERSION` stays 4 and a legacy archive
 reads `NULL` through its compatibility view. `tests/caller_index.rs`.
 
+**3. An integrity check (landed).** `Db::verify(depth)` returns a `Report`
+of `Problem`s rather than failing on the first thing, because a caller
+asking "is this archive sound" wants the list. It runs SQLite's own check,
+`foreign_key_check`, and the catalog invariants the container is responsible
+for: a segment whose span runs backwards or claims no rows, and — the
+finding worth having — **WAL rows at or below their stream's watermark**,
+which no read path can reach. A current writer drops such an append; an
+archive written before it did is carrying space spent on rows nothing can
+read, and nothing said so. `Err` is reserved for a database too damaged to
+query at all.
+
+`Depth` was documented wrongly first, and the test caught it. The claim was
+that `quick_check` skips reading segment payloads and so would miss bit-rot;
+the test asserted the quick pass would MISS a scribbled page and failed,
+because `quick_check` walks the whole database too. What it actually skips
+is cross-checking index entries against table rows. Both the doc and the
+test now say that, and the test pins detection at *both* depths — the depth
+parameter buys index consistency, not page coverage.
+
+What verify deliberately cannot say: nothing here opens a segment. The bytes
+are the encoder's, so a segment full of valid-but-wrong data reads as sound,
+and the report says so. `tests/verify.rs`.
+
 ## Outcome
 
 In progress.
