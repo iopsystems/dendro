@@ -87,7 +87,9 @@ means.
 
 ## Outcome
 
-Open, not started.
+Open, not started. Ranked second of four in [what a TSDB has that we do
+not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which honours the GO
+criterion above rather than pre-empting it: the measurement comes first.
 
 ## Deferred or Reopen Items
 

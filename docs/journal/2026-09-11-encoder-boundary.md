@@ -117,6 +117,11 @@ the gap rather than closing it.
 
 ## Deferred or Reopen Items
 
+- **Two items came off this list.** The encoder version marker landed with
+  [container hardening](2026-09-11-container-hardening.md); `writer_props`
+  became per-copy configuration rather than a fixed choice. The schema
+  objects (`wall_offset`, `clock_anchor_wall_ns`, `clock_offsets`) and the
+  trait's expressiveness are untouched.
 - **Reopen** when a second non-telemetry caller exists. It will settle which of
   these are real and which were theoretical, which one round of review cannot.
 - A source parameter on `encode` does not need to wait for that.
