@@ -1,3 +1,8 @@
+// Feature annotations in the rendered docs. `docsrs` is set only by the
+// docs.rs build (see `[package.metadata.docs.rs]`), which runs nightly, so
+// this is inert for every ordinary build including the stable one.
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 //! A segmented-parquet archive with a write-ahead log, in a single file.
 //!
 //! dendro stores an append-only stream of timestamped rows as parquet, and
@@ -153,7 +158,8 @@
 /// The metadata map is the caller's, and dendro reads none of it. These are
 /// the keys with an agreed meaning across callers, so that a tool built on
 /// one producer's archives can read another's. dendro *writes* exactly one of
-/// them itself ([`WRITER_SESSIONS`], and an [`EVENTS`] entry alongside it
+/// them itself ([`WRITER_SESSIONS`](keys::WRITER_SESSIONS), and an
+/// [`EVENTS`](keys::EVENTS) entry alongside it
 /// when a source is resumed); the rest are conventions a producer follows
 /// through [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata),
 /// which is what lets them be written *during* a recording rather than only

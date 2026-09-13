@@ -49,3 +49,41 @@ jobs:
       # actually using the reader build.
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo test --no-default-features
+
+  # The documentation is a deliverable: it is what a reader sees on docs.rs,
+  # and a broken intra-doc link ships silently without this. `-D warnings`
+  # because rustdoc reports unresolved links as warnings by default.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # `rust-version` in Cargo.toml is a promise. This is what keeps it one:
+  # without it the floor drifts up silently the first time anyone uses a
+  # newer API, and clippy's MSRV-gated lints quietly encourage exactly that.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      # `--all-targets` so tests and the test-support binaries are covered,
+      # not just the library.
+      - run: cargo check --all-targets --all-features
+      - run: cargo check --all-targets --no-default-features
+
+  # What `cargo publish` will actually do, minus the upload: packaging, then
+  # a full build of the packaged tree. Catches a file missing from the
+  # package and a dependency that only resolves locally.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run

@@ -2179,7 +2179,7 @@ impl Db {
     /// The newest SEALED row of every stream, as `source -> stream ->
     /// last_ts`.
     ///
-    /// The watermark [`LIVE_WAL_PREDICATE`] compares against, lifted out of
+    /// The watermark the live-WAL predicate compares against, lifted out of
     /// SQL so a writer can hold it in memory and check an append against it
     /// without a query per row. A writer reopening an archive seeds from
     /// this; one that created it starts empty, which is the same thing.

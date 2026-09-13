@@ -2,12 +2,25 @@
 name = "dendro"
 version = "0.1.0"
 edition = "2021"
+# The floor the dependency graph sets (arrow/parquet 58 require 1.85). CI
+# builds on it, so raising it is a deliberate act rather than a drift. Note
+# this also configures clippy: MSRV-gated lints stop suggesting APIs newer
+# than this, which is why `seal.rs` can use `%` where clippy would otherwise
+# demand `is_multiple_of`.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/iopsystems/dendro"
-homepage = "https://github.com/iopsystems/dendro"
 description = "A segmented-parquet archive with a write-ahead log, in a single SQLite file"
 keywords = ["parquet", "sqlite", "wal", "timeseries", "archive"]
 categories = ["database-implementations", "encoding"]
+
+# docs.rs builds with default features, which hides the whole writer half and
+# every `test-support` item. `all-features` documents the real surface, and
+# `docsrs` turns on the feature annotations so a reader can see WHICH feature
+# gates an item rather than wondering why it is missing locally.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 arrow = "58.2.0"
