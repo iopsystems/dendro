@@ -46,6 +46,13 @@ name = "append-until-killed"
 path = "src/bin/append-until-killed.rs"
 required-features = ["test-support"]
 
+# The compaction gate's measurement: does read cost track segment count?
+# Behind `test-support` for `Archive::single`, and because nothing ships it.
+[[bin]]
+name = "measure-compaction"
+path = "src/bin/measure-compaction.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 # Building a legacy-schema fixture by hand, in `tests/legacy_v3.rs`.
 rusqlite = { version = "0.40", features = ["bundled"] }

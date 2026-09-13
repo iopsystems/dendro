@@ -1,5 +1,5 @@
 ---
-status: open
+status: measured — GO
 opened: 2026-09-11
 updated: 2026-09-11
 ---
@@ -36,6 +36,56 @@ downsampling, which is a different operation — it changes the rows, not just
 their packaging, and belongs with `rewrite`.
 
 ## Evidence
+
+### Measured 2026-09-13: read cost tracks segment count, and so does size
+
+The GO criterion above asked for "a measured read that is slower than the
+same data in fewer segments". It is, by a lot.
+
+`src/bin/measure-compaction.rs` writes one body of data several times —
+identical rows, columns and encoder — differing only in how often the caller
+seals, then reads each archive the way a consumer does: every segment's bytes
+fetched, every segment's parquet footer parsed, which is the work a planner
+must do before it can answer anything. Arms are **interleaved** rather than
+run in sequence, so machine load lands on all of them, and the median of
+seven repetitions is reported. 20,000 rows of 50 `i64` columns:
+
+| rows/segment | segments | read + parse | catalog only | archive |
+|---|---|---|---|---|
+| 50 | 400 | 12.26 ms | 452 µs | 9.92 MB |
+| 250 | 80 | 2.96 ms | 239 µs | 5.29 MB |
+| 1,000 | 20 | 1.22 ms | 184 µs | 4.43 MB |
+| 5,000 | 4 | 721 µs | 177 µs | 4.21 MB |
+| 20,000 | 1 | 674 µs | 182 µs | 4.17 MB |
+
+**18.2× slower to read and 2.38× larger**, finest against coarsest. Three
+runs gave 18.07×, 18.18× and 17.58× — the spread is noise, the gap is not,
+and the machine was not idle (load average 5.8), which interleaving is there
+to absorb.
+
+**The relationship is linear in segment count, which is the claim.** Fitting
+fixed + per-segment to the extremes gives **674 µs + 29.0 µs per segment**,
+and it predicts the middle of the table to within 3% (80 segments: 2,997 µs
+predicted against 2,960 measured; 20 segments: 1,255 against 1,220).
+
+**And the per-segment cost is footer work, not something else.** Re-running
+at 10 columns instead of 50 moves the slope from 29.0 µs to **7.8 µs** per
+segment — it scales with column count, which is what a parquet footer is
+made of. The same run still shows 13.0× end to end.
+
+**Size has the same shape and a separate cause**: 2.38× at both column
+counts. Each segment carries a complete footer, and compression cannot work
+across a segment boundary, so a stream cut 400 ways pays both 400 times.
+
+One thing the table also shows that the entry did not predict: **dendro's own
+catalog read grows too**, 182 µs to 452 µs, because the catalog has 400 rows
+where it had one. Smaller than the footer cost by an order of magnitude, and
+in the same direction.
+
+**Verdict: GO.** The trade the three comments name is real, it is large, and
+it is one-way without a compactor.
+
+### The claim, before it was measured
 
 The crate says three separate times, in its own words, that this matters:
 
@@ -87,14 +137,16 @@ means.
 
 ## Outcome
 
-Open, not started. Ranked second of four in [what a TSDB has that we do
-not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which honours the GO
-criterion above rather than pre-empting it: the measurement comes first.
+**GO, measured 2026-09-13** (above). Ranked second of four in [what a TSDB
+has that we do not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which
+honoured the criterion rather than pre-empting it; the measurement came
+first, and it passed decisively. Implementation follows.
 
 ## Deferred or Reopen Items
 
-- **Reopen** when a measured read is slower than the same data in fewer
-  segments, on a real workload.
+- ~~**Reopen** when a measured read is slower than the same data in fewer
+  segments.~~ **Done**: 18.2× slower and 2.38× larger, reproducible, with
+  the per-segment cost identified as footer parsing.
 - Related: this is one of the two gaps that decide whether dendro can sit under
   a time-series database. The other is
   [backfill](2026-09-11-out-of-order-appends.md). Retention, the third thing

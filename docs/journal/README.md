@@ -12,7 +12,7 @@ as ours or not ours, and links the entries that own each one.
 | 2026-09-12 | [What a TSDB has that we do not, and which of it is ours to build](2026-09-12-what-a-tsdb-has-that-we-do-not.md) | implemented (4 of 5; compaction gated) |
 | 2026-09-12 | [Generations: telling a counter reset from a counter wrap](2026-09-12-generations-reset-versus-wrap.md) | open |
 | 2026-09-11 | [Container hardening: failure classes, identity, sessions, and one materialization](2026-09-11-container-hardening.md) | implemented |
-| 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | open |
+| 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | measured — GO (18.2x read, 2.38x size) |
 | 2026-09-11 | [Out-of-order appends are accepted and never read](2026-09-11-out-of-order-appends.md) | partly resolved (loud; backfill open) |
 | 2026-09-11 | [One source's bad tick kills the writer for the whole archive](2026-09-11-writer-failure-blast-radius.md) | resolved (container hardening, item 2) |
 | 2026-09-11 | [The encoder boundary does not yet earn the crate's generality claim](2026-09-11-encoder-boundary.md) | open |
