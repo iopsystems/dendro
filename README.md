@@ -72,11 +72,7 @@ boundaries.
   source takes the same timestamp happily, and backfilling either is not
   out-of-order at all. Late samples *within* one stream are not supported.
   [Journal](docs/journal/2026-09-11-out-of-order-appends.md).
-- **Segments are never merged.** They are created by a seal and destroyed whole
-  by eviction; nothing compacts them. Read cost tracks segment *count*, so an
-  archive kept for a long time gets slower and there is no mechanism to fix it.
-  A rolling buffer is unaffected, because eviction removes the old ones.
-  [Journal](docs/journal/2026-09-11-segment-compaction.md).
+
 - **An encoder failure ends the recording for every source.** A transient
   SQLite condition (a lock, a full disk) is retried and then dropped per tick,
   and a duplicate `(stream, ts)` costs only the colliding source its tick — but
@@ -189,6 +185,11 @@ extracted from.
   time span. Anything finer — which series, which labels — is yours, and a
   segment has an opaque slot to keep it in, so "which segments could hold X"
   need not mean opening parquet footers.
+- **Compaction.** Read cost is linear in segment count — measured at 18.6x
+  between 400 segments and one, with the archive 2.37x larger —
+  and `rewrite::compact` merges a stream's small segments back into large
+  ones in place, reclaiming the space as it goes. An archive compacted is
+  the same artifact as one written coarse.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.

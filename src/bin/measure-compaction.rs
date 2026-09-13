@@ -203,6 +203,42 @@ fn main() {
             *bytes as f64 / 1e6
         );
     }
+    // Does compacting the finest arm actually recover the difference? The
+    // measurement above says segment count costs; this says the compactor
+    // buys it back, on the same data, in the same process.
+    let (finest_per, finest_path, finest_bytes, finest_segments) = &built[0];
+    let compact_started = Instant::now();
+    let done = {
+        let mut db = Db::open(finest_path).expect("open to compact");
+        dendro::rewrite::compact(&mut db, &dendro::rewrite::CompactSpec::to_rows(rows as u64))
+            .expect("compact")
+    };
+    let compact_took = compact_started.elapsed();
+    let mut after: Vec<Duration> = Vec::new();
+    for _ in 0..reps {
+        after.push(read_all(finest_path, columns).0);
+    }
+    let after_bytes = Db::open_read_only(finest_path)
+        .expect("open")
+        .archive_bytes()
+        .expect("size");
+    let before_read = median(reads[finest_per].clone());
+    let after_read = median(after);
+    println!(
+        "
+compacting the {}-segment arm: {} -> {} segments in {:.2?};          read {:.2?} -> {:.2?} ({:.2}x); archive {:.2} MB -> {:.2} MB ({:.2}x)",
+        finest_segments,
+        done.before,
+        done.after,
+        compact_took,
+        before_read,
+        after_read,
+        before_read.as_secs_f64() / after_read.as_secs_f64(),
+        *finest_bytes as f64 / 1e6,
+        after_bytes as f64 / 1e6,
+        *finest_bytes as f64 / after_bytes as f64,
+    );
+
     let (slowest, biggest) = baseline.expect("at least one arm");
     let (per, _, bytes, segments) = built.last().expect("at least one arm");
     let read = median(reads[per].clone());

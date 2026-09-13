@@ -1,5 +1,5 @@
 ---
-status: measured — GO
+status: implemented
 opened: 2026-09-11
 updated: 2026-09-11
 ---
@@ -108,7 +108,70 @@ since old segments are evicted. For an archive that is kept, it is not.
 
 ## Design and Implementation
 
-Nothing built. Two constraints any design has to answer, both already in the
+**Built 2026-09-13**, `rewrite::compact` and `compact_stream`, taking a
+`CompactSpec` (a target row count, and optional writer properties for the
+merged segment). Both constraints below were answered the way this entry
+predicted, and a third turned up in measurement that it did not.
+
+**`seq` ordering.** A merged segment takes the run's FIRST seq and the rest
+of the run's numbers are left unused, so numbering stays ascending with
+gaps. The entry guessed a gap would be cheaper than renumbering and that
+readers already tolerate one; both hold — `read_segments` is `ORDER BY seq`
+and `rewrite` already produces gaps.
+
+**The watermark.** The entry worried that deleting before inserting lowers
+`MAX(last_ts)` in between, so a reader landing in the window would see
+sealed rows resurrected as a live tail. One transaction settles it: other
+connections see the whole merge or none of it, and the merged segment's
+`last_ts` equals the run's last anyway. `Tx::delete_segment` exists for this
+and is documented as the reason it is on `Tx` at all, unlike the WAL prune.
+
+**A run stops at a schema change**, rather than reconciling two shapes: a
+stream's schema may drift, and dendro concatenates parquet rather than
+understanding it. Segments either side of a change stay separate.
+
+**The merged segment carries no index**, for the same reason a column
+projection carries none: the index described one input, and combining two
+needs to know what they mean.
+
+**Parquet, not a trait method.** As this entry proposed: concatenation is a
+property of the container, not of what a row means, so `concat_parquet`
+decodes and re-encodes rather than every caller implementing a merge. The
+cost is that compaction, like column projection, requires segments to really
+be parquet.
+
+### The finding measurement turned up: merging alone gives back no space
+
+Compaction was justified partly on size, and the first working version
+delivered none of it:
+
+```
+compacting the 400-segment arm: 400 -> 1 segments in 60.67ms;
+read 12.10ms -> 643.42µs (18.80x); archive 9.92 MB -> 9.92 MB (1.00x)
+```
+
+SQLite does not return deleted pages to the filesystem; they go on the free
+list to be reused. The read cost was recovered in full and the file was
+exactly as large as before — the opposite of what anyone compacting would
+expect, and invisible without measuring it, because every test that checks
+rows and catalogs passes either way.
+
+So the archive-wide `compact` reclaims at the end, uncapped, which it can
+afford because compaction already requires that nothing else is writing.
+`compact_stream` does not, and says so. After the fix:
+
+```
+compacting the 400-segment arm: 400 -> 1 segments in 69.60ms;
+read 12.10ms -> 650.46µs (18.61x); archive 9.92 MB -> 4.19 MB (2.37x)
+```
+
+**Compacting an archive now lands on the same artifact as writing it coarse
+in the first place** — 650 µs against 708 µs, 4.19 MB against 4.17 MB — which
+is the strongest statement this could end on.
+
+### The constraints, as they stood before it was built
+
+Two constraints any design has to answer, both already in the
 code:
 
 **`seq` ordering is load-bearing.** `read_segments` is `ORDER BY seq`, and
@@ -137,10 +200,18 @@ means.
 
 ## Outcome
 
-**GO, measured 2026-09-13** (above). Ranked second of four in [what a TSDB
-has that we do not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which
-honoured the criterion rather than pre-empting it; the measurement came
-first, and it passed decisively. Implementation follows.
+**Implemented 2026-09-13**, after the measurement it was gated on passed
+decisively. `tests/compaction.rs` covers rows and order preserved, the
+catalog agreeing, the watermark and live tail untouched, a run stopping at a
+schema change, the index dropped, idempotence, one stream at a time, and the
+reclaim. The measurement lives in `src/bin/measure-compaction.rs` and is
+rerunnable.
+
+The order mattered. Ranked second of four in [what a TSDB has that we do
+not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which honoured this
+entry's gate rather than pre-empting it — and the measurement then paid for
+itself twice: once by justifying the work, and once by catching that the
+first working version returned no space at all.
 
 ## Deferred or Reopen Items
 

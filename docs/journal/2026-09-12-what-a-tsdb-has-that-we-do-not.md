@@ -192,7 +192,13 @@ filling this archive" is now a field rather than an exercise.
 
 ## Outcome
 
-**Four of the five in-scope items landed; compaction did not, deliberately.**
+**All five in-scope items landed.** Four directly; compaction after its own
+entry's measurement gate was run and passed — 18.2× read and 2.38× size
+between 400 segments and one — which is the order this effort argued for and
+which paid off, since the measurement also caught that the first compactor
+gave back no disk space at all.
+
+The original four:
 Somewhere for a caller's index, an integrity check, wall-clock alignment, and
 one call to describe an archive — each with tests, each under all three CI
 configurations. Compaction is the largest of the five and the only one whose
@@ -211,9 +217,9 @@ under item 3: `quick_check` does not skip reading pages.
 
 ## Deferred or Reopen Items
 
-- **Compaction** stays gated on its own entry's measurement. It is now the
-  only item on this survey's in-scope list that is not built, which makes
-  running that measurement the obvious next move.
+- Nothing. Compaction, the last item, is
+  [built](2026-09-11-segment-compaction.md); its own entry carries the
+  measurement and what it found.
 - The out-of-scope list above is the deferral for everything else; each line
   carries the reason it would have to stop being true.
 

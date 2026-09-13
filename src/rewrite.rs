@@ -18,6 +18,236 @@ use crate::db::{Db, SegmentMeta, Tx};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
+/// What one compaction pass aims for. See [`compact`].
+pub struct CompactSpec {
+    /// Merge adjacent segments until the next one would push the total past
+    /// this. A run of one is left alone.
+    pub target_rows: u64,
+    /// Properties for the merged segment. `None` uses the archive's own
+    /// ([`segment::writer_props`](crate::segment::writer_props)); a caller
+    /// whose encoder writes with other settings should pass them, or its
+    /// compacted segments come back encoded differently from its sealed
+    /// ones.
+    pub writer_props: Option<parquet::file::properties::WriterProperties>,
+}
+
+impl CompactSpec {
+    /// Merge toward segments of `target_rows`, with the archive's own writer
+    /// properties.
+    pub fn to_rows(target_rows: u64) -> Self {
+        CompactSpec {
+            target_rows,
+            writer_props: None,
+        }
+    }
+
+    fn props(&self) -> parquet::file::properties::WriterProperties {
+        self.writer_props
+            .clone()
+            .unwrap_or_else(crate::segment::writer_props)
+    }
+}
+
+/// What one compaction pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Compacted {
+    /// Sealed segments before the pass, across everything it looked at.
+    pub before: usize,
+    /// And after. The difference is what a reader stops paying for.
+    pub after: usize,
+    /// How many merges were performed. Zero is a no-op, and the normal
+    /// answer for an archive that is already coarse.
+    pub merges: usize,
+}
+
+/// Merge a stream's small adjacent segments into larger ones, in place.
+///
+/// **Why.** Read cost is linear in segment count — measured at 674 µs plus
+/// 29 µs per segment on a 50-column stream, an 18.2× difference between 400
+/// segments and one, with the archive 2.38× larger as well (see
+/// `docs/journal/2026-09-11-segment-compaction.md`). Segments are sized when
+/// they are sealed, by a policy that is trading against finalize latency and
+/// kill-loss, and an archive that is kept rather than rolled has no way to
+/// revisit that trade. This is the way.
+///
+/// **What it does not touch.** The live WAL tail, which has no segment yet.
+/// Segments whose schemas differ: a run stops at a schema change, because
+/// dendro concatenates parquet rather than reconciling it, and a stream's
+/// schema may drift. And any run of one.
+///
+/// **The caller's index is dropped** on a merged segment, for the same
+/// reason a column projection drops it: the index described one of the
+/// inputs, dendro cannot combine two of them without knowing what they mean,
+/// and a wrong index is worse than none.
+///
+/// **This does not shrink the file.** The segments it replaces are deleted,
+/// and SQLite keeps their pages on the free list rather than returning them,
+/// so the archive reads faster and occupies exactly what it did. [`compact`]
+/// reclaims at the end; a caller driving streams individually should finish
+/// with [`Db::incremental_vacuum`](crate::db::Db::incremental_vacuum).
+///
+/// **Concurrency.** In place, on this connection, so the archive must have no
+/// other writer — the same single-writer rule everything else here obeys. A
+/// reader on another connection is unaffected: each merge is one transaction,
+/// and until it commits a reader sees the segments exactly as they were.
+pub fn compact_stream(
+    db: &mut Db,
+    source_id: i64,
+    stream: &str,
+    spec: &CompactSpec,
+) -> Result<Compacted> {
+    let metas = db.read_segment_meta(source_id, stream)?;
+    let mut done = Compacted {
+        before: metas.len(),
+        after: metas.len(),
+        merges: 0,
+    };
+
+    let mut at = 0usize;
+    while at < metas.len() {
+        // Plan a run: adjacent segments whose rows fit the target.
+        let mut end = at;
+        let mut rows = 0u64;
+        while end < metas.len() && rows + metas[end].1.rows <= spec.target_rows.max(1) {
+            rows += metas[end].1.rows;
+            end += 1;
+        }
+        if end - at < 2 {
+            // Nothing to gain here — one segment already at or over target.
+            at = (at + 1).max(end);
+            continue;
+        }
+
+        // Read and re-encode BEFORE the transaction opens, as `seal_batch`
+        // does: both are proportional to segment size and would otherwise
+        // hold the write lock for their whole duration.
+        let mut blobs = Vec::with_capacity(end - at);
+        for (seq, _) in &metas[at..end] {
+            match db.read_segment_bytes(source_id, stream, *seq)? {
+                Some(b) => blobs.push(b),
+                // Vanished under us, which the single-writer rule says
+                // cannot happen; leave the run alone rather than guess.
+                None => break,
+            }
+        }
+        let (merged, merged_rows, consumed) = concat_parquet(&blobs, spec.props(), stream)?;
+        if consumed < 2 {
+            // A schema change at the very front of the run.
+            at += 1;
+            continue;
+        }
+        let run = &metas[at..at + consumed];
+        let meta = SegmentMeta {
+            rows: merged_rows,
+            first_ts: run[0].1.first_ts,
+            last_ts: run[consumed - 1].1.last_ts,
+        };
+        // ONE transaction. Delete then insert is safe only in here: between
+        // them the stream's watermark dips, and a reader that saw the gap
+        // would be handed sealed rows again as a live tail. Other
+        // connections see the whole thing or none of it.
+        let seq = run[0].0;
+        db.transaction(|tx| {
+            for (s, _) in run {
+                tx.delete_segment(source_id, stream, *s)?;
+            }
+            tx.insert_segment(source_id, stream, seq, &meta, &merged)
+        })?;
+
+        done.merges += 1;
+        done.after -= consumed - 1;
+        at += consumed;
+    }
+    Ok(done)
+}
+
+/// [`compact_stream`] over every stream of every source, then hand the freed
+/// pages back to the filesystem.
+///
+/// **The reclaim is the difference between this and calling
+/// `compact_stream` in a loop, and it is not a detail.** Merging deletes the
+/// segments it replaced, and SQLite does not return deleted pages to the
+/// filesystem — they go on the free list, to be reused. So compaction on its
+/// own makes an archive faster to read and exactly as large as it was:
+/// measured at 400 segments merged to one, read 12.10 ms to 643 µs, file
+/// 9.92 MB to 9.92 MB. Since half of what compaction is for is size, the
+/// whole-archive entry point finishes the job.
+///
+/// Uncapped, unlike the writer's reclaim, which is bounded because it runs on
+/// the append path. There is no append path here: compaction already
+/// requires that nothing else is writing.
+pub fn compact(db: &mut Db, spec: &CompactSpec) -> Result<Compacted> {
+    let mut total = Compacted::default();
+    let sources = db.read_sources()?;
+    for src in sources {
+        for stream in db.all_streams(src.id)? {
+            let one = compact_stream(db, src.id, &stream, spec)?;
+            total.before += one.before;
+            total.after += one.after;
+            total.merges += one.merges;
+        }
+    }
+    if total.merges > 0 {
+        db.incremental_vacuum(u32::MAX)?;
+    }
+    Ok(total)
+}
+
+/// Concatenate the leading run of `blobs` that share a schema into one
+/// parquet file. Returns the bytes, the rows in them, and how many blobs
+/// were consumed — fewer than all of them when the schema changes partway,
+/// which a stream's schema is allowed to do.
+///
+/// This is dendro looking inside a segment, which it otherwise does only for
+/// a column projection. The compaction entry weighed the alternative — a
+/// second method on the encoder trait, implemented by every caller — and
+/// chose this: concatenation is a property of the container, not of what a
+/// row means. The cost is that compaction, like projection, requires
+/// segments to actually be parquet.
+fn concat_parquet(
+    blobs: &[Vec<u8>],
+    props: parquet::file::properties::WriterProperties,
+    stream: &str,
+) -> Result<(Vec<u8>, u64, usize)> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ArrowWriter;
+
+    let open = |b: &Vec<u8>| {
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(b.clone()))
+            .map_err(|e| Error::Message(format!("failed to open a {stream} segment to merge: {e}")))
+    };
+    let first = open(&blobs[0])?;
+    let schema = first.schema().clone();
+    let mut consumed = 1usize;
+    while consumed < blobs.len() && open(&blobs[consumed])?.schema() == &schema {
+        consumed += 1;
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut rows = 0u64;
+    {
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+            .map_err(|e| Error::Message(format!("failed to open a merged {stream} writer: {e}")))?;
+        for b in &blobs[..consumed] {
+            for batch in open(b)?.build().map_err(|e| {
+                Error::Message(format!("failed to read a {stream} segment to merge: {e}"))
+            })? {
+                let batch = batch.map_err(|e| {
+                    Error::Message(format!("failed to read a {stream} batch to merge: {e}"))
+                })?;
+                rows += batch.num_rows() as u64;
+                writer.write(&batch).map_err(|e| {
+                    Error::Message(format!("failed to write a merged {stream} batch: {e}"))
+                })?;
+            }
+        }
+        writer.close().map_err(|e| {
+            Error::Message(format!("failed to finish a merged {stream} segment: {e}"))
+        })?;
+    }
+    Ok((buf, rows, consumed))
+}
+
 /// Which columns of a segment survive a [`project_segment_columns`] pass.
 ///
 /// dendro does not know what a column is for, so both halves of the decision

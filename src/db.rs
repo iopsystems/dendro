@@ -2380,6 +2380,26 @@ impl Tx<'_> {
         insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes, None)
     }
 
+    /// Remove one sealed segment.
+    ///
+    /// Exposed on `Tx` — unlike the WAL prune, which is deliberately not —
+    /// because the one operation that needs it, compaction, must delete the
+    /// segments it replaced and insert the replacement **in the same
+    /// transaction**. Apart is not an option: between them the stream's
+    /// watermark would dip, and `live_wal` would hand a reader rows that are
+    /// already sealed.
+    pub fn delete_segment(&self, source_id: i64, stream: &str, seq: u64) -> Result<()> {
+        self.tx
+            .execute(
+                "DELETE FROM segments WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+                rusqlite::params![source_id, stream, seq as i64],
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to drop segment {stream}#{seq}"
+            )))?;
+        Ok(())
+    }
+
     /// [`insert_segment`](Self::insert_segment), carrying the caller's index.
     pub fn insert_segment_with_index(
         &self,
