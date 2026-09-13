@@ -66,6 +66,57 @@ type, order and count. Arrow compares field metadata in schema equality, so a
 single changed key in a single field is as fatal to a run as adding ten
 columns. From the outside, nothing about those segments looks different.
 
+### Measured 2026-09-13: unioning pays off at every churn level, by less and less
+
+The table above says union merging restores merging. It does not say whether
+that is worth having, because union merging does not make churn free — it
+converts it. Segments that would not merge become one segment carrying every
+column any of them had, most of them sparse. dendro's own compaction
+measurement found the per-segment read cost is footer parsing and scales with
+column count, so this trade could in principle give back what it gains.
+
+A second fixture, closer to the caller that raised the question: 40 sealed
+segments, 50 columns live at any moment, and `k` of those slots recycled per
+segment onto a fresh identity — the cgroup case, where a recycled slot is a
+new column rather than a redescribed one. Merged with one target far larger
+than the stream, so the whole archive collapses to a single segment. Median
+shape over three repetitions, release build:
+
+| slots recycled per segment | segments | merged columns | read before | read after | gain | archive after |
+|---|---|---|---|---|---|---|
+| 0 | 40 → 1 | 51 | 1.25 ms | 50 µs | 25x | 0.07 MB |
+| 1 | 40 → 1 | 90 | 1.31 ms | 72 µs | 18x | 0.08 MB |
+| 5 | 40 → 1 | 246 | 1.29 ms | 162 µs | 8.0x | 0.12 MB |
+| 25 | 40 → 1 | 1,026 | 1.30 ms | 577 µs | 2.3x | 0.35 MB |
+
+**Unioning is worth doing at every level, and the decay is real.** Half the
+slot population turning over every segment still reads 2.3x faster merged than
+unmerged, but the 25x of a stable schema is gone, and the archive is five
+times the size of the unchurned one. Nulls are cheap, not free.
+
+**And there is no sweet spot to tune to.** The obvious hedge is to merge less
+hard, keeping runs short so fewer generations coexist in one segment. At the
+heaviest churn arm, merging to 4, 8 and 20 segments instead of 1 gives 2.0x,
+1.8x and 1.3x against the full merge's 2.3x, with the archive growing from
+0.35 MB to 0.48 MB as the target loosens. Every step away from a full merge is
+worse on both axes. The column count does fall as predicted — 1,026 to 276 to
+151 to 76 — and it does not buy anything, because the segments it is spread
+over cost more than the columns saved.
+
+So the caller's knob is already correct at its existing setting, and the
+merge-hardest default needs no qualification.
+
+**The dendro feature this rules out.** The natural next move was for a union
+merge to drop columns that are entirely null in the merged output, recovering
+the width. It would do nothing here: a recycled slot's column is *sparse*, not
+empty — it carries real readings for the segments in which it was live and
+nulls elsewhere. A column with no readings anywhere in the merge range does not
+arise from churn at all. Not built, and the reason is recorded so it is not
+proposed again.
+
+(Both measurements above used scratch fixtures driven through the public API,
+not kept in the tree; the committed tests pin the behaviour, not the numbers.)
+
 ### Three effects compound, and only one of them is compaction
 
 Churn costs more than the blocked merge:
@@ -172,6 +223,12 @@ completely different row shapes could both use it, because it stores bytes
 against a timestamp and nothing else. The transition *semantics* — what a slot
 meant, how a reader resolves one — stay entirely the caller's.
 
+The measurement above is also what sizes this. Unioning leaves a churning
+caller at 2.3x where a stable schema gets 25x, and the gap is entirely column
+count. A secondary index closes it, because the columns go back to being
+static and the merged segment goes back to being narrow. That is the argument
+for doing it, and it is a factor of ten rather than a matter of taste.
+
 Not built, and not costless: the caller's read path has to resolve a slot
 through the index at a timestamp, which is a real change in rezolus rather
 than a storage detail. It is recorded here so the shape is settled before
@@ -179,6 +236,10 @@ anyone starts.
 
 ## Deferred or Reopen Items
 
+- ~~**Drop all-null columns during a union merge**, to recover the width the
+  policy costs.~~ **NO-GO, measured**: churn produces sparse columns, not
+  empty ones, so there is nothing for it to drop. Reopen only if a caller
+  turns up whose columns really do go entirely silent across a merge range.
 - **A time-keyed caller store.** Reopen when a caller commits to the secondary
   index above. The design constraint is fixed: segment-independent, so
   compaction and projection cannot destroy it, and evictable on timestamp
