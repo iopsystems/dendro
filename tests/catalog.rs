@@ -105,6 +105,44 @@ fn the_catalog_describes_every_stream_without_a_blob() {
     assert_eq!(c.span(), Some((9, 9)));
 }
 
+/// One call for "describe this archive": the file's own size and page
+/// accounting alongside the whole catalog, from one snapshot, without
+/// reading a segment.
+#[test]
+fn describe_answers_the_whole_archive_in_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    fixture(&path);
+    let db = Db::open_read_only(&path).unwrap();
+    let overview = read::describe(&db).unwrap();
+
+    assert_eq!(overview.sources.len(), 1);
+    assert_eq!(overview.segments(), 3, "two on `a`, one on `c`");
+    assert_eq!(overview.rows(), 8, "sealed and live, everywhere");
+    assert_eq!(overview.span(), Some((1, 9)));
+    assert!(overview.bytes > 0, "the file has a size");
+    assert_eq!(
+        overview.bytes,
+        overview.pages.pages as u64 * overview.pages.page_size as u64,
+        "the size and the page accounting agree, being one snapshot"
+    );
+    assert!(overview.free_bytes() <= overview.bytes);
+
+    // Per stream, what its sealed segments occupy — the question
+    // `segment_sizes` could not answer, since it does not break down by
+    // stream.
+    let by_name: BTreeMap<&str, &read::StreamCatalog> = overview.sources[0]
+        .streams
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    assert!(by_name["a"].bytes > 0, "two sealed segments");
+    assert_eq!(
+        by_name["b"].bytes, 0,
+        "a stream with only a live tail has sealed nothing, so occupies nothing"
+    );
+}
+
 #[test]
 fn a_probe_is_the_first_sealed_segment_or_the_tail() {
     let dir = tempfile::tempdir().unwrap();

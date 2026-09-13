@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: implemented
 opened: 2026-09-12
 updated: 2026-09-12
 ---
@@ -182,13 +182,38 @@ value of alignment is that every stream cuts at the same instant. `div_euclid`
 rather than `/`, because timestamps are signed and truncation would put the
 rows either side of the epoch in one bucket — which has a test.
 
+**5. One call for "describe this archive" (landed).** `read::describe`
+returns an `Overview`: the file's own size and page accounting alongside the
+whole catalog, from one snapshot, without reading a segment. The five
+scattered entry points remain for a caller that wants one number; what they
+could not answer between them was per-stream size, since `segment_sizes` does
+not break down by stream — so `StreamCatalog` gained `bytes`, and "what is
+filling this archive" is now a field rather than an exercise.
+
 ## Outcome
 
-In progress.
+**Four of the five in-scope items landed; compaction did not, deliberately.**
+Somewhere for a caller's index, an integrity check, wall-clock alignment, and
+one call to describe an archive — each with tests, each under all three CI
+configurations. Compaction is the largest of the five and the only one whose
+own entry sets a measurement gate, which this effort honours rather than
+pre-empts.
+
+Two of the four came out smaller than the survey billed them, and both for
+the same reason: the survey read the feature list before it read who drives
+what. Alignment needed arithmetic, not a mechanism, because `seal.rs` is
+advisory and a caller could always have aligned by hand. And the index item
+was half boundary and half gap — the README had them fused, which is why the
+gap had gone unnoticed.
+
+One claim in this effort was wrong and a test caught it, which is recorded
+under item 3: `quick_check` does not skip reading pages.
 
 ## Deferred or Reopen Items
 
-- **Compaction** stays gated on its own entry's measurement.
+- **Compaction** stays gated on its own entry's measurement. It is now the
+  only item on this survey's in-scope list that is not built, which makes
+  running that measurement the obvious next move.
 - The out-of-scope list above is the deferral for everything else; each line
   carries the reason it would have to stop being true.
 

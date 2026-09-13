@@ -9,7 +9,7 @@ as ours or not ours, and links the entries that own each one.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
-| 2026-09-12 | [What a TSDB has that we do not, and which of it is ours to build](2026-09-12-what-a-tsdb-has-that-we-do-not.md) | in-progress |
+| 2026-09-12 | [What a TSDB has that we do not, and which of it is ours to build](2026-09-12-what-a-tsdb-has-that-we-do-not.md) | implemented (4 of 5; compaction gated) |
 | 2026-09-12 | [Generations: telling a counter reset from a counter wrap](2026-09-12-generations-reset-versus-wrap.md) | open |
 | 2026-09-11 | [Container hardening: failure classes, identity, sessions, and one materialization](2026-09-11-container-hardening.md) | implemented |
 | 2026-09-11 | [Segment compaction](2026-09-11-segment-compaction.md) | open |

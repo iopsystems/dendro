@@ -192,6 +192,9 @@ extracted from.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment — the parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
+- **One call to describe an archive.** `read::describe` answers what is in
+  it, what it spans, and what it occupies — per source and per stream —
+  without reading a segment.
 - **A soundness check.** `Db::verify` reports what is wrong with an archive
   rather than failing on the first thing: SQLite's own integrity check,
   dangling references, self-contradicting segments, and WAL rows no read path

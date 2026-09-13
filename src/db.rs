@@ -2153,6 +2153,25 @@ impl Db {
             )))
     }
 
+    /// How many bytes one stream's sealed segments occupy.
+    ///
+    /// `length()` on a blob is answered from the record header, so this does
+    /// not read the payloads. The per-source
+    /// [`segment_sizes`](Self::segment_sizes) is what a retention policy
+    /// walks; this is the per-stream total, which is what answers "what is
+    /// filling this archive".
+    pub fn stream_bytes(&self, source_id: i64, stream: &str) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(length(bytes)), 0) FROM segments \
+                 WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, stream],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .map_err(Error::sqlite(format!("failed to size {stream}")))
+    }
+
     /// The next `seq` for every stream that has sealed at least once:
     /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
     /// archive seeds its numbering from, so it continues each stream's

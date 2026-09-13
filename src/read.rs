@@ -25,6 +25,10 @@ pub struct StreamCatalog {
     /// The live WAL tail's rows and span — rows past the newest segment,
     /// which a reader materializes as one more.
     pub live: Span,
+    /// What this stream's sealed segments occupy, in bytes. The live tail is
+    /// not counted: it has no segment yet, and what it will encode to is not
+    /// known until it seals.
+    pub bytes: u64,
 }
 
 impl StreamCatalog {
@@ -82,31 +86,103 @@ impl SourceCatalog {
 /// [`probe`] for the one segment a schema needs and [`SegmentBytes`] for
 /// the rest on demand, is the shape that fixed it.
 pub fn catalog(db: &Db) -> Result<Vec<SourceCatalog>> {
-    db.read_snapshot(|db| {
-        let mut out = Vec::new();
-        for src in db.read_sources()? {
-            let mut streams = Vec::new();
-            for name in db.all_streams(src.id)? {
-                let (segments, sealed) = db.segment_span(src.id, &name)?;
-                let live = db.live_wal_span(src.id, &name)?;
-                streams.push(StreamCatalog {
-                    name,
-                    segments,
-                    sealed,
-                    live,
-                });
-            }
-            out.push(SourceCatalog {
-                id: src.id,
-                uuid: src.uuid,
-                labels: src.meta.labels,
-                metadata: src.meta.metadata,
-                complete: src.complete,
-                clock_anchor_wall_ns: src.meta.clock_anchor_wall_ns,
-                streams,
+    db.read_snapshot(catalog_snapshotted)
+}
+
+/// [`catalog`] without opening a snapshot, for a caller that already holds
+/// one — [`describe`], whose file-level facts and catalog must describe the
+/// same instant.
+fn catalog_snapshotted(db: &Db) -> Result<Vec<SourceCatalog>> {
+    let mut out = Vec::new();
+    for src in db.read_sources()? {
+        let mut streams = Vec::new();
+        for name in db.all_streams(src.id)? {
+            let (segments, sealed) = db.segment_span(src.id, &name)?;
+            let live = db.live_wal_span(src.id, &name)?;
+            let bytes = db.stream_bytes(src.id, &name)?;
+            streams.push(StreamCatalog {
+                name,
+                segments,
+                sealed,
+                live,
+                bytes,
             });
         }
-        Ok(out)
+        out.push(SourceCatalog {
+            id: src.id,
+            uuid: src.uuid,
+            labels: src.meta.labels,
+            metadata: src.meta.metadata,
+            complete: src.complete,
+            clock_anchor_wall_ns: src.meta.clock_anchor_wall_ns,
+            streams,
+        });
+    }
+    Ok(out)
+}
+
+/// Everything about an archive that does not require reading a segment: the
+/// file's own size and page accounting, and the whole catalog.
+///
+/// The consolidation. These facts were spread across `Db::archive_bytes`,
+/// `Db::page_stats`, `Db::segment_sizes`, `Db::total_rows` and [`catalog`] —
+/// five entry points, so every consumer assembled "describe this archive"
+/// itself and each did it differently. Those all remain, for a caller that
+/// wants one number; this is the answer to the question people actually ask.
+#[derive(Debug, Clone)]
+pub struct Overview {
+    /// The archive's size on disk, as SQLite accounts it. Excludes the
+    /// `-wal` sidecar, which is not part of the artifact.
+    pub bytes: u64,
+    pub pages: crate::db::PageStats,
+    pub sources: Vec<SourceCatalog>,
+}
+
+impl Overview {
+    /// Sealed segments across every stream of every source.
+    pub fn segments(&self) -> u64 {
+        self.sources
+            .iter()
+            .flat_map(|s| &s.streams)
+            .map(|s| s.segments)
+            .sum()
+    }
+
+    /// Rows a reader would see: sealed plus live, everywhere.
+    pub fn rows(&self) -> u64 {
+        self.sources
+            .iter()
+            .flat_map(|s| &s.streams)
+            .map(|s| s.rows())
+            .sum()
+    }
+
+    /// The span everything in the archive covers, or `None` when it holds no
+    /// rows.
+    pub fn span(&self) -> Option<(i64, i64)> {
+        let spans: Vec<(i64, i64)> = self.sources.iter().filter_map(|s| s.span()).collect();
+        Some((
+            spans.iter().map(|s| s.0).min()?,
+            spans.iter().map(|s| s.1).max()?,
+        ))
+    }
+
+    /// How much of the file is on the free list: space eviction released
+    /// that has not gone back to the filesystem. A large fraction means the
+    /// working set shrank — see `writer::reclaim_if_fragmented`.
+    pub fn free_bytes(&self) -> u64 {
+        self.pages.free as u64 * self.pages.page_size as u64
+    }
+}
+
+/// Describe an archive without reading a segment. See [`Overview`].
+pub fn describe(db: &Db) -> Result<Overview> {
+    db.read_snapshot(|db| {
+        Ok(Overview {
+            bytes: db.archive_bytes()?,
+            pages: db.page_stats()?,
+            sources: catalog_snapshotted(db)?,
+        })
     })
 }
 
