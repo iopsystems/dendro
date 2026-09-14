@@ -410,13 +410,13 @@ impl Archive {
     /// Close the channel and join the writer, returning its stored result.
     /// Idempotent: a second call is a no-op `Ok`.
     ///
-    /// Handles should be dropped first — but not because this would otherwise
-    /// block. `Shutdown` is sent below *before* our own sender is released, and
-    /// the writer honours it whoever else still holds a clone, so a wrong order
-    /// is an error (work queued after the stop is dropped), not a hang. That
-    /// The guarantee comes from `Msg::Shutdown`, not
-    /// in the drop order, and removing it would turn every "must drop first"
-    /// note in this file into a real deadlock.
+    /// Drop every handle first — but not because this would otherwise block.
+    /// `Shutdown` is sent below *before* our own sender is released, and the
+    /// writer honors it whoever else still holds a clone, so a wrong order is
+    /// an error (work queued after the stop is dropped), not a hang. The
+    /// guarantee comes from `Msg::Shutdown`, not from the drop order, and
+    /// removing it would turn every "must drop first" note in this file into a
+    /// real deadlock.
     pub fn join(&mut self) -> Result<()> {
         // Tell the writer to stop before releasing our own sender. A handle
         // that outlived its archive still holds a clone, so waiting for the
@@ -504,13 +504,6 @@ impl Archive {
         }
     }
 
-    /// Create an archive holding exactly one source.
-    ///
-    /// The shape every caller had before archives could hold several, and
-    /// still what a rolling buffer and a single-producer source want. Returns
-    /// both halves because the archive owns the writer thread and must outlive
-    /// the handle — `Shutdown` means a wrong order is an error rather than a
-    /// hang, but the right order is still: finish with the handle, then join.
     /// Finalize the one source and join the writer, so the file is fully
     /// committed when this returns.
     ///
@@ -525,7 +518,13 @@ impl Archive {
         queued.and(joined)
     }
 
-    /// An archive holding exactly one source, opened and ready to write.
+    /// Create an archive holding exactly one source.
+    ///
+    /// The shape every caller had before archives could hold several, and
+    /// still what a rolling buffer and a single-producer source want. Returns
+    /// both halves because the archive owns the writer thread and must outlive
+    /// the handle — `Shutdown` means a wrong order is an error rather than a
+    /// hang, but the right order is still: finish with the handle, then join.
     #[cfg(any(test, feature = "test-support"))]
     pub fn single(
         path: &Path,
@@ -624,7 +623,7 @@ impl SourceWriter {
     /// Hand one tick's WAL rows to the writer for this source.
     ///
     /// The single-source spelling.
-    /// An archive with several sources should stage each one and commit the
+    /// An archive with several sources must stage each one and commit the
     /// tick once, through [`Archive::wal_tick`]: one transaction instead of
     /// one per source.
     pub fn wal(&mut self, rows: Vec<WalRow>) -> Result<()> {
@@ -658,14 +657,13 @@ impl SourceWriter {
     /// How many of this source's appends have been dropped for arriving at
     /// or below their stream's newest sealed row.
     ///
-    /// A nonzero value usually indicates a producer error. Such a row cannot
-    /// be read: the watermark
-    /// that keeps the seal seam free of duplicates shadows it exactly as it
-    /// shadows an already-sealed row — so the writer drops it rather than
-    /// spending space on it, and logs once per stream. A non-zero count is a
-    /// producer appending out of order, which this container does not
-    /// support within a stream; a different stream or a different source has
-    /// its own watermark and is not affected.
+    /// A non-zero count is a producer appending out of order within a stream,
+    /// which this container does not support. Such a row cannot be read: the
+    /// watermark that keeps the seal seam free of duplicates shadows it
+    /// exactly as it shadows an already-sealed row — so the writer drops it
+    /// rather than spending space on it, and logs once per stream. A different
+    /// stream or a different source has its own watermark and is not
+    /// affected.
     ///
     /// Counted rather than returned because an append is deliberately
     /// fire-and-forget: reporting per call would make every tick a
@@ -851,7 +849,7 @@ impl SourceWriter {
 }
 
 /// Read the writer thread's stored failure, or a generic one if it exited
-/// without source anything (a clean exit that a handle nonetheless outlived).
+/// without storing one (a clean exit that a handle nonetheless outlived).
 fn take_writer_error(slot: &ErrorSlot) -> Error {
     match slot.lock().ok().and_then(|guard| guard.clone()) {
         Some(e) => Error::Writer(e),
@@ -1229,7 +1227,7 @@ fn writer_thread(
 /// a checkpoint, so a copy of the archive alone — which is what anyone who
 /// `cp`s one, or uploads one to a browser, ends up with — is a consistent view
 /// as of the last checkpoint and nothing after it. That copy is not corrupt; it
-/// simply ends early, and nothing about it says so.
+/// ends early, and nothing about it says so.
 ///
 /// [`crate::db`]'s autocheckpoint bounds how many bytes can accumulate
 /// (4 MiB). It cannot bound how much TIME they represent: a busy source
@@ -1270,7 +1268,7 @@ fn writer_loop(
     // against. Advanced by `seal_batch`, and held here rather than queried
     // per append because an append is the hot path; see `commit_tick`.
     //
-    // Seeded from the catalog, which on a reopened archive is defence in
+    // Seeded from the catalog, which on a reopened archive is defense in
     // depth rather than the thing doing the work: a resumed source also
     // carries a FLOOR (the newest row anywhere in it), the floor is at or
     // above every one of its streams' watermarks, and the handle refuses
@@ -1422,7 +1420,7 @@ fn writer_loop(
                 }
                 // Same rule for the reclaim that follows: the caller was just
                 // told retention succeeded, and it did. Handing pages back is
-                // an optimisation; a failure here is the next pass's problem,
+                // an optimization; a failure here is the next pass's problem,
                 // not the recording's.
                 if let Err(e) = reclaim_if_fragmented(db) {
                     warn!("reclaiming freed pages after retention failed ({e}); skipped");
@@ -1640,7 +1638,7 @@ fn seal_batch(
             meta: SegmentMeta {
                 // ALL THREE from `tail`, never from the input rows. An encoder
                 // may drop rows it cannot decode on their own, and those are
-                // real WAL rows that never reach the segment; cataloguing the
+                // real WAL rows that never reach the segment; cataloging the
                 // input's span would claim coverage the bytes do not have.
                 //
                 // `last_ts` is the one that used to come from the input, and it
@@ -1648,7 +1646,7 @@ fn seal_batch(
                 // read watermark are both computed from, so a dropped trailing
                 // row was deleted from the WAL, absent from the segment, and
                 // hidden by a watermark claiming to cover it. Taken from the
-                // segment, that row simply stays live and seals next time.
+                // segment, that row stays live and seals next time.
                 rows: tail.rows,
                 first_ts: tail.first_ts,
                 last_ts: tail.last_ts,
@@ -1699,8 +1697,8 @@ fn seal_batch(
     // thousands of rows before it seals, so pruning inside the seal commit puts
     // a large delete on the tick path. `live_wal`'s watermark filter makes a
     // crash between the commit above and the delete below harmless — a
-    // straddling row is simply not live — which leaves the prune a pure
-    // background optimisation. `Tx` does not expose `prune_wal`, so this
+    // straddling row is not live — which leaves the prune a pure
+    // background optimization. `Tx` does not expose `prune_wal`, so this
     // ordering is enforced by the type, not by this comment.
     //
     // Each stream is pruned only up to its OWN segment's `last_ts`: rows a

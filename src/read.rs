@@ -350,7 +350,7 @@ fn check_encoder_of(db: &Db, source_id: i64, encoder: &dyn SegmentEncoder) -> Re
 /// [`stream_segments`] without opening a snapshot, for a caller that already
 /// holds one.
 ///
-/// **The snapshot is not an optimisation.** Reading the segments and then the
+/// **The snapshot is not an optimization.** Reading the segments and then the
 /// live WAL as two statements leaves a window in which a seal commits between
 /// them: the segment is missing from the first read, and the watermark it
 /// installed shadows those same rows in the second, so they appear in neither
@@ -418,10 +418,6 @@ pub fn stream_indexes(
 ///
 /// Named for the bytes rather than the origin because `source` already means
 /// something else here: one producer, one clock domain, one label set.
-///
-/// A caller typically needs one segment per stream at open — enough to learn
-/// what the stream holds — and the catalog answers everything else. Deferring
-/// the rest until a stream is actually read is the difference worth having.
 pub enum SegmentBytes {
     Bytes(Vec<Vec<u8>>),
     Db {

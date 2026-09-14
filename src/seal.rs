@@ -97,10 +97,10 @@ pub struct SealPolicy {
 ///
 /// **These numbers were measured on one workload**: a telemetry agent
 /// sealing a few dozen streams at a ~46 ms append cadence, on a production
-/// fleet — and are a starting point, not a property of the container. A
-/// caller appending at a very different cadence, or with rows of a very
-/// different size, should tune them for its own finalize latency, peak memory
-/// and kill-loss window.
+/// fleet — and are a starting point, not a property of the container. If you
+/// append at a very different cadence, or with rows of a very different size,
+/// tune them for your own finalize latency, peak memory and kill-loss
+/// window.
 impl Default for SealPolicy {
     fn default() -> Self {
         Self {
@@ -208,7 +208,7 @@ impl SegmentAccount {
     /// Which aligned bucket a timestamp falls in, or `None` when the caller
     /// asked for no alignment.
     ///
-    /// `div_euclid`, not `/`: a timestamp may be negative (it is an `i64`,
+    /// `div_euclid`, not `/`: a timestamp can be negative (it is an `i64`,
     /// and zero is 1970, not the bottom of the range), and truncating
     /// division rounds toward zero, which would put `-1` and `1` in the same
     /// bucket either side of the epoch.
@@ -334,13 +334,13 @@ pub fn stagger_bucket(stream: &str, source_key: &str) -> u64 {
     // absorbed byte XORs 0x20 through the whole chain and a second flip
     // cancels it. Two label sets differing by an EVEN number of bit-5 flips
     // share every bucket. In printable ASCII bit 5 is the case bit, so this
-    // needs two sources whose labels differ only by capitalisation.
+    // needs two sources whose labels differ only by capitalization.
     //
     // **Closing it costs more than it buys, because the spread and the alias
     // are the same property.** The low-bit structure that makes this hash
     // spread a real stream set PERFECTLY is exactly the affine structure the
     // alias exploits. Measured over 500 source keys, as colliding
-    // stream-pairs normalised by what a uniform random assignment would give
+    // stream-pairs normalized by what a uniform random assignment would give
     // (0 = perfect, 1.0 = random):
     //
     //     candidate                12 streams   26 streams   alias
@@ -386,7 +386,7 @@ pub fn stagger_bucket(stream: &str, source_key: &str) -> u64 {
 /// bit 5, in an EVEN number of positions.
 ///
 /// In printable ASCII bit 5 is the case bit, so among realistic label values
-/// this is: the same labels typed with different capitalisation, in an even
+/// this is: the same labels typed with different capitalization, in an even
 /// number of letters. `arm=valkey`/`arm=VALKEY` (six letters) shares all 26
 /// buckets; `arm=redis`/`arm=REDIS` (five) shares none.
 ///
@@ -572,7 +572,7 @@ mod tests {
     /// The property the stagger exists for, stated as a number so a future
     /// change to the hash has to answer for it.
     ///
-    /// Colliding stream-pairs, normalised by what a uniform random assignment
+    /// Colliding stream-pairs, normalized by what a uniform random assignment
     /// would give: 0 = every table its own bucket, 1.0 = random. This hash
     /// spreads a 12-stream source PERFECTLY and a 26-stream one better
     /// than random — which is the reason bit-5 aliasing is warned about rather

@@ -69,7 +69,7 @@
 //! * A stream can stop existing. Once retention has evicted its last segment
 //!   and its last WAL row it vanishes from `all_streams` entirely, and the
 //!   archive keeps no record that it was ever there. Reusing the name later
-//!   simply starts a new one.
+//!   starts a new one.
 //!
 //! The sources ladder is therefore about containment, not lifetime: an archive
 //! holds what its sources' streams currently hold, and nothing more.
@@ -78,14 +78,14 @@
 //!
 //! The model contains nothing about metrics, samples, series or
 //! observations. dendro came out of a telemetry agent and is a good fit for
-//! telemetry, but the container does not know that and should not learn it.
+//! telemetry, but the container does not know that and must not learn it.
 //!
 //! # The boundary
 //!
 //! **dendro does not know what a row means.** A row is bytes and a timestamp;
 //! turning a batch of them into a parquet segment is the caller's job,
 //! expressed as a [`SegmentEncoder`]. That is the whole schema boundary — the
-//! archive owns storage, cataloguing, retention, checkpointing and segment
+//! archive owns storage, cataloging, retention, checkpointing and segment
 //! mechanics, and the caller owns what is in the columns.
 //!
 //! Two consequences are important for implementers:
@@ -147,8 +147,8 @@
 //! connection that is the last one open **checkpoints on close**, so
 //! [`db::Db::open`] on a crashed archive folds the sidecar back in and deletes
 //! it — measured at 4 KiB to 110 KiB from nothing but an open and a drop. That
-//! is usually what you want and it is never what a reader should do by
-//! surprise, so [`db::Db::open_read_only`] exists and leaves all three files
+//! is usually what you want, and a reader must never do it by surprise, so
+//! [`db::Db::open_read_only`] exists and leaves all three files
 //! exactly as it found them. Use it for anything pointed at a live buffer, at
 //! an artifact you do not own, or at read-only media, where `open` fails
 //! outright because its durability pragmas are themselves writes.
@@ -215,7 +215,7 @@ pub mod keys {
     /// question is unanswerable from a file that does not carry this.
     ///
     /// **It has to distinguish builds, not releases.** A bare crate version is
-    /// the weak form, because the behaviour worth bisecting usually changed in
+    /// the weak form, because the behavior worth bisecting usually changed in
     /// a pre-release build; a version with a commit or build identifier
     /// alongside it is the useful one. Any stable-per-build string will do.
     ///

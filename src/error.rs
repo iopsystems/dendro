@@ -140,7 +140,7 @@ impl fmt::Display for Error {
                 f,
                 "source {source_id} was written with encoder version {wrote:?} and is being \
                  read with {reading:?}; the rows are the encoder's bytes, so a different \
-                 version may not decode them the same way"
+                 version is not guaranteed to decode them the same way"
             ),
             Error::TimelineBackwards {
                 source_id,
@@ -232,8 +232,8 @@ impl Error {
 
     /// A condition that can clear on its own — another connection's lock, a
     /// full disk, an interrupted call, memory pressure, a schema change under
-    /// a prepared statement — so a writer should try again before giving up
-    /// on the work.
+    /// a prepared statement — so a retry before giving up on the work can
+    /// succeed.
     pub fn is_retryable(&self) -> bool {
         use rusqlite::ErrorCode::*;
         matches!(

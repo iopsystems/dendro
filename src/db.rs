@@ -211,7 +211,7 @@ pub struct SegmentRow {
     /// The caller's index over this segment, as it was written — see
     /// [`Segment::index`](crate::segment::Segment::index). Carried here so a
     /// copy can move it with the bytes it describes; a caller that only
-    /// wants indexes should use
+    /// wants indexes uses
     /// [`read_segment_indexes`](Db::read_segment_indexes), which reads no
     /// payload.
     pub caller_index: Option<Vec<u8>>,
@@ -248,8 +248,8 @@ pub struct Evicted {
     /// unclean kill would have kept them, and retention did not. It happens
     /// when a stream's seal cadence is slower than the retention lookback,
     /// and it is data loss the caller's own two policies caused, so it is
-    /// reported rather than hidden: a caller seeing this non-zero should
-    /// seal at least as often as it evicts.
+    /// reported rather than hidden: a caller seeing this non-zero must seal at
+    /// least as often as it evicts.
     pub live_rows: usize,
 }
 
@@ -525,7 +525,7 @@ impl Db {
     /// test can create at a NON-default page size: SQLite's own default happens
     /// to equal `PAGE_SIZE`, so asserting 4096 on a normally-created file passes
     /// even if the `page_size` pragma is never issued or is issued too late.
-    /// Only `create` (and that test) should call this — the page size is not a
+    /// Only `create` (and that test) may call this — the page size is not a
     /// caller's choice.
     fn create_with_page_size(path: &Path, page_size: u32) -> Result<Self> {
         // Claim the path atomically rather than testing `exists()` — this is
@@ -1023,7 +1023,7 @@ impl Db {
         mint_uuid(&self.conn)
     }
 
-    /// Every source in the file, in insertion order. An archive may hold
+    /// Every source in the file, in insertion order. An archive can hold
     /// several (multi-host, or an A/B pair).
     pub fn read_sources(&self) -> Result<Vec<SourceRow>> {
         // The `uuid` column arrived after the first archives were written,
@@ -1079,6 +1079,17 @@ impl Db {
         Ok(out)
     }
 
+    /// How many transactions this connection has COMMITTED.
+    ///
+    /// Exists so "one commit per tick, whatever the endpoint count" is a
+    /// property a test can assert rather than one a comment claims. At
+    /// `synchronous=FULL` a commit is an fsync, and fsyncs are not otherwise
+    /// observable from inside the process.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commits(&self) -> u64 {
+        self.commits.get()
+    }
+
     /// Run `f` inside one transaction: it commits when `f` returns `Ok` and
     /// rolls back — leaving the database exactly as it was — when `f` returns
     /// `Err` or the commit itself fails.
@@ -1094,17 +1105,6 @@ impl Db {
     /// prune runs outside the seal transaction" is made unrepresentable rather
     /// than merely documented — inside it, a quiet stream's accumulated rows
     /// make the delete long enough to threaten the tick.
-    /// How many transactions this connection has COMMITTED.
-    ///
-    /// Exists so "one commit per tick, whatever the endpoint count" is a
-    /// property a test can assert rather than one a comment claims. At
-    /// `synchronous=FULL` a commit is an fsync, and fsyncs are not otherwise
-    /// observable from inside the process.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn commits(&self) -> u64 {
-        self.commits.get()
-    }
-
     pub fn transaction<T>(&mut self, f: impl FnOnce(&Tx<'_>) -> Result<T>) -> Result<T> {
         self.writable()?;
         let tx = Tx {
@@ -1125,7 +1125,7 @@ impl Db {
     }
 
     /// Insert one sealed segment's bytes and catalog facts, committing on its
-    /// own. Batch writers should use `transaction` instead.
+    /// own. Batch writers must use `transaction` instead.
     pub fn insert_segment(
         &mut self,
         source_id: i64,
@@ -1179,19 +1179,6 @@ impl Db {
         read_segment_indexes_sql(&self.conn, source_id, stream)
     }
 
-    /// Every segment for `(source_id, stream)`, in `seq` order.
-    ///
-    /// The `ORDER BY seq` is required: the reader splices
-    /// segment bytes together assuming they arrive in sequence order, and SQL
-    /// makes no ordering guarantee without it. Confirmed with
-    /// `EXPLAIN QUERY PLAN`: dropping the clause does not fall back to
-    /// insertion order or to the primary key — the planner instead picks the
-    /// `segments_by_time` index for the `(source_id, stream)` equality
-    /// filter, which is ordered by `last_ts`, not `seq`, and is not even
-    /// covering (it still fetches `bytes` per row from the table). `last_ts`
-    /// happens to track `seq` in the common case (segments seal in order),
-    /// which is exactly the kind of coincidence that makes a missing
-    /// `ORDER BY` dangerous rather than obviously wrong.
     /// Segment metadata for one stream — `seq`, `rows` and the timestamp
     /// bounds — WITHOUT the payload.
     ///
@@ -1269,6 +1256,19 @@ impl Db {
         }
     }
 
+    /// Every segment for `(source_id, stream)`, in `seq` order.
+    ///
+    /// The `ORDER BY seq` is required: the reader splices
+    /// segment bytes together assuming they arrive in sequence order, and SQL
+    /// makes no ordering guarantee without it. Confirmed with
+    /// `EXPLAIN QUERY PLAN`: dropping the clause does not fall back to
+    /// insertion order or to the primary key — the planner instead picks the
+    /// `segments_by_time` index for the `(source_id, stream)` equality
+    /// filter, which is ordered by `last_ts`, not `seq`, and is not even
+    /// covering (it still fetches `bytes` per row from the table). `last_ts`
+    /// happens to track `seq` in the common case (segments seal in order),
+    /// which is exactly the kind of coincidence that makes a missing
+    /// `ORDER BY` dangerous rather than obviously wrong.
     pub fn read_segments(&self, source_id: i64, stream: &str) -> Result<Vec<SegmentRow>> {
         let mut stmt = self
             .conn
@@ -1336,7 +1336,7 @@ impl Db {
     /// **Whole segments, always.** A segment is an immutable parquet BLOB, so
     /// selecting part of one would mean decoding and re-encoding it — the cost
     /// the container exists to avoid. A caller gets a little more than it asked
-    /// for at each edge and should report the span it actually got.
+    /// for at each edge and must report the span it actually got.
     pub fn segments_overlapping(
         &self,
         source_id: i64,
@@ -1373,13 +1373,11 @@ impl Db {
     /// returns `Ok`, and both staleness bounds in DESIGN.md lapse for the
     /// duration. Keep a snapshot for one answer, not for the life of a reader.
     ///
-    /// `f` should not write through this handle. That is a contract, not a
-    /// guarantee: every mutator on `Db` takes `&self`, so nothing stops you,
-    /// and a write in here joins the snapshot's transaction.
-    ///
-    /// `f` gets `&Self`, so it may call any reader here; it must not write
+    /// `f` gets `&Self`, so it may call any reader here. It must not write
     /// through this handle, which is why this is not exposed as a general
-    /// transaction.
+    /// transaction — but that is a contract, not a guarantee: every mutator on
+    /// `Db` takes `&self`, so nothing stops you, and a write in here joins the
+    /// snapshot's transaction.
     pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         // Re-entrant: a caller already inside a snapshot keeps that one rather
         // than failing on SQLite's "cannot start a transaction within a
@@ -1458,12 +1456,12 @@ impl Db {
     /// Every distinct stream this source has ever seen, alphabetically —
     /// the union of `segments.stream` and `wal.stream`. This is what
     /// closes the gap `streams()` deliberately leaves open: a stream that
-    /// has never sealed a segment (a quiet table, still inside its first
-    /// seal period — the 16-of-26 case this whole design exists to fix) is
+    /// has never sealed a segment — a quiet table, still inside its first
+    /// seal period, which is the case the WAL exists to keep readable — is
     /// otherwise unnameable, because `streams()` only sees `segments` and
     /// this module is the only place that knows the schema well enough to
-    /// look at both tables. Recovery/inventory callers should call this, not
-    /// `streams()`, when they need to know which tables exist at all.
+    /// look at both tables. A recovery or inventory caller that needs to know
+    /// which tables exist at all must call this, not `streams()`.
     pub fn all_streams(&self, source_id: i64) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -1527,7 +1525,7 @@ impl Db {
     }
 
     /// Every WAL row for `(source_id, stream)`, sealed or not, oldest
-    /// first. Recovery should use `live_wal` instead — this is the raw table,
+    /// first. Recovery must use `live_wal` instead — this is the raw table,
     /// kept for inspection and for the WAL tests to compare against.
     pub fn read_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>> {
         let mut stmt = self
@@ -1541,8 +1539,9 @@ impl Db {
     }
 
     /// Rows not covered by any sealed segment — this filter IS the recovery
-    /// rule, not just a helper for it: **`ts > COALESCE(MAX(last_ts) of that
-    /// stream's segments, 0)`.**
+    /// rule, not just a helper for it: **a row is live when its `ts` is past
+    /// `MAX(last_ts)` over that stream's own segments, or when that stream has
+    /// no segments at all.**
     ///
     /// The prune (`prune_wal`) deliberately runs OUTSIDE the seal transaction,
     /// because a quiet stream accumulates thousands of rows before it seals
@@ -1554,24 +1553,20 @@ impl Db {
     /// segments for its own stream, full stop — one idempotent rule that needs
     /// no ordering guarantee between sealing and pruning.
     ///
-    /// `COALESCE(..., -1)` is what makes the rule correct for a stream with
-    /// no segments at all, not just a straddling one: the subquery's `MAX`
-    /// over zero rows is SQL `NULL`, which `COALESCE` turns into `-1`, so
-    /// every row there is, is live.
-    ///
-    /// **`NOT EXISTS`, rather than a sentinel.** This was
+    /// **`NOT EXISTS`, rather than a sentinel.** The rule was
     /// `ts > COALESCE(MAX(last_ts), 0)`, which made a row at ts=0 invisible for
     /// the entire life of a stream that had not yet sealed — durable, never
     /// read, never reported. Lowering the sentinel to -1 fixed that case and
     /// moved the boundary rather than removing it: timestamps are `i64`, so
     /// there is no value below every legal one. Asking whether any segment
-    /// exists has no boundary to get wrong. That is exactly
-    /// the quiet-table case: a stream that has never sealed keeps its WHOLE
-    /// history live. That is the property a segment-only container cannot
-    /// offer: with kill-safety per segment, a stream that had not sealed one
-    /// yet recovers nothing at all.
+    /// exists has no boundary to get wrong.
     ///
-    /// This turns the prune into a pure background optimisation with no
+    /// A stream with no segments is the quiet-table case, and it keeps its
+    /// WHOLE history live. That is the property a segment-only container
+    /// cannot offer: with kill-safety per segment, a stream that had not
+    /// sealed one yet recovers nothing at all.
+    ///
+    /// This turns the prune into a pure background optimization with no
     /// correctness role.
     pub fn live_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>> {
         let mut stmt = self
@@ -1603,10 +1598,11 @@ impl Db {
     }
 
     /// A stream's sealed segments as the CATALOG sees them: how many segments,
-    /// how many rows across them, and the span they cover. **No BLOB is read** —
-    /// A catalog summary describes a 197 MB archive from this, and pulling
-    /// `bytes` back only to discard it is exactly the cost the catalog exists to
-    /// avoid.
+    /// how many rows across them, and the span they cover. **No BLOB is read.**
+    ///
+    /// This is what answers "what is in this archive" for a 197 MB file
+    /// without touching a payload; pulling `bytes` back only to discard it is
+    /// exactly the cost the catalog exists to avoid.
     pub fn segment_span(&self, source_id: i64, stream: &str) -> Result<(u64, Span)> {
         let segments: i64 = self
             .conn
@@ -1714,7 +1710,8 @@ impl Db {
     /// delete an indexed lookup rather than a scan; that index exists for this
     /// statement.
     ///
-    /// one transaction, and that is required for correctness. Deleting a
+    /// **The segment delete and the WAL delete are one transaction**, and that
+    /// is required for correctness. Deleting a
     /// segment lowers `live_wal`'s watermark for its stream, so WAL rows the
     /// segment already covered would become live again — a reader would splice
     /// them back in as a tail. The same-cutoff WAL delete is what stops that,
@@ -1963,7 +1960,7 @@ impl Db {
     /// **This is the dump.** It runs inside a read transaction, so the copy is
     /// a point-in-time snapshot even while the writer keeps committing — the
     /// property a ring of slots overwritten in place cannot offer. It also
-    /// rebuilds the destination from scratch, so a dump is where a rolling buffer
+    /// rebuilds the destination from scratch, so a dump is where a rolling
     /// buffer's free list gets compacted away for free.
     ///
     /// A plain file copy is not equivalent: in WAL mode the main database
@@ -2036,12 +2033,6 @@ impl Db {
             .map_err(Error::sqlite("failed to list tables"))
     }
 
-    /// Replace one source's metadata map.
-    ///
-    /// In place rather than through a copy because metadata is a catalog
-    /// column: `annotate` changes it and nothing else, and rewriting an
-    /// archive's every segment BLOB to edit one JSON string would make a
-    /// cheap operation cost the size of the source.
     /// Check the archive over, and report what is wrong rather than failing
     /// on the first thing.
     ///
@@ -2196,10 +2187,6 @@ impl Db {
             .map_err(Error::sqlite(format!("failed to size {stream}")))
     }
 
-    /// The next `seq` for every stream that has sealed at least once:
-    /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
-    /// archive seeds its numbering from, so it continues each stream's
-    /// sequence rather than colliding with it.
     /// The newest SEALED row of every stream, as `source -> stream ->
     /// last_ts`.
     ///
@@ -2237,6 +2224,10 @@ impl Db {
         Ok(out)
     }
 
+    /// The next `seq` for every stream that has sealed at least once:
+    /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
+    /// archive seeds its numbering from, so it continues each stream's
+    /// sequence rather than colliding with it.
     pub fn next_seqs(&self) -> Result<BTreeMap<(i64, String), u64>> {
         let mut stmt = self
             .conn
@@ -2294,6 +2285,12 @@ impl Db {
         self.update_source_metadata(source_id, &metadata)
     }
 
+    /// Replace one source's metadata map.
+    ///
+    /// In place rather than through a copy because metadata is a catalog
+    /// column: `annotate` changes it and nothing else, and rewriting an
+    /// archive's every segment BLOB to edit one JSON string would make a
+    /// cheap operation cost the size of the source.
     pub fn update_source_metadata(
         &mut self,
         source_id: i64,
@@ -2474,9 +2471,6 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Mark the source cleanly finalized. This is what replaced the
-    /// `.partial` filename convention: the file is valid from creation, so
-    /// "was it finished" is a queryable property instead of a name.
     /// The inverse of `mark_complete`, for a source a new writer session is
     /// about to append to: it is no longer finished. `Err` if there is no
     /// such source.
@@ -2493,6 +2487,9 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Mark the source cleanly finalized. This is what replaced the
+    /// `.partial` filename convention: the file is valid from creation, so
+    /// "was it finished" is a queryable property instead of a name.
     pub fn mark_complete(&self, source_id: i64) -> Result<()> {
         self.tx
             .execute("UPDATE sources SET complete = 1 WHERE id = ?1", [source_id])
@@ -2564,13 +2561,10 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Shared by `Db::insert_segment` (its own commit) and
-/// `Tx::insert_segment` (part of a batch): `Transaction` derefs to
-/// `Connection`, so both reach the same statement.
 /// Every segment index for one stream, in `seq` order, WITHOUT the payload.
 ///
 /// The point of the column: answering "could this stream hold what I am
-/// looking for" should not mean reading the segment. `None` where the
+/// looking for" does not mean reading the segment. `None` where the
 /// caller wrote no index, and for every segment of an archive written
 /// before the column existed.
 fn read_segment_indexes_sql(
@@ -2604,6 +2598,9 @@ fn read_segment_indexes_sql(
     Ok(out)
 }
 
+/// Shared by `Db::insert_segment` (its own commit) and
+/// `Tx::insert_segment` (part of a batch): `Transaction` derefs to
+/// `Connection`, so both reach the same statement.
 fn insert_segment_sql(
     conn: &Connection,
     source_id: i64,
@@ -2643,7 +2640,7 @@ fn insert_segment_sql(
 /// buffer another process is still appending to.
 ///
 /// Writes through a view fail (`cannot modify segments because it is a view`),
-/// which is the behaviour we want but not the message; [`Db::writable`] catches
+/// which is the behavior we want but not the message; [`Db::writable`] catches
 /// it first and says what to do instead.
 const LEGACY_VIEWS_SQL: &str = "\
 CREATE TEMP VIEW sources AS SELECT id, labels, metadata, complete, \
@@ -3094,7 +3091,7 @@ mod tests {
     /// it silently becomes a REAL and loses precision. So the API takes what
     /// the column takes. Taking `u64` and rejecting half of it, which this did
     /// until it was questioned, offered a range the store could not hold while
-    /// refusing one it could: a negative timestamp is simply before 1970.
+    /// refusing one it could: a negative timestamp is a timestamp before 1970.
     #[test]
     fn timestamps_span_the_whole_signed_range() {
         let dir = tempfile::tempdir().unwrap();

@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 /// crate did until it was measured, deletes rows the segment does not contain:
 /// they are gone from the WAL, absent from the bytes, and shadowed by a
 /// watermark that claims coverage up to a timestamp nothing holds. Reporting it
-/// here means a dropped trailing row simply stays live and is sealed by the
+/// here means a dropped trailing row stays live and is sealed by the
 /// next batch.
 ///
 /// The writer validates these against the rows it supplied - see
@@ -37,11 +37,12 @@ use crate::error::{Error, Result};
 /// the prune deletes everything up to `last_ts`.
 ///
 /// So an encoder may drop a LEADING or a TRAILING run - both narrow the span
-/// without holing it, and a trailing drop simply leaves those rows live for
+/// without holing it, and a trailing drop leaves those rows live for
 /// the next batch. It may not drop from the middle, and it may not claim rows
 /// its span does not hold.
 #[derive(Debug, PartialEq)]
 pub struct Segment {
+    /// The segment itself: one parquet file.
     pub bytes: Vec<u8>,
     /// How many rows are in `bytes`.
     pub rows: u64,
@@ -89,6 +90,9 @@ pub struct Segment {
 /// that indexes `rows[0]` without checking panics inside the reader, and on the
 /// seal path the reader is the writer thread. Return `Ok(None)`.
 pub trait SegmentEncoder {
+    /// Encode `rows` — one stream's, in timestamp order — as one segment, or
+    /// `Ok(None)` for no segment. See the trait for what a returned segment
+    /// may claim, and for the empty slice this is called with.
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
 
     /// A version string for this encoding, or `None` to opt out.
@@ -106,12 +110,14 @@ pub trait SegmentEncoder {
     }
 }
 
-/// Run an encoder over a run of WAL rows and validate the result. This is the
-/// shared enforcement point for the writer,
-/// when it seals, a copy when it carries a live tail across, and a reader
-/// materializing a tail. They used to check three different things, and the
-/// reader's was the weakest, so an encoder the seal refused was materialized
-/// silently on read: the reader and the next seal disagreed about the tail.
+/// Run an encoder over a run of WAL rows and validate the result.
+///
+/// The shared enforcement point for all three callers that build a segment:
+/// the writer when it seals, a copy when it carries a live tail across, and a
+/// reader materializing a tail. They used to check three different things, and
+/// the reader's was the weakest, so an encoder the seal refused was
+/// materialized silently on read: the reader and the next seal disagreed about
+/// the tail.
 ///
 /// The check is CONTIGUITY, by counting: the rows handed over that fall
 /// inside `[first_ts, last_ts]` must number exactly `rows`. A hole anywhere
@@ -187,8 +193,8 @@ pub fn materialize(
 /// What an encoder returns.
 ///
 /// A boxed `std::error::Error` rather than this crate's own type. The failure is
-/// the caller's, and stringifying it at the boundary would discard its concrete type.
-/// had. Wrapped in [`Error::Encoder`](crate::Error), which keeps it as
+/// the caller's, and stringifying it at the boundary would discard its concrete
+/// type. Wrapped in [`Error::Encoder`](crate::Error), which keeps it as
 /// `source()`, so a caller can downcast back to its own error rather than
 /// matching on a message it built.
 pub type EncodeResult =
@@ -206,7 +212,7 @@ impl<T: SegmentEncoder + ?Sized> SegmentEncoder for &T {
 /// Refuse a source written by a different encoder version than `encoder`
 /// reports. Either side reporting nothing is not a mismatch: an encoder
 /// that does not version itself, or a source from before the key, is
-/// simply unchecked.
+/// unchecked.
 pub fn check_encoder(
     source_id: i64,
     metadata: &std::collections::BTreeMap<String, String>,
@@ -263,12 +269,13 @@ pub fn encode_batch(schema: Arc<Schema>, batch: &RecordBatch) -> Result<Vec<u8>>
 ///
 /// It costs nothing to disable for the numeric columns this format is built
 /// for: a monotonic counter makes every value distinct, so the dictionary
-/// grows as large as the column it encodes. Callers who put string data in a
-/// segment should know that is the trade being made on their behalf.
+/// grows as large as the column it encodes. A caller that puts string data
+/// in a segment pays for that on its behalf: repeated values a dictionary
+/// would have collapsed are written out in full.
 ///
 /// **Deliberately left at parquet-rs defaults:** `write_batch_size`,
-/// statistics granularity, and the page-size limits. Each looks like it should
-/// bound per-column-writer memory and none of them measurably does, while
+/// statistics granularity, and the page-size limits. Each looks like a bound
+/// on per-column-writer memory and none of them measurably is, while
 /// chunk-level statistics costs finalize latency and read pruning. The
 /// dictionary is the whole effect.
 pub fn writer_props() -> WriterProperties {

@@ -39,7 +39,7 @@ pub enum SchemaPolicy {
     /// **It does not merge across a changed field.** A name that appears in
     /// two segments with any difference at all — type, nullability, or
     /// metadata — still stops the run, because a column whose metadata
-    /// changed may be a different series wearing the same name, and fusing
+    /// changed can be a different series under the same name, and fusing
     /// two series into one column is silent corruption rather than a policy
     /// choice. A caller whose column identity lives in field metadata and
     /// churns gets no more merging from this than from the default; the fix
@@ -54,7 +54,7 @@ pub struct CompactSpec {
     pub target_rows: u64,
     /// Properties for the merged segment. `None` uses the archive's own
     /// ([`segment::writer_props`](crate::segment::writer_props)); a caller
-    /// whose encoder writes with other settings should pass them, or its
+    /// whose encoder writes with other settings must pass them, or its
     /// compacted segments come back encoded differently from its sealed
     /// ones.
     pub writer_props: Option<parquet::file::properties::WriterProperties>,
@@ -111,7 +111,7 @@ pub struct Compacted {
 /// `docs/journal/2026-09-11-segment-compaction.md`). Segments are sized when
 /// they are sealed, by a policy that is trading against finalize latency and
 /// kill-loss, and an archive that is kept rather than rolled has no way to
-/// revisit that trade. This is the way.
+/// revisit that trade. This is where it is revisited.
 ///
 /// **What it does not touch.** The live WAL tail, which has no segment yet.
 /// Segments whose schemas differ: a run stops at a schema change, because
@@ -126,7 +126,7 @@ pub struct Compacted {
 /// **This does not shrink the file.** The segments it replaces are deleted,
 /// and SQLite keeps their pages on the free list rather than returning them,
 /// so the archive reads faster and occupies exactly what it did. [`compact`]
-/// reclaims at the end; a caller driving streams individually should finish
+/// reclaims at the end; a caller driving streams individually must finish
 /// with [`Db::incremental_vacuum`](crate::db::Db::incremental_vacuum).
 ///
 /// **Concurrency.** In place, on this connection, so the archive must have no
@@ -402,7 +402,7 @@ pub struct CopySpec<'a> {
     pub end: i64,
     /// Keep only the streams this accepts; `None` keeps every stream.
     ///
-    /// A predicate rather than a name set because a caller may group streams
+    /// A predicate rather than a name set because a caller can group streams
     /// under a coarser unit than the stream key — one an operator names, that
     /// owns several streams — and dropping that unit has to drop all of them.
     pub keep_streams: Option<&'a dyn Fn(&str) -> bool>,
@@ -418,7 +418,7 @@ pub struct CopySpec<'a> {
     /// Writer properties for a projected segment (`keep_columns`), which is
     /// re-encoded. `None` uses the archive's own
     /// ([`segment::writer_props`](crate::segment::writer_props): LZ4, no
-    /// dictionary); a caller whose encoder writes with other settings should
+    /// dictionary); a caller whose encoder writes with other settings must
     /// pass them, or its projected segments come back encoded differently
     /// from its sealed ones.
     pub writer_props: Option<parquet::file::properties::WriterProperties>,
@@ -478,7 +478,7 @@ pub fn shared_sources(a: &Db, b: &Db) -> Result<Vec<String>> {
 /// of its inputs or it does not exist.
 ///
 /// Each copied source keeps its source's `complete` flag. That flag answers
-/// "may data after the last row be missing", which is a property of the DATA
+/// whether data after the last row can be missing, which is a property of the DATA
 /// and survives being copied — a source recovered from a checkpoint rather
 /// than cleanly finalized is still truncated after a combine or a filter, and
 /// claiming otherwise would hide the loss. Missing beats wrong.
@@ -547,7 +547,7 @@ fn copy_sources_snapshotted(
                 match spec.keep_columns {
                     // Column trim re-encodes; a stream with none of the kept
                     // columns projects to no data column and is dropped (its
-                    // segments simply never inserted). Row count, timestamps
+                    // segments never inserted). Row count, timestamps
                     // and windows are unchanged by a projection, so the
                     // segment's own `meta` is reused verbatim.
                     Some(keep) => {
@@ -645,7 +645,7 @@ fn copy_sources_snapshotted(
 /// a segment has columns, not which of them a reader cannot do without. An
 /// implementation that drops a column its own reader needs to place rows in
 /// time will produce a segment that opens and answers wrongly, so
-/// [`ColumnFilter::keep`] should accept those unconditionally.
+/// [`ColumnFilter::keep`] must accept those unconditionally.
 pub fn project_segment_columns(
     bytes: &[u8],
     keep: &dyn ColumnFilter,
