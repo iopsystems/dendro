@@ -60,7 +60,7 @@ Nothing in `(prev, cur)` selects between them.
 
 **Everything here assumes reset.** metriken-query's `RateMode::Grid` is
 documented as using "the reset-adjusted cumulative counter", and its test
-`test_grid_rate_counter_reset` pins the behaviour: the series
+`test_grid_rate_counter_reset` pins the behavior: the series
 `100, 200, 300, 50, 150` yields increments `100, 100, 50, 100`. The
 `300 → 50` step contributes **50**. Had that been a 32-bit wrap, the true
 increment was `50 + (2^32 − 300)` ≈ **4.29 × 10⁹**. The engine is not wrong

@@ -63,7 +63,7 @@ not incidental. It is the entire reason the seal seam needs no coordination: the
 prune that follows a seal runs *outside* the seal transaction, so the `wal`
 table routinely still holds rows a sealed segment already covers, and the
 watermark is what stops a reader splicing them in twice. `db.rs` calls the prune
-"a pure background optimisation with no correctness role" precisely because of
+"a pure background optimization with no correctness role" precisely because of
 it.
 
 ## Design and Implementation
@@ -135,7 +135,7 @@ timestamp the sealed stream just refused — each has its own watermark. So
 the common shapes of backfill (a whole producer's history as another source;
 a metric family that did not exist before as another stream) need nothing
 from (2) at all. That materially narrows what backfill has left to solve,
-and is why the current behaviour is acceptable rather than merely
+and is why the current behavior is acceptable rather than merely
 documented.
 
 ## Deferred or Reopen Items
@@ -157,7 +157,7 @@ documented.
   `ORDER BY seq`, and dendro hands back bytes it never decodes — so the
   merge lands on the consumer or on
   [compaction](2026-09-11-segment-compaction.md), which that makes a
-  prerequisite rather than an optimisation.
+  prerequisite rather than an optimization.
 - Related: [segment compaction](2026-09-11-segment-compaction.md) is the other
   gap between dendro and a time-series database's storage layer.
 

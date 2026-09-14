@@ -22,7 +22,7 @@ and overstated everywhere else.
 fake it. Until then the evidence is one test faking it, which argues for the
 claim being softened rather than the schema being churned.
 
-**NO-GO on generalising the trait speculatively.** Every option below widens the
+**NO-GO on generalizing the trait speculatively.** Every option below widens the
 surface for a use case nobody has yet. The crate has one consumer; a second
 would settle most of this in an afternoon of contact.
 

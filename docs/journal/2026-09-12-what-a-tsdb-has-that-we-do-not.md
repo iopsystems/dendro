@@ -19,7 +19,7 @@ README stops describing one as the other.
 
 ## Decision Criteria
 
-**In scope** when the feature is about *storing, cataloguing, or handing back*
+**In scope** when the feature is about *storing, cataloging, or handing back*
 bytes, and can be built without the container knowing what a row means.
 
 **Out of scope** when it needs value semantics (is this a counter? a gauge? a
@@ -75,7 +75,7 @@ construction and vanish when their last row is evicted.
    parquet row groups, which dendro already depends on both crates for. It
    has its own entry, [segment compaction](2026-09-11-segment-compaction.md),
    whose GO criterion is a measured read slower than the same data in fewer
-   segments. That gate is honoured here rather than pre-empted: this survey
+   segments. That gate is honored here rather than pre-empted: this survey
    does not build it.
 
 3. **No integrity check.** An archive is an artifact you hand someone, and
@@ -202,7 +202,7 @@ The original four:
 Somewhere for a caller's index, an integrity check, wall-clock alignment, and
 one call to describe an archive — each with tests, each under all three CI
 configurations. Compaction is the largest of the five and the only one whose
-own entry sets a measurement gate, which this effort honours rather than
+own entry sets a measurement gate, which this effort honors rather than
 pre-empts.
 
 Two of the four came out smaller than the survey billed them, and both for

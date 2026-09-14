@@ -212,7 +212,7 @@ reclaim. The measurement lives in `src/bin/measure-compaction.rs` and is
 rerunnable.
 
 The order mattered. Ranked second of four in [what a TSDB has that we do
-not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which honoured this
+not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which honored this
 entry's gate rather than pre-empting it — and the measurement then paid for
 itself twice: once by justifying the work, and once by catching that the
 first working version returned no space at all.

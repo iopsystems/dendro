@@ -85,7 +85,7 @@ or `SQLITE_FULL`.
 **Let the caller choose.** A policy on the archive: fail-stop, or isolate. That
 is honest about there being no single right answer — a single-source recorder
 genuinely does want to stop — but it is more surface, and the crate has so far
-preferred to pick a behaviour and explain it.
+preferred to pick a behavior and explain it.
 
 ## Outcome
 
