@@ -15,11 +15,11 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::rewrite::{compact, compact_stream, CompactSpec};
 use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 /// Columns are `v0..vN`, where N comes from the row itself — so a stream can
 /// change shape partway and exercise the schema-drift rule.
@@ -74,7 +74,7 @@ fn row(ts: i64, columns: usize) -> WalRow {
 
 /// Every timestamp a reader can see, in order, decoded from the segments.
 fn timestamps(path: &std::path::Path) -> Vec<i64> {
-    let db = Db::open_read_only(path).unwrap();
+    let db = Archive::open(path).unwrap();
     let mut out = Vec::new();
     for src in read::read_archive(&db, &Widening).unwrap() {
         for (_, blobs) in src.streams {
@@ -103,7 +103,7 @@ fn timestamps(path: &std::path::Path) -> Vec<i64> {
 
 /// `rows` rows, sealed every `per`, all the same width.
 fn archive(path: &std::path::Path, rows: i64, per: i64, columns: usize) {
-    let (a, mut w) = Archive::single(path, Box::new(Widening), meta()).unwrap();
+    let (a, mut w) = Writer::single(path, Box::new(Widening), meta()).unwrap();
     for ts in 1..=rows {
         w.wal(vec![row(ts, columns)]).unwrap();
         if ts % per == 0 {
@@ -121,7 +121,7 @@ fn merging_preserves_every_row_and_shrinks_the_catalog() {
     let before = timestamps(&path);
     assert_eq!(before.len(), 20);
 
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     let done = compact(&mut db, &CompactSpec::to_rows(8)).unwrap();
     assert_eq!(done.before, 10);
     assert_eq!(done.after, 3, "8 + 8 + 4 rows");
@@ -133,14 +133,14 @@ fn merging_preserves_every_row_and_shrinks_the_catalog() {
         before,
         "the same rows, in the same order"
     );
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(db.total_rows(1, "s").unwrap(), 20, "the catalog agrees");
     let metas = db.read_segment_meta(1, "s").unwrap();
     assert_eq!(metas.len(), 3);
     assert_eq!(metas[0].1.rows, 8);
     assert_eq!((metas[0].1.first_ts, metas[0].1.last_ts), (1, 8));
     assert_eq!((metas[2].1.first_ts, metas[2].1.last_ts), (17, 20));
-    assert!(db.verify(dendro::db::Depth::Full).unwrap().is_sound());
+    assert!(db.verify(dendro::archive::Depth::Full).unwrap().is_sound());
 }
 
 /// The watermark must not move: it is what keeps the seal seam free of
@@ -150,7 +150,7 @@ fn merging_preserves_every_row_and_shrinks_the_catalog() {
 fn merging_leaves_the_watermark_and_the_live_tail_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
-    let (a, mut w) = Archive::single(&path, Box::new(Widening), meta()).unwrap();
+    let (a, mut w) = Writer::single(&path, Box::new(Widening), meta()).unwrap();
     for ts in 1..=8 {
         w.wal(vec![row(ts, 2)]).unwrap();
         if ts % 2 == 0 {
@@ -161,15 +161,12 @@ fn merging_leaves_the_watermark_and_the_live_tail_alone() {
     w.wal(vec![row(9, 2), row(10, 2)]).unwrap();
     a.finalize_single(w, (10, 0)).unwrap();
 
-    let before = Db::open_read_only(&path)
-        .unwrap()
-        .sealed_watermarks()
-        .unwrap();
-    let mut db = Db::open(&path).unwrap();
+    let before = Archive::open(&path).unwrap().sealed_watermarks().unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
     drop(db);
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(db.sealed_watermarks().unwrap(), before, "unchanged at 8");
     assert_eq!(
         db.live_wal(1, "s").unwrap().len(),
@@ -185,7 +182,7 @@ fn merging_leaves_the_watermark_and_the_live_tail_alone() {
 fn a_run_stops_at_a_schema_change() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
-    let (a, mut w) = Archive::single(&path, Box::new(Widening), meta()).unwrap();
+    let (a, mut w) = Writer::single(&path, Box::new(Widening), meta()).unwrap();
     // Two narrow segments, then two wide ones.
     for (ts, columns) in [
         (1, 2),
@@ -204,7 +201,7 @@ fn a_run_stops_at_a_schema_change() {
     }
     a.finalize_single(w, (8, 0)).unwrap();
 
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     let done = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
     assert_eq!(done.before, 4);
     assert_eq!(
@@ -213,7 +210,7 @@ fn a_run_stops_at_a_schema_change() {
     );
     drop(db);
     assert_eq!(timestamps(&path), (1..=8).collect::<Vec<_>>());
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let metas = db.read_segment_meta(1, "s").unwrap();
     assert_eq!(metas.len(), 2);
     assert_eq!(metas[0].1.rows, 4);
@@ -227,14 +224,14 @@ fn a_merge_drops_the_index_it_cannot_combine() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     archive(&path, 4, 2, 3);
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(
         db.read_segment_indexes(1, "s").unwrap(),
         vec![(0, Some(vec![3])), (1, Some(vec![3]))]
     );
     drop(db);
 
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
     assert_eq!(db.read_segment_indexes(1, "s").unwrap(), vec![(0, None)]);
 }
@@ -246,7 +243,7 @@ fn compaction_is_a_no_op_when_there_is_nothing_to_gain() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     archive(&path, 20, 10, 3); // two segments of ten
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
 
     let first = compact(&mut db, &CompactSpec::to_rows(10)).unwrap();
     assert_eq!(
@@ -273,10 +270,10 @@ fn the_archive_wide_pass_gives_the_space_back() {
     let path = dir.path().join("c.dendro");
     // Enough segments that the freed pages are a large fraction of the file.
     archive(&path, 400, 2, 8);
-    let before = Db::open_read_only(&path).unwrap().archive_bytes().unwrap();
+    let before = Archive::open(&path).unwrap().archive_bytes().unwrap();
 
     // Per stream: faster, and exactly as large.
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     compact_stream(&mut db, 1, "s", &CompactSpec::to_rows(10_000)).unwrap();
     assert_eq!(
         db.archive_bytes().unwrap(),
@@ -292,7 +289,7 @@ fn the_archive_wide_pass_gives_the_space_back() {
     // Archive-wide, on a fresh copy of the same fixture: smaller on disk.
     let path2 = dir.path().join("d.dendro");
     archive(&path2, 400, 2, 8);
-    let mut db = Db::open(&path2).unwrap();
+    let mut db = ArchiveMut::open(&path2).unwrap();
     compact(&mut db, &CompactSpec::to_rows(10_000)).unwrap();
     let after = db.archive_bytes().unwrap();
     assert!(
@@ -308,7 +305,7 @@ fn the_archive_wide_pass_gives_the_space_back() {
 fn compacting_one_stream_leaves_the_others_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
-    let (a, mut w) = Archive::single(&path, Box::new(Widening), meta()).unwrap();
+    let (a, mut w) = Writer::single(&path, Box::new(Widening), meta()).unwrap();
     for ts in 1..=4i64 {
         w.wal(vec![
             WalRow {
@@ -330,7 +327,7 @@ fn compacting_one_stream_leaves_the_others_alone() {
     }
     a.finalize_single(w, (4, 0)).unwrap();
 
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     let done = compact_stream(&mut db, 1, "squash", &CompactSpec::to_rows(100)).unwrap();
     assert_eq!((done.before, done.after), (4, 1));
     assert_eq!(db.read_segment_meta(1, "keep").unwrap().len(), 4);
@@ -383,7 +380,7 @@ impl SegmentEncoder for Relabeling {
 fn unioning_merges_across_a_column_set_that_grew() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
-    let (a, mut w) = Archive::single(&path, Box::new(Widening), meta()).unwrap();
+    let (a, mut w) = Writer::single(&path, Box::new(Widening), meta()).unwrap();
     for (ts, columns) in [(1, 2), (2, 2), (3, 5), (4, 5), (5, 2), (6, 2)] {
         w.wal(vec![row(ts, columns)]).unwrap();
         w.seal(vec!["s".to_string()]).unwrap();
@@ -391,31 +388,31 @@ fn unioning_merges_across_a_column_set_that_grew() {
     a.finalize_single(w, (6, 0)).unwrap();
 
     // The default still refuses, so this fixture is the churn case.
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     let stopped = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
     assert_eq!((stopped.before, stopped.after), (6, 3), "a run per shape");
     drop(db);
 
     // Union: one segment, every row, the wider column set.
     let path2 = dir.path().join("d.dendro");
-    let (a, mut w) = Archive::single(&path2, Box::new(Widening), meta()).unwrap();
+    let (a, mut w) = Writer::single(&path2, Box::new(Widening), meta()).unwrap();
     for (ts, columns) in [(1, 2), (2, 2), (3, 5), (4, 5), (5, 2), (6, 2)] {
         w.wal(vec![row(ts, columns)]).unwrap();
         w.seal(vec!["s".to_string()]).unwrap();
     }
     a.finalize_single(w, (6, 0)).unwrap();
 
-    let mut db = Db::open(&path2).unwrap();
+    let mut db = ArchiveMut::open(&path2).unwrap();
     let done = compact(&mut db, &CompactSpec::to_rows(100).unioning_fields()).unwrap();
     assert_eq!((done.before, done.after, done.merges), (6, 1, 1));
-    assert!(db.verify(dendro::db::Depth::Full).unwrap().is_sound());
+    assert!(db.verify(dendro::archive::Depth::Full).unwrap().is_sound());
     drop(db);
 
     assert_eq!(timestamps(&path2), (1..=6).collect::<Vec<_>>());
 
     // The merged segment: six rows, v0..v4, and null where a row predates a
     // column rather than a zero standing in for a reading nobody took.
-    let db = Db::open_read_only(&path2).unwrap();
+    let db = Archive::open(&path2).unwrap();
     let seqs: Vec<u64> = db
         .read_segment_meta(1, "s")
         .unwrap()
@@ -459,7 +456,7 @@ fn unioning_merges_across_a_column_set_that_grew() {
 fn unioning_still_stops_at_a_column_that_changed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
-    let (a, mut w) = Archive::single(&path, Box::new(Relabeling), meta()).unwrap();
+    let (a, mut w) = Writer::single(&path, Box::new(Relabeling), meta()).unwrap();
     for ts in 1..=4i64 {
         // The tag changes at ts 3: same column name, different series.
         let tag = if ts < 3 { 7u8 } else { 9u8 };
@@ -474,7 +471,7 @@ fn unioning_still_stops_at_a_column_that_changed() {
     }
     a.finalize_single(w, (4, 0)).unwrap();
 
-    let mut db = Db::open(&path).unwrap();
+    let mut db = ArchiveMut::open(&path).unwrap();
     let done = compact(&mut db, &CompactSpec::to_rows(100).unioning_fields()).unwrap();
     assert_eq!(
         (done.before, done.after),
@@ -483,7 +480,7 @@ fn unioning_still_stops_at_a_column_that_changed() {
     );
     drop(db);
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let seqs: Vec<u64> = db
         .read_segment_meta(1, "s")
         .unwrap()

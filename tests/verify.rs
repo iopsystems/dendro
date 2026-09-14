@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, Depth, Problem, SegmentMeta, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, Depth, Problem, SegmentMeta, SourceMeta, WalRow};
 
 fn meta() -> SourceMeta {
     SourceMeta {
@@ -29,7 +29,7 @@ fn row(ts: i64) -> WalRow {
 fn a_healthy_archive_is_sound_and_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.dendro");
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&meta()).unwrap();
     db.insert_segment(
         id,
@@ -67,7 +67,7 @@ fn a_healthy_archive_is_sound_and_counted() {
 fn wal_rows_no_read_path_can_reach_are_reported() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.dendro");
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&meta()).unwrap();
     // Rows at 1 and 2, then a segment sealing through 2: both are shadowed.
     db.insert_wal_rows(id, &[row(1), row(2), row(9)]).unwrap();
@@ -110,7 +110,7 @@ fn wal_rows_no_read_path_can_reach_are_reported() {
 fn a_self_contradicting_segment_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.dendro");
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&meta()).unwrap();
     db.insert_segment(
         id,
@@ -163,7 +163,7 @@ fn damage_inside_the_file_is_found_at_either_depth() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.dendro");
     {
-        let mut db = Db::create(&path).unwrap();
+        let mut db = ArchiveMut::create(&path).unwrap();
         let id = db.insert_source(&meta()).unwrap();
         // Big enough to occupy pages well past the header and the catalog.
         for seq in 0..40u64 {
@@ -191,7 +191,7 @@ fn damage_inside_the_file_is_found_at_either_depth() {
     }
     std::fs::write(&path, &bytes).unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let report = db.verify(Depth::Full).unwrap();
     assert!(
         report

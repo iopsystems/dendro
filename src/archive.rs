@@ -5,6 +5,9 @@
 //!
 //! This is the only module that knows SQL. Everything above it speaks in
 //! sources, segments, and WAL rows.
+//!
+//! [`Archive`](crate::archive::Archive) reads. [`ArchiveMut`](crate::archive::ArchiveMut) writes: a new
+//! archive, or an existing one it holds exclusively.
 
 use crate::error::{Error, ReadOnly, Result};
 use std::collections::BTreeMap;
@@ -84,7 +87,7 @@ const SCHEMA_VERSION: i64 = 4;
 /// The pre-`dendro` schema, written by `rezolus` when this container was still
 /// that project's internal `.rez` v3 format. Identical but for the column name, so it is READ
 /// through the compatibility views in [`LEGACY_VIEWS_SQL`] rather than
-/// converted. Writing to one is refused: see [`Db::writable`].
+/// converted. Writing to one is refused: see [`Archive::writable`].
 const LEGACY_SCHEMA_VERSION: i64 = 3;
 
 /// `PRAGMA application_id`, stamped into the SQLite file header at creation:
@@ -163,6 +166,44 @@ pub fn sniff(path: &Path) -> Result<Sniff> {
     }
 }
 
+/// Whether an open failed because the media is read-only. SQLite reports
+/// `SQLITE_READONLY` when it cannot create the `-shm` sidecar WAL mode needs,
+/// and `SQLITE_CANTOPEN` when a `-wal` exists beside an archive whose `-shm`
+/// it cannot create.
+fn is_readonly_media(e: &Error) -> bool {
+    matches!(
+        e.sqlite_code(),
+        Some(rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::CannotOpen)
+    )
+}
+
+/// Whether `<path><suffix>` exists. SQLite appends the suffix to the whole
+/// filename, so `x.dendro` has `x.dendro-wal`.
+fn sidecar_exists(path: &Path, suffix: &str) -> bool {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(suffix);
+    Path::new(&p).exists()
+}
+
+/// `path` as a SQLite URI with `immutable=1`, or `None` for a path that is
+/// not UTF-8. Every byte outside the unreserved set is percent-encoded, so a
+/// `?` or `#` in a filename stays part of the filename.
+fn immutable_uri(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    let mut uri = String::with_capacity(path.len() + 24);
+    uri.push_str("file:");
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+
 /// One source's identity: everything known when the source starts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceMeta {
@@ -228,7 +269,7 @@ pub struct SegmentRow {
     /// [`Segment::index`](crate::segment::Segment::index). Carried here so a
     /// copy can move it with the bytes it describes; a caller that only
     /// wants indexes uses
-    /// [`read_segment_indexes`](Db::read_segment_indexes), which reads no
+    /// [`read_segment_indexes`](Archive::read_segment_indexes), which reads no
     /// payload.
     pub caller_index: Option<Vec<u8>>,
 }
@@ -297,7 +338,7 @@ pub struct Span {
 /// past the watermark of the sealed segments **for its own stream in its own
 /// source**. Written once and shared by `live_wal` and `live_wal_span` so a
 /// reported WAL depth can never disagree with the rows the reader will replay.
-/// See [`Db::live_wal`] for why the rule is what it is.
+/// See [`Archive::live_wal`] for why the rule is what it is.
 const LIVE_WAL_PREDICATE: &str = "source_id = ?1 AND stream = ?2 \
      AND ( \
        ts > (SELECT MAX(last_ts) FROM segments \
@@ -314,7 +355,7 @@ const LIVE_WAL_PREDICATE_FOR_ROW: &str = "\
        OR NOT EXISTS (SELECT 1 FROM segments s \
                       WHERE s.source_id = wal.source_id AND s.stream = wal.stream)";
 
-/// How hard [`Db::verify`] looks.
+/// How hard [`Archive::verify`] looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Depth {
     /// SQLite's `quick_check`, foreign keys, and the catalog's own
@@ -335,7 +376,7 @@ pub enum Depth {
     Full,
 }
 
-/// What [`Db::verify`] found. Empty `problems` is a sound archive.
+/// What [`Archive::verify`] found. Empty `problems` is a sound archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Fields are added without a major version; construct one only by
 /// asking dendro for it, and match with a wildcard arm.
@@ -427,7 +468,7 @@ impl std::fmt::Display for Problem {
     }
 }
 
-/// How an archive's pages stand. See [`Db::page_stats`].
+/// How an archive's pages stand. See [`Archive::page_stats`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Fields are added without a major version; construct one only by
 /// asking dendro for it, and match with a wildcard arm.
@@ -443,75 +484,24 @@ pub struct PageStats {
 }
 
 /// An open handle on a dendro archive.
-pub struct Db {
+pub struct Archive {
     conn: Connection,
     /// True when this handle is on a [`LEGACY_SCHEMA_VERSION`] file, reading it
-    /// through [`LEGACY_VIEWS_SQL`]. Read-only; see [`Db::writable`].
+    /// through [`LEGACY_VIEWS_SQL`]. A [`ArchiveMut`] is never on one: both of its
+    /// opens refuse a legacy archive.
     legacy: bool,
-    /// True when this handle was opened by [`Db::open_read_only`].
-    read_only: bool,
-    /// Committed transactions. See [`Db::commits`].
-    #[cfg(any(test, feature = "test-support"))]
-    commits: std::cell::Cell<u64>,
 }
 
-impl std::fmt::Debug for Db {
+impl std::fmt::Debug for Archive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Db")
+        f.debug_struct("Archive")
             .field("path", &self.conn.path())
             .field("legacy", &self.legacy)
-            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
 
-impl Db {
-    /// Create a new archive at `path`, applying the pragmas that can only be set
-    /// on a database that does not yet exist, then installing the schema.
-    ///
-    /// Fails if `path` already exists: an archive is valid from creation, so there
-    /// is no `.partial` staging file standing between a new source and a
-    /// previous one.
-    pub fn create(path: &Path) -> Result<Self> {
-        Self::create_with_page_size(path, PAGE_SIZE)
-    }
-
-    /// Create an archive that lives only in memory, for a consumer with no
-    /// filesystem to write to — a browser assembling a report archive from
-    /// uploaded bytes. It has NO WAL (an in-memory database cannot have one),
-    /// which is exactly the shape [`serialize`](Self::serialize) then
-    /// [`open_bytes`](Self::open_bytes) expect: the bytes carry the whole
-    /// archive, sidecar-free.
-    ///
-    /// Unlike [`create`](Self::create) it skips the on-disk geometry pragmas
-    /// (`auto_vacuum`, `journal_mode=WAL`) — those bound a long-lived file's
-    /// footprint and durability, neither of which a transient in-memory image
-    /// serialized straight to bytes has any use for.
-    pub fn create_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(Error::sqlite("failed to open an in-memory database"))?;
-        let db = Db {
-            conn,
-            legacy: false,
-            read_only: false,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
-        };
-        db.set_pragma("page_size", PAGE_SIZE)?;
-        db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
-        db.conn
-            .execute_batch(SCHEMA_SQL)
-            .map_err(Error::sqlite("failed to create archive schema"))?;
-        db.conn
-            .execute(
-                "INSERT INTO schema_version(version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )
-            .map_err(Error::sqlite("failed to record archive schema version"))?;
-        db.stamp_header()?;
-        Ok(db)
-    }
-
+impl Archive {
     /// Serialize the whole database to bytes — the inverse of
     /// [`open_bytes`](Self::open_bytes). Used to hand a report archive built in
     /// memory back to a caller (a browser download) without a filesystem.
@@ -545,7 +535,7 @@ impl Db {
     ///
     /// Best-effort by design: this runs on failure paths, where the error that
     /// brought us here is the one worth reporting.
-    pub fn remove_archive(path: &Path) {
+    pub(crate) fn remove_archive(path: &Path) {
         for p in [
             path.to_path_buf(),
             Self::sidecar(path, "-wal"),
@@ -565,7 +555,7 @@ impl Db {
     /// even if the `page_size` pragma is never issued or is issued too late.
     /// Only `create` (and that test) may call this — the page size is not a
     /// caller's choice.
-    fn create_with_page_size(path: &Path, page_size: u32) -> Result<Self> {
+    fn create_with_page_size(path: &Path, page_size: u32) -> Result<ArchiveMut> {
         // Claim the path atomically rather than testing `exists()` — this is
         // also what stops SQLite from silently adopting a file that appeared
         // between the check and the open. A zero-length file is a valid empty
@@ -593,18 +583,15 @@ impl Db {
     /// Everything `create_with_page_size` does after claiming the path. Split
     /// out so a failure in any of it has one cleanup site rather than one per
     /// `?`.
-    fn init_created(path: &Path, page_size: u32) -> Result<Self> {
+    fn init_created(path: &Path, page_size: u32) -> Result<ArchiveMut> {
         // No `SQLITE_OPEN_CREATE`: the file above is the only one this may
         // adopt. No `SQLITE_OPEN_URI` either, so a path that happens to begin
         // with `file:` stays a filename.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
-        let mut db = Db {
+        let db = Archive {
             conn,
             legacy: false,
-            read_only: false,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
         };
 
         // ORDER IS LOAD-BEARING, and a reordering here fails invisibly — the
@@ -649,39 +636,37 @@ impl Db {
         // reads the header page the file had before the stamp: unstamped.
         // The whole point of the stamp is to be readable without opening the
         // file, and a rolling buffer is sniffed while its writer holds it.
+        let mut db = ArchiveMut::wrap(db);
         db.checkpoint_passive()?;
 
         Ok(db)
     }
 
-    /// Open an existing archive, reapplying the per-connection pragmas.
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_cache(path, READER_CACHE_SIZE_KIB)
-    }
-
-    /// Open an existing archive to APPEND to it — the writer's half of
-    /// [`open`](Self::open): same gate, the writer's (smaller) page cache,
-    /// and a refusal up front for a legacy archive, which cannot be written.
-    /// There must be exactly one writing connection to a file; this is for
-    /// the writer thread that will own it.
-    pub fn open_for_write(path: &Path) -> Result<Self> {
-        let db = Self::open_with_cache(path, WRITER_CACHE_SIZE_KIB)?;
-        db.writable()?;
-        Ok(db)
-    }
-
-    fn open_with_cache(path: &Path, cache_size_kib: i32) -> Result<Self> {
+    fn open_with_cache(path: &Path, cache_size_kib: i32, exclusive: bool) -> Result<Self> {
         // No `SQLITE_OPEN_CREATE`: opening an archive that is not there is an
         // error, not an empty new source.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
-        let mut db = Db {
+        // SQLite opens a write-protected file read-only without saying so, and
+        // the first write then fails with `attempt to write a readonly
+        // database`. Say so here instead: a write handle that cannot write is
+        // refused, and [`Archive::open`] is the open for read-only media.
+        if conn
+            .is_readonly(rusqlite::MAIN_DB)
+            .map_err(Error::sqlite(format!("failed to open {}", path.display())))?
+        {
+            return Err(Error::ReadOnly(ReadOnly::Media));
+        }
+        let mut db = Archive {
             conn,
             legacy: false,
-            read_only: false,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
         };
+        // The lock before the gate: `locking_mode` touches no file, and the
+        // gate's first read is what acquires the lock, so a file someone else
+        // holds is refused there as `InUse` before anything is written.
+        if exclusive {
+            db.take_exclusive_lock()?;
+        }
         // The gate FIRST. `apply_connection_pragmas` writes `synchronous` and
         // friends, and a file that is not ours must be refused untouched —
         // before this ordering, a foreign SQLite database had its pragmas
@@ -701,39 +686,71 @@ impl Db {
         Ok(db)
     }
 
-    /// Open an archive WITHOUT the ability to modify it, and without SQLite
-    /// modifying it either.
+    /// Open an archive to read it. This handle cannot write, and SQLite does
+    /// not write either.
     ///
-    /// [`open`](Self::open) takes a read-write connection, and that has two
-    /// consequences a reader usually does not want. SQLite checkpoints a WAL
-    /// database when the last connection to it closes, so a pure read can
-    /// rewrite the archive and delete its sidecars — measured at 4 KiB to 61 KiB
-    /// on a crashed archive, from nothing but an open and a drop. And the
-    /// durability pragmas `open` applies are themselves writes, so `open` fails
-    /// outright on read-only media with `attempt to write a readonly database`.
-    ///
-    /// This opens `SQLITE_OPEN_READ_ONLY` and sets `query_only`, so neither
-    /// this crate nor SQLite writes to the file. Use it for anything pointed at
+    /// The read handle. [`ArchiveMut::open`] is the write handle, and it differs
+    /// in two ways a reader does not want: SQLite checkpoints a WAL database
+    /// when the last read-write connection to it closes, which rewrites the
+    /// archive and deletes its sidecars (measured at 45 KiB to 61 KiB on a
+    /// killed archive with a 3.3 MB sidecar, from nothing but an open and a
+    /// drop), and the durability pragmas it applies are themselves writes,
+    /// which read-only media refuses. This opens `SQLITE_OPEN_READ_ONLY` and
+    /// sets `query_only`, so neither applies. Use it for anything pointed at
     /// a buffer another process is still appending to, at an artifact you do
     /// not own, or at read-only media.
     ///
+    /// **Read-only media.** WAL mode must create the `-shm` sidecar beside
+    /// the archive, and read-only media refuses. When that happens and no
+    /// `-wal` sidecar exists, this reopens the file with SQLite's
+    /// `immutable=1` parameter, which uses no sidecars and no locks. When a
+    /// `-wal` sidecar does exist it is refused instead, because `immutable=1`
+    /// would ignore the commits in it and read the archive short with nothing
+    /// saying so. Where the directory is writable, or both sidecars already
+    /// exist, none of this applies and SQLite reads the sidecar as usual.
+    ///
     /// What it cannot do is recover: an archive whose sidecar holds
     /// un-checkpointed commits is read as far as the sidecar can be read, and
-    /// the sidecar is not folded back in. That is the trade — a reader that
-    /// leaves its subject alone cannot also tidy it up.
-    pub fn open_read_only(path: &Path) -> Result<Self> {
-        // No `SQLITE_OPEN_URI`, same as every other open here: a path is a
-        // path, and `file:` or `?` in a name must not change what is opened.
-        let conn =
-            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
-                Error::Message(format!("failed to open {} read-only: {e}", path.display()))
-            })?;
-        let mut db = Db {
+    /// the sidecar is not folded back in. A reader that leaves its subject
+    /// alone cannot also tidy it; [`ArchiveMut::open`] does.
+    ///
+    /// Refused as [`Error::InUse`] while a [`ArchiveMut::open`] handle holds the
+    /// file.
+    pub fn open(path: &Path) -> Result<Self> {
+        match Self::open_at(path, None) {
+            Err(e) if is_readonly_media(&e) => {
+                if sidecar_exists(path, "-wal") {
+                    return Err(e);
+                }
+                match immutable_uri(path) {
+                    Some(uri) => Self::open_at(path, Some(&uri)),
+                    None => Err(e),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// [`open`](Self::open) over either the plain path or the `immutable=1`
+    /// URI [`immutable_uri`] builds from it.
+    fn open_at(path: &Path, uri: Option<&str>) -> Result<Self> {
+        // Without a URI: no `SQLITE_OPEN_URI`, same as every other open here,
+        // so `file:` or `?` in a name cannot change what is opened. With one:
+        // `immutable_uri` percent-encodes the path, so the same holds.
+        let conn = match uri {
+            None => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY),
+            Some(uri) => Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            ),
+        }
+        .map_err(Error::sqlite(format!(
+            "failed to open {} read-only",
+            path.display()
+        )))?;
+        let mut db = Archive {
             conn,
             legacy: false,
-            read_only: true,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
         };
         let what = path.display().to_string();
         // ORDER MATTERS, twice over. The gate goes first of all: `cache_size`
@@ -814,12 +831,9 @@ impl Db {
         // its own copy of the image.
         conn.deserialize_read_exact(rusqlite::MAIN_DB, &mut bytes.as_slice(), len, true)
             .map_err(Error::sqlite("failed to read the archive"))?;
-        let mut db = Db {
+        let mut db = Archive {
             conn,
             legacy: false,
-            read_only: false,
-            #[cfg(any(test, feature = "test-support"))]
-            commits: std::cell::Cell::new(0),
         };
         // The gate first, for the same reason as `open`; the catalog-less
         // copy that used to be diagnosed here is diagnosed inside it.
@@ -872,6 +886,13 @@ impl Db {
             {
                 return Err(not_an_archive("not a SQLite database"));
             }
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                return Err(Error::InUse {
+                    what: what.to_string(),
+                });
+            }
             Err(e) => return Err(Error::sqlite("failed to read application_id")(e)),
         };
         let version: i64 = if app == i64::from(APPLICATION_ID) {
@@ -892,7 +913,7 @@ impl Db {
                     "no catalog. Either this is not an archive, or it is a copy taken \
                      while it was still being written — an archive's most recent pages \
                      live in a `-wal` sidecar that a single copied file does not carry. \
-                     Take the copy with `Db::vacuum_into`, which reads through the \
+                     Take the copy with `Archive::vacuum_into`, which reads through the \
                      sidecar without stopping the writer",
                 ));
             }
@@ -926,58 +947,6 @@ impl Db {
         }
     }
 
-    /// Refuse a write to a [`LEGACY_SCHEMA_VERSION`] archive.
-    ///
-    /// Its stream column is reached through a view, and SQLite will not write
-    /// through one. Catching it here turns `cannot modify segments because it
-    /// is a view` — which reads like a bug in this crate — into a sentence that
-    /// names the file and the way forward.
-    fn writable(&self) -> Result<()> {
-        if self.read_only {
-            return Err(Error::ReadOnly(ReadOnly::Handle));
-        }
-        if self.legacy {
-            return Err(Error::ReadOnly(ReadOnly::LegacySchema));
-        }
-        Ok(())
-    }
-
-    /// How long a write waits on another connection's lock before failing
-    /// with `SQLITE_BUSY`. rusqlite's default is 5 s. Exposed so a test can
-    /// make the writer's retry path reachable in milliseconds rather than
-    /// seconds; production keeps the default.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
-        self.conn
-            .busy_timeout(timeout)
-            .map_err(Error::sqlite("failed to set busy_timeout"))
-    }
-
-    /// Copy what the `-wal` sidecar holds into the archive itself, best-effort.
-    ///
-    /// **Passive by design.** A passive checkpoint moves whatever frames it
-    /// can and returns; it never waits for a reader, and it never blocks the
-    /// writer behind one. `FULL`/`TRUNCATE` would stall until readers finish,
-    /// and this runs on the writer thread with a capacity-1 channel behind it —
-    /// a stall there backpressures the append loop, which is the one cost this
-    /// whole container is shaped to avoid.
-    ///
-    /// Best-effort is the right contract: the caller is bounding how STALE a
-    /// copy of the archive can be, not demanding an exact one.
-    /// [`vacuum_into`](Self::vacuum_into) is the exact one.
-    pub fn checkpoint_passive(&mut self) -> Result<()> {
-        // `execute_batch`, not `pragma_query`: rusqlite QUOTES the pragma name
-        // it is given, so `pragma_query(None, "wal_checkpoint(PASSIVE)", ..)`
-        // asks for a pragma literally named `wal_checkpoint(PASSIVE)`. SQLite
-        // answers an unknown pragma with no rows and no error — the call
-        // returns `Ok` having checkpointed nothing. Found by the test that
-        // asserts a plain copy keeps up; it would otherwise have shipped as a
-        // cadence that silently never ran.
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(Error::sqlite("failed to checkpoint the WAL"))
-    }
-
     /// The pragmas that live on the connection, not in the file. Applied by
     /// both `create` and `open`.
     ///
@@ -1008,7 +977,7 @@ impl Db {
         self.set_pragma("wal_autocheckpoint", pages)?;
         self.set_pragma("cache_size", cache_size_kib)?;
         // NOT set here, and worth knowing about: `busy_timeout` is 5000 ms —
-        // rusqlite's default, not SQLite's own (which is 0, i.e. fail at
+        // rusqlite's default, not SQLite's own (which is 0, that is, fail at
         // once) and not ours. It never fires for the writer, which owns its
         // file (the journal makes concurrent writers to one file an explicit
         // non-goal), and it never fires for a reader either, because WAL mode
@@ -1020,6 +989,26 @@ impl Db {
         // a caller that does not exist yet. A future one should set its own,
         // with a value it can justify.
         Ok(())
+    }
+
+    /// `PRAGMA locking_mode = EXCLUSIVE`, for [`ArchiveMut::open`]. The lock itself
+    /// is taken by the connection's first read, and a holder of the file does
+    /// not let go until it closes (a WAL-mode connection keeps a shared lock
+    /// for its whole life), so the wait is short: a second that covers
+    /// another exclusive holder finishing, not rusqlite's five.
+    fn take_exclusive_lock(&self) -> Result<()> {
+        let mode: String = self
+            .conn
+            .pragma_update_and_check(None, "locking_mode", "EXCLUSIVE", |row| row.get(0))
+            .map_err(Error::sqlite("failed to set locking_mode=EXCLUSIVE"))?;
+        if !mode.eq_ignore_ascii_case("exclusive") {
+            return Err(Error::Message(format!(
+                "locking_mode is {mode}, expected exclusive"
+            )));
+        }
+        self.conn
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .map_err(Error::sqlite("failed to set busy_timeout"))
     }
 
     /// `PRAGMA journal_mode = WAL`. Separate because, unlike the others, it
@@ -1041,12 +1030,6 @@ impl Db {
         self.conn
             .pragma_update(None, name, value)
             .map_err(Error::sqlite(format!("failed to set pragma {name}")))
-    }
-
-    /// Start a source, returning its id.
-    pub fn insert_source(&mut self, meta: &SourceMeta) -> Result<i64> {
-        self.writable()?;
-        insert_source_sql(&self.conn, meta, None)
     }
 
     /// A fresh random (version 4) UUID, in the canonical 8-4-4-4-12 form.
@@ -1115,90 +1098,6 @@ impl Db {
             });
         }
         Ok(out)
-    }
-
-    /// How many transactions this connection has COMMITTED.
-    ///
-    /// Exists so "one commit per tick, whatever the endpoint count" is a
-    /// property a test can assert rather than one a comment claims. At
-    /// `synchronous=FULL` a commit is an fsync, and fsyncs are not otherwise
-    /// observable from inside the process.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn commits(&self) -> u64 {
-        self.commits.get()
-    }
-
-    /// Run `f` inside one transaction: it commits when `f` returns `Ok` and
-    /// rolls back — leaving the database exactly as it was — when `f` returns
-    /// `Err` or the commit itself fails.
-    ///
-    /// This exists because streams seal in lockstep — a dozen tables at once
-    /// is normal. Without a way to group them, one co-seal is a dozen implicit
-    /// commits, i.e. a dozen fsyncs at `synchronous=FULL`, against a tick
-    /// budget that a single segment insert already eats into.
-    ///
-    /// `f` receives a `Tx`, not the connection: SQL stays inside this
-    /// module, and `Tx` deliberately exposes only the *writes that belong
-    /// in a seal batch*. `prune_wal` is not among them, which is how "the
-    /// prune runs outside the seal transaction" is made unrepresentable rather
-    /// than merely documented — inside it, a quiet stream's accumulated rows
-    /// make the delete long enough to threaten the tick.
-    pub fn transaction<T>(&mut self, f: impl FnOnce(&Tx<'_>) -> Result<T>) -> Result<T> {
-        self.writable()?;
-        let tx = Tx {
-            tx: self
-                .conn
-                .transaction()
-                .map_err(Error::sqlite("failed to begin transaction"))?,
-        };
-        // `?` drops `tx` on the error path, and `Transaction`'s drop behavior
-        // is rollback — so a failure partway through leaves nothing behind.
-        let out = f(&tx)?;
-        tx.tx
-            .commit()
-            .map_err(Error::sqlite("failed to commit transaction"))?;
-        #[cfg(any(test, feature = "test-support"))]
-        self.commits.set(self.commits.get() + 1);
-        Ok(out)
-    }
-
-    /// Insert one sealed segment's bytes and catalog facts, committing on its
-    /// own. Batch writers must use `transaction` instead.
-    pub fn insert_segment(
-        &mut self,
-        source_id: i64,
-        stream: &str,
-        seq: u64,
-        meta: &SegmentMeta,
-        bytes: &[u8],
-    ) -> Result<()> {
-        self.writable()?;
-        insert_segment_sql(&self.conn, source_id, stream, seq, meta, bytes, None)
-    }
-
-    /// [`insert_segment`](Self::insert_segment), carrying the caller's index
-    /// over the segment — see [`Segment::index`](crate::segment::Segment::index).
-    /// Separate rather than a sixth parameter because an index is opt-in and
-    /// most callers have none; `None` at every call site would be noise.
-    pub fn insert_segment_with_index(
-        &mut self,
-        source_id: i64,
-        stream: &str,
-        seq: u64,
-        meta: &SegmentMeta,
-        bytes: &[u8],
-        caller_index: Option<&[u8]>,
-    ) -> Result<()> {
-        self.writable()?;
-        insert_segment_sql(
-            &self.conn,
-            source_id,
-            stream,
-            seq,
-            meta,
-            bytes,
-            caller_index,
-        )
     }
 
     /// Every segment index for `(source_id, stream)`, in `seq` order and
@@ -1407,14 +1306,13 @@ impl Db {
     ///
     /// **It does block CHECKPOINTING**, which is not the same thing. A held
     /// snapshot pins the sidecar frames it can still see, so
-    /// [`checkpoint_passive`](Self::checkpoint_passive) moves nothing and
+    /// [`checkpoint_passive`](ArchiveMut::checkpoint_passive) moves nothing and
     /// returns `Ok`, and both staleness bounds in DESIGN.md lapse for the
     /// duration. Keep a snapshot for one answer, not for the life of a reader.
     ///
-    /// `f` gets `&Self`, so it may call any reader here. It must not write
-    /// through this handle, which is why this is not exposed as a general
-    /// transaction — but that is a contract, not a guarantee: every mutator on
-    /// `Db` takes `&self`, so nothing stops you, and a write in here joins the
+    /// `f` gets `&Self`, so it can call any reader here and no mutator: the
+    /// mutators live on [`ArchiveMut`], so a write through this handle inside a
+    /// snapshot is a compile error rather than a write that joins the
     /// snapshot's transaction.
     pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         // Re-entrant: a caller already inside a snapshot keeps that one rather
@@ -1438,7 +1336,7 @@ impl Db {
         /// re-entrancy check above then reuses that stale snapshot for every
         /// later read on this handle, silently and forever. The trait doc for
         /// `SegmentEncoder` warns that a naive encoder panics inside the
-        /// reader, and `read::SegmentBytes::SharedDb` deliberately recovers
+        /// reader, and `read::SegmentBytes::Shared` deliberately recovers
         /// from lock poisoning - so one thread's panic could freeze every
         /// later reader on that handle in time.
         ///
@@ -1473,10 +1371,10 @@ impl Db {
     }
 
     /// Every distinct stream with at least one segment for `source_id`,
-    /// alphabetically. A stream with only unsealed WAL rows and no sealed
-    /// segment yet will not appear here — use `all_streams` for "every
-    /// stream this source has ever seen".
-    pub fn streams(&self, source_id: i64) -> Result<Vec<String>> {
+    /// alphabetically. What `all_streams` is contrasted against in its
+    /// tests: a stream with only unsealed WAL rows does not appear here.
+    #[cfg(test)]
+    fn streams(&self, source_id: i64) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT stream FROM segments WHERE source_id = ?1 ORDER BY stream")
@@ -1491,15 +1389,11 @@ impl Db {
         Ok(out)
     }
 
-    /// Every distinct stream this source has ever seen, alphabetically —
-    /// the union of `segments.stream` and `wal.stream`. This is what
-    /// closes the gap `streams()` deliberately leaves open: a stream that
-    /// has never sealed a segment — a quiet table, still inside its first
-    /// seal period, which is the case the WAL exists to keep readable — is
-    /// otherwise unnameable, because `streams()` only sees `segments` and
-    /// this module is the only place that knows the schema well enough to
-    /// look at both tables. A recovery or inventory caller that needs to know
-    /// which tables exist at all must call this, not `streams()`.
+    /// Every distinct stream this source currently holds, alphabetically:
+    /// the union of `segments.stream` and `wal.stream`. Both tables, because
+    /// a stream that has never sealed a segment (a quiet stream still inside
+    /// its first seal period, which is the case the WAL exists to keep
+    /// readable) is otherwise unnameable.
     pub fn all_streams(&self, source_id: i64) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -1520,46 +1414,6 @@ impl Db {
             out.push(row.map_err(Error::sqlite("failed to read stream name"))?);
         }
         Ok(out)
-    }
-
-    /// Insert every WAL row for one tick — one stream each, typically — in a
-    /// single transaction. This is what makes a tick atomic: either every
-    /// stream's row for this tick lands, or none does.
-    ///
-    /// Takes `&mut self`, unlike every reader in this file: `Connection::
-    /// transaction()` requires `&mut Connection`. An earlier version used
-    /// `unchecked_transaction()` to keep `&self`, on the reasoning that this
-    /// module never nests transactions — but the hazard `&mut` guards
-    /// against is on the caller's side, not this function's: the writer
-    /// thread owns this `Db` outright ("no concurrent writers to one file" is
-    /// an explicit non-goal) and does want a transaction
-    /// around a whole co-seal batch — `transaction`, which this now goes
-    /// through. `&mut self` makes "don't open a nested transaction while one
-    /// is outstanding" a compile error for that caller instead of a runtime
-    /// one. Reads stay on `&self`.
-    pub fn insert_wal_rows(&mut self, source_id: i64, rows: &[WalRow]) -> Result<()> {
-        self.writable()?;
-        self.transaction(|tx| tx.insert_wal_rows(source_id, rows))
-    }
-
-    /// One tick's rows for several sources, in one transaction.
-    ///
-    /// **The transaction count is the point, not the row count.** At
-    /// `synchronous=FULL` every commit is an fsync, and the send that carries
-    /// this is a blocking hand-off from inside the append — so a commit
-    /// per source made the tick's cost scale linearly with endpoint count.
-    /// Committing the tick once makes it constant. It also makes the tick
-    /// atomic across sources: a crash cannot leave one endpoint's row for
-    /// tick N present and another's missing, which is the state a reader
-    /// comparing two arms would have to interpret.
-    pub fn insert_wal_rows_batch(&mut self, ticks: &[(i64, Vec<WalRow>)]) -> Result<()> {
-        self.writable()?;
-        self.transaction(|tx| {
-            for (source_id, rows) in ticks {
-                tx.insert_wal_rows(*source_id, rows)?;
-            }
-            Ok(())
-        })
     }
 
     /// Every WAL row for `(source_id, stream)`, sealed or not, oldest
@@ -1712,151 +1566,11 @@ impl Db {
         Ok(out)
     }
 
-    /// Delete WAL rows at or below `upto_ts` for `(source_id, stream)`.
-    /// Runs OUTSIDE the seal transaction — see `live_wal` for why that is
-    /// safe and has no correctness role. Returns the number of rows deleted,
-    /// so callers/tests can assert idempotency (a second prune of the same
-    /// watermark deletes 0).
-    ///
-    /// Bounded to one stream by construction (the `stream = ?2` filter):
-    /// that is why WAL rows are per-stream rather than whole snapshots — a
-    /// slow-sealing table's prune must not touch, or be blocked by, any other
-    /// stream's tail.
-    pub fn prune_wal(&mut self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
-        self.writable()?;
-        self.conn
-            .execute(
-                "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
-                rusqlite::params![source_id, stream, upto_ts],
-            )
-            .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")))
-    }
-
-    /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
-    /// and every WAL row stamped before it. This is what makes a bounded
-    /// rolling buffer possible — the whole reason a rolling buffer works — and it is
-    /// the only destructive operation the container has.
-    ///
-    /// Segment granularity is deliberate and visible to the caller: a segment
-    /// goes only when its NEWEST row is out of the window (`last_ts <
-    /// cutoff_ts`), so a straddling segment is kept whole and the buffer holds
-    /// *at least* the lookback, never less. Trimming inside a sealed segment
-    /// would mean rewriting an immutable parquet BLOB, which is exactly what
-    /// this container refuses to do.
-    ///
-    /// `segments_by_time` (`source_id, stream, last_ts`) makes the segment
-    /// delete an indexed lookup rather than a scan; that index exists for this
-    /// statement.
-    ///
-    /// **The segment delete and the WAL delete are one transaction**, and that
-    /// is required for correctness. Deleting a
-    /// segment lowers `live_wal`'s watermark for its stream, so WAL rows the
-    /// segment already covered would become live again — a reader would splice
-    /// them back in as a tail. The same-cutoff WAL delete is what stops that,
-    /// and it only stops it if the two land together: a straddling row has
-    /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
-    /// the segment delete un-shadows.
-    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: i64) -> Result<Evicted> {
-        self.writable()?;
-        self.evict(
-            source_id,
-            "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
-            "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
-            cutoff_ts,
-        )
-    }
-
-    /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
-    /// accepts.
-    ///
-    /// **`evict` selects what is REMOVED.** Note this is the opposite polarity
-    /// from [`CopySpec::keep_streams`](crate::rewrite::CopySpec), which selects
-    /// what survives — each matches the verb in its own name, and conflating
-    /// them deletes the data you meant to keep.
-    ///
-    /// Retention is the caller's policy, the way sealing is: dendro knows what
-    /// a cutoff means but not that debug counters are worth a day and the
-    /// metric they explain is worth a month. A predicate rather than a name set
-    /// so a caller whose streams are grouped under some coarser unit can
-    /// express retention by that unit.
-    ///
-    /// Still one transaction, for the reason
-    /// [`evict_before`](Self::evict_before) gives — but note the scope is now
-    /// per stream, which is what makes that reason keep holding: the WAL delete
-    /// that stops a segment delete from un-shadowing rows has to carry the same
-    /// stream as the segment delete, or it would either miss rows or take rows
-    /// belonging to a stream this pass is meant to leave alone.
-    pub fn evict_streams_before(
-        &mut self,
-        source_id: i64,
-        cutoff_ts: i64,
-        evict: &dyn Fn(&str) -> bool,
-    ) -> Result<Evicted> {
-        self.writable()?;
-        let streams: Vec<String> = self
-            .all_streams(source_id)?
-            .into_iter()
-            .filter(|s| evict(s))
-            .collect();
-        self.transaction(|tx| {
-            let mut total = Evicted::default();
-            for stream in &streams {
-                let params = rusqlite::params![source_id, stream, cutoff_ts];
-                // Before the segment delete, for the reason `evict` gives.
-                total.live_rows += tx
-                    .tx
-                    .query_row(
-                        &format!("SELECT COUNT(*) FROM wal WHERE {LIVE_WAL_PREDICATE} AND ts < ?3"),
-                        params,
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(Error::sqlite(format!(
-                        "failed to count live {stream} rows before eviction"
-                    )))? as usize;
-                total.segments += tx
-                    .tx
-                    .execute(
-                        "DELETE FROM segments \
-                         WHERE source_id = ?1 AND stream = ?2 AND last_ts < ?3",
-                        params,
-                    )
-                    .map_err(Error::sqlite(format!("failed to evict {stream} segments")))?;
-                total.wal_rows += tx
-                    .tx
-                    .execute(
-                        "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
-                        params,
-                    )
-                    .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
-            }
-            // The clock-offset series is per SOURCE, and a per-stream pass
-            // has no single cutoff for it: the streams it left alone may
-            // still hold rows older than `cutoff_ts`. So it is cut at the
-            // oldest row the source still holds anywhere — segments and WAL
-            // together — and at `cutoff_ts` when nothing is left. Without
-            // this the series was the one part of a per-stream rolling buffer
-            // that grew without bound, exactly what whole-source eviction
-            // already closed.
-            tx.tx
-                .execute(
-                    "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < COALESCE( \
-                       (SELECT MIN(oldest) FROM ( \
-                          SELECT MIN(first_ts) AS oldest FROM segments WHERE source_id = ?1 \
-                          UNION ALL \
-                          SELECT MIN(ts) FROM wal WHERE source_id = ?1)), \
-                       ?2)",
-                    rusqlite::params![source_id, cutoff_ts],
-                )
-                .map_err(Error::sqlite("failed to evict clock offsets"))?;
-            Ok(total)
-        })
-    }
-
     /// Sealed segment sizes across a source, oldest first: `(last_ts, bytes)`.
     ///
     /// What a size-bounded policy walks. Accumulate from the front until the
     /// running total covers the overage, then pass that entry's `last_ts + 1`
-    /// to [`evict_before`](Self::evict_before) — segments are immutable, so a
+    /// to [`evict_before`](ArchiveMut::evict_before) — segments are immutable, so a
     /// cutoff is the only granularity there is.
     ///
     /// **There is no "drop these segments" primitive.** Dropping
@@ -1906,90 +1620,12 @@ impl Db {
     ///
     /// `page_count * page_size`, so it is the FILE's size rather than the sum
     /// of what is live in it: pages freed by eviction stay counted until
-    /// [`incremental_vacuum`](Self::incremental_vacuum) hands them back. That
+    /// [`incremental_vacuum`](ArchiveMut::incremental_vacuum) hands them back. That
     /// is the number a size cap wants, since it is the number the filesystem
     /// sees. It does not include the `-wal` sidecar.
     pub fn archive_bytes(&self) -> Result<u64> {
         let s = self.page_stats()?;
         Ok(s.pages as u64 * s.page_size as u64)
-    }
-
-    fn evict(
-        &mut self,
-        source_id: i64,
-        segments_sql: &str,
-        wal_sql: &str,
-        cutoff_ts: i64,
-    ) -> Result<Evicted> {
-        self.transaction(|tx| {
-            let params = rusqlite::params![source_id, cutoff_ts];
-            // Counted BEFORE the segment delete: removing a stream's segments
-            // lowers its watermark, and rows those segments already covered
-            // would count as live afterwards when they were not.
-            let live_rows: i64 = tx
-                .tx
-                .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM wal WHERE source_id = ?1 AND ts < ?2 \
-                         AND ({LIVE_WAL_PREDICATE_FOR_ROW})"
-                    ),
-                    params,
-                    |row| row.get(0),
-                )
-                .map_err(Error::sqlite("failed to count live rows before eviction"))?;
-            let segments = tx
-                .tx
-                .execute(segments_sql, params)
-                .map_err(Error::sqlite("failed to evict segments"))?;
-            let wal_rows = tx
-                .tx
-                .execute(wal_sql, params)
-                .map_err(Error::sqlite("failed to evict WAL rows"))?;
-            // The clock-offset series is per SOURCE, so it is cut by the same
-            // cutoff whichever streams the pass named. Without this the series
-            // is the one part of a rolling buffer that grows without bound: one
-            // row per seal batch, forever, faithfully re-copied by every
-            // rewrite. Small in bytes and unbounded in shape, in exactly the
-            // mode that runs for months.
-            tx.tx
-                .execute(
-                    "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < ?2",
-                    rusqlite::params![source_id, cutoff_ts],
-                )
-                .map_err(Error::sqlite("failed to evict clock offsets"))?;
-            Ok(Evicted {
-                segments,
-                wal_rows,
-                live_rows: live_rows as usize,
-            })
-        })
-    }
-
-    /// Return `pages` freed pages to the filesystem, or as many as the free
-    /// list holds. Requires `auto_vacuum=INCREMENTAL`, which is set at
-    /// creation and cannot be turned on later without a full `VACUUM`.
-    ///
-    /// Eviction alone keeps the file bounded, since freed pages get reused —
-    /// but the bound it keeps is the HIGH-WATER mark, so a transient spike
-    /// parks space on the free list permanently. This is the trickle that gives
-    /// it back, sized (`pages`) to fit inside a tick.
-    ///
-    /// **Stepped to exhaustion, rather than using `execute_batch`.** This pragma
-    /// reclaims one page per step and `execute_batch` steps a statement once,
-    /// so the obvious spelling silently reclaims only one page whatever
-    /// `pages` says. That is not a slow reclaim, it is no reclaim at all: at
-    /// one page per retention pass a rolling buffer would never work off a
-    /// spike.
-    pub fn incremental_vacuum(&mut self, pages: u32) -> Result<()> {
-        self.writable()?;
-        let fail = |e| format!("failed to reclaim {pages} pages: {e}");
-        let mut stmt = self
-            .conn
-            .prepare(&format!("PRAGMA incremental_vacuum({pages})"))
-            .map_err(fail)?;
-        let mut rows = stmt.query([]).map_err(fail)?;
-        while rows.next().map_err(fail)?.is_some() {}
-        Ok(())
     }
 
     /// Write a consistent, compacted copy of the whole database to `dest`,
@@ -2023,7 +1659,8 @@ impl Db {
     /// (already sealed, or appended out of order) is invisible to every read
     /// path and is not counted here either, so the span cannot start before
     /// any row a reader can reach.
-    pub fn source_time_span(&self, source_id: i64) -> Result<(Option<i64>, Option<i64>)> {
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn source_time_span(&self, source_id: i64) -> Result<(Option<i64>, Option<i64>)> {
         self.conn
             .query_row(
                 &format!(
@@ -2041,14 +1678,6 @@ impl Db {
             )))
     }
 
-    /// Mark a source cleanly finalized, outside any batch. The dump uses
-    /// it: a copy taken at time T is a finished artifact even though the
-    /// buffer it came from is still running.
-    pub fn mark_complete(&mut self, source_id: i64) -> Result<()> {
-        self.writable()?;
-        self.transaction(|tx| tx.mark_complete(source_id))
-    }
-
     /// Every user table in this database, by name — SQLite's own internal
     /// tables (`sqlite_*`) excluded.
     ///
@@ -2057,7 +1686,7 @@ impl Db {
     /// table added here without being handled there would vanish silently
     /// from every rewritten archive.
     #[cfg(test)]
-    pub fn user_table_names(&self) -> Result<Vec<String>> {
+    pub(crate) fn user_table_names(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -2193,7 +1822,7 @@ impl Db {
 
     /// Every WAL row the archive holds for a stream, live or shadowed. The
     /// denominator [`verify`](Self::verify) compares `live_wal_span` against.
-    pub fn total_wal_rows(&self, source_id: i64, stream: &str) -> Result<usize> {
+    pub(crate) fn total_wal_rows(&self, source_id: i64, stream: &str) -> Result<usize> {
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM wal WHERE source_id = ?1 AND stream = ?2",
@@ -2266,7 +1895,8 @@ impl Db {
     /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
     /// archive seeds its numbering from, so it continues each stream's
     /// sequence rather than colliding with it.
-    pub fn next_seqs(&self) -> Result<BTreeMap<(i64, String), u64>> {
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn next_seqs(&self) -> Result<BTreeMap<(i64, String), u64>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -2306,60 +1936,14 @@ impl Db {
             .map_err(|e| Error::Message(format!("source {source_id} has invalid metadata: {e}")))
     }
 
-    /// Merge `patch` into a source's metadata: keys in the patch replace the
-    /// stored value, every other key is kept. A read-modify-write on this
-    /// connection, so it belongs to whoever owns the connection — during a
-    /// recording, the writer thread, through
-    /// [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata).
-    pub fn patch_source_metadata(
-        &mut self,
-        source_id: i64,
-        patch: &BTreeMap<String, String>,
-    ) -> Result<()> {
-        let mut metadata = self.source_metadata(source_id)?;
-        for (k, v) in patch {
-            metadata.insert(k.clone(), v.clone());
-        }
-        self.update_source_metadata(source_id, &metadata)
-    }
-
-    /// Replace one source's metadata map.
-    ///
-    /// In place rather than through a copy because metadata is a catalog
-    /// column: `annotate` changes it and nothing else, and rewriting an
-    /// archive's every segment BLOB to edit one JSON string would make a
-    /// cheap operation cost the size of the source.
-    pub fn update_source_metadata(
-        &mut self,
-        source_id: i64,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<()> {
-        self.writable()?;
-        let encoded = serde_json::to_string(metadata)
-            .map_err(|e| Error::Message(format!("failed to encode source metadata: {e}")))?;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE sources SET metadata = ?1 WHERE id = ?2",
-                rusqlite::params![encoded, source_id],
-            )
-            .map_err(Error::sqlite("failed to update source metadata"))?;
-        if changed == 0 {
-            return Err(Error::Message(format!("no source with id {source_id}")));
-        }
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn pragma_u32(&self, name: &str) -> Result<u32> {
+    pub(crate) fn pragma_u32(&self, name: &str) -> Result<u32> {
         let value = self.pragma_i64(name)?;
         u32::try_from(value)
             .map_err(|_| Error::Message(format!("pragma {name} is {value}, not a u32")))
     }
 
     /// Signed, because `cache_size` is negative when denominated in kibibytes.
-    #[doc(hidden)]
-    pub fn pragma_i64(&self, name: &str) -> Result<i64> {
+    pub(crate) fn pragma_i64(&self, name: &str) -> Result<i64> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
             .map_err(Error::sqlite(format!("failed to read pragma {name}")))
@@ -2384,26 +1968,581 @@ impl Db {
         Ok(out)
     }
 
-    #[doc(hidden)]
-    pub fn pragma_string(&self, name: &str) -> Result<String> {
+    #[cfg(test)]
+    fn pragma_string(&self, name: &str) -> Result<String> {
         self.conn
             .pragma_query_value(None, name, |row| row.get(0))
             .map_err(Error::sqlite(format!("failed to read pragma {name}")))
     }
 }
 
-/// The writes that may share one transaction, handed to `Db::transaction`'s
+/// The write handle: a [`Archive`] that can also write.
+///
+/// `Deref<Target = Archive>`, so every reader on `Archive` is available here and a
+/// `&ArchiveMut` coerces to `&Archive` at any read entry point. The mutators live only
+/// here, so a `Archive` cannot write by construction rather than by a runtime
+/// check.
+///
+/// Two constructors, for two situations. [`ArchiveMut::create`] makes a new
+/// archive, which nothing else can hold yet. [`ArchiveMut::open`] takes an
+/// existing archive with SQLite's exclusive locking mode, so it is refused
+/// as [`Error::InUse`] while any other connection holds the file (a writer
+/// thread, a reader, another `ArchiveMut`) and, once it holds the file, every
+/// other open is refused the same way. That is the intent a write to an
+/// existing archive has to state: the in-place rewrites (`rewrite::compact`,
+/// assembly through [`transaction`](Self::transaction)) and crash recovery
+/// (a read-write connection folds the sidecar in when it closes) all run on
+/// an archive nothing else holds. The streaming writer
+/// ([`crate::writer::Writer`]) opens its connection privately and without
+/// the exclusive lock, because its readers must coexist with it.
+pub struct ArchiveMut {
+    db: Archive,
+    /// Committed transactions. See [`ArchiveMut::commits`].
+    #[cfg(any(test, feature = "test-support"))]
+    commits: std::cell::Cell<u64>,
+}
+
+impl std::ops::Deref for ArchiveMut {
+    type Target = Archive;
+    fn deref(&self) -> &Archive {
+        &self.db
+    }
+}
+
+impl std::fmt::Debug for ArchiveMut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveMut").field("db", &self.db).finish()
+    }
+}
+
+impl ArchiveMut {
+    fn wrap(db: Archive) -> Self {
+        ArchiveMut {
+            db,
+            #[cfg(any(test, feature = "test-support"))]
+            commits: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Open an existing archive to write to it, with SQLite's exclusive
+    /// locking mode: refused as [`Error::InUse`] while anything else holds
+    /// the file, and holding it against every other open until dropped. A
+    /// legacy-schema archive is refused as
+    /// [`ReadOnly::LegacySchema`]; copy it
+    /// forward with [`crate::rewrite`] instead.
+    ///
+    /// This is also the recovery open: a read-write connection that is the
+    /// last one on a WAL database checkpoints on close, so opening a killed
+    /// archive this way and dropping the handle folds its sidecar in and
+    /// deletes it. [`Archive::open`] leaves the files as they are.
+    pub fn open(path: &Path) -> Result<Self> {
+        let db = Archive::open_with_cache(path, READER_CACHE_SIZE_KIB, true)?;
+        if db.legacy {
+            return Err(Error::ReadOnly(ReadOnly::LegacySchema));
+        }
+        Ok(ArchiveMut::wrap(db))
+    }
+
+    /// Run `f` inside one transaction: it commits when `f` returns `Ok` and
+    /// rolls back — leaving the database exactly as it was — when `f` returns
+    /// `Err` or the commit itself fails.
+    ///
+    /// This exists because streams seal in lockstep — a dozen tables at once
+    /// is normal. Without a way to group them, one co-seal is a dozen implicit
+    /// commits, that is, a dozen fsyncs at `synchronous=FULL`, against a tick
+    /// budget that a single segment insert already eats into.
+    ///
+    /// `f` receives a `Transaction`, not the connection: SQL stays inside this
+    /// module, and `Transaction` deliberately exposes only the *writes that belong
+    /// in a seal batch*. `prune_wal` is not among them, which is how "the
+    /// prune runs outside the seal transaction" is made unrepresentable rather
+    /// than merely documented — inside it, a quiet stream's accumulated rows
+    /// make the delete long enough to threaten the tick.
+    pub fn transaction<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        let tx = Transaction {
+            tx: self
+                .db
+                .conn
+                .transaction()
+                .map_err(Error::sqlite("failed to begin transaction"))?,
+        };
+        // `?` drops `tx` on the error path, and `Transaction`'s drop behavior
+        // is rollback — so a failure partway through leaves nothing behind.
+        let out = f(&tx)?;
+        tx.tx
+            .commit()
+            .map_err(Error::sqlite("failed to commit transaction"))?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.commits.set(self.commits.get() + 1);
+        Ok(out)
+    }
+
+    /// Start a source, returning its id.
+    pub fn insert_source(&mut self, meta: &SourceMeta) -> Result<i64> {
+        insert_source_sql(&self.db.conn, meta, None)
+    }
+
+    /// Insert one sealed segment's bytes and catalog facts, committing on its
+    /// own. Batch writers must use `transaction` instead.
+    pub fn insert_segment(
+        &mut self,
+        source_id: i64,
+        stream: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+    ) -> Result<()> {
+        insert_segment_sql(&self.db.conn, source_id, stream, seq, meta, bytes, None)
+    }
+
+    /// [`insert_segment`](Self::insert_segment), carrying the caller's index
+    /// over the segment — see [`Segment::index`](crate::segment::Segment::index).
+    /// Separate rather than a sixth parameter because an index is opt-in and
+    /// most callers have none; `None` at every call site would be noise.
+    pub fn insert_segment_with_index(
+        &mut self,
+        source_id: i64,
+        stream: &str,
+        seq: u64,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+        caller_index: Option<&[u8]>,
+    ) -> Result<()> {
+        insert_segment_sql(
+            &self.db.conn,
+            source_id,
+            stream,
+            seq,
+            meta,
+            bytes,
+            caller_index,
+        )
+    }
+
+    /// Insert every WAL row for one tick — one stream each, typically — in a
+    /// single transaction. This is what makes a tick atomic: either every
+    /// stream's row for this tick lands, or none does.
+    ///
+    /// Takes `&mut self`, unlike every reader in this file: `Connection::
+    /// transaction()` requires `&mut Connection`. An earlier version used
+    /// `unchecked_transaction()` to keep `&self`, on the reasoning that this
+    /// module never nests transactions — but the hazard `&mut` guards
+    /// against is on the caller's side, not this function's: the writer
+    /// thread owns this `Archive` outright ("no concurrent writers to one file" is
+    /// an explicit non-goal) and does want a transaction
+    /// around a whole co-seal batch — `transaction`, which this now goes
+    /// through. `&mut self` makes "don't open a nested transaction while one
+    /// is outstanding" a compile error for that caller instead of a runtime
+    /// one. Reads stay on `&self`.
+    pub fn insert_wal_rows(&mut self, source_id: i64, rows: &[WalRow]) -> Result<()> {
+        self.transaction(|tx| tx.insert_wal_rows(source_id, rows))
+    }
+
+    /// One tick's rows for several sources, in one transaction.
+    ///
+    /// **The transaction count is the point, not the row count.** At
+    /// `synchronous=FULL` every commit is an fsync, and the send that carries
+    /// this is a blocking hand-off from inside the append — so a commit
+    /// per source made the tick's cost scale linearly with endpoint count.
+    /// Committing the tick once makes it constant. It also makes the tick
+    /// atomic across sources: a crash cannot leave one endpoint's row for
+    /// tick N present and another's missing, which is the state a reader
+    /// comparing two arms would have to interpret.
+    pub fn insert_wal_rows_batch(&mut self, ticks: &[(i64, Vec<WalRow>)]) -> Result<()> {
+        self.transaction(|tx| {
+            for (source_id, rows) in ticks {
+                tx.insert_wal_rows(*source_id, rows)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Delete WAL rows at or below `upto_ts` for `(source_id, stream)`.
+    /// Runs OUTSIDE the seal transaction — see `live_wal` for why that is
+    /// safe and has no correctness role. Returns the number of rows deleted,
+    /// so callers/tests can assert idempotency (a second prune of the same
+    /// watermark deletes 0).
+    ///
+    /// Bounded to one stream by construction (the `stream = ?2` filter):
+    /// that is why WAL rows are per-stream rather than whole snapshots — a
+    /// slow-sealing table's prune must not touch, or be blocked by, any other
+    /// stream's tail.
+    pub fn prune_wal(&mut self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
+        self.db
+            .conn
+            .execute(
+                "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
+                rusqlite::params![source_id, stream, upto_ts],
+            )
+            .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")))
+    }
+
+    /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
+    /// and every WAL row stamped before it. This is what makes a bounded
+    /// rolling buffer possible — the whole reason a rolling buffer works — and it is
+    /// the only destructive operation the container has.
+    ///
+    /// Segment granularity is deliberate and visible to the caller: a segment
+    /// goes only when its NEWEST row is out of the window (`last_ts <
+    /// cutoff_ts`), so a straddling segment is kept whole and the buffer holds
+    /// *at least* the lookback, never less. Trimming inside a sealed segment
+    /// would mean rewriting an immutable parquet BLOB, which is exactly what
+    /// this container refuses to do.
+    ///
+    /// `segments_by_time` (`source_id, stream, last_ts`) makes the segment
+    /// delete an indexed lookup rather than a scan; that index exists for this
+    /// statement.
+    ///
+    /// **The segment delete and the WAL delete are one transaction**, and that
+    /// is required for correctness. Deleting a
+    /// segment lowers `live_wal`'s watermark for its stream, so WAL rows the
+    /// segment already covered would become live again — a reader would splice
+    /// them back in as a tail. The same-cutoff WAL delete is what stops that,
+    /// and it only stops it if the two land together: a straddling row has
+    /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
+    /// the segment delete un-shadows.
+    pub fn evict_before(&mut self, source_id: i64, cutoff_ts: i64) -> Result<Evicted> {
+        self.evict(
+            source_id,
+            "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
+            "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
+            cutoff_ts,
+        )
+    }
+
+    /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
+    /// accepts.
+    ///
+    /// **`evict` selects what is REMOVED.** Note this is the opposite polarity
+    /// from [`CopySpec::keep_streams`](crate::rewrite::CopySpec), which selects
+    /// what survives — each matches the verb in its own name, and conflating
+    /// them deletes the data you meant to keep.
+    ///
+    /// Retention is the caller's policy, the way sealing is: dendro knows what
+    /// a cutoff means but not that debug counters are worth a day and the
+    /// metric they explain is worth a month. A predicate rather than a name set
+    /// so a caller whose streams are grouped under some coarser unit can
+    /// express retention by that unit.
+    ///
+    /// Still one transaction, for the reason
+    /// [`evict_before`](Self::evict_before) gives — but note the scope is now
+    /// per stream, which is what makes that reason keep holding: the WAL delete
+    /// that stops a segment delete from un-shadowing rows has to carry the same
+    /// stream as the segment delete, or it would either miss rows or take rows
+    /// belonging to a stream this pass is meant to leave alone.
+    pub fn evict_streams_before(
+        &mut self,
+        source_id: i64,
+        cutoff_ts: i64,
+        evict: &dyn Fn(&str) -> bool,
+    ) -> Result<Evicted> {
+        let streams: Vec<String> = self
+            .db
+            .all_streams(source_id)?
+            .into_iter()
+            .filter(|s| evict(s))
+            .collect();
+        self.transaction(|tx| {
+            let mut total = Evicted::default();
+            for stream in &streams {
+                let params = rusqlite::params![source_id, stream, cutoff_ts];
+                // Before the segment delete, for the reason `evict` gives.
+                total.live_rows += tx
+                    .tx
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM wal WHERE {LIVE_WAL_PREDICATE} AND ts < ?3"),
+                        params,
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Error::sqlite(format!(
+                        "failed to count live {stream} rows before eviction"
+                    )))? as usize;
+                total.segments += tx
+                    .tx
+                    .execute(
+                        "DELETE FROM segments \
+                         WHERE source_id = ?1 AND stream = ?2 AND last_ts < ?3",
+                        params,
+                    )
+                    .map_err(Error::sqlite(format!("failed to evict {stream} segments")))?;
+                total.wal_rows += tx
+                    .tx
+                    .execute(
+                        "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
+                        params,
+                    )
+                    .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
+            }
+            // The clock-offset series is per SOURCE, and a per-stream pass
+            // has no single cutoff for it: the streams it left alone may
+            // still hold rows older than `cutoff_ts`. So it is cut at the
+            // oldest row the source still holds anywhere — segments and WAL
+            // together — and at `cutoff_ts` when nothing is left. Without
+            // this the series was the one part of a per-stream rolling buffer
+            // that grew without bound, exactly what whole-source eviction
+            // already closed.
+            tx.tx
+                .execute(
+                    "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < COALESCE( \
+                       (SELECT MIN(oldest) FROM ( \
+                          SELECT MIN(first_ts) AS oldest FROM segments WHERE source_id = ?1 \
+                          UNION ALL \
+                          SELECT MIN(ts) FROM wal WHERE source_id = ?1)), \
+                       ?2)",
+                    rusqlite::params![source_id, cutoff_ts],
+                )
+                .map_err(Error::sqlite("failed to evict clock offsets"))?;
+            Ok(total)
+        })
+    }
+
+    fn evict(
+        &mut self,
+        source_id: i64,
+        segments_sql: &str,
+        wal_sql: &str,
+        cutoff_ts: i64,
+    ) -> Result<Evicted> {
+        self.transaction(|tx| {
+            let params = rusqlite::params![source_id, cutoff_ts];
+            // Counted BEFORE the segment delete: removing a stream's segments
+            // lowers its watermark, and rows those segments already covered
+            // would count as live afterwards when they were not.
+            let live_rows: i64 = tx
+                .tx
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM wal WHERE source_id = ?1 AND ts < ?2 \
+                         AND ({LIVE_WAL_PREDICATE_FOR_ROW})"
+                    ),
+                    params,
+                    |row| row.get(0),
+                )
+                .map_err(Error::sqlite("failed to count live rows before eviction"))?;
+            let segments = tx
+                .tx
+                .execute(segments_sql, params)
+                .map_err(Error::sqlite("failed to evict segments"))?;
+            let wal_rows = tx
+                .tx
+                .execute(wal_sql, params)
+                .map_err(Error::sqlite("failed to evict WAL rows"))?;
+            // The clock-offset series is per SOURCE, so it is cut by the same
+            // cutoff whichever streams the pass named. Without this the series
+            // is the one part of a rolling buffer that grows without bound: one
+            // row per seal batch, forever, faithfully re-copied by every
+            // rewrite. Small in bytes and unbounded in shape, in exactly the
+            // mode that runs for months.
+            tx.tx
+                .execute(
+                    "DELETE FROM clock_offsets WHERE source_id = ?1 AND ts < ?2",
+                    rusqlite::params![source_id, cutoff_ts],
+                )
+                .map_err(Error::sqlite("failed to evict clock offsets"))?;
+            Ok(Evicted {
+                segments,
+                wal_rows,
+                live_rows: live_rows as usize,
+            })
+        })
+    }
+
+    /// Mark a source cleanly finalized, outside any batch. The dump uses
+    /// it: a copy taken at time T is a finished artifact even though the
+    /// buffer it came from is still running.
+    pub fn mark_complete(&mut self, source_id: i64) -> Result<()> {
+        self.transaction(|tx| tx.mark_complete(source_id))
+    }
+
+    /// Merge `patch` into a source's metadata: keys in the patch replace the
+    /// stored value, every other key is kept. A read-modify-write on this
+    /// connection, so it belongs to whoever owns the connection — during a
+    /// recording, the writer thread, through
+    /// [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata).
+    pub fn patch_source_metadata(
+        &mut self,
+        source_id: i64,
+        patch: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut metadata = self.db.source_metadata(source_id)?;
+        for (k, v) in patch {
+            metadata.insert(k.clone(), v.clone());
+        }
+        self.update_source_metadata(source_id, &metadata)
+    }
+
+    /// Replace one source's metadata map.
+    ///
+    /// In place rather than through a copy because metadata is a catalog
+    /// column: `annotate` changes it and nothing else, and rewriting an
+    /// archive's every segment BLOB to edit one JSON string would make a
+    /// cheap operation cost the size of the source.
+    pub fn update_source_metadata(
+        &mut self,
+        source_id: i64,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(metadata)
+            .map_err(|e| Error::Message(format!("failed to encode source metadata: {e}")))?;
+        let changed = self
+            .db
+            .conn
+            .execute(
+                "UPDATE sources SET metadata = ?1 WHERE id = ?2",
+                rusqlite::params![encoded, source_id],
+            )
+            .map_err(Error::sqlite("failed to update source metadata"))?;
+        if changed == 0 {
+            return Err(Error::Message(format!("no source with id {source_id}")));
+        }
+        Ok(())
+    }
+
+    /// Copy what the `-wal` sidecar holds into the archive itself, best-effort.
+    ///
+    /// **Passive by design.** A passive checkpoint moves whatever frames it
+    /// can and returns; it never waits for a reader, and it never blocks the
+    /// writer behind one. `FULL`/`TRUNCATE` would stall until readers finish,
+    /// and this runs on the writer thread with a capacity-1 channel behind it —
+    /// a stall there backpressures the append loop, which is the one cost this
+    /// whole container is shaped to avoid.
+    ///
+    /// Best-effort is the right contract: the caller is bounding how STALE a
+    /// copy of the archive can be, not demanding an exact one.
+    /// [`vacuum_into`](Archive::vacuum_into) is the exact one.
+    pub fn checkpoint_passive(&mut self) -> Result<()> {
+        // `execute_batch`, not `pragma_query`: rusqlite QUOTES the pragma name
+        // it is given, so `pragma_query(None, "wal_checkpoint(PASSIVE)", ..)`
+        // asks for a pragma literally named `wal_checkpoint(PASSIVE)`. SQLite
+        // answers an unknown pragma with no rows and no error — the call
+        // returns `Ok` having checkpointed nothing. Found by the test that
+        // asserts a plain copy keeps up; it would otherwise have shipped as a
+        // cadence that silently never ran.
+        self.db
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .map_err(Error::sqlite("failed to checkpoint the WAL"))
+    }
+
+    /// How long a write waits on another connection's lock before failing
+    /// with `SQLITE_BUSY`. rusqlite's default is 5 s. Exposed so a test can
+    /// make the writer's retry path reachable in milliseconds rather than
+    /// seconds; production keeps the default.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        self.db
+            .conn
+            .busy_timeout(timeout)
+            .map_err(Error::sqlite("failed to set busy_timeout"))
+    }
+
+    /// Create a new archive at `path`, applying the pragmas that can only be set
+    /// on a database that does not yet exist, then installing the schema.
+    ///
+    /// Fails if `path` already exists: an archive is valid from creation, so there
+    /// is no `.partial` staging file standing between a new source and a
+    /// previous one.
+    pub fn create(path: &Path) -> Result<Self> {
+        Archive::create_with_page_size(path, PAGE_SIZE)
+    }
+
+    /// Create an archive that lives only in memory, for a consumer with no
+    /// filesystem to write to — a browser assembling a report archive from
+    /// uploaded bytes. It has NO WAL (an in-memory database cannot have one),
+    /// which is exactly the shape [`serialize`](Archive::serialize) then
+    /// [`open_bytes`](Archive::open_bytes) expect: the bytes carry the whole
+    /// archive, sidecar-free.
+    ///
+    /// Unlike [`create`](Self::create) it skips the on-disk geometry pragmas
+    /// (`auto_vacuum`, `journal_mode=WAL`) — those bound a long-lived file's
+    /// footprint and durability, neither of which a transient in-memory image
+    /// serialized straight to bytes has any use for.
+    pub fn create_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()
+            .map_err(Error::sqlite("failed to open an in-memory database"))?;
+        let db = Archive {
+            conn,
+            legacy: false,
+        };
+        db.set_pragma("page_size", PAGE_SIZE)?;
+        db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
+        db.conn
+            .execute_batch(SCHEMA_SQL)
+            .map_err(Error::sqlite("failed to create archive schema"))?;
+        db.conn
+            .execute(
+                "INSERT INTO schema_version(version) VALUES (?1)",
+                [SCHEMA_VERSION],
+            )
+            .map_err(Error::sqlite("failed to record archive schema version"))?;
+        db.stamp_header()?;
+        Ok(ArchiveMut::wrap(db))
+    }
+
+    /// Open an existing archive to APPEND to it: the writer thread's open.
+    /// The same gate as [`open`](Self::open) with the writer's (smaller) page
+    /// cache and no exclusive lock, because the writer's readers must coexist
+    /// with it. There must be exactly one writing connection to a file; this
+    /// is for the writer thread that will own it.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn open_for_write(path: &Path) -> Result<Self> {
+        let db = Archive::open_with_cache(path, WRITER_CACHE_SIZE_KIB, false)?;
+        if db.legacy {
+            return Err(Error::ReadOnly(ReadOnly::LegacySchema));
+        }
+        Ok(ArchiveMut::wrap(db))
+    }
+
+    /// How many transactions this connection has COMMITTED.
+    ///
+    /// Exists so "one commit per tick, whatever the endpoint count" is a
+    /// property a test can assert rather than one a comment claims. At
+    /// `synchronous=FULL` a commit is an fsync, and fsyncs are not otherwise
+    /// observable from inside the process.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commits(&self) -> u64 {
+        self.commits.get()
+    }
+
+    /// Return `pages` freed pages to the filesystem, or as many as the free
+    /// list holds. Requires `auto_vacuum=INCREMENTAL`, which is set at
+    /// creation and cannot be turned on later without a full `VACUUM`.
+    ///
+    /// Eviction alone keeps the file bounded, since freed pages get reused —
+    /// but the bound it keeps is the HIGH-WATER mark, so a transient spike
+    /// parks space on the free list permanently. This is the trickle that gives
+    /// it back, sized (`pages`) to fit inside a tick.
+    ///
+    /// **Stepped to exhaustion, rather than using `execute_batch`.** This pragma
+    /// reclaims one page per step and `execute_batch` steps a statement once,
+    /// so the obvious spelling silently reclaims only one page whatever
+    /// `pages` says. That is not a slow reclaim, it is no reclaim at all: at
+    /// one page per retention pass a rolling buffer would never work off a
+    /// spike.
+    pub fn incremental_vacuum(&mut self, pages: u32) -> Result<()> {
+        let fail = |e| format!("failed to reclaim {pages} pages: {e}");
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA incremental_vacuum({pages})"))
+            .map_err(fail)?;
+        let mut rows = stmt.query([]).map_err(fail)?;
+        while rows.next().map_err(fail)?.is_some() {}
+        Ok(())
+    }
+}
+
+/// The writes that may share one transaction, handed to `ArchiveMut::transaction`'s
 /// closure. Everything here lands or nothing does.
 ///
 /// What is absent is as deliberate as what is present: there is no `prune_wal`
 /// and no read accessor. The prune belongs OUTSIDE the seal transaction, where
 /// its cost cannot land on a tick, and `live_wal`'s watermark filter is what
 /// makes a crash between the two harmless — see `live_wal`.
-pub struct Tx<'a> {
+pub struct Transaction<'a> {
     tx: rusqlite::Transaction<'a>,
 }
 
-impl Tx<'_> {
+impl Transaction<'_> {
     /// Start a source, returning its id.
     ///
     /// In a transaction because an archive can be *assembled* as well as
@@ -2441,7 +2580,7 @@ impl Tx<'_> {
 
     /// Remove one sealed segment.
     ///
-    /// Exposed on `Tx` — unlike the WAL prune, which is deliberately not —
+    /// Exposed on `Transaction` — unlike the WAL prune, which is deliberately not —
     /// because the one operation that needs it, compaction, must delete the
     /// segments it replaced and insert the replacement **in the same
     /// transaction**. Apart is not an option: between them the stream's
@@ -2538,8 +2677,8 @@ impl Tx<'_> {
     }
 }
 
-/// Shared by `Db::insert_source` (its own commit) and
-/// `Tx::insert_source` (part of a batch).
+/// Shared by `ArchiveMut::insert_source` (its own commit) and
+/// `Transaction::insert_source` (part of a batch).
 fn insert_source_sql(conn: &Connection, meta: &SourceMeta, uuid: Option<&str>) -> Result<i64> {
     let labels = serde_json::to_string(&meta.labels)
         .map_err(|e| Error::Message(format!("failed to encode source labels: {e}")))?;
@@ -2558,7 +2697,7 @@ fn insert_source_sql(conn: &Connection, meta: &SourceMeta, uuid: Option<&str>) -
     Ok(conn.last_insert_rowid())
 }
 
-/// See [`Db::mint_uuid`].
+/// See [`Archive::mint_uuid`].
 fn mint_uuid(conn: &Connection) -> Result<String> {
     let mut b: Vec<u8> = conn
         .query_row("SELECT randomblob(16)", [], |row| row.get(0))
@@ -2636,8 +2775,8 @@ fn read_segment_indexes_sql(
     Ok(out)
 }
 
-/// Shared by `Db::insert_segment` (its own commit) and
-/// `Tx::insert_segment` (part of a batch): `Transaction` derefs to
+/// Shared by `Archive::insert_segment` (its own commit) and
+/// `Transaction::insert_segment` (part of a batch): `Transaction` derefs to
 /// `Connection`, so both reach the same statement.
 fn insert_segment_sql(
     conn: &Connection,
@@ -2678,7 +2817,7 @@ fn insert_segment_sql(
 /// buffer another process is still appending to.
 ///
 /// Writes through a view fail (`cannot modify segments because it is a view`),
-/// which is the behavior we want but not the message; [`Db::writable`] catches
+/// which is the behavior we want but not the message; [`Archive::writable`] catches
 /// it first and says what to do instead.
 const LEGACY_VIEWS_SQL: &str = "\
 CREATE TEMP VIEW sources AS SELECT id, labels, metadata, complete, \
@@ -2771,7 +2910,7 @@ mod tests {
         // size, and `effective_config_matches_what_was_measured` for whether it
         // is still the value we benchmarked.
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         assert_eq!(db.pragma_u32("auto_vacuum").unwrap(), 2, "INCREMENTAL");
         assert_eq!(db.pragma_string("journal_mode").unwrap(), "wal");
     }
@@ -2786,12 +2925,15 @@ mod tests {
         // reordering fail loudly here instead of invisibly in production.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.dendro");
-        let db = Db::create_with_page_size(&path, 8192).unwrap();
+        let db = Archive::create_with_page_size(&path, 8192).unwrap();
         assert_eq!(db.pragma_u32("page_size").unwrap(), 8192);
-        // And it survives the connection, i.e. it really is welded into the file.
+        // And it survives the connection, that is, it is welded into the file.
         drop(db);
         assert_eq!(
-            Db::open(&path).unwrap().pragma_u32("page_size").unwrap(),
+            Archive::open(&path)
+                .unwrap()
+                .pragma_u32("page_size")
+                .unwrap(),
             8192
         );
     }
@@ -2807,8 +2949,8 @@ mod tests {
         // `effective_config_matches_what_was_measured` instead, for job (b).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.dendro");
-        drop(Db::create(&path).unwrap());
-        let db = Db::open(&path).unwrap();
+        drop(ArchiveMut::create(&path).unwrap());
+        let db = ArchiveMut::open(&path).unwrap();
         assert_eq!(
             db.pragma_u32("wal_autocheckpoint").unwrap(),
             WAL_AUTOCHECKPOINT_BYTES / PAGE_SIZE,
@@ -2834,14 +2976,17 @@ mod tests {
         // throughput.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.dendro");
-        let created = Db::create(&path).unwrap();
+        let created = ArchiveMut::create(&path).unwrap();
         assert_eq!(
             created.pragma_i64("cache_size").unwrap(),
             WRITER_CACHE_SIZE_KIB as i64,
             "a created (writing) connection takes the writer cache"
         );
         assert_eq!(
-            Db::open(&path).unwrap().pragma_i64("cache_size").unwrap(),
+            Archive::open(&path)
+                .unwrap()
+                .pragma_i64("cache_size")
+                .unwrap(),
             READER_CACHE_SIZE_KIB as i64,
             "an opened connection still takes the reader cache"
         );
@@ -2871,13 +3016,13 @@ mod tests {
         // here to catch.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.dendro");
-        let created = Db::create(&path).unwrap();
-        let reopened = Db::open(&path).unwrap();
+        let created = ArchiveMut::create(&path).unwrap();
+        let reopened = Archive::open(&path).unwrap();
 
         assert_eq!(PAGE_SIZE, 4096, "the swept and measured page size");
         // Checked on both connections: page_size must also survive the reopen,
         // and synchronous must hold on a connection that did not create the file.
-        for (which, db) in [("created", &created), ("reopened", &reopened)] {
+        for (which, db) in [("created", &*created), ("reopened", &reopened)] {
             assert_eq!(db.pragma_u32("page_size").unwrap(), 4096, "{which}");
             assert_eq!(
                 db.pragma_u32("synchronous").unwrap(),
@@ -2890,7 +3035,7 @@ mod tests {
     #[test]
     fn schema_round_trips_a_source() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: [("host".to_string(), "h1".to_string())]
@@ -2926,7 +3071,7 @@ mod tests {
         // with the correct order, so dropping `ORDER BY seq` would silently
         // pass. This fixture doesn't have that escape hatch.
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -2973,7 +3118,7 @@ mod tests {
     #[test]
     fn total_rows_sums_across_segments() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3012,7 +3157,7 @@ mod tests {
     #[test]
     fn streams_lists_each_stream_once() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3040,7 +3185,7 @@ mod tests {
         // only `streams()` cannot discover, let alone recover, a stream
         // that has never sealed.
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3085,7 +3230,7 @@ mod tests {
     #[test]
     fn an_unbounded_cutoff_evicts_everything_rather_than_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3133,7 +3278,7 @@ mod tests {
     #[test]
     fn timestamps_span_the_whole_signed_range() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3192,7 +3337,7 @@ mod tests {
     #[test]
     fn a_row_at_timestamp_zero_is_live() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3239,74 +3384,6 @@ mod tests {
     /// The refusal is belt and braces: `writable()` catches it with a message
     /// that says what to do, and `query_only` means SQLite would refuse too if
     /// a path ever slipped past that guard.
-    #[test]
-    fn a_read_only_handle_reads_but_will_not_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.dendro");
-        {
-            let mut db = Db::create(&path).unwrap();
-            let id = db
-                .insert_source(&SourceMeta {
-                    labels: [("host".to_string(), "web-01".to_string())]
-                        .into_iter()
-                        .collect(),
-                    metadata: BTreeMap::new(),
-                    clock_anchor_wall_ns: 7,
-                })
-                .unwrap();
-            db.insert_segment(
-                id,
-                "s",
-                0,
-                &SegmentMeta {
-                    rows: 2,
-                    first_ts: 10,
-                    last_ts: 20,
-                },
-                b"sealed",
-            )
-            .unwrap();
-            db.insert_wal_rows(
-                id,
-                &[WalRow {
-                    stream: "s".to_string(),
-                    ts: 30,
-                    wall_offset: 0,
-                    row: vec![1],
-                }],
-            )
-            .unwrap();
-        }
-
-        let mut db = Db::open_read_only(&path).unwrap();
-        let sources = db.read_sources().unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].meta.labels["host"], "web-01");
-        assert_eq!(db.all_streams(sources[0].id).unwrap(), vec!["s"]);
-        assert_eq!(db.read_segments(sources[0].id, "s").unwrap().len(), 1);
-        assert_eq!(db.live_wal(sources[0].id, "s").unwrap().len(), 1);
-
-        let err = db
-            .insert_wal_rows(
-                sources[0].id,
-                &[WalRow {
-                    stream: "s".to_string(),
-                    ts: 40,
-                    wall_offset: 0,
-                    row: vec![1],
-                }],
-            )
-            .expect_err("a read-only handle must refuse a write");
-        assert!(
-            matches!(err, Error::ReadOnly(ReadOnly::Handle)),
-            "got: {err:?}"
-        );
-        assert!(
-            db.evict_before(sources[0].id, 100).is_err(),
-            "retention is a write too"
-        );
-    }
-
     /// Retention can be per stream, and a pass names the streams it touches.
     ///
     /// The reason the predicate exists: a caller keeping debug counters for a
@@ -3315,7 +3392,7 @@ mod tests {
     #[test]
     fn per_stream_eviction_leaves_the_streams_it_was_not_given() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3365,7 +3442,7 @@ mod tests {
     #[test]
     fn per_stream_eviction_takes_the_wal_rows_its_segments_shadowed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3418,7 +3495,7 @@ mod tests {
     #[test]
     fn segment_sizes_are_oldest_first_and_measure_the_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3461,7 +3538,7 @@ mod tests {
     #[test]
     fn archive_bytes_counts_the_file_including_pages_not_yet_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3505,7 +3582,7 @@ mod tests {
         // source's segments must never see another source's rows for a
         // stream of the same name.
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let meta = |labels: &str| SourceMeta {
             labels: [("host".to_string(), labels.to_string())]
                 .into_iter()
@@ -3544,8 +3621,8 @@ mod tests {
         // previous source — create must not clobber one.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.dendro");
-        drop(Db::create(&path).unwrap());
-        let err = match Db::create(&path) {
+        drop(ArchiveMut::create(&path).unwrap());
+        let err = match ArchiveMut::create(&path) {
             Ok(_) => panic!("create clobbered an existing archive"),
             Err(e) => e,
         };
@@ -3568,9 +3645,9 @@ mod tests {
     }
 
     /// Shared setup for the WAL tests: a fresh archive with one source.
-    fn wal_test_db() -> (tempfile::TempDir, Db, i64) {
+    fn wal_test_db() -> (tempfile::TempDir, ArchiveMut, i64) {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let rid = db
             .insert_source(&SourceMeta {
                 labels: BTreeMap::new(),
@@ -3669,7 +3746,7 @@ mod tests {
         // to do with it: exactly the failure mode this design exists to
         // rule out.
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let meta = |host: &str| SourceMeta {
             labels: [("host".to_string(), host.to_string())]
                 .into_iter()
@@ -3992,7 +4069,7 @@ mod tests {
         // Same as segments: an archive can hold several sources, and reading
         // one must not see another's WAL rows for a same-named stream.
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::create(&dir.path().join("t.dendro")).unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let meta = |host: &str| SourceMeta {
             labels: [("host".to_string(), host.to_string())]
                 .into_iter()

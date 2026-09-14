@@ -15,21 +15,26 @@
 //!
 //! Parquet is a batch format. A file is unreadable until its footer lands, so
 //! a process that stops with a batch still open loses that batch. Shortening
-//! the batches puts less at risk and charges you for it elsewhere: on one body
-//! of data, 400 segments instead of one read 18x slower and took 2.4x the
-//! space, because every segment carries its own footer and compression cannot
-//! cross a segment boundary.
+//! the batches puts less at risk and costs read performance and space: on one
+//! body of data, 400 segments instead of one read 18.2x slower and took 2.38x
+//! the space, because every segment carries its own footer and compression
+//! cannot cross a segment boundary.
 //!
-//! dendro splits the two apart. Rows land in a write-ahead log, and a
-//! committed row is durable and readable at once — the WAL is not a staging
-//! area you flush before the data counts. When the caller decides a stream has
-//! accumulated enough, it seals those rows into an immutable Parquet segment;
-//! dendro never seals behind your back. Readers union the sealed segments with
-//! the live WAL tail, so they see a consistent view while another process goes
-//! on appending.
+//! dendro separates the two. Rows land in a write-ahead log, and a committed
+//! row is durable and readable at once; the WAL is not a staging area you
+//! flush before the data counts. When the caller decides a stream has
+//! accumulated enough, it seals those rows into an immutable Parquet segment.
+//! dendro never seals on its own. Readers union the sealed segments with the
+//! live WAL tail, so they see a consistent view while another process goes on
+//! appending.
 //!
 //! Durability then belongs to the commit and segment size belongs to the seal,
 //! and you can choose them independently.
+//!
+//! Two things here are write-ahead logs. The archive's WAL is the `wal` table
+//! inside the SQLite file, which holds unsealed rows and which readers query.
+//! SQLite's WAL is the `-wal` file it writes commits into before folding them
+//! into the main file; these docs call that file the sidecar.
 //!
 //! # Vocabulary
 //!
@@ -39,125 +44,145 @@
 //!
 //! | term | meaning |
 //! |---|---|
-//! | **archive** | The file. One SQLite database, holding everything below — one file at rest, three while it is open; see [`db`]. |
-//! | **stream** | A named sequence of rows inside a source. Streams are independent — each accumulates, seals and expires on its own schedule — and **transient**: one can start late, stop early, have gaps, and stop existing altogether once its rows are evicted. |
-//! | **segment** | An immutable parquet blob holding one sealed run of a stream's rows. A stream is many segments end to end. |
-//! | **row** | One timestamped payload. The timestamp is an `i64` — SQLite's only integer type, so negative means before 1970 — and the payload is opaque to dendro. |
+//! | **archive** | The file. One SQLite database, holding everything below. One file at rest, three while it is open; see [`archive`]. |
+//! | **stream** | A named sequence of rows inside a source. Streams are independent: each accumulates, seals and expires on its own schedule. They are also **transient**: one can start late, stop early, have gaps, and stop existing once its rows are evicted. |
+//! | **segment** | An immutable Parquet BLOB holding one sealed run of a stream's rows. A stream is many segments end to end. |
+//! | **row** | One payload with a timestamp and a wall-clock offset. The timestamp is an `i64`, SQLite's only integer type, so negative means before 1970. The payload is opaque to dendro. |
 //!
 //! Plus five that are not containers:
 //!
 //! | term | meaning |
 //! |---|---|
 //! | **source** | The namespace a stream belongs to: one producer, one clock domain, one label set. `cpu` from `host=web-01` and `cpu` from `host=web-02` are two streams in two sources. Most archives have exactly one; several when you record two hosts or two arms into one file. |
-//! | **WAL** | The write-ahead log rows land in. Durable and readable immediately; not a staging area you have to flush before the data counts. |
+//! | **WAL** | The `wal` table rows land in. Durable and readable immediately; not a staging area you have to flush before the data counts. |
 //! | **seal** | Turning a stream's accumulated WAL rows into a segment. |
 //! | **tail** | The live WAL rows past a stream's newest segment, materialized on read. |
-//! | **catalog** | The SQLite tables describing sources, streams and segments — what makes retention and range reads indexed lookups rather than scans. |
+//! | **catalog** | The SQLite tables describing sources, streams and segments. It is what makes retention and range reads indexed lookups rather than scans. |
 //! | **index** | The caller's, not dendro's: an opaque blob stored beside a segment ([`Segment::index`]) that the archive never reads. The catalog knows a segment's stream and span; anything finer lives here. |
 //! | **encoder** | The caller's [`SegmentEncoder`]. The only thing that knows what a row means. |
 //!
-//! **A source is a namespace.** It makes a stream name
-//! unambiguous and what gives its rows a shared wall-clock anchor — row
-//! timestamps are `anchor + monotonic elapsed`, so one source is one clock. It
-//! is deliberately not a rung on the ladder above: nothing is stored "in" a
-//! source that is not in one of its streams.
+//! **A source is a namespace.** It makes a stream name unambiguous and gives
+//! its rows a shared wall-clock anchor: row timestamps are
+//! `anchor + monotonic elapsed`, so one source is one clock. It is not a
+//! level of the nesting above, because nothing is stored in a source that is
+//! not in one of its streams.
 //!
-//! **A stream is derived from its rows.** There is
-//! no `streams` table: a stream is a name that rows in `segments` and `wal`
-//! carry, and the set of streams is derived by [`Db::all_streams`], which
-//! unions those two columns. This has three consequences:
+//! **A stream is derived from its rows.** There is no `streams` table: a
+//! stream is a name that rows in `segments` and `wal` carry, and the set of
+//! streams is derived by [`Archive::all_streams`], which unions those two columns.
+//! This has three consequences:
 //!
 //! * A stream needs no declaration. It exists from its first row.
 //! * A stream has no lifetime of its own. It can begin partway through a
-//!   source, stop before the source does, and leave gaps — nothing in the
+//!   source, stop before the source does, and leave gaps. Nothing in the
 //!   container says otherwise, and nothing records what its span was meant to
 //!   be.
 //! * A stream can stop existing. Once retention has evicted its last segment
-//!   and its last WAL row it vanishes from `all_streams` entirely, and the
-//!   archive keeps no record that it was ever there. Reusing the name later
-//!   starts a new one.
+//!   and its last WAL row it vanishes from `all_streams`, and the archive
+//!   keeps no record that it was ever there. Reusing the name later starts a
+//!   new one.
 //!
-//! The sources ladder is therefore about containment, not lifetime: an archive
-//! holds what its sources' streams currently hold, and nothing more.
+//! The nesting is therefore about containment, not lifetime: an archive holds
+//! what its sources' streams currently hold, and nothing more.
 //!
-//! [`Db::all_streams`]: db::Db::all_streams
+//! [`Archive::all_streams`]: archive::Archive::all_streams
 //!
-//! The model contains nothing about metrics, samples, series or
-//! observations. dendro came out of a telemetry agent and is a good fit for
-//! telemetry, but the container does not know that and must not learn it.
+//! The model contains nothing about metrics, samples, series or observations.
+//! dendro came out of a telemetry agent and fits telemetry, but the container
+//! does not know that and must not learn it.
 //!
 //! # The boundary
 //!
-//! **dendro does not know what a row means.** A row is bytes and a timestamp;
-//! turning a batch of them into a parquet segment is the caller's job,
-//! expressed as a [`SegmentEncoder`]. That is the whole schema boundary — the
-//! archive owns storage, cataloging, retention, checkpointing and segment
-//! mechanics, and the caller owns what is in the columns.
+//! **dendro does not know what a row means.** A row is bytes, a timestamp and
+//! a wall-clock offset; turning a batch of them into a Parquet segment is the
+//! caller's job, expressed as a [`SegmentEncoder`]. That is the whole schema
+//! boundary. The archive owns storage, cataloging, retention, checkpointing
+//! and segment mechanics, and the caller owns what is in the columns.
 //!
-//! Two consequences are important for implementers:
+//! Two consequences matter for implementers:
 //!
 //! * An encoder must work from the rows alone. Both the writer (when it seals)
-//!   and a completely separate reader (materializing a tail out of an archive
-//!   another *process* is appending to) call it, and the reader has none of the
-//!   writer's in-memory state. Anything an encode needs must travel in the rows.
+//!   and a separate reader (materializing a tail out of an archive another
+//!   *process* is appending to) call it, and the reader has none of the
+//!   writer's in-memory state. Anything an encode needs must travel in the
+//!   rows.
 //! * An encoder may drop a leading or trailing run of rows it cannot decode on
-//!   their own — a caller whose rows reference a schema anchor, say. It may not
-//!   drop from the MIDDLE: the prune deletes every WAL row up to the segment's
+//!   their own, such as rows that reference a schema anchor. It may not drop
+//!   from the middle: the prune deletes every WAL row up to the segment's
 //!   `last_ts`, so a hole inside that span is rows left in no segment and no
-//!   WAL. The writer checks this by counting, not by trusting, and refuses a
-//!   segment whose span does not hold exactly the rows it claims.
+//!   WAL. The writer checks this by counting, and refuses a segment whose span
+//!   does not hold exactly the rows it claims.
+//!
+//! A reader without the caller's encoder reads sealed segments only. Any
+//! Parquet reader opens those; the live tail is unencoded rows.
 //!
 //! # Shape of the API
 //!
-//! Writing goes through [`writer::Archive`], which owns the single writing
+//! Writing goes through [`writer::Writer`], which owns the single writing
 //! connection on its own thread:
 //!
 //! ```no_run
 //! # #[cfg(feature = "write")]
 //! # fn demo() -> dendro::Result<()> {
-//! # use dendro::{db::{SourceMeta, WalRow}, segment::{EncodeResult, SegmentEncoder}, writer::Archive};
+//! # use dendro::{archive::{SourceMeta, WalRow}, segment::{EncodeResult, SegmentEncoder}, writer::Writer};
 //! # struct MyEncoder;
 //! # impl SegmentEncoder for MyEncoder {
 //! #     fn encode(&self, _: &str, _: &[WalRow]) -> EncodeResult { Ok(None) }
 //! # }
 //! # let seed = SourceMeta { labels: Default::default(), metadata: Default::default(), clock_anchor_wall_ns: 0 };
 //! # let rows: Vec<WalRow> = vec![];
-//! let mut archive = Archive::create("out.dendro".as_ref(), Box::new(MyEncoder))?;
-//! let mut source = archive.add_source(seed)?;
+//! let mut writer = Writer::create("out.dendro".as_ref(), Box::new(MyEncoder))?;
+//! let mut source = writer.add_source(seed)?;
 //! source.wal(rows)?;                            // durable, and readable now
 //! source.seal(vec!["temps".to_string()])?;      // -> one parquet segment
 //! source.finalize((0, 0))?;
-//! archive.join()?;
+//! writer.join()?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! Reading hands back Parquet bytes. dendro does not open them and has no
-//! opinion about the query engine that will — see [`read::read_archive`].
+//! opinion about the query engine that will; see [`read::read_archive`].
+//!
+//! A [`archive::Archive`] reads. Every write to the catalog and the WAL is a method on
+//! [`archive::ArchiveMut`]: [`archive::ArchiveMut::create`] for a new archive, and
+//! [`archive::ArchiveMut::open`] for an existing one, which takes the file exclusively
+//! and is refused while a writer thread, a reader, or another `ArchiveMut` holds
+//! it. So a caller cannot write to an archive behind its writer's back.
 //!
 //! # One file, or three
 //!
 //! An archive is one file at rest and three while anyone has it open: SQLite
-//! adds a `-wal` and a `-shm` whenever the file is opened — a read is enough —
-//! and removes them on a clean close. An unclean kill leaves all three, and can
-//! leave the archive itself holding nothing, with the whole recording in the
-//! sidecar until something opens the set and folds it back in.
+//! adds a `-wal` and a `-shm` whenever the file is opened, a read included,
+//! and removes them on a clean close. An unclean kill leaves all three.
+//! Creation checkpoints the catalog into the archive, so the archive alone
+//! always opens; every commit since the last checkpoint is in the sidecar
+//! until something opens the set and folds it back in.
 //!
-//! **dendro does not rewrite an archive on its own**. It does not
-//! migrate a legacy schema in place, and it does not normalize a crashed one.
-//! An open is how you read a buffer another process is still appending to, and
-//! a reader that rearranges its subject is a reader you cannot point at
-//! production.
+//! **dendro does not rewrite an archive on its own.** It does not migrate a
+//! legacy schema in place, and it does not normalize a crashed one. An open is
+//! how you read a buffer another process is still appending to, and a reader
+//! that rearranges its subject cannot be pointed at production.
 //!
-//! SQLite is not so restrained, and the distinction matters. A read-write
-//! connection that is the last one open **checkpoints on close**, so
-//! [`db::Db::open`] on a crashed archive folds the sidecar back in and deletes
-//! it — measured at 4 KiB to 110 KiB from nothing but an open and a drop. That
-//! is usually what you want, and a reader must never do it by surprise, so
-//! [`db::Db::open_read_only`] exists and leaves all three files
-//! exactly as it found them. Use it for anything pointed at a live buffer, at
-//! an artifact you do not own, or at read-only media, where `open` fails
-//! outright because its durability pragmas are themselves writes.
+//! SQLite does rewrite, and the distinction matters. A read-write connection
+//! that is the last one open **checkpoints on close**, so [`archive::ArchiveMut::open`]
+//! on a crashed archive folds the sidecar back in and deletes it: measured at
+//! 45 KiB to 61 KiB, with a 3.3 MB sidecar, from nothing but an open and a
+//! drop. That is recovery, and it is intentional: `ArchiveMut::open` takes the
+//! file exclusively. A reader must never do it by surprise, so
+//! [`archive::Archive::open`] is read-only and writes nothing to the archive. Use it
+//! for anything pointed at a live buffer, at an artifact you do not own, or
+//! at read-only media, where `ArchiveMut::open` is refused by name.
+//!
+//! # Where dendro sits
+//!
+//! dendro is a two-level log-structured merge tree whose memtable is a SQLite
+//! table and whose sorted files are Parquet BLOBs in the same file. `DESIGN.md`
+//! in the repository places it against RocksDB, Prometheus, InfluxDB,
+//! TimescaleDB, Apache Hudi and the lakehouse table formats, and lists what
+//! the single-file design costs: one host and one writer, a tail readable only
+//! through the encoder, a measured 3.14x write amplification, and large BLOBs
+//! in 4 KiB SQLite pages.
 //!
 //! [`Segment::index`]: segment::Segment::index
 //! [`SegmentEncoder`]: segment::SegmentEncoder
@@ -167,17 +192,18 @@
 ///
 /// The metadata map is the caller's, and dendro reads none of it. These are
 /// the keys with an agreed meaning across callers, so that a tool built on
-/// one producer's archives can read another's. dendro *writes* exactly one of
-/// them itself ([`WRITER_SESSIONS`](keys::WRITER_SESSIONS), and an
-/// [`EVENTS`](keys::EVENTS) entry alongside it
-/// when a source is resumed); the rest are conventions a producer follows
-/// through [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata),
+/// one producer's archives can read another's. dendro *writes* two of them
+/// itself, [`WRITER_SESSIONS`](keys::WRITER_SESSIONS) and
+/// [`ENCODER`](keys::ENCODER), plus an [`EVENTS`](keys::EVENTS) entry
+/// alongside the first when a source is resumed. The rest are conventions a
+/// producer follows through
+/// [`SourceWriter::update_metadata`](crate::writer::SourceWriter::update_metadata),
 /// which is what lets them be written *during* a recording rather than only
 /// at finalize, which an unclean kill never reaches.
 pub mod keys {
     /// The observed producer's current **counter epoch**: an opaque id the
     /// producer regenerates whenever *all* of its cumulative counters start
-    /// from zero together — for a process-scoped producer, once per process.
+    /// from zero together; for a process-scoped producer, once per process.
     /// Two sources with equal epochs over overlapping time are two
     /// observations of one monotonic series: mergeable, never summable.
     /// OpenTelemetry's `start_time_unix_nano` is the precedent. Absent means
@@ -185,11 +211,11 @@ pub mod keys {
     ///
     /// **This is the source-wide level, and it does not cover a single
     /// counter.** A counter that wrapped, or that the producer zeroed on
-    /// read, did not restart the process, so this key says nothing about it —
-    /// and from the values alone a wrap and a reset are identical, while
-    /// their arithmetic is not (`cur` versus `cur + (2^w - prev)`). Telling
-    /// those apart needs a generation per counter, which is row data and
-    /// therefore the encoder's, not the container's. See
+    /// read, did not restart the process, so this key says nothing about it.
+    /// From the values alone a wrap and a reset are identical, while their
+    /// arithmetic is not (`cur` versus `cur + (2^w - prev)`). Telling those
+    /// apart needs a generation per counter, which is row data and therefore
+    /// the encoder's, not the container's. See
     /// `docs/journal/2026-09-12-generations-reset-versus-wrap.md`.
     pub const PRODUCER_EPOCH: &str = "producer_epoch";
     /// Every epoch the source observed, in order: a JSON array of
@@ -200,7 +226,7 @@ pub mod keys {
     pub const PRODUCER_EPOCHS: &str = "producer_epochs";
     /// Every writer session that appended to the source, in order: a JSON
     /// array of `{"session": <uuid>, "clock_anchor_wall_ns": <anchor>,
-    /// "resumed_after_ts": <ts>}` — the last field only on a session that
+    /// "resumed_after_ts": <ts>}`, with the last field only on a session that
     /// reopened the archive, naming the newest row the previous session
     /// left. One entry means the source was written in one go. Written by
     /// dendro.
@@ -209,21 +235,22 @@ pub mod keys {
     /// "description": <text>, "kind": <tag>?, "details": <text>?, "id":
     /// <stable id>? }, … ]}`. `kind` `producer_epoch` marks a counter reset;
     /// `writer_session` marks a resume; `id` lets a merge de-duplicate. The
-    /// shape is open — a viewer's own event schema may carry more fields —
+    /// shape is open, so a viewer's own event schema can carry more fields,
     /// and dendro appends to the array rather than replacing it.
     pub const EVENTS: &str = "events";
     /// The version of the **software that produced the source's values**, as
-    /// an opaque string — dendro stores it, displays nothing, and never parses
+    /// an opaque string. dendro stores it, displays nothing, and never parses
     /// it. Written by the producer, not by dendro.
     ///
     /// What it answers: two recordings from one host disagree about a metric,
     /// and the first question is whether the thing measuring it changed. That
-    /// question is unanswerable from a file that does not carry this.
+    /// question cannot be answered from a file that does not carry this.
     ///
-    /// **It has to distinguish builds, not releases.** A bare crate version is
-    /// the weak form, because the behavior worth bisecting usually changed in
-    /// a pre-release build; a version with a commit or build identifier
-    /// alongside it is the useful one. Any stable-per-build string will do.
+    /// **It must distinguish builds, not releases.** A bare crate version is
+    /// the weak form, because the behavior a bisection looks for usually
+    /// changed in a pre-release build; a version with a commit or build
+    /// identifier alongside it is the useful one. Any string that is stable
+    /// per build is acceptable.
     ///
     /// **It is not the producer's identity.** Two producers' version strings
     /// are not comparable and this key does not say whose they are; that
@@ -233,7 +260,7 @@ pub mod keys {
     /// Distinct from [`ENCODER`], and both are needed. `encoder` versions the
     /// **encoding** of a row and dendro enforces it, refusing a reader whose
     /// encoder disagrees. This versions whatever produced the **values**, and
-    /// dendro enforces nothing — a sampler that starts measuring the same
+    /// dendro enforces nothing: a sampler that starts measuring the same
     /// quantity differently changes every value while the encoding, and so the
     /// encoder version, stays identical. That case is invisible to `encoder`
     /// by construction.
@@ -247,7 +274,7 @@ pub mod keys {
 }
 
 /// The container: schema, catalog, and every statement that touches SQL.
-pub mod db;
+pub mod archive;
 /// What can go wrong.
 pub mod error;
 /// Resolving an archive to segment bytes, live tail included.
@@ -259,7 +286,10 @@ pub mod seal;
 /// Segments, and the encoder boundary.
 pub mod segment;
 
+pub use archive::{Archive, ArchiveMut, Transaction};
 pub use error::{Error, ReadOnly, Result};
+#[cfg(feature = "write")]
+pub use writer::{SourceWriter, Writer};
 /// The writer thread.
 ///
 /// Behind the `write` feature: it spawns a thread, and `std::thread::spawn`

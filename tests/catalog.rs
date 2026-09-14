@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use dendro::db::{Db, SegmentMeta, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SegmentMeta, SourceMeta, WalRow};
 use dendro::read::{self, SegmentBytes};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
@@ -37,7 +37,7 @@ fn row(stream: &str, ts: i64) -> WalRow {
 /// Stream `a`: two sealed segments (1..=2, 3..=4) and live rows 5 and 6.
 /// Stream `b`: live rows only, 7. Stream `c`: nothing live, one segment.
 fn fixture(path: &std::path::Path) -> i64 {
-    let mut db = Db::create(path).unwrap();
+    let mut db = ArchiveMut::create(path).unwrap();
     let id = db
         .insert_source(&SourceMeta {
             labels: BTreeMap::from([("source".to_string(), "x".to_string())]),
@@ -81,7 +81,7 @@ fn the_catalog_describes_every_stream_without_a_blob() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     let id = fixture(&path);
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let cat = read::catalog(&db).unwrap();
     assert_eq!(cat.len(), 1);
     let src = &cat[0];
@@ -113,7 +113,7 @@ fn describe_answers_the_whole_archive_in_one_call() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     fixture(&path);
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let overview = read::describe(&db).unwrap();
 
     assert_eq!(overview.sources.len(), 1);
@@ -148,7 +148,7 @@ fn a_probe_is_the_first_sealed_segment_or_the_tail() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     let id = fixture(&path);
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(read::probe(&db, id, "a", &Tags).unwrap().unwrap(), b"1,2");
     assert_eq!(read::probe(&db, id, "b", &Tags).unwrap().unwrap(), b"7");
     assert_eq!(read::probe(&db, id, "c", &Tags).unwrap().unwrap(), b"9");
@@ -160,7 +160,7 @@ fn a_ranged_read_takes_whole_segments_and_trims_the_tail() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     let id = fixture(&path);
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let got = read::stream_range(&db, id, "a", 3, 5, &Tags).unwrap();
     assert_eq!(got, vec![b"3,4".to_vec(), b"5".to_vec()]);
     // A range past everything sealed reads only the tail, trimmed.
@@ -181,7 +181,7 @@ fn segment_bytes_resolve_lazily_by_path_and_by_shared_connection() {
     let by_path = SegmentBytes::at_path(path.clone(), id, "a".to_string());
     assert_eq!(by_path.all(&Tags).unwrap(), full);
     let shared = Arc::new(Mutex::new(
-        Db::open_bytes(std::fs::read(&path).unwrap()).unwrap(),
+        Archive::open_bytes(std::fs::read(&path).unwrap()).unwrap(),
     ));
     let by_conn = SegmentBytes::shared(shared, id, "a".to_string());
     assert_eq!(by_conn.all(&Tags).unwrap(), full);

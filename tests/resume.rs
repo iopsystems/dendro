@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, SourceMeta, WalRow};
 use dendro::keys;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 use dendro::Error;
 
 /// Reports the timestamps it was handed.
@@ -48,12 +48,12 @@ fn row(ts: i64) -> WalRow {
     }
 }
 
-fn sessions_of(db: &Db, id: i64) -> Vec<serde_json::Value> {
+fn sessions_of(db: &Archive, id: i64) -> Vec<serde_json::Value> {
     let md = db.source_metadata(id).unwrap();
     serde_json::from_str(&md[keys::WRITER_SESSIONS]).unwrap()
 }
 
-fn seqs_of(db: &Db, id: i64) -> Vec<u64> {
+fn seqs_of(db: &Archive, id: i64) -> Vec<u64> {
     db.read_segment_meta(id, "s")
         .unwrap()
         .into_iter()
@@ -69,7 +69,7 @@ fn seqs_of(db: &Db, id: i64) -> Vec<u64> {
 fn a_source_resumes_and_continues_its_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Tags), source()).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), source()).unwrap();
     let id = w.source_id();
     for ts in [1_000, 2_000] {
         w.wal(vec![row(ts)]).unwrap();
@@ -77,19 +77,19 @@ fn a_source_resumes_and_continues_its_sequence() {
     }
     archive.finalize_single(w, (2_000, 0)).unwrap();
     {
-        let db = Db::open_read_only(&path).unwrap();
+        let db = Archive::open(&path).unwrap();
         assert!(db.read_sources().unwrap()[0].complete);
         assert_eq!(sessions_of(&db, id).len(), 1, "one session so far");
         assert_eq!(seqs_of(&db, id), vec![0, 1]);
     }
 
     // A new process: new archive handle, new anchor, same source.
-    let mut archive = Archive::open(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
     let (mut w, last_ts) = archive.resume_source(id, 10_000).unwrap();
     assert_eq!(last_ts, Some(2_000));
     assert_eq!(w.floor_ts(), Some(2_000));
     {
-        let db = Db::open_read_only(&path).unwrap();
+        let db = Archive::open(&path).unwrap();
         assert!(
             !db.read_sources().unwrap()[0].complete,
             "resumed: not finished"
@@ -112,7 +112,7 @@ fn a_source_resumes_and_continues_its_sequence() {
     }
     archive.finalize_single(w, (12_000, 0)).unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert!(db.read_sources().unwrap()[0].complete, "finalized again");
     assert_eq!(seqs_of(&db, id), vec![0, 1, 2, 3], "the sequence continued");
     assert_eq!(db.total_rows(id, "s").unwrap(), 4);
@@ -138,18 +138,18 @@ fn a_source_resumes_and_continues_its_sequence() {
 fn a_resumed_source_refuses_to_run_backwards() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Tags), source()).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), source()).unwrap();
     let id = w.source_id();
     w.wal(vec![row(5_000)]).unwrap();
     archive.finalize_single(w, (5_000, 0)).unwrap();
 
-    let mut archive = Archive::open(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
     match archive.resume_source(id, 5_000).unwrap_err() {
         Error::TimelineBackwards { ts, floor, .. } => assert_eq!((ts, floor), (5_000, 5_000)),
         other => panic!("expected TimelineBackwards, got {other}"),
     }
     // Refused before anything changed.
-    assert!(Db::open_read_only(&path).unwrap().read_sources().unwrap()[0].complete);
+    assert!(Archive::open(&path).unwrap().read_sources().unwrap()[0].complete);
 
     let (mut w, _) = archive.resume_source(id, 6_000).unwrap();
     assert!(matches!(
@@ -164,7 +164,7 @@ fn a_resumed_source_refuses_to_run_backwards() {
     archive.wal_tick(vec![(id, vec![row(4_500)])]).unwrap();
     w.wal(vec![row(6_001)]).unwrap();
     archive.finalize_single(w, (6_001, 0)).unwrap();
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let live: Vec<i64> = db
         .live_wal(id, "s")
         .unwrap()
@@ -182,9 +182,9 @@ fn a_resumed_source_refuses_to_run_backwards() {
 fn resume_refuses_a_source_that_is_not_there_and_stays_usable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.dendro");
-    let (archive, w) = Archive::single(&path, Box::new(Tags), source()).unwrap();
+    let (archive, w) = Writer::single(&path, Box::new(Tags), source()).unwrap();
     archive.finalize_single(w, (1, 0)).unwrap();
-    let mut archive = Archive::open(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
     let err = archive.resume_source(999, 1_000).unwrap_err();
     assert!(err.to_string().contains("no source with id 999"), "{err}");
     // The writer is still usable: a fresh source can be added.
@@ -215,7 +215,7 @@ fn a_legacy_archive_cannot_be_reopened_for_append() {
     )
     .unwrap();
     drop(conn);
-    let err = Archive::open(&path, Box::new(Tags)).unwrap_err();
+    let err = Writer::open(&path, Box::new(Tags)).unwrap_err();
     assert!(
         matches!(err, Error::ReadOnly(dendro::ReadOnly::LegacySchema)),
         "{err}"

@@ -10,9 +10,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, SourceMeta, WalRow};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 use dendro::Error;
 
 /// Reports the timestamps it was handed.
@@ -51,7 +51,7 @@ fn row(ts: i64) -> WalRow {
     }
 }
 
-fn wal_ts(db: &Db, id: i64) -> Vec<i64> {
+fn wal_ts(db: &Archive, id: i64) -> Vec<i64> {
     db.read_wal(id, "s")
         .unwrap()
         .into_iter()
@@ -67,7 +67,7 @@ fn wal_ts(db: &Db, id: i64) -> Vec<i64> {
 fn a_sources_colliding_tick_is_dropped_without_taking_the_archive_down() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two.dendro");
-    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut a = archive.add_source(source("a")).unwrap();
     let b = archive.add_source(source("b")).unwrap();
     let (ia, ib) = (a.source_id(), b.source_id());
@@ -85,7 +85,7 @@ fn a_sources_colliding_tick_is_dropped_without_taking_the_archive_down() {
         .unwrap();
     a.sync().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(
         wal_ts(&db, ia),
         vec![1_000, 3_000],
@@ -107,7 +107,7 @@ fn a_sources_colliding_tick_is_dropped_without_taking_the_archive_down() {
 fn a_busy_database_is_retried_rather_than_fatal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("busy.dendro");
-    let mut archive = Archive::create_with_busy_timeout(
+    let mut archive = Writer::create_with_busy_timeout(
         &path,
         Box::new(Tags),
         Duration::from_secs(10),
@@ -146,7 +146,7 @@ fn a_busy_database_is_retried_rather_than_fatal() {
     w.sync().unwrap();
     holder.join().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let seqs: Vec<u64> = db
         .read_segment_meta(id, "s")
         .unwrap()
@@ -175,7 +175,7 @@ fn an_encoder_panic_is_the_encoders_error_not_writer_gone() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("panic.dendro");
-    let mut archive = Archive::create(&path, Box::new(Panics)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Panics)).unwrap();
     let mut w = archive.add_source(source("a")).unwrap();
     w.wal(vec![row(1_000)]).unwrap();
     w.seal(vec!["s".to_string()]).unwrap();
@@ -191,6 +191,6 @@ fn an_encoder_panic_is_the_encoders_error_not_writer_gone() {
     // The row it could not seal is still there for a reader with a working
     // encoder: nothing was lost, only the seal.
     let _ = archive.join();
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(wal_ts(&db, 1), vec![1_000]);
 }

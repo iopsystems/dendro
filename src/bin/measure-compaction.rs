@@ -24,10 +24,10 @@ use std::time::{Duration, Instant};
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 /// A row is `columns` little-endian i64s; a segment is those as columns, plus
 /// a timestamp. Deliberately wide, because a footer's cost is per column and
@@ -91,7 +91,7 @@ fn write(path: &Path, rows: i64, columns: usize, per_segment: i64) -> u64 {
         metadata: BTreeMap::new(),
         clock_anchor_wall_ns: 0,
     };
-    let (archive, mut w) = Archive::single(path, Box::new(Wide { columns }), seed).expect("create");
+    let (archive, mut w) = Writer::single(path, Box::new(Wide { columns }), seed).expect("create");
     for ts in 1..=rows {
         w.wal(vec![row(ts, columns)]).expect("append");
         if ts % per_segment == 0 {
@@ -99,7 +99,7 @@ fn write(path: &Path, rows: i64, columns: usize, per_segment: i64) -> u64 {
         }
     }
     archive.finalize_single(w, (rows, 0)).expect("finalize");
-    Db::open_read_only(path)
+    Archive::open(path)
         .expect("open")
         .archive_bytes()
         .expect("size")
@@ -108,7 +108,7 @@ fn write(path: &Path, rows: i64, columns: usize, per_segment: i64) -> u64 {
 /// What a consumer does: every segment's bytes, and every footer parsed.
 fn read_all(path: &Path, columns: usize) -> (Duration, usize) {
     let started = Instant::now();
-    let db = Db::open_read_only(path).expect("open");
+    let db = Archive::open(path).expect("open");
     let sources = read::read_archive(&db, &Wide { columns }).expect("read");
     let mut segments = 0usize;
     for src in sources {
@@ -133,7 +133,7 @@ fn read_all(path: &Path, columns: usize) -> (Duration, usize) {
 /// Just the catalog: dendro's own fixed cost, with no payload read at all.
 fn describe_only(path: &Path) -> Duration {
     let started = Instant::now();
-    let db = Db::open_read_only(path).expect("open");
+    let db = Archive::open(path).expect("open");
     std::hint::black_box(read::describe(&db).expect("describe"));
     started.elapsed()
 }
@@ -209,7 +209,7 @@ fn main() {
     let (finest_per, finest_path, finest_bytes, finest_segments) = &built[0];
     let compact_started = Instant::now();
     let done = {
-        let mut db = Db::open(finest_path).expect("open to compact");
+        let mut db = ArchiveMut::open(finest_path).expect("open to compact");
         dendro::rewrite::compact(&mut db, &dendro::rewrite::CompactSpec::to_rows(rows as u64))
             .expect("compact")
     };
@@ -218,7 +218,7 @@ fn main() {
     for _ in 0..reps {
         after.push(read_all(finest_path, columns).0);
     }
-    let after_bytes = Db::open_read_only(finest_path)
+    let after_bytes = Archive::open(finest_path)
         .expect("open")
         .archive_bytes()
         .expect("size");

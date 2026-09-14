@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{sniff, sniff_bytes, Db, Sniff, SourceMeta, WalRow};
+use dendro::archive::{sniff, sniff_bytes, Archive, ArchiveMut, Sniff, SourceMeta, WalRow};
 use dendro::rewrite::{copy_sources_into, shared_sources, CopySpec};
 use dendro::segment::{EncodeResult, SegmentEncoder};
 use dendro::Error;
@@ -53,13 +53,13 @@ fn is_not_an_archive(e: &Error) -> bool {
 fn create_stamps_the_header_and_a_copy_carries_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.dendro");
-    let db = Db::create(&path).unwrap();
+    let db = ArchiveMut::create(&path).unwrap();
     // Sniffed while the creating connection is still open: the stamp has to
     // be in the archive itself, not waiting in the sidecar for a checkpoint
     // — a rolling buffer is sniffed while its writer holds it.
     assert_eq!(sniff(&path).unwrap(), Sniff::Stamped { version: 4 });
     // In memory too — the browser's report path serializes straight to bytes.
-    let mem = Db::create_in_memory().unwrap();
+    let mem = ArchiveMut::create_in_memory().unwrap();
     assert_eq!(
         sniff_bytes(&mem.serialize().unwrap()),
         Sniff::Stamped { version: 4 }
@@ -70,22 +70,22 @@ fn create_stamps_the_header_and_a_copy_carries_it() {
     let copy = dir.path().join("copy.dendro");
     db.vacuum_into(&copy).unwrap();
     assert_eq!(sniff(&copy).unwrap(), Sniff::Stamped { version: 4 });
-    Db::open_read_only(&copy).unwrap();
+    Archive::open(&copy).unwrap();
 }
 
 #[test]
 fn a_newer_schema_is_refused_by_name_on_every_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.dendro");
-    drop(Db::create(&path).unwrap());
-    restamp(&path, i64::from(dendro::db::APPLICATION_ID), 5);
+    drop(ArchiveMut::create(&path).unwrap());
+    restamp(&path, i64::from(dendro::archive::APPLICATION_ID), 5);
     // Detection still says "an archive" — the sniff cannot read a version it
     // does not know — and the open is where the refusal lands.
     assert_eq!(sniff(&path).unwrap(), Sniff::Stamped { version: 5 });
     for result in [
-        Db::open(&path).map(drop),
-        Db::open_read_only(&path).map(drop),
-        Db::open_bytes(std::fs::read(&path).unwrap()).map(drop),
+        Archive::open(&path).map(drop),
+        Archive::open(&path).map(drop),
+        Archive::open_bytes(std::fs::read(&path).unwrap()).map(drop),
     ] {
         match result.unwrap_err() {
             Error::UnsupportedSchema { found, writes, .. } => {
@@ -104,7 +104,7 @@ fn another_applications_database_is_refused() {
     // Unstamped, so the header cannot tell it from a pre-stamp archive; the
     // open looks for the catalog and refuses.
     assert_eq!(sniff(&path).unwrap(), Sniff::Unstamped);
-    let err = Db::open(&path).unwrap_err();
+    let err = Archive::open(&path).unwrap_err();
     assert!(is_not_an_archive(&err), "{err}");
     assert!(err.to_string().contains("no catalog"), "{err}");
     // And its pragmas were not rewritten on the way to that refusal.
@@ -124,9 +124,9 @@ fn another_applications_database_is_refused() {
     restamp(&stamped, 0x4142_4344, 7);
     assert_eq!(sniff(&stamped).unwrap(), Sniff::NotAnArchive);
     for result in [
-        Db::open(&stamped).map(drop),
-        Db::open_read_only(&stamped).map(drop),
-        Db::open_bytes(std::fs::read(&stamped).unwrap()).map(drop),
+        Archive::open(&stamped).map(drop),
+        Archive::open(&stamped).map(drop),
+        Archive::open_bytes(std::fs::read(&stamped).unwrap()).map(drop),
     ] {
         let err = result.unwrap_err();
         assert!(is_not_an_archive(&err), "{err}");
@@ -144,10 +144,10 @@ fn a_file_that_is_not_sqlite_is_refused() {
     )
     .unwrap();
     assert_eq!(sniff(&path).unwrap(), Sniff::NotAnArchive);
-    assert!(is_not_an_archive(&Db::open(&path).unwrap_err()));
-    assert!(is_not_an_archive(&Db::open_read_only(&path).unwrap_err()));
+    assert!(is_not_an_archive(&Archive::open(&path).unwrap_err()));
+    assert!(is_not_an_archive(&Archive::open(&path).unwrap_err()));
     assert!(is_not_an_archive(
-        &Db::open_bytes(std::fs::read(&path).unwrap()).unwrap_err()
+        &Archive::open_bytes(std::fs::read(&path).unwrap()).unwrap_err()
     ));
     // Shorter than a header is not an archive either, and not an error.
     std::fs::write(&path, b"short").unwrap();
@@ -167,7 +167,7 @@ fn a_header_only_copy_is_named_for_what_it_is() {
     drop(conn);
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(bytes.len(), 4096, "header page only");
-    let err = Db::open_bytes(bytes).unwrap_err();
+    let err = Archive::open_bytes(bytes).unwrap_err();
     assert!(is_not_an_archive(&err), "{err}");
     assert!(err.to_string().contains("vacuum_into"), "{err}");
 }
@@ -179,18 +179,18 @@ fn a_header_only_copy_is_named_for_what_it_is() {
 fn a_pre_stamp_archive_still_opens_and_is_still_gated() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.dendro");
-    drop(Db::create(&path).unwrap());
+    drop(ArchiveMut::create(&path).unwrap());
     restamp(&path, 0, 0);
     assert_eq!(sniff(&path).unwrap(), Sniff::Unstamped);
-    Db::open(&path).expect("opens");
-    Db::open_read_only(&path).expect("opens read-only");
-    Db::open_bytes(std::fs::read(&path).unwrap()).expect("opens from bytes");
+    Archive::open(&path).expect("opens");
+    Archive::open(&path).expect("opens read-only");
+    Archive::open_bytes(std::fs::read(&path).unwrap()).expect("opens from bytes");
 
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute("UPDATE schema_version SET version = 5", [])
         .unwrap();
-    match Db::open(&path).unwrap_err() {
+    match Archive::open(&path).unwrap_err() {
         Error::UnsupportedSchema { found, .. } => assert_eq!(found, 5),
         other => panic!("expected UnsupportedSchema, got {other}"),
     }
@@ -200,7 +200,7 @@ fn a_pre_stamp_archive_still_opens_and_is_still_gated() {
 fn a_source_is_minted_a_v4_uuid_and_a_copy_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let src_path = dir.path().join("src.dendro");
-    let mut src = Db::create(&src_path).unwrap();
+    let mut src = ArchiveMut::create(&src_path).unwrap();
     src.insert_source(&source("a")).unwrap();
     src.insert_source(&source("b")).unwrap();
     let ids: Vec<String> = src
@@ -223,7 +223,7 @@ fn a_source_is_minted_a_v4_uuid_and_a_copy_keeps_it() {
     // A copy carries the identity verbatim, so the two archives can agree
     // they hold the same sources.
     let dst_path = dir.path().join("dst.dendro");
-    let mut dst = Db::create(&dst_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Never))
         .unwrap();
     let copied: Vec<String> = dst
@@ -242,7 +242,7 @@ fn a_source_is_minted_a_v4_uuid_and_a_copy_keeps_it() {
     // A different archive with different sources shares nothing, even with
     // identical labels — labels are a name, the uuid is the identity.
     let other_path = dir.path().join("other.dendro");
-    let mut other = Db::create(&other_path).unwrap();
+    let mut other = ArchiveMut::create(&other_path).unwrap();
     other.insert_source(&source("a")).unwrap();
     assert!(shared_sources(&src, &other).unwrap().is_empty());
 }
@@ -253,7 +253,7 @@ fn a_source_is_minted_a_v4_uuid_and_a_copy_keeps_it() {
 fn an_archive_without_the_uuid_column_reads_unknown_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.dendro");
-    drop(Db::create(&path).unwrap());
+    drop(ArchiveMut::create(&path).unwrap());
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("ALTER TABLE sources DROP COLUMN uuid;")
         .unwrap();
@@ -264,13 +264,13 @@ fn an_archive_without_the_uuid_column_reads_unknown_identity() {
     )
     .unwrap();
     drop(conn);
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let rows = db.read_sources().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].uuid, None);
     // And a copy of it mints a fresh identity rather than claiming sameness.
     let dst_path = dir.path().join("dst.dendro");
-    let mut dst = Db::create(&dst_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     dst.transaction(|tx| copy_sources_into(&db, tx, &CopySpec::everything(), &Never))
         .unwrap();
     assert!(dst.read_sources().unwrap()[0].uuid.is_some());

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::segment::{materialize, EncodeResult, Segment, SegmentEncoder};
 use dendro::Error;
@@ -99,7 +99,7 @@ fn the_shared_check_refuses_a_hole_an_overclaim_and_a_panic() {
 fn a_reader_refuses_what_the_seal_would_refuse() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.dendro");
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&source()).unwrap();
     db.insert_wal_rows(id, &rows(&[1, 2, 3])).unwrap();
 

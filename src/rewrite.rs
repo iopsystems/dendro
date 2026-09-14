@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::db::{Db, SegmentMeta, Tx};
+use crate::archive::{Archive, ArchiveMut, SegmentMeta, Transaction};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -127,14 +127,14 @@ pub struct Compacted {
 /// and SQLite keeps their pages on the free list rather than returning them,
 /// so the archive reads faster and occupies exactly what it did. [`compact`]
 /// reclaims at the end; a caller driving streams individually must finish
-/// with [`Db::incremental_vacuum`](crate::db::Db::incremental_vacuum).
+/// with [`ArchiveMut::incremental_vacuum`](crate::archive::ArchiveMut::incremental_vacuum).
 ///
 /// **Concurrency.** In place, on this connection, so the archive must have no
 /// other writer — the same single-writer rule everything else here obeys. A
 /// reader on another connection is unaffected: each merge is one transaction,
 /// and until it commits a reader sees the segments exactly as they were.
 pub fn compact_stream(
-    db: &mut Db,
+    db: &mut ArchiveMut,
     source_id: i64,
     stream: &str,
     spec: &CompactSpec,
@@ -220,7 +220,7 @@ pub fn compact_stream(
 /// Uncapped, unlike the writer's reclaim, which is bounded because it runs on
 /// the append path. There is no append path here: compaction already
 /// requires that nothing else is writing.
-pub fn compact(db: &mut Db, spec: &CompactSpec) -> Result<Compacted> {
+pub fn compact(db: &mut ArchiveMut, spec: &CompactSpec) -> Result<Compacted> {
     let mut total = Compacted::default();
     let sources = db.read_sources()?;
     for src in sources {
@@ -396,8 +396,9 @@ pub trait ColumnFilter {
 
 /// What one copy pass carries across.
 pub struct CopySpec<'a> {
-    /// Row-timestamp bound in nanoseconds. The rewrite tools copy everything;
-    /// a ranged dump narrows it to the incident window.
+    /// Row-timestamp bound, inclusive, in the unit of the row timestamps.
+    /// [`everything`](Self::everything) sets it to `i64::MIN`; a ranged copy
+    /// narrows it to the window of interest.
     pub start: i64,
     /// The other end of that bound, inclusive. A segment is carried whole
     /// when it overlaps `[start, end]` at all, so a copy holds a little more
@@ -410,7 +411,8 @@ pub struct CopySpec<'a> {
     /// owns several streams — and dropping that unit has to drop all of them.
     pub keep_streams: Option<&'a dyn Fn(&str) -> bool>,
     /// Extra metadata merged into each copied source's own, overwriting on
-    /// key collision. `annotate` embeds KPIs this way; the others pass `None`.
+    /// key collision. A caller that stamps results of its own into a copy
+    /// uses this; `None` leaves the metadata as it was.
     pub metadata_extra: Option<&'a BTreeMap<String, String>>,
     /// When set, project each copied segment's parquet down to the columns
     /// this accepts, decoding and re-encoding it. `None` is the fast path —
@@ -460,7 +462,7 @@ impl CopySpec<'_> {
 /// alongside its original, would otherwise land twice and double every
 /// value it holds. Sources without a uuid (archives from before the column)
 /// are never reported; they are not known to be the same.
-pub fn shared_sources(a: &Db, b: &Db) -> Result<Vec<String>> {
+pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
     let in_a: std::collections::BTreeSet<String> = a
         .read_sources()?
         .into_iter()
@@ -491,8 +493,8 @@ pub fn shared_sources(a: &Db, b: &Db) -> Result<Vec<String>> {
 /// perpetually mid-source and would otherwise never produce a snapshot that
 /// did not warn.
 pub fn copy_sources_into(
-    src: &Db,
-    tx: &Tx<'_>,
+    src: &Archive,
+    tx: &Transaction<'_>,
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
 ) -> Result<usize> {
@@ -510,8 +512,8 @@ pub fn copy_sources_into(
 }
 
 fn copy_sources_snapshotted(
-    src: &Db,
-    tx: &Tx<'_>,
+    src: &Archive,
+    tx: &Transaction<'_>,
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
 ) -> Result<usize> {
@@ -594,7 +596,7 @@ fn copy_sources_snapshotted(
             }
             // `first`/`tail.len()` served the range check above and nothing
             // else: every catalog fact below comes from what actually
-            // materializes. Cataloguing the raw tail's span would claim rows
+            // materializes. Cataloging the raw tail's span would claim rows
             // the bytes do not contain — at either end.
             let materialized = crate::segment::materialize(encoder, &table, &tail)?;
             if let Some(materialized) = materialized {
@@ -707,7 +709,7 @@ pub fn project_segment_columns(
 
 #[cfg(test)]
 mod tests {
-    use crate::db::Db;
+    use crate::archive::ArchiveMut;
 
     /// Every table in the schema is either copied by
     /// [`copy_sources_into`] or deliberately not carried, and this
@@ -728,14 +730,14 @@ mod tests {
         const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets"];
         /// Not carried, and correct not to be.
         const NOT_CARRIED: &[&str] = &[
-            // Written by `Db::create` for the destination itself; copying
+            // Written by `Archive::create` for the destination itself; copying
             // the source's would say nothing new and could disagree.
             "schema_version",
         ];
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("schema.dendro");
-        let db = Db::create(&path).unwrap();
+        let db = ArchiveMut::create(&path).unwrap();
 
         let mut actual = db.user_table_names().unwrap();
         actual.sort();

@@ -15,7 +15,7 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-use dendro::db::{Db, WalRow};
+use dendro::archive::{Archive, WalRow};
 use dendro::read;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
@@ -66,7 +66,7 @@ fn sidecar(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-fn rows_of(db: &Db) -> Vec<String> {
+fn rows_of(db: &Archive) -> Vec<String> {
     read::read_archive(db, &Tags)
         .expect("a killed archive still opens")
         .into_iter()
@@ -92,7 +92,7 @@ fn an_unclean_kill_keeps_every_committed_append() {
         "a killed writer leaves its -wal behind"
     );
 
-    let db = Db::open(&path).expect("a killed archive opens");
+    let db = Archive::open(&path).expect("a killed archive opens");
     assert_eq!(
         rows_of(&db),
         vec!["1,2,3".to_string(), "4,5".to_string()],
@@ -121,8 +121,8 @@ fn the_archive_without_its_sidecar_is_stale_not_broken() {
     let alone = dir.path().join("alone.dendro");
     std::fs::copy(&path, &alone).unwrap();
 
-    let copied = rows_of(&Db::open_read_only(&alone).expect("the copy opens"));
-    let whole = rows_of(&Db::open_read_only(&path).expect("the original opens"));
+    let copied = rows_of(&Archive::open(&alone).expect("the copy opens"));
+    let whole = rows_of(&Archive::open(&path).expect("the original opens"));
     let copied_rows: usize = copied.iter().map(|s| s.split(',').count()).sum();
     let whole_rows: usize = whole.iter().map(|s| s.split(',').count()).sum();
     assert!(
@@ -133,7 +133,7 @@ fn the_archive_without_its_sidecar_is_stale_not_broken() {
     assert_eq!(whole_rows, 5, "the full set holds everything committed");
     // And it is a real archive, not a diagnosis: no source it reports is
     // invented, and its own catalog reads.
-    for src in read::catalog(&Db::open_read_only(&alone).unwrap()).unwrap() {
+    for src in read::catalog(&Archive::open(&alone).unwrap()).unwrap() {
         assert!(src.uuid.is_some());
     }
 }
@@ -162,7 +162,7 @@ fn a_truncated_sidecar_recovers_to_its_last_intact_frame() {
 
     // Opens, and answers with whatever whole frames survived — never more
     // than the five that were committed, and never an error.
-    let db = Db::open(&path).expect("a torn sidecar is recovered, not refused");
+    let db = Archive::open(&path).expect("a torn sidecar is recovered, not refused");
     let rows: usize = rows_of(&db).iter().map(|s| s.split(',').count()).sum();
     assert!(
         rows <= 5,
@@ -181,14 +181,14 @@ fn a_truncated_sidecar_recovers_to_its_last_intact_frame() {
 /// here, and nothing had tested them together.
 #[test]
 fn a_killed_source_can_be_resumed() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("killed.dendro");
     write_then_kill(&path, 5, 3);
 
-    let id = Db::open_read_only(&path).unwrap().read_sources().unwrap()[0].id;
-    let mut archive = Archive::open(&path, Box::new(Tags)).expect("reopen after a kill");
+    let id = Archive::open(&path).unwrap().read_sources().unwrap()[0].id;
+    let mut archive = Writer::open(&path, Box::new(Tags)).expect("reopen after a kill");
     // The newest row the killed writer left is 5, so an anchor at or before
     // it is refused and one after it is taken.
     assert!(archive.resume_source(id, 5).is_err(), "5 is not after 5");
@@ -205,7 +205,7 @@ fn a_killed_source_can_be_resumed() {
     w.seal(vec!["s".to_string()]).unwrap();
     archive.finalize_single(w, (7, 0)).unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert!(
         db.read_sources().unwrap()[0].complete,
         "finalized this time"

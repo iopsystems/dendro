@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::db::{Db, Span};
+use crate::archive::{Archive, Span};
 use crate::error::Result;
 use crate::segment::SegmentEncoder;
 
@@ -105,14 +105,14 @@ impl SourceCatalog {
 /// measured at 91% of its query time on streams it never read; this, plus
 /// [`probe`] for the one segment a schema needs and [`SegmentBytes`] for
 /// the rest on demand, is the shape that fixed it.
-pub fn catalog(db: &Db) -> Result<Vec<SourceCatalog>> {
+pub fn catalog(db: &Archive) -> Result<Vec<SourceCatalog>> {
     db.read_snapshot(catalog_snapshotted)
 }
 
 /// [`catalog`] without opening a snapshot, for a caller that already holds
 /// one — [`describe`], whose file-level facts and catalog must describe the
 /// same instant.
-fn catalog_snapshotted(db: &Db) -> Result<Vec<SourceCatalog>> {
+fn catalog_snapshotted(db: &Archive) -> Result<Vec<SourceCatalog>> {
     let mut out = Vec::new();
     for src in db.read_sources()? {
         let mut streams = Vec::new();
@@ -144,8 +144,8 @@ fn catalog_snapshotted(db: &Db) -> Result<Vec<SourceCatalog>> {
 /// Everything about an archive that does not require reading a segment: the
 /// file's own size and page accounting, and the whole catalog.
 ///
-/// The consolidation. These facts were spread across `Db::archive_bytes`,
-/// `Db::page_stats`, `Db::segment_sizes`, `Db::total_rows` and [`catalog`] —
+/// The consolidation. These facts were spread across `Archive::archive_bytes`,
+/// `Archive::page_stats`, `Archive::segment_sizes`, `Archive::total_rows` and [`catalog`] —
 /// five entry points, so every consumer assembled "describe this archive"
 /// itself and each did it differently. Those all remain, for a caller that
 /// wants one number; this is the answer to the question people actually ask.
@@ -158,7 +158,7 @@ pub struct Overview {
     /// `-wal` sidecar, which is not part of the artifact.
     pub bytes: u64,
     /// How the archive's pages stand: how many, how many free, how big one is.
-    pub pages: crate::db::PageStats,
+    pub pages: crate::archive::PageStats,
     /// Every source in the file, with every stream each currently holds.
     pub sources: Vec<SourceCatalog>,
 }
@@ -201,7 +201,7 @@ impl Overview {
 }
 
 /// Describe an archive without reading a segment. See [`Overview`].
-pub fn describe(db: &Db) -> Result<Overview> {
+pub fn describe(db: &Archive) -> Result<Overview> {
     db.read_snapshot(|db| {
         Ok(Overview {
             bytes: db.archive_bytes()?,
@@ -220,7 +220,7 @@ pub fn describe(db: &Db) -> Result<Overview> {
 /// `None` for a stream with no rows. One snapshot, so the segment and the
 /// tail cannot come from different instants.
 pub fn probe(
-    db: &Db,
+    db: &Archive,
     source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
@@ -243,7 +243,7 @@ pub fn probe(
 /// tail is rows, and IS trimmed, since it is materialized here anyway. One
 /// snapshot.
 pub fn stream_range(
-    db: &Db,
+    db: &Archive,
     source_id: i64,
     stream: &str,
     start: i64,
@@ -291,15 +291,16 @@ pub struct SourceSegments {
 ///
 /// Two things differ from a mechanical transcription of the catalog:
 ///
-/// * Streams are enumerated with [`Db::all_streams`], not [`Db::streams`]. The
-///   latter sees only `segments`, so a stream still inside its first seal
-///   period — 16 of 26 in production measurement that motivated this container
-///   — would be invisible, which is precisely the data the WAL exists to keep.
+/// * Streams are enumerated with [`Archive::all_streams`], which unions the
+///   `segments` and `wal` tables. Enumerating `segments` alone would miss a
+///   stream still inside its first seal period (16 of 26 in the production
+///   measurement that motivated this container), which is the data the WAL
+///   exists to keep.
 /// * Each stream's live WAL tail is materialized into an in-memory parquet
-///   segment and appended as the NEWEST segment. [`Db::live_wal`]'s watermark
+///   segment and appended as the NEWEST segment. [`Archive::live_wal`]'s watermark
 ///   (`ts > MAX(last_ts)` of that stream's own segments) is what guarantees the
 ///   seam has no duplicate row, so nothing here has to de-duplicate.
-pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>> {
+pub fn read_archive(db: &Archive, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>> {
     db.read_snapshot(|db| read_archive_snapshotted(db, encoder))
 }
 
@@ -311,7 +312,10 @@ pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceS
 /// and the watermark it installed shadows the same rows in the second. Across
 /// streams, it is that two streams answer from different instants, which makes
 /// a single archive internally inconsistent for anything that joins them.
-fn read_archive_snapshotted(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceSegments>> {
+fn read_archive_snapshotted(
+    db: &Archive,
+    encoder: &dyn SegmentEncoder,
+) -> Result<Vec<SourceSegments>> {
     let mut out = Vec::new();
     for src in db.read_sources()? {
         crate::segment::check_encoder(src.id, &src.meta.metadata, encoder)?;
@@ -340,13 +344,13 @@ fn read_archive_snapshotted(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec
 /// One stream's parquet segments, oldest first: its sealed segments in `seq`
 /// order, then its live WAL tail materialized as the newest segment.
 ///
-/// [`Db::live_wal`], not [`Db::read_wal`]: the watermark (`ts > MAX(last_ts)`
+/// [`Archive::live_wal`], not [`Archive::read_wal`]: the watermark (`ts > MAX(last_ts)`
 /// over that stream's own segments) is the only thing keeping the seam free of
 /// duplicates. The prune runs outside the seal transaction, so `wal` routinely
 /// still holds rows a sealed segment already covers; replaying the raw table
 /// would splice those rows in a second time.
 pub fn stream_segments(
-    db: &Db,
+    db: &Archive,
     source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
@@ -359,7 +363,7 @@ pub fn stream_segments(
 
 /// [`segment::check_encoder`](crate::segment::check_encoder) for a source
 /// named by id, inside the caller's snapshot.
-fn check_encoder_of(db: &Db, source_id: i64, encoder: &dyn SegmentEncoder) -> Result<()> {
+fn check_encoder_of(db: &Archive, source_id: i64, encoder: &dyn SegmentEncoder) -> Result<()> {
     if encoder.version().is_none() {
         return Ok(());
     }
@@ -377,7 +381,7 @@ fn check_encoder_of(db: &Db, source_id: i64, encoder: &dyn SegmentEncoder) -> Re
 /// the watermark alone is enough. One snapshot is what makes
 /// `MAX(last_ts)` and the rows it shadows the same instant's facts.
 fn stream_segments_snapshotted(
-    db: &Db,
+    db: &Archive,
     source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
@@ -401,13 +405,13 @@ fn stream_segments_snapshotted(
 /// [`stream_segments`] returns its segments: the sealed ones from the
 /// catalog, then the live tail's.
 ///
-/// `Db::read_segment_indexes` is the cheaper half and answers for sealed
+/// `Archive::read_segment_indexes` is the cheaper half and answers for sealed
 /// segments alone. This one also materializes the tail, because a tail's
 /// index does not exist until its segment does, so use it when "what is in
 /// this stream right now" has to include data that has not sealed yet, and
 /// the catalog version when it does not.
 pub fn stream_indexes(
-    db: &Db,
+    db: &Archive,
     source_id: i64,
     stream: &str,
     encoder: &dyn SegmentEncoder,
@@ -441,7 +445,7 @@ pub enum SegmentBytes {
     /// Already resolved: the segments, oldest first, live tail included.
     Bytes(Vec<Vec<u8>>),
     /// A stream in an archive on disk, reopened read-only per fetch.
-    Db {
+    AtPath {
         /// The archive holding it.
         path: PathBuf,
         /// The source the stream belongs to.
@@ -452,16 +456,16 @@ pub enum SegmentBytes {
     /// A catalog that exists only in memory, shared by every stream of the
     /// archive it came from.
     ///
-    /// The [`Db`](Self::Db) arm above reopens the file per lazy read, which a
+    /// The [`Archive`](Self::AtPath) arm above reopens the file per lazy read, which a
     /// byte-backed archive cannot do — there is no path, and re-deserializing
     /// the image per stream would copy the whole archive once per stream. So
     /// this arm shares one connection instead. The `Mutex` is what makes that
     /// legal: `rusqlite::Connection` is `Send` but not `Sync`, and a reader is
     /// read from several threads on the native probe path.
-    SharedDb {
+    Shared {
         /// The one open connection every stream of this archive fetches
         /// through.
-        db: Arc<std::sync::Mutex<Db>>,
+        db: Arc<std::sync::Mutex<Archive>>,
         /// The source the stream belongs to.
         source_id: i64,
         /// The stream to fetch.
@@ -473,7 +477,7 @@ impl SegmentBytes {
     /// A stream whose bytes will be fetched from the archive at `path`,
     /// through a read-only connection opened per fetch.
     pub fn at_path(path: PathBuf, source_id: i64, stream: String) -> Self {
-        SegmentBytes::Db {
+        SegmentBytes::AtPath {
             path,
             source_id,
             stream,
@@ -482,8 +486,8 @@ impl SegmentBytes {
 
     /// A stream whose bytes will be fetched through a shared, already-open
     /// connection — for a byte-backed archive, which has no path to reopen.
-    pub fn shared(db: Arc<std::sync::Mutex<Db>>, source_id: i64, stream: String) -> Self {
-        SegmentBytes::SharedDb {
+    pub fn shared(db: Arc<std::sync::Mutex<Archive>>, source_id: i64, stream: String) -> Self {
+        SegmentBytes::Shared {
             db,
             source_id,
             stream,
@@ -495,18 +499,18 @@ impl SegmentBytes {
     pub fn all(&self, encoder: &dyn SegmentEncoder) -> Result<Vec<Vec<u8>>> {
         match self {
             SegmentBytes::Bytes(b) => Ok(b.clone()),
-            SegmentBytes::Db {
+            SegmentBytes::AtPath {
                 path,
                 source_id,
                 stream,
             } => {
                 // Read-only: this is a pure read, and a read-write connection
                 // that happens to be the last one open checkpoints the archive
-                // on close. See [`Db::open_read_only`].
-                let db = Db::open_read_only(path)?;
+                // on close. See [`Archive::open`].
+                let db = Archive::open(path)?;
                 stream_segments(&db, *source_id, stream, encoder)
             }
-            SegmentBytes::SharedDb {
+            SegmentBytes::Shared {
                 db,
                 source_id,
                 stream,

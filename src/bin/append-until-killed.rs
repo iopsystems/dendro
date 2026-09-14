@@ -1,7 +1,7 @@
 //! Appends to an archive, commits, and then waits to be killed.
 //!
 //! A test binary, not a tool. An unclean kill cannot be staged in-process:
-//! `Archive`'s `Drop` joins the writer, and anything that runs `Drop` is by
+//! `Writer`'s `Drop` joins the writer, and anything that runs `Drop` is by
 //! definition a clean close. So the only honest way to test what a SIGKILL
 //! leaves behind is to put the writer in a process and kill that.
 //!
@@ -15,9 +15,9 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use dendro::db::{SourceMeta, WalRow};
+use dendro::archive::{SourceMeta, WalRow};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 struct Tags;
 
@@ -51,7 +51,7 @@ fn main() {
         metadata: BTreeMap::new(),
         clock_anchor_wall_ns: 1_000,
     };
-    let (archive, mut w) = Archive::single(Path::new(path), Box::new(Tags), seed).expect("create");
+    let (archive, mut w) = Writer::single(Path::new(path), Box::new(Tags), seed).expect("create");
     for ts in 1..=rows {
         w.wal(vec![WalRow {
             stream: "s".to_string(),

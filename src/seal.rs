@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 /// Granularity of the first-seal stagger. A stream's first segment closes at
 /// `max_rows - (max_rows / (2 * STAGGER_BUCKETS)) * bucket` for a `bucket` in
-/// `[0, STAGGER_BUCKETS)`, i.e. somewhere in `[max_rows / 2, max_rows]`. 64
+/// `[0, STAGGER_BUCKETS)`, that is, somewhere in `[max_rows / 2, max_rows]`. 64
 /// buckets is ample spread for a dozen streams, and capping the reduction at
 /// 50% bounds the startup cost to one short segment per stream.
 pub const STAGGER_BUCKETS: u64 = 64;

@@ -67,6 +67,14 @@ pub enum Error {
         floor: i64,
     },
 
+    /// Another connection holds the file and this open needed it to itself,
+    /// or a [`ArchiveMut::open`](crate::archive::ArchiveMut::open) holds it exclusively and
+    /// this open needed any access at all. `what` names the file.
+    InUse {
+        /// The file, as the caller named it.
+        what: String,
+    },
+
     /// The file is not a dendro archive: not SQLite, another application's
     /// database, or a copy taken from under a writer that carries no catalog.
     /// `what` names the file (or `<bytes>`), `reason` says which.
@@ -133,8 +141,8 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReadOnly {
-    /// Opened with [`Db::open_read_only`](crate::db::Db::open_read_only).
-    Handle,
+    /// The file is write-protected, or the media is. `Archive::open` reads it.
+    Media,
     /// A legacy-schema archive, which is read through compatibility views.
     /// Writing would mean migrating it in place, which this crate does not do.
     LegacySchema,
@@ -146,9 +154,9 @@ impl fmt::Display for Error {
             Error::AlreadyExists(p) => {
                 write!(f, "{} already exists", p.display())
             }
-            Error::ReadOnly(ReadOnly::Handle) => write!(
+            Error::ReadOnly(ReadOnly::Media) => write!(
                 f,
-                "this archive was opened read-only; reopen it with `Db::open` to modify it"
+                "this archive is on read-only media; open it with `Archive::open` to read it"
             ),
             Error::ReadOnly(ReadOnly::LegacySchema) => write!(
                 f,
@@ -183,6 +191,11 @@ impl fmt::Display for Error {
                 "source {source_id}: timestamp {ts} is not after the newest row its previous \
                  writer session left ({floor}); the clock went backwards across the restart, \
                  and rows would collide or run backwards"
+            ),
+            Error::InUse { what } => write!(
+                f,
+                "{what} is held by another connection: an exclusive open needs the file to \
+                 itself, and nothing can open a file an exclusive handle holds"
             ),
             Error::NotAnArchive { what, reason } => {
                 write!(f, "{what}: not a dendro archive: {reason}")

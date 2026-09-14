@@ -7,10 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, SourceMeta, WalRow};
 use dendro::keys;
 use dendro::segment::{EncodeResult, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 struct Never;
 impl SegmentEncoder for Never {
@@ -44,7 +44,7 @@ fn patch(k: &str, v: &str) -> BTreeMap<String, String> {
 fn a_patch_lands_in_order_with_the_ticks_and_without_a_finalize() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.dendro");
-    let mut archive = Archive::create(&path, Box::new(Never)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Never)).unwrap();
     let mut w = archive.add_source(source()).unwrap();
     let id = w.source_id();
 
@@ -59,10 +59,7 @@ fn a_patch_lands_in_order_with_the_ticks_and_without_a_finalize() {
     w.sync().unwrap();
 
     // Seen from another connection while the writer still holds the file.
-    let seen = Db::open_read_only(&path)
-        .unwrap()
-        .source_metadata(id)
-        .unwrap();
+    let seen = Archive::open(&path).unwrap().source_metadata(id).unwrap();
     assert_eq!(
         seen.get(keys::PRODUCER_EPOCH).map(String::as_str),
         Some("epoch-a")
@@ -81,10 +78,7 @@ fn a_patch_lands_in_order_with_the_ticks_and_without_a_finalize() {
     w.update_metadata(patch(keys::PRODUCER_EPOCH, "epoch-b"))
         .unwrap();
     archive.finalize_single(w, (2_000, 0)).unwrap();
-    let after = Db::open_read_only(&path)
-        .unwrap()
-        .source_metadata(id)
-        .unwrap();
+    let after = Archive::open(&path).unwrap().source_metadata(id).unwrap();
     assert_eq!(
         after.get(keys::PRODUCER_EPOCH).map(String::as_str),
         Some("epoch-b")
@@ -105,21 +99,18 @@ fn a_patch_lands_in_order_with_the_ticks_and_without_a_finalize() {
 fn a_patch_that_cannot_land_does_not_stop_the_writer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.dendro");
-    let mut archive = Archive::create(&path, Box::new(Never)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Never)).unwrap();
     let mut w = archive.add_source(source()).unwrap();
     let id = w.source_id();
     // Delete the source's row out from under the writer, so its patch has no
-    // row to land on. (A second writing connection, deliberately: the point
-    // is the writer's reaction, not the ordering.)
+    // row to land on. A raw second connection, deliberately: the point is the
+    // writer's reaction, and the write handle would refuse a file the writer
+    // holds.
     w.sync().unwrap();
-    {
-        let mut other = Db::open(&path).unwrap();
-        other.update_source_metadata(id, &BTreeMap::new()).unwrap();
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute("DELETE FROM sources WHERE id = ?1", [id])
-            .unwrap();
-    }
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM sources WHERE id = ?1", [id])
+        .unwrap();
     w.update_metadata(patch("k", "v")).unwrap();
     // Still alive: the next hand-off is answered, not refused.
     w.sync().unwrap();

@@ -12,11 +12,11 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::rewrite::{copy_sources_into, ColumnFilter, CopySpec};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 /// Writes the rows, and indexes them by the one thing the archive cannot
 /// see: which "series" each row belongs to. A byte set, deliberately not
@@ -69,7 +69,7 @@ fn row(ts: i64, series: u8) -> WalRow {
 fn an_index_is_stored_beside_its_segment_and_read_back_without_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("i.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Indexed), meta()).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Indexed), meta()).unwrap();
     let id = w.source_id();
 
     // Two segments holding different series, and a live tail holding a third.
@@ -80,7 +80,7 @@ fn an_index_is_stored_beside_its_segment_and_read_back_without_it() {
     w.wal(vec![row(4, 99)]).unwrap();
     w.sync().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     // The cheap half: sealed segments only, and no segment payload is read.
     assert_eq!(
         db.read_segment_indexes(id, "s").unwrap(),
@@ -102,8 +102,8 @@ fn an_index_is_stored_beside_its_segment_and_read_back_without_it() {
 
     // A copy carries each index with the bytes it describes.
     let copied = dir.path().join("copy.dendro");
-    let src = Db::open_read_only(&path).unwrap();
-    let mut dst = Db::create(&copied).unwrap();
+    let src = Archive::open(&path).unwrap();
+    let mut dst = ArchiveMut::create(&copied).unwrap();
     dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Indexed))
         .unwrap();
     let all: Vec<Option<Vec<u8>>> = dst
@@ -139,12 +139,12 @@ fn no_index_is_a_null_not_a_failure() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("i.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Plain), meta()).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Plain), meta()).unwrap();
     let id = w.source_id();
     w.wal(vec![row(1, 1)]).unwrap();
     w.seal(vec!["s".to_string()]).unwrap();
     archive.finalize_single(w, (1, 0)).unwrap();
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(db.read_segment_indexes(id, "s").unwrap(), vec![(0, None)]);
 }
 
@@ -197,18 +197,18 @@ fn a_column_projection_drops_the_index_it_can_no_longer_vouch_for() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("i.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Parquet), meta()).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Parquet), meta()).unwrap();
     w.wal(vec![row(1, 1)]).unwrap();
     w.seal(vec!["s".to_string()]).unwrap();
     archive.finalize_single(w, (1, 0)).unwrap();
 
-    let src = Db::open_read_only(&path).unwrap();
+    let src = Archive::open(&path).unwrap();
     assert_eq!(
         src.read_segment_indexes(1, "s").unwrap()[0].1,
         Some(vec![7])
     );
     let copied = dir.path().join("copy.dendro");
-    let mut dst = Db::create(&copied).unwrap();
+    let mut dst = ArchiveMut::create(&copied).unwrap();
     let keep = KeepAll;
     dst.transaction(|tx| {
         copy_sources_into(

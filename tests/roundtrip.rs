@@ -17,11 +17,11 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::rewrite::{self, ColumnFilter, CopySpec};
 use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 /// A row is a little-endian `i64` and a UTF-8 note. Two columns, one of them a
 /// string — deliberately unlike anything the format was extracted from.
@@ -166,7 +166,7 @@ fn decode(bytes: &[u8]) -> Vec<(i64, i64, String)> {
 }
 
 fn all_rows(path: &std::path::Path, stream: &str) -> Vec<(i64, i64, String)> {
-    let db = Db::open(path).expect("open");
+    let db = Archive::open(path).expect("open");
     let sources = read::read_archive(&db, &ReadingEncoder).expect("read");
     let rec = sources.first().expect("a source");
     let (_, segments) = rec
@@ -186,7 +186,7 @@ fn unsealed_rows_are_readable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
 
-    let mut archive = Archive::create(&path, Box::new(ReadingEncoder)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(ReadingEncoder)).unwrap();
     let mut rec = archive.add_source(seed("probe")).unwrap();
     rec.wal(vec![
         row("temps", 10, 1, "cold"),
@@ -208,7 +208,7 @@ fn sealed_segments_and_the_live_tail_join_without_a_seam() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
 
-    let mut archive = Archive::create(&path, Box::new(ReadingEncoder)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(ReadingEncoder)).unwrap();
     let mut rec = archive.add_source(seed("probe")).unwrap();
     rec.wal(vec![row("temps", 10, 1, "a"), row("temps", 20, 2, "b")])
         .unwrap();
@@ -228,7 +228,7 @@ fn sealed_segments_and_the_live_tail_join_without_a_seam() {
     );
 
     // And the split is real: two segments, not one materialized tail.
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let rec_id = db.read_sources().unwrap()[0].id;
     assert_eq!(db.read_segments(rec_id, "temps").unwrap().len(), 1);
 }
@@ -239,14 +239,14 @@ fn a_seal_touches_only_the_stream_it_names() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
 
-    let mut archive = Archive::create(&path, Box::new(ReadingEncoder)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(ReadingEncoder)).unwrap();
     let mut rec = archive.add_source(seed("probe")).unwrap();
     rec.wal(vec![row("temps", 10, 1, "a"), row("winds", 10, 9, "z")])
         .unwrap();
     rec.seal(vec!["temps".to_string()]).unwrap();
     rec.sync().unwrap();
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let rec_id = db.read_sources().unwrap()[0].id;
     assert_eq!(db.read_segments(rec_id, "temps").unwrap().len(), 1);
     assert_eq!(
@@ -264,7 +264,7 @@ fn a_copy_carries_every_source() {
     let src_path = dir.path().join("src.dendro");
     let dst_path = dir.path().join("dst.dendro");
 
-    let mut archive = Archive::create(&src_path, Box::new(ReadingEncoder)).unwrap();
+    let mut archive = Writer::create(&src_path, Box::new(ReadingEncoder)).unwrap();
     let mut rec = archive.add_source(seed("probe")).unwrap();
     rec.wal(vec![row("temps", 10, 1, "a"), row("temps", 20, 2, "b")])
         .unwrap();
@@ -272,8 +272,8 @@ fn a_copy_carries_every_source() {
     rec.finalize((20, 0)).unwrap();
     archive.join().unwrap();
 
-    let src = Db::open(&src_path).unwrap();
-    let mut dst = Db::create(&dst_path).unwrap();
+    let src = Archive::open(&src_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     let copied = dst
         .transaction(|tx| {
             rewrite::copy_sources_into(&src, tx, &CopySpec::everything(), &ReadingEncoder)
@@ -294,7 +294,7 @@ fn a_copy_keeps_only_the_streams_the_caller_accepts() {
     let src_path = dir.path().join("src.dendro");
     let dst_path = dir.path().join("dst.dendro");
 
-    let mut archive = Archive::create(&src_path, Box::new(ReadingEncoder)).unwrap();
+    let mut archive = Writer::create(&src_path, Box::new(ReadingEncoder)).unwrap();
     let mut rec = archive.add_source(seed("probe")).unwrap();
     rec.wal(vec![
         row("weather/temps", 10, 1, "a"),
@@ -316,12 +316,12 @@ fn a_copy_keeps_only_the_streams_the_caller_accepts() {
         keep_streams: Some(&keep),
         ..CopySpec::everything()
     };
-    let src = Db::open(&src_path).unwrap();
-    let mut dst = Db::create(&dst_path).unwrap();
+    let src = Archive::open(&src_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     dst.transaction(|tx| rewrite::copy_sources_into(&src, tx, &spec, &ReadingEncoder))
         .unwrap();
 
-    let db = Db::open(&dst_path).unwrap();
+    let db = Archive::open(&dst_path).unwrap();
     let rec_id = db.read_sources().unwrap()[0].id;
     let mut streams = db.all_streams(rec_id).unwrap();
     streams.sort();
@@ -336,7 +336,7 @@ fn projection_trims_columns_and_drops_a_stream_left_with_none() {
     let src_path = dir.path().join("src.dendro");
     let dst_path = dir.path().join("dst.dendro");
 
-    let mut archive = Archive::create(&src_path, Box::new(ReadingEncoder)).unwrap();
+    let mut archive = Writer::create(&src_path, Box::new(ReadingEncoder)).unwrap();
     let mut rec = archive.add_source(seed("probe")).unwrap();
     rec.wal(vec![row("temps", 10, 7, "note")]).unwrap();
     rec.seal(vec!["temps".to_string()]).unwrap();
@@ -348,11 +348,11 @@ fn projection_trims_columns_and_drops_a_stream_left_with_none() {
         keep_columns: Some(&Keep(&["value"])),
         ..CopySpec::everything()
     };
-    let src = Db::open(&src_path).unwrap();
-    let mut dst = Db::create(&dst_path).unwrap();
+    let src = Archive::open(&src_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     dst.transaction(|tx| rewrite::copy_sources_into(&src, tx, &spec, &ReadingEncoder))
         .unwrap();
-    let db = Db::open(&dst_path).unwrap();
+    let db = Archive::open(&dst_path).unwrap();
     let rec_id = db.read_sources().unwrap()[0].id;
     let bytes = &db.read_segments(rec_id, "temps").unwrap()[0].bytes;
     assert_eq!(decode(bytes), vec![(10, 7, String::new())]);
@@ -363,10 +363,10 @@ fn projection_trims_columns_and_drops_a_stream_left_with_none() {
         keep_columns: Some(&Keep(&[])),
         ..CopySpec::everything()
     };
-    let mut dst = Db::create(&nothing).unwrap();
+    let mut dst = ArchiveMut::create(&nothing).unwrap();
     dst.transaction(|tx| rewrite::copy_sources_into(&src, tx, &spec, &ReadingEncoder))
         .unwrap();
-    let db = Db::open(&nothing).unwrap();
+    let db = Archive::open(&nothing).unwrap();
     let rec_id = db.read_sources().unwrap()[0].id;
     assert!(db.all_streams(rec_id).unwrap().is_empty());
 }

@@ -7,7 +7,7 @@
 //! bytes are all resident at once (see `seal_batch`).
 //!
 //! **A seal batch is one transaction.** The file at `path` is a valid,
-//! openable archive from the moment [`Archive::create`](crate::writer::Archive::create) returns. There is no
+//! openable archive from the moment [`Writer::create`](crate::writer::Writer::create) returns. There is no
 //! staging file, no rename, and no separate manifest to keep in step — the
 //! catalog IS the database, so the container gets transactions instead of
 //! imitating them.
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::db::{Db, Evicted, SegmentMeta, SourceMeta, WalRow};
+use crate::archive::{Archive, ArchiveMut, Evicted, SegmentMeta, SourceMeta, WalRow};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -168,7 +168,7 @@ pub const RECLAIM_AT_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Handle to the writer thread. Every fallible hand-off reports the writer's
 /// stored error, in the required order: send-failure → join → report.
-pub struct Archive {
+pub struct Writer {
     /// The master sender. Kept only to clone per-source handles from, and
     /// dropped by `join` so the writer's channel can actually close.
     tx: Option<SyncSender<Msg>>,
@@ -178,14 +178,14 @@ pub struct Archive {
     shadowed: ShadowCounts,
 }
 
-impl Archive {
+impl Writer {
     /// Create the archive at `path` and spawn its writer thread.
     ///
     /// The file is a valid, openable archive from the moment this returns:
     /// there is no `.partial`, no rename at the end, and nothing to move
-    /// aside at the start (`Db::create` refuses an existing file
-    /// atomically). That property is what retires the whole staging dance —
-    /// an early-killed source is just a source whose `complete` is 0.
+    /// aside at the start (`Archive::create` refuses an existing file
+    /// atomically). No staging file is needed: an early-killed source is a
+    /// source whose `complete` is 0.
     ///
     /// The archive holds no sources yet; add each with `add_source`.
     pub fn create(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Result<Self> {
@@ -203,7 +203,7 @@ impl Archive {
         encoder: Box<dyn SegmentEncoder + Send>,
         checkpoint_every: Duration,
     ) -> Result<Self> {
-        let db = Db::create(path)?;
+        let db = ArchiveMut::create(path)?;
         Self::spawn(db, path, encoder, checkpoint_every, true)
     }
 
@@ -225,7 +225,7 @@ impl Archive {
         encoder: Box<dyn SegmentEncoder + Send>,
         checkpoint_every: Duration,
     ) -> Result<Self> {
-        let db = Db::open_for_write(path)?;
+        let db = ArchiveMut::open_for_write(path)?;
         Self::spawn(db, path, encoder, checkpoint_every, false)
     }
 
@@ -242,7 +242,7 @@ impl Archive {
         checkpoint_every: Duration,
         busy_timeout: Duration,
     ) -> Result<Self> {
-        let db = Db::create(path)?;
+        let db = ArchiveMut::create(path)?;
         db.set_busy_timeout(busy_timeout)?;
         Self::spawn(db, path, encoder, checkpoint_every, true)
     }
@@ -251,7 +251,7 @@ impl Archive {
     /// whether the file is ours to remove if the spawn fails: a file we just
     /// created is; one we reopened is not.
     fn spawn(
-        db: Db,
+        db: ArchiveMut,
         path: &Path,
         encoder: Box<dyn SegmentEncoder + Send>,
         checkpoint_every: Duration,
@@ -293,7 +293,7 @@ impl Archive {
                 // connection with it, so the file is closed and ours to remove
                 // — if we made it. A reopened archive is left as it was.
                 if created {
-                    Db::remove_archive(path);
+                    Archive::remove_archive(path);
                 }
                 return Err(Error::Message(format!(
                     "failed to spawn the archive writer thread: {e}"
@@ -537,16 +537,16 @@ impl Archive {
     }
 }
 
-impl std::fmt::Debug for Archive {
+impl std::fmt::Debug for Writer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Archive")
+        f.debug_struct("Writer")
             .field("path", &self.path)
             .field("joined", &self.thread.is_none())
             .finish_non_exhaustive()
     }
 }
 
-impl Drop for Archive {
+impl Drop for Writer {
     /// The writer must be joined on every path out — including the ones that
     /// skip an explicit join — so a dropped archive never leaves a detached
     /// thread still writing to the database.
@@ -574,7 +574,7 @@ pub struct SourceWriter {
     tx: SyncSender<Msg>,
     source_id: i64,
     /// Set on a resumed source: every row this session commits must be
-    /// stamped after it. See [`Archive::resume_source`].
+    /// stamped after it. See [`Writer::resume_source`].
     floor_ts: Option<i64>,
     /// This source's stagger identity — its canonical label set. Held here
     /// so the seal policy can desync tables ACROSS sources as well as
@@ -624,7 +624,7 @@ impl SourceWriter {
     ///
     /// The single-source spelling.
     /// An archive with several sources must stage each one and commit the
-    /// tick once, through [`Archive::wal_tick`]: one transaction instead of
+    /// tick once, through [`Writer::wal_tick`]: one transaction instead of
     /// one per source.
     pub fn wal(&mut self, rows: Vec<WalRow>) -> Result<()> {
         if rows.is_empty() {
@@ -633,7 +633,7 @@ impl SourceWriter {
         // The handle's half of the floor: a resumed source refuses, here and
         // now, a row at or before its previous session's newest. The writer
         // thread enforces the same rule for rows that arrive through
-        // `Archive::wal_tick`, which has no handle to ask.
+        // `Writer::wal_tick`, which has no handle to ask.
         if let Some(floor) = self.floor_ts {
             if let Some(r) = rows.iter().find(|r| r.ts <= floor) {
                 return Err(Error::TimelineBackwards {
@@ -712,10 +712,9 @@ impl SourceWriter {
     /// Ask the writer to apply retention at `cutoff_ts`.
     ///
     /// It goes through the writer thread rather than a second connection for
-    /// the same reason everything else does: the writer OWNS this file, and a
-    /// second writing connection would stall on the write lock for up to
-    /// `busy_timeout` (5 s, rusqlite's default) before failing — which against
-    /// a tick reads as a hang. Readers are unaffected either way; WAL mode
+    /// the same reason everything else does: the writer OWNS this file, and
+    /// [`ArchiveMut::open`](crate::archive::ArchiveMut::open) on a file it holds is refused
+    /// as `InUse`. Readers are unaffected either way; WAL mode
     /// lets them proceed while this commits.
     ///
     /// Fire-and-forget, like `wal` and `seal`: a failure surfaces on the next
@@ -733,10 +732,9 @@ impl SourceWriter {
     /// irreversibly.
     ///
     /// The writer-side spelling of
-    /// [`Db::evict_streams_before`](crate::db::Db::evict_streams_before), and
-    /// the one to use: reaching the `Db` method directly means a second writing
-    /// connection to a file this thread already owns, which stalls on SQLite's
-    /// write lock for `busy_timeout` and then fails.
+    /// [`ArchiveMut::evict_streams_before`](crate::archive::ArchiveMut::evict_streams_before),
+    /// and the one to use while the writer runs: a `ArchiveMut::open` on a file
+    /// this thread holds is refused as `InUse`.
     pub fn evict_streams_before(&mut self, cutoff_ts: i64, keep: StreamFilter) -> Result<Evicted> {
         self.evict(cutoff_ts, Some(keep))
     }
@@ -763,9 +761,9 @@ impl SourceWriter {
     /// **The one place the writer is not fire-and-forget, and it exists because
     /// the file lags the caller.** Every other hand-off queues work and returns
     /// immediately, so a caller that hands off an ingest or an eviction and
-    /// then opens a SECOND connection to look at the file — `summarize`, a
-    /// dump, `/status` — can legitimately observe the state from before its own
-    /// last call. That is fine for a status reading and fatal for an assertion.
+    /// then opens a SECOND connection to look at the file, for a status report
+    /// or a dump, can observe the state from before its own last call. That is
+    /// fine for a status reading and fatal for an assertion.
     ///
     /// Ordering is what makes this work rather than any locking: the channel is
     /// FIFO and the writer is single-threaded, so the reply cannot be sent
@@ -779,7 +777,7 @@ impl SourceWriter {
     ///
     /// **Test-only, and that is a statement about the callers rather than the
     /// mechanism.** Nothing in production asserts on the file immediately after
-    /// handing off a tick: `/status` reporting retention a tick behind is
+    /// handing off a tick: a status report showing retention a tick behind is
     /// inherent to an asynchronous writer and harmless. Tests do assert it, and
     /// without a barrier they race the writer. Give this a `cfg`-free home the
     /// moment a real caller needs to see its own last tick.
@@ -801,7 +799,7 @@ impl SourceWriter {
     /// gone, so a handle kept alive past its finalize would stall the join.
     /// **Synchronous**, unlike the per-tick hand-offs. It used to queue and
     /// return `Ok(())` with nothing committed, so the only way to learn that
-    /// the final transaction had failed was `Archive::join`, which is easy to
+    /// the final transaction had failed was `Writer::join`, which is easy to
     /// omit because `Drop` looks like it handles things — and `Drop` cannot
     /// return an error, so it turns the failure into a log line. A caller that
     /// skipped the join got a silent downgrade from "finished archive" to
@@ -968,7 +966,7 @@ impl WriterHealth {
 /// bad tick failed every source in the archive, permanently, and told the
 /// culprit `Ok`.
 fn commit_tick(
-    db: &mut Db,
+    db: &mut ArchiveMut,
     ticks: &[(i64, Vec<WalRow>)],
     floors: &BTreeMap<i64, i64>,
     watermarks: &BTreeMap<i64, BTreeMap<String, i64>>,
@@ -1096,7 +1094,7 @@ fn commit_tick(
 /// Append a writer session to a source's `WRITER_SESSIONS` metadata — and,
 /// for a resume, a `writer_session` event under `EVENTS` at the new anchor.
 fn record_session(
-    db: &mut Db,
+    db: &mut ArchiveMut,
     source_id: i64,
     clock_anchor_wall_ns: i64,
     resumed_after_ts: Option<Option<i64>>,
@@ -1147,9 +1145,9 @@ fn record_session(
     db.patch_source_metadata(source_id, &patch)
 }
 
-/// The writer-thread half of [`Archive::resume_source`].
+/// The writer-thread half of [`Writer::resume_source`].
 fn resume_source(
-    db: &mut Db,
+    db: &mut ArchiveMut,
     source_id: i64,
     clock_anchor_wall_ns: i64,
     encoder: &(dyn SegmentEncoder + Send),
@@ -1194,7 +1192,7 @@ struct Encoded {
 /// instead of accumulating against a broken source.
 fn writer_thread(
     rx: Receiver<Msg>,
-    mut db: Db,
+    mut db: ArchiveMut,
     err_slot: ErrorSlot,
     shadowed: ShadowCounts,
     checkpoint_every: Duration,
@@ -1229,7 +1227,7 @@ fn writer_thread(
 /// as of the last checkpoint and nothing after it. That copy is not corrupt; it
 /// ends early, and nothing about it says so.
 ///
-/// [`crate::db`]'s autocheckpoint bounds how many bytes can accumulate
+/// [`crate::archive`]'s autocheckpoint bounds how many bytes can accumulate
 /// (4 MiB). It cannot bound how much TIME they represent: a busy source
 /// crosses 4 MiB in seconds, a quiet one in hours, and the quiet one is the
 /// case where a copy is silently useless. Measured before this existed: 123
@@ -1240,13 +1238,13 @@ fn writer_thread(
 /// incident, a benchmark run) and long against the work: a passive checkpoint
 /// of one interval's frames is a few tens of KiB at a typical cadence,
 /// and it runs on the writer thread rather than the append loop. It does not
-/// make a copy exact — [`Db::vacuum_into`] does that — it makes what a
+/// make a copy exact — [`Archive::vacuum_into`] does that — it makes what a
 /// copy loses bounded and small.
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 
 fn writer_loop(
     rx: &Receiver<Msg>,
-    db: &mut Db,
+    db: &mut ArchiveMut,
     shadowed: &ShadowCounts,
     checkpoint_every: Duration,
     encoder: &(dyn SegmentEncoder + Send),
@@ -1507,7 +1505,7 @@ fn writer_loop(
 /// reclaim a buffer that shrank would keep its high-water size forever.
 #[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
 #[doc(hidden)]
-pub fn reclaim_if_fragmented(db: &mut Db) -> Result<()> {
+pub fn reclaim_if_fragmented(db: &mut ArchiveMut) -> Result<()> {
     if should_reclaim(
         db.pragma_u32("freelist_count")?,
         db.pragma_u32("page_count")?,
@@ -1536,7 +1534,7 @@ pub fn should_reclaim(free_pages: u32, pages: u32) -> bool {
 /// return. Whatever is left is reclaimed by the next retention pass on the
 /// next open; nothing is lost by stopping early, only space not yet given
 /// back.
-fn reclaim_all(db: &mut Db) -> Result<()> {
+fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
     let started = Instant::now();
     while db.pragma_u32("freelist_count")? > 0 {
         db.incremental_vacuum(RECLAIM_PAGES_PER_PASS)?;
@@ -1557,7 +1555,7 @@ fn reclaim_all(db: &mut Db) -> Result<()> {
 /// observation in one transaction, then prune the sealed streams' WAL
 /// outside it. Returns the timestamp of the observation recorded, if any.
 fn seal_batch(
-    db: &mut Db,
+    db: &mut ArchiveMut,
     source_id: i64,
     next_seq: &mut BTreeMap<(i64, String), u64>,
     watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
@@ -1698,7 +1696,7 @@ fn seal_batch(
     // a large delete on the tick path. `live_wal`'s watermark filter makes a
     // crash between the commit above and the delete below harmless — a
     // straddling row is not live — which leaves the prune a pure
-    // background optimization. `Tx` does not expose `prune_wal`, so this
+    // background optimization. `Transaction` does not expose `prune_wal`, so this
     // ordering is enforced by the type, not by this comment.
     //
     // Each stream is pruned only up to its OWN segment's `last_ts`: rows a

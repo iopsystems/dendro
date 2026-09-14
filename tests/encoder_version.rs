@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::keys;
 use dendro::read;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 use dendro::Error;
 
 struct Tags(&'static str);
@@ -55,7 +55,7 @@ fn row(ts: i64) -> WalRow {
 }
 
 fn written_with(path: &std::path::Path, version: &'static str) -> i64 {
-    let (archive, mut w) = Archive::single(path, Box::new(Tags(version)), source()).unwrap();
+    let (archive, mut w) = Writer::single(path, Box::new(Tags(version)), source()).unwrap();
     let id = w.source_id();
     w.wal(vec![row(1)]).unwrap();
     archive.finalize_single(w, (1, 0)).unwrap();
@@ -67,7 +67,7 @@ fn the_writing_encoders_version_is_recorded_and_a_mismatch_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.dendro");
     let id = written_with(&path, "v1");
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(
         db.source_metadata(id)
             .unwrap()
@@ -98,11 +98,11 @@ fn the_writing_encoders_version_is_recorded_and_a_mismatch_is_refused() {
 
     // Nor can a different version resume the source, or copy it (the tail
     // is re-encoded on the way across).
-    let mut archive = Archive::open(&path, Box::new(Tags("v2"))).unwrap();
+    let mut archive = Writer::open(&path, Box::new(Tags("v2"))).unwrap();
     assert!(is_mismatch(archive.resume_source(id, 100).unwrap_err()));
     drop(archive);
-    let src = Db::open_read_only(&path).unwrap();
-    let mut dst = Db::create(&dir.path().join("copy.dendro")).unwrap();
+    let src = Archive::open(&path).unwrap();
+    let mut dst = ArchiveMut::create(&dir.path().join("copy.dendro")).unwrap();
     let err = dst
         .transaction(|tx| {
             dendro::rewrite::copy_sources_into(
@@ -123,7 +123,7 @@ fn an_unversioned_source_is_read_by_any_encoder() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.dendro");
     let id = written_with(&path, "");
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert!(!db.source_metadata(id).unwrap().contains_key(keys::ENCODER));
     assert!(read::read_archive(&db, &Tags("v9")).is_ok());
 }

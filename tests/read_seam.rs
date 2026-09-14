@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SegmentMeta, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
@@ -45,7 +45,7 @@ fn source() -> SourceMeta {
 
 /// An archive holding ts 1..=3 on stream `s`, unsealed.
 fn unsealed(path: &std::path::Path) -> i64 {
-    let mut db = Db::create(path).unwrap();
+    let mut db = ArchiveMut::create(path).unwrap();
     let id = db.insert_source(&source()).unwrap();
     for ts in 1..=3i64 {
         db.insert_wal_rows(
@@ -66,22 +66,37 @@ fn unsealed(path: &std::path::Path) -> i64 {
 ///
 /// On its own connection, so the reader's snapshot is what is under test rather
 /// than the borrow checker.
+///
+/// A raw connection rather than a [`ArchiveMut`]: the write handle takes the file
+/// exclusively and would be refused while the reader under test holds it,
+/// and what this stands in for is the writer thread, which shares.
 fn seal_concurrently(path: &std::path::Path, id: i64) {
-    let mut other = Db::open(path).unwrap();
+    let other = rusqlite::Connection::open(path).unwrap();
     other
-        .insert_segment(
-            id,
-            "s",
-            0,
-            &SegmentMeta {
-                rows: 3,
-                first_ts: 1,
-                last_ts: 3,
-            },
-            b"1,2,3",
+        .execute(
+            "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes) \
+             VALUES (?1, 's', 0, 3, 1, 3, ?2)",
+            rusqlite::params![id, b"1,2,3".as_slice()],
         )
         .unwrap();
-    other.prune_wal(id, "s", 3).unwrap();
+    other
+        .execute(
+            "DELETE FROM wal WHERE source_id = ?1 AND stream = 's' AND ts <= 3",
+            [id],
+        )
+        .unwrap();
+}
+
+/// One WAL row for stream `s`, committed from a raw connection for the same
+/// reason as [`seal_concurrently`].
+fn append_concurrently(path: &std::path::Path, id: i64, ts: i64) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute(
+            "INSERT INTO wal(source_id, stream, ts, wall_offset, row) VALUES (?1, 's', ?2, 0, x'01')",
+            rusqlite::params![id, ts],
+        )
+        .unwrap();
 }
 
 /// Two unsnapshotted reads lose every row. This is the defect, staged.
@@ -95,7 +110,7 @@ fn two_reads_without_a_snapshot_lose_the_rows_entirely() {
     let path = dir.path().join("a.dendro");
     let id = unsealed(&path);
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     // Exactly what `stream_segments` used to do: segments, then live WAL, as
     // two separate statements.
     let segments = db.read_segments(id, "s").unwrap();
@@ -119,7 +134,7 @@ fn one_snapshot_survives_a_seal_landing_mid_read() {
     let path = dir.path().join("a.dendro");
     let id = unsealed(&path);
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let seen = db
         .read_snapshot(|db| {
             // Takes the snapshot (BEGIN DEFERRED acquires on first read).
@@ -164,18 +179,7 @@ struct AppendsWhileEncoding {
 impl SegmentEncoder for AppendsWhileEncoding {
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
         if stream == "a" && !self.fired.replace(true) {
-            let mut other = Db::open(&self.path).unwrap();
-            other
-                .insert_wal_rows(
-                    self.id,
-                    &[WalRow {
-                        stream: "s".to_string(),
-                        ts: 4,
-                        wall_offset: 0,
-                        row: vec![1],
-                    }],
-                )
-                .unwrap();
+            append_concurrently(&self.path, self.id, 4);
         }
         Tags.encode(stream, rows)
     }
@@ -186,7 +190,7 @@ fn read_archive_holds_one_snapshot_across_streams() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
 
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&source()).unwrap();
     // `a` sorts before `s`, so it is read first and its encode runs before the
     // reads of `s`.
@@ -206,7 +210,7 @@ fn read_archive_holds_one_snapshot_across_streams() {
     }
     drop(db);
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let encoder = AppendsWhileEncoding {
         path: path.clone(),
         id,
@@ -241,7 +245,7 @@ fn read_archive_holds_one_snapshot_across_streams() {
 #[test]
 #[cfg(feature = "write")]
 fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     /// Encodes everything except the newest row, the way an encoder waiting for
     /// a record to complete would.
@@ -257,7 +261,7 @@ fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(DropsLast)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(DropsLast)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for ts in 1..=3i64 {
         src.wal(vec![WalRow {
@@ -271,7 +275,7 @@ fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
     src.seal(vec!["s".to_string()]).unwrap();
     src.sync().unwrap();
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let meta = db.read_segment_meta(1, "s").unwrap();
     assert_eq!(
         (meta[0].1.first_ts, meta[0].1.last_ts),
@@ -302,7 +306,7 @@ fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
 #[test]
 #[cfg(feature = "write")]
 fn an_encoder_cannot_invent_coverage() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     struct Liar;
     impl SegmentEncoder for Liar {
@@ -322,7 +326,7 @@ fn an_encoder_cannot_invent_coverage() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(Liar)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Liar)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     src.wal(vec![WalRow {
         stream: "s".to_string(),
@@ -345,18 +349,18 @@ fn an_encoder_cannot_invent_coverage() {
 
 /// Retention through the writer: per stream, and it reports what it did.
 ///
-/// Both halves were unreachable. `evict_streams_before` existed only on `Db`,
+/// Both halves were unreachable. `evict_streams_before` existed only on `Archive`,
 /// so using it meant a second writing connection to a file the writer thread
 /// owns; and the writer discarded the `Evicted` count, which is what tells a
 /// caller "the window moved" from "nothing was old enough yet".
 #[test]
 #[cfg(feature = "write")]
 fn retention_runs_through_the_writer_and_reports_what_it_removed() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for stream in ["debug/a", "metric/b"] {
         for ts in [10i64, 20] {
@@ -380,7 +384,7 @@ fn retention_runs_through_the_writer_and_reports_what_it_removed() {
         .unwrap();
     assert_eq!(evicted.segments, 1, "only the debug stream's segment");
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(db.all_streams(1).unwrap(), vec!["metric/b".to_string()]);
 }
 
@@ -393,11 +397,11 @@ fn retention_runs_through_the_writer_and_reports_what_it_removed() {
 #[test]
 #[cfg(feature = "write")]
 fn two_seals_at_one_timestamp_leave_one_clock_observation() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for (stream, offset) in [("a", 11i64), ("s", 22)] {
         src.wal(vec![WalRow {
@@ -411,7 +415,7 @@ fn two_seals_at_one_timestamp_leave_one_clock_observation() {
     }
     src.sync().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let offsets = db.read_clock_offsets(1).unwrap();
     assert_eq!(
         offsets.len(),
@@ -426,11 +430,11 @@ fn two_seals_at_one_timestamp_leave_one_clock_observation() {
 #[test]
 #[cfg(feature = "write")]
 fn retention_bounds_the_clock_offset_series() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for ts in [10i64, 20, 30] {
         src.wal(vec![WalRow {
@@ -444,14 +448,14 @@ fn retention_bounds_the_clock_offset_series() {
     }
     src.sync().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(db.read_clock_offsets(1).unwrap().len(), 3);
     drop(db);
 
     src.evict_before(25).unwrap();
     src.sync().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let left: Vec<i64> = db
         .read_clock_offsets(1)
         .unwrap()
@@ -470,14 +474,14 @@ fn retention_bounds_the_clock_offset_series() {
 #[test]
 #[cfg(feature = "write")]
 fn everything_copies_rows_from_before_the_epoch() {
-    use dendro::db::SegmentMeta;
+    use dendro::archive::SegmentMeta;
     use dendro::rewrite::{copy_sources_into, CopySpec};
 
     let dir = tempfile::tempdir().unwrap();
     let src_path = dir.path().join("src.dendro");
     let dst_path = dir.path().join("dst.dendro");
 
-    let mut src = Db::create(&src_path).unwrap();
+    let mut src = ArchiveMut::create(&src_path).unwrap();
     let id = src.insert_source(&source()).unwrap();
     src.insert_segment(
         id,
@@ -502,11 +506,11 @@ fn everything_copies_rows_from_before_the_epoch() {
     )
     .unwrap();
 
-    let mut dst = Db::create(&dst_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Tags))
         .unwrap();
 
-    let db = Db::open(&dst_path).unwrap();
+    let db = Archive::open(&dst_path).unwrap();
     let mut streams = db.all_streams(1).unwrap();
     streams.sort();
     assert_eq!(
@@ -526,7 +530,7 @@ fn everything_copies_rows_from_before_the_epoch() {
 #[test]
 #[cfg(feature = "write")]
 fn an_encoder_that_drops_a_middle_run_does_not_lose_the_rows() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     /// Keeps the first and last row only — the shape that slipped through.
     struct DropsMiddle;
@@ -542,7 +546,7 @@ fn an_encoder_that_drops_a_middle_run_does_not_lose_the_rows() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(DropsMiddle)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(DropsMiddle)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for ts in 1..=4i64 {
         src.wal(vec![WalRow {
@@ -564,7 +568,7 @@ fn an_encoder_that_drops_a_middle_run_does_not_lose_the_rows() {
             "if it is refused, it must be refused as a contract breach: {e:?}"
         ),
         Ok(()) => {
-            let db = Db::open_read_only(&path).unwrap();
+            let db = Archive::open(&path).unwrap();
             let live: Vec<i64> = db.live_wal(1, "s").unwrap().iter().map(|r| r.ts).collect();
             let sealed: Vec<String> = db
                 .read_segments(1, "s")
@@ -587,7 +591,7 @@ fn an_encoder_that_drops_a_middle_run_does_not_lose_the_rows() {
 #[test]
 #[cfg(feature = "write")]
 fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     struct UnderstatesLast;
     impl SegmentEncoder for UnderstatesLast {
@@ -605,7 +609,7 @@ fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(UnderstatesLast)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(UnderstatesLast)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     for ts in 1..=3i64 {
         src.wal(vec![WalRow {
@@ -636,7 +640,7 @@ fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
 #[test]
 #[cfg(feature = "write")]
 fn a_copy_catalogs_the_tail_it_wrote() {
-    use dendro::db::SegmentMeta;
+    use dendro::archive::SegmentMeta;
     use dendro::rewrite::{copy_sources_into, CopySpec};
 
     /// Drops the newest row, the way an encoder waiting on a complete record
@@ -655,7 +659,7 @@ fn a_copy_catalogs_the_tail_it_wrote() {
     let src_path = dir.path().join("src.dendro");
     let dst_path = dir.path().join("dst.dendro");
 
-    let mut src = Db::create(&src_path).unwrap();
+    let mut src = ArchiveMut::create(&src_path).unwrap();
     let id = src.insert_source(&source()).unwrap();
     for ts in 1..=3i64 {
         src.insert_wal_rows(
@@ -670,11 +674,11 @@ fn a_copy_catalogs_the_tail_it_wrote() {
         .unwrap();
     }
 
-    let mut dst = Db::create(&dst_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
     dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &DropsLast))
         .unwrap();
 
-    let db = Db::open_read_only(&dst_path).unwrap();
+    let db = Archive::open(&dst_path).unwrap();
     let meta: Vec<SegmentMeta> = db
         .read_segment_meta(1, "s")
         .unwrap()
@@ -698,7 +702,7 @@ fn a_copy_catalogs_the_tail_it_wrote() {
 #[test]
 #[cfg(feature = "write")]
 fn a_clock_observation_comes_from_one_row() {
-    use dendro::writer::Archive;
+    use dendro::writer::Writer;
 
     struct DropsLast;
     impl SegmentEncoder for DropsLast {
@@ -712,7 +716,7 @@ fn a_clock_observation_comes_from_one_row() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
-    let mut archive = Archive::create(&path, Box::new(DropsLast)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(DropsLast)).unwrap();
     let mut src = archive.add_source(source()).unwrap();
     // ts=10 carries offset 10000; ts=20 carries 20000; ts=30 carries 30000.
     for ts in [10i64, 20, 30] {
@@ -727,7 +731,7 @@ fn a_clock_observation_comes_from_one_row() {
     src.seal(vec!["s".to_string()]).unwrap();
     src.sync().unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let offsets = db.read_clock_offsets(1).unwrap();
     assert_eq!(offsets.len(), 1);
     let (ts, offset) = offsets[0];
@@ -744,7 +748,7 @@ fn a_clock_observation_comes_from_one_row() {
 /// it and left the transaction open. The re-entrancy guard then saw a non-
 /// autocommit connection and reused that stale snapshot for every later read —
 /// silently, forever. The trait doc for `SegmentEncoder` explicitly warns that
-/// a naive encoder panics inside the reader, and `SegmentBytes::SharedDb`
+/// a naive encoder panics inside the reader, and `SegmentBytes::Shared`
 /// deliberately recovers from lock poisoning, so one thread's panic could pin
 /// every later reader on that handle.
 #[test]
@@ -753,7 +757,7 @@ fn a_panic_inside_a_snapshot_does_not_leave_the_transaction_open() {
     let path = dir.path().join("a.dendro");
     let id = unsealed(&path);
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let before: Vec<i64> = db
         .read_snapshot(|db| Ok(db.live_wal(id, "s")?.iter().map(|r| r.ts).collect()))
         .unwrap();
@@ -771,20 +775,7 @@ fn a_panic_inside_a_snapshot_does_not_leave_the_transaction_open() {
     );
 
     // A row committed after the panic, from another connection.
-    {
-        let mut other = Db::open(&path).unwrap();
-        other
-            .insert_wal_rows(
-                id,
-                &[WalRow {
-                    stream: "s".to_string(),
-                    ts: 4,
-                    wall_offset: 0,
-                    row: vec![1],
-                }],
-            )
-            .unwrap();
-    }
+    append_concurrently(&path, id, 4);
 
     let after: Vec<i64> = db
         .read_snapshot(|db| Ok(db.live_wal(id, "s")?.iter().map(|r| r.ts).collect()))

@@ -13,10 +13,10 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SourceMeta, WalRow};
+use dendro::archive::{Archive, SourceMeta, WalRow};
 use dendro::read;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Archive;
+use dendro::writer::Writer;
 
 struct Tags;
 
@@ -55,7 +55,7 @@ fn row(stream: &str, ts: i64) -> WalRow {
 
 /// Every stream of every source, as the encoder rendered it.
 fn read_back(path: &std::path::Path) -> BTreeMap<String, Vec<String>> {
-    let db = Db::open_read_only(path).unwrap();
+    let db = Archive::open(path).unwrap();
     let mut out = BTreeMap::new();
     for src in read::read_archive(&db, &Tags).unwrap() {
         for (stream, segments) in src.streams {
@@ -75,7 +75,7 @@ fn read_back(path: &std::path::Path) -> BTreeMap<String, Vec<String>> {
 fn an_append_below_the_sealed_watermark_is_dropped_and_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Tags), meta("a")).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
 
     w.wal(vec![row("s", 100)]).unwrap();
     w.seal(vec!["s".to_string()]).unwrap();
@@ -100,7 +100,7 @@ fn an_append_below_the_sealed_watermark_is_dropped_and_counted() {
     // And the archive holds exactly the two rows it can serve — the dropped
     // ones are not in the WAL either, which is the point: before this they
     // were stored, forever, and readable by nobody.
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let id = db.read_sources().unwrap()[0].id;
     assert_eq!(
         db.read_wal(id, "s")
@@ -122,7 +122,7 @@ fn an_append_below_the_sealed_watermark_is_dropped_and_counted() {
 fn a_late_row_does_not_take_its_tick_with_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Tags), meta("a")).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
     w.wal(vec![row("s", 100)]).unwrap();
     w.seal(vec!["s".to_string()]).unwrap();
     w.sync().unwrap();
@@ -147,7 +147,7 @@ fn a_late_row_does_not_take_its_tick_with_it() {
 fn a_sibling_stream_and_another_source_are_unaffected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut a = archive.add_source(meta("a")).unwrap();
     let mut b = archive.add_source(meta("b")).unwrap();
 
@@ -192,19 +192,19 @@ fn a_sibling_stream_and_another_source_are_unaffected() {
 /// That floor is at or above every one of the source's stream watermarks, so
 /// for a resumed source it subsumes the check below entirely. The writer
 /// still seeds its watermarks from the catalog on reopen (see
-/// `Db::sealed_watermarks`); this records that the floor is what a caller
+/// `Archive::sealed_watermarks`); this records that the floor is what a caller
 /// actually meets, so nobody reads the seeding as the thing doing the work.
 #[test]
 fn a_resumed_source_is_refused_at_the_handle_which_is_stronger() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Tags), meta("a")).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
     let id = w.source_id();
     w.wal(vec![row("s", 100)]).unwrap();
     w.seal(vec!["s".to_string()]).unwrap();
     archive.finalize_single(w, (100, 0)).unwrap();
 
-    let mut archive = Archive::open(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
     let (mut w, floor) = archive.resume_source(id, 101).unwrap();
     assert_eq!(floor, Some(100));
     match w.wal(vec![row("s", 60)]).unwrap_err() {
@@ -228,7 +228,7 @@ fn a_resumed_source_is_refused_at_the_handle_which_is_stronger() {
 fn sealed_watermarks_are_per_source_and_per_stream() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let mut archive = Archive::create(&path, Box::new(Tags)).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut a = archive.add_source(meta("a")).unwrap();
     let mut b = archive.add_source(meta("b")).unwrap();
     let (ia, ib) = (a.source_id(), b.source_id());
@@ -243,10 +243,7 @@ fn sealed_watermarks_are_per_source_and_per_stream() {
     a.wal(vec![row("unsealed", 999)]).unwrap();
     a.sync().unwrap();
 
-    let marks = Db::open_read_only(&path)
-        .unwrap()
-        .sealed_watermarks()
-        .unwrap();
+    let marks = Archive::open(&path).unwrap().sealed_watermarks().unwrap();
     assert_eq!(marks[&ia]["fast"], 100);
     assert_eq!(
         marks[&ia]["slow"], 5,
@@ -271,7 +268,7 @@ fn sealed_watermarks_are_per_source_and_per_stream() {
 fn the_watermark_moves_with_the_commit_not_the_request() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let (archive, mut w) = Archive::single(&path, Box::new(Tags), meta("a")).unwrap();
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
 
     // Never sealed, so there is no watermark at all: out-of-order rows
     // within one unsealed span are the encoder's to order, and are kept.
@@ -281,7 +278,7 @@ fn the_watermark_moves_with_the_commit_not_the_request() {
     assert_eq!(w.dropped_out_of_order(), 0, "no segment, no watermark");
     archive.finalize_single(w, (300, 0)).unwrap();
 
-    let db = Db::open_read_only(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     let id = db.read_sources().unwrap()[0].id;
     assert_eq!(db.live_wal(id, "s").unwrap().len(), 2, "both are readable");
 }

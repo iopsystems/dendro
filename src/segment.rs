@@ -9,7 +9,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::db::WalRow;
+use crate::archive::WalRow;
 use crate::error::{Error, Result};
 
 /// One sealed segment: parquet bytes plus the catalog facts about what is in
@@ -60,7 +60,7 @@ pub struct Segment {
     /// cost the single-file property the whole container is shaped around.
     ///
     /// So the archive stores these bytes beside the segment and hands them
-    /// back ([`Db::read_segment_indexes`](crate::db::Db::read_segment_indexes),
+    /// back ([`Archive::read_segment_indexes`](crate::archive::Archive::read_segment_indexes),
     /// [`read::stream_indexes`](crate::read::stream_indexes)) without ever
     /// interpreting them. A name set, a bloom filter, per-column min/max,
     /// whatever answers your question — it is opaque either way, exactly as

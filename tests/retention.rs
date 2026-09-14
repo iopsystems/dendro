@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, SegmentMeta, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SegmentMeta, SourceMeta, WalRow};
 
 fn source() -> SourceMeta {
     SourceMeta {
@@ -13,7 +13,7 @@ fn source() -> SourceMeta {
     }
 }
 
-fn segment(db: &mut Db, id: i64, stream: &str, seq: u64, first_ts: i64, last_ts: i64) {
+fn segment(db: &mut ArchiveMut, id: i64, stream: &str, seq: u64, first_ts: i64, last_ts: i64) {
     db.insert_segment(
         id,
         stream,
@@ -28,7 +28,7 @@ fn segment(db: &mut Db, id: i64, stream: &str, seq: u64, first_ts: i64, last_ts:
     .unwrap();
 }
 
-fn offsets(db: &Db, id: i64) -> Vec<i64> {
+fn offsets(db: &Archive, id: i64) -> Vec<i64> {
     db.read_clock_offsets(id)
         .unwrap()
         .into_iter()
@@ -40,7 +40,7 @@ fn offsets(db: &Db, id: i64) -> Vec<i64> {
 fn per_stream_eviction_cuts_clock_offsets_at_the_oldest_surviving_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.dendro");
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&source()).unwrap();
     // Stream `a` is expensive and kept briefly; `b` is kept longer.
     segment(&mut db, id, "a", 0, 100, 100);
@@ -83,7 +83,7 @@ fn per_stream_eviction_cuts_clock_offsets_at_the_oldest_surviving_row() {
 fn eviction_reports_the_unsealed_rows_it_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.dendro");
-    let mut db = Db::create(&path).unwrap();
+    let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&source()).unwrap();
     // `a`: sealed through 100, with a shadowed (pruned-later) row at 100
     // still in the WAL, and live rows at 150 and 250.
@@ -142,7 +142,7 @@ fn eviction_reports_the_unsealed_rows_it_deleted() {
     );
 
     // Per stream, the same accounting, per stream.
-    let mut db2 = Db::create(&dir.path().join("r2.dendro")).unwrap();
+    let mut db2 = ArchiveMut::create(&dir.path().join("r2.dendro")).unwrap();
     let id2 = db2.insert_source(&source()).unwrap();
     db2.insert_wal_rows(
         id2,

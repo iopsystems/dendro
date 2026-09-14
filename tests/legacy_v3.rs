@@ -4,12 +4,12 @@
 //!
 //! The fixture is built here with raw SQL rather than checked in as a binary,
 //! so the schema this crate promises to read is written down in a form a
-//! reader can check against the compatibility views in `db.rs`. If those views
+//! reader can check against the compatibility views in `archive.rs`. If those views
 //! and this DDL ever disagree, that is the bug this file exists to catch.
 
 use std::collections::BTreeMap;
 
-use dendro::db::{Db, WalRow};
+use dendro::archive::{Archive, ArchiveMut, WalRow};
 use dendro::read;
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
@@ -108,7 +108,7 @@ fn a_legacy_v3_archive_reads() {
     let path = dir.path().join("legacy.rez");
     write_v3_fixture(&path);
 
-    let db = Db::open(&path).expect("a v3 archive should open");
+    let db = Archive::open(&path).expect("a v3 archive should open");
     let sources = read::read_archive(&db, &CountingEncoder).expect("read");
     assert_eq!(sources.len(), 1);
 
@@ -135,32 +135,21 @@ fn a_legacy_v3_archive_answers_catalog_questions() {
     let path = dir.path().join("legacy.rez");
     write_v3_fixture(&path);
 
-    let db = Db::open(&path).unwrap();
+    let db = Archive::open(&path).unwrap();
     assert_eq!(db.all_streams(1).unwrap(), vec!["temps".to_string()]);
     assert_eq!(db.read_segments(1, "temps").unwrap().len(), 1);
     assert_eq!(db.live_wal(1, "temps").unwrap().len(), 2);
 }
 
-/// Writing is refused, and the message says why rather than leaking SQLite's
-/// `cannot modify segments because it is a view`.
+/// The write handle is refused at the open, and the message says why rather
+/// than leaking SQLite's `cannot modify segments because it is a view`.
 #[test]
 fn a_legacy_v3_archive_refuses_a_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.rez");
     write_v3_fixture(&path);
 
-    let mut db = Db::open(&path).unwrap();
-    let err = db
-        .insert_wal_rows(
-            1,
-            &[WalRow {
-                stream: "temps".to_string(),
-                ts: 50,
-                wall_offset: 0,
-                row: b"row50".to_vec(),
-            }],
-        )
-        .expect_err("a v3 archive must not accept a write");
+    let err = ArchiveMut::open(&path).expect_err("a v3 archive must not open for writing");
     assert!(
         matches!(err, dendro::Error::ReadOnly(dendro::ReadOnly::LegacySchema)),
         "the refusal should be the typed one a caller can branch on, got: {err:?}"
@@ -183,7 +172,7 @@ fn an_unknown_schema_version_is_refused() {
         .execute("UPDATE schema_version SET version = 99", [])
         .unwrap();
 
-    let err = match Db::open(&path) {
+    let err = match Archive::open(&path) {
         Ok(_) => panic!("an unknown version must not open"),
         Err(e) => e,
     };
@@ -205,7 +194,7 @@ fn a_legacy_v3_archive_opens_read_only() {
     let path = dir.path().join("legacy.rez");
     write_v3_fixture(&path);
 
-    let db = Db::open_read_only(&path).expect("a v3 archive must open read-only");
+    let db = Archive::open(&path).expect("a v3 archive must open read-only");
     assert_eq!(db.all_streams(1).unwrap(), vec!["temps".to_string()]);
     assert_eq!(db.read_segments(1, "temps").unwrap().len(), 1);
     assert_eq!(db.live_wal(1, "temps").unwrap().len(), 2);
@@ -227,7 +216,7 @@ fn a_legacy_v3_archive_opens_from_bytes() {
     write_v3_fixture(&path);
 
     let bytes = std::fs::read(&path).unwrap();
-    let db = Db::open_bytes(bytes).expect("a v3 archive must open from bytes");
+    let db = Archive::open_bytes(bytes).expect("a v3 archive must open from bytes");
     assert_eq!(db.all_streams(1).unwrap(), vec!["temps".to_string()]);
     assert_eq!(db.read_sources().unwrap().len(), 1);
 }
