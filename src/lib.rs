@@ -159,8 +159,8 @@
 //! always opens; every commit since the last checkpoint is in the sidecar
 //! until something opens the set and folds it back in.
 //!
-//! **dendro does not rewrite an archive on its own.** It does not migrate a
-//! legacy schema in place, and it does not normalize a crashed one. An open is
+//! **dendro does not rewrite an archive on its own.** It does not migrate an
+//! older schema in place, and it does not normalize a crashed one. An open is
 //! how you read a buffer another process is still appending to, and a reader
 //! that rearranges its subject cannot be pointed at production.
 //!

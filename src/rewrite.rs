@@ -728,12 +728,9 @@ mod tests {
     fn every_schema_table_is_either_copied_or_deliberately_dropped() {
         /// Carried across by [`copy_sources_into`].
         const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets"];
-        /// Not carried, and correct not to be.
-        const NOT_CARRIED: &[&str] = &[
-            // Written by `Archive::create` for the destination itself; copying
-            // the source's would say nothing new and could disagree.
-            "schema_version",
-        ];
+        /// Not carried, and correct not to be. Empty today: the schema version
+        /// lives in the header stamp, not in a table.
+        const NOT_CARRIED: &[&str] = &[];
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("schema.dendro");

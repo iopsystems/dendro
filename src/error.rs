@@ -4,9 +4,9 @@
 //! inside one program and costs a library consumer real things: the errors
 //! cannot be the `source()` of anything, they cannot be boxed without a
 //! wrapper, and — the expensive one — a caller who wants to *behave*
-//! differently has to match on message text. "This archive is a legacy schema,
-//! offer to upgrade it" and "the disk is full" were the same type and
-//! distinguishable only by substring.
+//! differently has to match on message text. "This file is held by another
+//! connection" and "the disk is full" were the same type and distinguishable
+//! only by substring.
 //!
 //! The enum is `#[non_exhaustive]`: adding variants is not a breaking change, and
 //! a caller that matches must keep a `_` arm.
@@ -143,9 +143,6 @@ pub enum Error {
 pub enum ReadOnly {
     /// The file is write-protected, or the media is. `Archive::open` reads it.
     Media,
-    /// A legacy-schema archive, which is read through compatibility views.
-    /// Writing would mean migrating it in place, which this crate does not do.
-    LegacySchema,
 }
 
 impl fmt::Display for Error {
@@ -157,11 +154,6 @@ impl fmt::Display for Error {
             Error::ReadOnly(ReadOnly::Media) => write!(
                 f,
                 "this archive is on read-only media; open it with `Archive::open` to read it"
-            ),
-            Error::ReadOnly(ReadOnly::LegacySchema) => write!(
-                f,
-                "this archive uses a legacy schema, which is readable but not \
-                 writable by this build; copy it forward first"
             ),
             Error::UnsupportedSchema {
                 found,

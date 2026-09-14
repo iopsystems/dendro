@@ -65,7 +65,7 @@ fn create_stamps_the_header_and_a_copy_carries_it() {
         Sniff::Stamped { version: 4 }
     );
     // `VACUUM INTO` is how a live archive is copied exactly; the stamp has to
-    // survive it or every such copy would open as pre-stamp and lose the
+    // survive it or every such copy would be refused as unstamped and lose the
     // header gate.
     let copy = dir.path().join("copy.dendro");
     db.vacuum_into(&copy).unwrap();
@@ -101,12 +101,12 @@ fn another_applications_database_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("places.sqlite");
     foreign_sqlite(&path);
-    // Unstamped, so the header cannot tell it from a pre-stamp archive; the
-    // open looks for the catalog and refuses.
-    assert_eq!(sniff(&path).unwrap(), Sniff::Unstamped);
+    // Unstamped, so the header alone settles it, and the open agrees and
+    // names the stamp in its refusal.
+    assert_eq!(sniff(&path).unwrap(), Sniff::NotAnArchive);
     let err = Archive::open(&path).unwrap_err();
     assert!(is_not_an_archive(&err), "{err}");
-    assert!(err.to_string().contains("no catalog"), "{err}");
+    assert!(err.to_string().contains("header stamp"), "{err}");
     // And its pragmas were not rewritten on the way to that refusal.
     let conn = rusqlite::Connection::open(&path).unwrap();
     let mode: String = conn
@@ -154,12 +154,11 @@ fn a_file_that_is_not_sqlite_is_refused() {
     assert_eq!(sniff(&path).unwrap(), Sniff::NotAnArchive);
 }
 
-/// A raw copy of a live archive before its first checkpoint is SQLite's
-/// header page and nothing else: no stamp, no catalog, everything in the
-/// sidecar the copy did not carry. The message has to say so, because "not
-/// an archive" sends the operator looking at the wrong thing.
+/// An empty WAL-mode SQLite file, SQLite's header page and nothing else, is
+/// not an archive, and the refusal names the missing stamp rather than a
+/// missing catalog.
 #[test]
-fn a_header_only_copy_is_named_for_what_it_is() {
+fn an_unstamped_header_page_is_refused_by_its_stamp() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("copy.dendro");
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -169,30 +168,27 @@ fn a_header_only_copy_is_named_for_what_it_is() {
     assert_eq!(bytes.len(), 4096, "header page only");
     let err = Archive::open_bytes(bytes).unwrap_err();
     assert!(is_not_an_archive(&err), "{err}");
-    assert!(err.to_string().contains("vacuum_into"), "{err}");
+    assert!(err.to_string().contains("header stamp"), "{err}");
 }
 
-/// Every archive written before the stamp carries `application_id = 0`; the
-/// `schema_version` table it has always had is what vouches for it — and is
-/// still gated.
+/// The stamp is the identity, and a catalog is not a substitute for it: an
+/// archive whose header has been zeroed is refused by every open, however
+/// complete its tables.
 #[test]
-fn a_pre_stamp_archive_still_opens_and_is_still_gated() {
+fn an_unstamped_file_is_refused_even_with_a_full_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.dendro");
     drop(ArchiveMut::create(&path).unwrap());
     restamp(&path, 0, 0);
-    assert_eq!(sniff(&path).unwrap(), Sniff::Unstamped);
-    Archive::open(&path).expect("opens");
-    Archive::open(&path).expect("opens read-only");
-    Archive::open_bytes(std::fs::read(&path).unwrap()).expect("opens from bytes");
-
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute("UPDATE schema_version SET version = 5", [])
-        .unwrap();
-    match Archive::open(&path).unwrap_err() {
-        Error::UnsupportedSchema { found, .. } => assert_eq!(found, 5),
-        other => panic!("expected UnsupportedSchema, got {other}"),
+    assert_eq!(sniff(&path).unwrap(), Sniff::NotAnArchive);
+    for result in [
+        Archive::open(&path).map(drop),
+        ArchiveMut::open(&path).map(drop),
+        Archive::open_bytes(std::fs::read(&path).unwrap()).map(drop),
+    ] {
+        let err = result.unwrap_err();
+        assert!(is_not_an_archive(&err), "{err}");
+        assert!(err.to_string().contains("header stamp"), "{err}");
     }
 }
 

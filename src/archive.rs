@@ -75,31 +75,20 @@ const _: () = assert!(
     "the writer's page cache must be smaller than the reader's"
 );
 
-/// The schema this build writes. Written once at creation.
+/// The schema this build writes and reads. Stamped into the header at
+/// creation as `user_version`.
 ///
-/// v4 renamed the stream column of `segments` and `wal` from `sampler` to
-/// `stream`, and `recordings`/`recording_id` to `sources`/`source_id`. The
-/// container stores streams of rows grouped by source, and what a caller puts
-/// in one is its own business. v3 files still open — see
-/// [`LEGACY_SCHEMA_VERSION`].
+/// Numbering starts at 4 because 1 through 3 were rezolus's `.rez` formats,
+/// which this crate does not read: a `.rez` recording is upgraded to a dendro
+/// archive by rezolus, and dendro reads only what dendro stamped.
 const SCHEMA_VERSION: i64 = 4;
-
-/// The pre-`dendro` schema, written by `rezolus` when this container was still
-/// that project's internal `.rez` v3 format. Identical but for the column name, so it is READ
-/// through the compatibility views in [`LEGACY_VIEWS_SQL`] rather than
-/// converted. Writing to one is refused: see [`Archive::writable`].
-const LEGACY_SCHEMA_VERSION: i64 = 3;
 
 /// `PRAGMA application_id`, stamped into the SQLite file header at creation:
 /// the ASCII bytes `dend`. It is what makes an archive recognizable as one
-/// and not merely as a SQLite database — [`sniff_bytes`] reads it from the
-/// first 100 bytes without opening the file, and every open refuses a SQLite
-/// database that carries some other application's id.
-///
-/// Archives written before the stamp existed carry SQLite's default of `0`
-/// (every legacy v3 file, and v4 files from before this constant). Those
-/// still open: `adopt_schema` falls back to the `schema_version` table for
-/// them, which every archive has always had.
+/// and not merely as a SQLite database. [`sniff_bytes`] reads it from the
+/// first 100 bytes without opening the file, and every open refuses a file
+/// that does not carry it, SQLite's default `0` included. An archive is
+/// exactly a file with this stamp; nothing is inferred from a catalog.
 pub const APPLICATION_ID: u32 = 0x6465_6e64;
 
 /// The information about a file available from its first 100 bytes. See [`sniff_bytes`].
@@ -115,11 +104,8 @@ pub enum Sniff {
         /// The file's `user_version`.
         version: i64,
     },
-    /// A SQLite file with the default id, which is what every archive
-    /// written before the stamp carries — and also what any other unstamped
-    /// SQLite database carries. Only an open can tell them apart.
-    Unstamped,
-    /// Not SQLite, or another application's SQLite database.
+    /// Not SQLite, or a SQLite database without the stamp: another
+    /// application's, or a `.rez` recording from before dendro.
     NotAnArchive,
 }
 
@@ -144,7 +130,6 @@ pub fn sniff_bytes(bytes: &[u8]) -> Sniff {
         APPLICATION_ID => Sniff::Stamped {
             version: i64::from(be(USER_VERSION_OFFSET)),
         },
-        0 => Sniff::Unstamped,
         _ => Sniff::NotAnArchive,
     }
 }
@@ -486,17 +471,12 @@ pub struct PageStats {
 /// An open handle on a dendro archive.
 pub struct Archive {
     conn: Connection,
-    /// True when this handle is on a [`LEGACY_SCHEMA_VERSION`] file, reading it
-    /// through [`LEGACY_VIEWS_SQL`]. A [`ArchiveMut`] is never on one: both of its
-    /// opens refuse a legacy archive.
-    legacy: bool,
 }
 
 impl std::fmt::Debug for Archive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Archive")
             .field("path", &self.conn.path())
-            .field("legacy", &self.legacy)
             .finish_non_exhaustive()
     }
 }
@@ -589,10 +569,7 @@ impl Archive {
         // with `file:` stays a filename.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
-        let db = Archive {
-            conn,
-            legacy: false,
-        };
+        let db = Archive { conn };
 
         // ORDER IS LOAD-BEARING, and a reordering here fails invisibly — the
         // file is written with the wrong geometry and only a full VACUUM of
@@ -623,12 +600,6 @@ impl Archive {
         db.conn
             .execute_batch(SCHEMA_SQL)
             .map_err(Error::sqlite("failed to create archive schema"))?;
-        db.conn
-            .execute(
-                "INSERT INTO schema_version(version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )
-            .map_err(Error::sqlite("failed to record archive schema version"))?;
         db.stamp_header()?;
         // Fold the stamp into the archive itself, now. In WAL mode every
         // commit — the header stamp included — lives in the `-wal` sidecar
@@ -657,10 +628,7 @@ impl Archive {
         {
             return Err(Error::ReadOnly(ReadOnly::Media));
         }
-        let mut db = Archive {
-            conn,
-            legacy: false,
-        };
+        let mut db = Archive { conn };
         // The lock before the gate: `locking_mode` touches no file, and the
         // gate's first read is what acquires the lock, so a file someone else
         // holds is refused there as `InUse` before anything is written.
@@ -748,10 +716,7 @@ impl Archive {
             "failed to open {} read-only",
             path.display()
         )))?;
-        let mut db = Archive {
-            conn,
-            legacy: false,
-        };
+        let mut db = Archive { conn };
         let what = path.display().to_string();
         // ORDER MATTERS, twice over. The gate goes first of all: `cache_size`
         // is harmless, but issuing any statement against a file that is not
@@ -762,11 +727,7 @@ impl Archive {
         // state. `synchronous` and `wal_autocheckpoint` are durability knobs
         // for a writer and are themselves writes; `query_only` is what makes
         // the refusal SQLite's rather than ours, so a bug here fails loudly
-        // instead of mutating. And `adopt_schema` installs the legacy compatibility views
-        // for an older archive, and `CREATE TEMP VIEW` is a write — to the temp
-        // schema, which `query_only` also covers. Setting it first refused
-        // every legacy archive with `attempt to write a readonly database`,
-        // which is the one format this path most exists to serve.
+        // instead of mutating.
         //
         // Nothing is at risk in the gap: the connection is
         // `SQLITE_OPEN_READ_ONLY`, so SQLite refuses writes to the archive
@@ -831,10 +792,7 @@ impl Archive {
         // its own copy of the image.
         conn.deserialize_read_exact(rusqlite::MAIN_DB, &mut bytes.as_slice(), len, true)
             .map_err(Error::sqlite("failed to read the archive"))?;
-        let mut db = Archive {
-            conn,
-            legacy: false,
-        };
+        let mut db = Archive { conn };
         // The gate first, for the same reason as `open`; the catalog-less
         // copy that used to be diagnosed here is diagnosed inside it.
         db.adopt_schema("<bytes>")?;
@@ -854,23 +812,15 @@ impl Archive {
     /// Refuse anything that is not an archive this build reads, then make
     /// this connection able to query it.
     ///
-    /// Decided from the header stamp, before any pragma that writes:
-    ///
-    /// * `application_id == APPLICATION_ID` — a stamped archive; its
-    ///   `user_version` is the schema version.
-    /// * `application_id == 0` — SQLite's default, which every archive
-    ///   written before the stamp carries. The `schema_version` table decides
-    ///   instead. Its absence has one overwhelmingly likely cause worth
-    ///   naming: a plain copy of an archive a writer still held, whose pages
-    ///   are in a `-wal` sidecar the copy does not carry.
-    /// * anything else — some other application's SQLite database.
-    ///
-    /// A [`SCHEMA_VERSION`] file then needs nothing. A
-    /// [`LEGACY_SCHEMA_VERSION`] one gets [`LEGACY_VIEWS_SQL`] and is marked
-    /// read-only. Anything else is refused rather than guessed at: the
-    /// catalog is the only thing standing between a caller and a pile of
-    /// opaque BLOBs, so reading it under the wrong shape yields wrong data
-    /// rather than an error.
+    /// Decided from the header stamp, before any pragma that writes: the
+    /// `application_id` must be [`APPLICATION_ID`], and the `user_version` it
+    /// vouches for must be [`SCHEMA_VERSION`]. Anything else is refused
+    /// rather than guessed at, by name: not SQLite, an unstamped SQLite
+    /// database (SQLite's default id, which is also what a `.rez` recording
+    /// from before dendro carries), another application's database, or a
+    /// schema version this build does not read. The catalog is the only thing
+    /// standing between a caller and a pile of opaque BLOBs, so reading it
+    /// under the wrong shape yields wrong data rather than an error.
     fn adopt_schema(&mut self, what: &str) -> Result<()> {
         let not_an_archive = |reason: &str| Error::NotAnArchive {
             what: what.to_string(),
@@ -895,54 +845,24 @@ impl Archive {
             }
             Err(e) => return Err(Error::sqlite("failed to read application_id")(e)),
         };
-        let version: i64 = if app == i64::from(APPLICATION_ID) {
-            self.pragma_i64("user_version")?
-        } else if app == 0 {
-            let has_table = |name: &str| -> Result<bool> {
-                self.conn
-                    .query_row(
-                        "select count(*) from sqlite_master where type = 'table' and name = ?1",
-                        [name],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map(|n| n > 0)
-                    .map_err(Error::sqlite("failed to inspect the archive"))
-            };
-            if !has_table("schema_version")? {
-                return Err(not_an_archive(
-                    "no catalog. Either this is not an archive, or it is a copy taken \
-                     while it was still being written — an archive's most recent pages \
-                     live in a `-wal` sidecar that a single copied file does not carry. \
-                     Take the copy with `Archive::vacuum_into`, which reads through the \
-                     sidecar without stopping the writer",
-                ));
-            }
-            self.conn
-                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-                    row.get::<_, Option<i64>>(0)
-                })
-                .map_err(Error::sqlite("failed to read the archive schema version"))?
-                .unwrap_or(0)
-        } else {
+        if app == 0 {
+            return Err(not_an_archive(
+                "a SQLite database without dendro's header stamp. dendro reads only \
+                 archives it wrote; a `.rez` recording from before dendro is upgraded \
+                 by rezolus",
+            ));
+        }
+        if app != i64::from(APPLICATION_ID) {
             return Err(not_an_archive(&format!(
                 "a SQLite database of another application (id {app:#x})"
             )));
-        };
-        match version {
+        }
+        match self.pragma_i64("user_version")? {
             SCHEMA_VERSION => Ok(()),
-            LEGACY_SCHEMA_VERSION => {
-                self.conn
-                    .execute_batch(LEGACY_VIEWS_SQL)
-                    .map_err(Error::sqlite(format!(
-                        "failed to open a v{version} archive"
-                    )))?;
-                self.legacy = true;
-                Ok(())
-            }
             other => Err(Error::UnsupportedSchema {
                 found: other,
                 writes: SCHEMA_VERSION,
-                reads: LEGACY_SCHEMA_VERSION,
+                reads: SCHEMA_VERSION,
             }),
         }
     }
@@ -1050,7 +970,7 @@ impl Archive {
         // The `uuid` column arrived after the first archives were written,
         // and a column a file does not have cannot be named in a SELECT
         // without erroring. Ask the schema first — one `PRAGMA`, and it
-        // answers for the legacy views too, which have no such column.
+        // answers for an older schema-4 file without the column.
         let uuid_col = if has_column(&self.conn, "sources", "uuid")? {
             "uuid"
         } else {
@@ -2026,10 +1946,7 @@ impl ArchiveMut {
 
     /// Open an existing archive to write to it, with SQLite's exclusive
     /// locking mode: refused as [`Error::InUse`] while anything else holds
-    /// the file, and holding it against every other open until dropped. A
-    /// legacy-schema archive is refused as
-    /// [`ReadOnly::LegacySchema`]; copy it
-    /// forward with [`crate::rewrite`] instead.
+    /// the file, and holding it against every other open until dropped.
     ///
     /// This is also the recovery open: a read-write connection that is the
     /// last one on a WAL database checkpoints on close, so opening a killed
@@ -2037,9 +1954,6 @@ impl ArchiveMut {
     /// deletes it. [`Archive::open`] leaves the files as they are.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Archive::open_with_cache(path, READER_CACHE_SIZE_KIB, true)?;
-        if db.legacy {
-            return Err(Error::ReadOnly(ReadOnly::LegacySchema));
-        }
         Ok(ArchiveMut::wrap(db))
     }
 
@@ -2460,21 +2374,12 @@ impl ArchiveMut {
     pub fn create_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
             .map_err(Error::sqlite("failed to open an in-memory database"))?;
-        let db = Archive {
-            conn,
-            legacy: false,
-        };
+        let db = Archive { conn };
         db.set_pragma("page_size", PAGE_SIZE)?;
         db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
         db.conn
             .execute_batch(SCHEMA_SQL)
             .map_err(Error::sqlite("failed to create archive schema"))?;
-        db.conn
-            .execute(
-                "INSERT INTO schema_version(version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )
-            .map_err(Error::sqlite("failed to record archive schema version"))?;
         db.stamp_header()?;
         Ok(ArchiveMut::wrap(db))
     }
@@ -2487,9 +2392,6 @@ impl ArchiveMut {
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn open_for_write(path: &Path) -> Result<Self> {
         let db = Archive::open_with_cache(path, WRITER_CACHE_SIZE_KIB, false)?;
-        if db.legacy {
-            return Err(Error::ReadOnly(ReadOnly::LegacySchema));
-        }
         Ok(ArchiveMut::wrap(db))
     }
 
@@ -2807,28 +2709,6 @@ fn insert_segment_sql(
     Ok(())
 }
 
-/// Read-side shim for a [`LEGACY_SCHEMA_VERSION`] file, whose stream column is
-/// named `stream`.
-///
-/// TEMP views, which SQLite resolves BEFORE the main schema, so every query in
-/// this module can name `stream` unconditionally and still hit a v3 file. They
-/// are per-connection and vanish with it, so nothing is written to the archive
-/// — opening a v3 file never modifies it, which matters when the file is a
-/// buffer another process is still appending to.
-///
-/// Writes through a view fail (`cannot modify segments because it is a view`),
-/// which is the behavior we want but not the message; [`Archive::writable`] catches
-/// it first and says what to do instead.
-const LEGACY_VIEWS_SQL: &str = "\
-CREATE TEMP VIEW sources AS SELECT id, labels, metadata, complete, \
-clock_anchor_wall_ns FROM main.recordings;
-CREATE TEMP VIEW segments AS SELECT recording_id AS source_id, sampler AS stream, \
-seq, rows, first_ts, last_ts, bytes, NULL AS caller_index FROM main.segments;
-CREATE TEMP VIEW wal AS SELECT recording_id AS source_id, sampler AS stream, ts, \
-wall_offset, row FROM main.wal;
-CREATE TEMP VIEW clock_offsets AS SELECT recording_id AS source_id, ts, offset_ns \
-FROM main.clock_offsets;";
-
 /// The catalog. Segment and WAL payloads are opaque BLOBs; everything the
 /// container needs to answer questions about them is a column.
 const SCHEMA_SQL: &str = "
@@ -2887,7 +2767,6 @@ CREATE TABLE clock_offsets(
   offset_ns INTEGER NOT NULL,
   PRIMARY KEY (source_id, ts)
 );
-CREATE TABLE schema_version(version INTEGER NOT NULL);
 ";
 
 #[cfg(test)]

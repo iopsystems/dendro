@@ -39,14 +39,16 @@ bytes *mean* is the caller's, expressed through one trait.
 - `SchemaPolicy::UnionFields`, opting into merging across a column set that
   grew or shrank.
 - Rewriting: combine, trim, range-copy and opt-in column projection.
-- Legacy-schema archives open read-only through compatibility views.
+- An archive is exactly a file that carries dendro's header stamp. There is
+  no fallback to a catalog table and no legacy schema: a `.rez` recording
+  from before dendro is upgraded by rezolus, which still reads it.
 - `archive::ArchiveMut`, the write handle, beside `Archive`, which now only reads.
   `Archive::open` is read-only (the former `open_read_only`), works on read-only
   media and on a file another process is writing, and is the only open the
   read paths use. `ArchiveMut::create` makes a new archive; `ArchiveMut::open` takes an
   existing one with SQLite's exclusive locking mode, so it is refused as
   `Error::InUse` while anything else holds the file, and it refuses read-only
-  media and legacy archives by name. `ArchiveMut` derefs to `Archive`. Before this, a
+  media by name. `ArchiveMut` derefs to `Archive`. Before this, a
   second read-write connection on a file the writer thread held wrote
   silently and left the writer's cached sequence numbers and watermarks
   wrong. Seven crate-internal methods (`open_for_write`, `remove_archive`,
@@ -109,7 +111,7 @@ These are release commitments tracked here rather than in the journal:
   offset, and the archive derives a per-source `clock_offsets` series from
   it. Both are a telemetry concept living in the container, as the
   encoder-boundary journal entry records. They stay in 0.x because the one
-  caller uses them and the legacy reader needs them, and they may move into
+  caller uses them, and they may move into
   the encoder's payload or the source's metadata before 1.0. Build on the
   timestamp; treat the offset as provisional.
 - **The encoder boundary has one caller.** Recorded as an open journal entry

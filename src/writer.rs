@@ -212,8 +212,7 @@ impl Writer {
     /// Opening changes nothing; a source is changed only by
     /// [`resume_source`](Self::resume_source), which is what a caller that
     /// wants to continue one calls next. Segment numbering continues from
-    /// what the file holds. There must be no other writer of this file, and a
-    /// legacy-schema archive is refused (it is readable, not writable).
+    /// what the file holds. There must be no other writer of this file.
     pub fn open(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Result<Self> {
         Self::open_checkpointing_every(path, encoder, CHECKPOINT_INTERVAL)
     }

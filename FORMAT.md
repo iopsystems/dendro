@@ -44,16 +44,14 @@ One SQLite database file. Detection is by content, never by filename
 | Bytes | Field | Archive value |
 |---|---|---|
 | `0..16` | magic | `SQLite format 3\0` |
-| `68..72` | `application_id`, big-endian u32 | `0x6465_6e64` (`dend`), or `0`, see below |
+| `68..72` | `application_id`, big-endian u32 | `0x6465_6e64` (`dend`) |
 | `60..64` | `user_version`, big-endian u32 | the schema version |
 
-An `application_id` of `0` is SQLite's default and is what every archive
-written before the stamp carried (all legacy v3 files, and v4 files from
-before the stamp). Such a file is accepted if it has the catalog below; the
-`schema_version` table decides its version. Any other id is another
-application's database and is not an archive. A stamped file whose
-`user_version` is not one this build reads is refused by name
-(`Error::UnsupportedSchema`), never guessed at.
+Any other `application_id` is not an archive: SQLite's default of `0`,
+which is what a `.rez` recording from before dendro carries, or another
+application's. The stamp is the identity, and nothing is inferred from the
+catalog. A stamped file whose `user_version` is not one this build reads is
+refused by name (`Error::UnsupportedSchema`), never guessed at.
 
 ### 2.1 Geometry
 
@@ -88,7 +86,7 @@ stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Five tables (`src/archive.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
+Four tables (`src/archive.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -127,7 +125,6 @@ CREATE TABLE clock_offsets(
   offset_ns INTEGER NOT NULL,
   PRIMARY KEY (source_id, ts)
 );
-CREATE TABLE schema_version(version INTEGER NOT NULL);
 ```
 
 Every timestamp is an `i64`: SQLite's only integer type, and the reason a
@@ -222,25 +219,12 @@ own `(ts, wall_offset)`, and one at finalize. At most one per `(source, ts)`
 cuts it at the cutoff, per-stream eviction at the oldest row the source
 still holds. See §5.
 
-### 3.5 `schema_version`
-
-One row, the schema version. Redundant with the header's `user_version` on
-a stamped file; kept because archives from before the stamp have only this.
-
-### 3.6 Legacy v3
-
-A file whose `schema_version` is 3 (rezolus's `.rez`) names `sources` as
-`recordings`, `source_id` as `recording_id`, and `stream` as `sampler`. It is
-read through per-connection `TEMP` views that rename them, never modified,
-and refused for writing (`Error::ReadOnly(LegacySchema)`), including by
-`Writer::open`. Copy it forward with `rewrite` to write to it.
-
 ## 4. Reading
 
 The rules a reader must follow; `src/read.rs` is the reference.
 
-1. **Detect** by content (§2). Refuse a foreign `application_id`, a version
-   above the one you implement, and a file with no catalog.
+1. **Detect** by content (§2). Refuse any `application_id` but dendro's, and
+   any `user_version` you do not implement.
 2. **Read the catalog in one snapshot.** Every catalog question about a
    stream (its segments, its live WAL rows, its span) must be answered
    from one `BEGIN DEFERRED` transaction. A seal committing between two
@@ -357,14 +341,12 @@ the rows changes shape; four things are guaranteed:
   ask the question rather than guess. The remaining generality question is
   the open [encoder boundary](docs/journal/2026-09-11-encoder-boundary.md)
   gap.
-- **Legacy v3 is frozen.** Read through views, never written, never
-  extended.
+- **Versions 1 to 3 are not dendro's.** They are rezolus's `.rez` formats,
+  never read here; rezolus upgrades them by copying into a new archive.
 - **What a release promises.** A build reads its own schema version and the
   one before it, and writes only its own. A schema bump therefore ships with
   a reader for the previous version and a copy-forward through `rewrite`,
-  and an archive is never migrated in place. Legacy v3 counts as the version
-  before 4 and stays readable for as long as 4 is current; when 5 arrives, 3
-  drops and 4 becomes the version read through views. Reserved metadata keys
-  are never removed and never change meaning; a key that stops being written
-  keeps its definition here. Within a schema version, a nullable column or a
-  new key is added without a bump and read as unknown by older builds.
+  and an archive is never migrated in place. Reserved metadata keys are never
+  removed and never change meaning; a key that stops being written keeps its
+  definition here. Within a schema version, a nullable column or a new key is
+  added without a bump and read as unknown by older builds.

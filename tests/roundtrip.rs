@@ -1,5 +1,5 @@
 // Drives the writer, so it needs the `write` feature. The reader-only build is
-// exercised by `legacy_v3.rs`, which opens an archive without ever writing one.
+// exercised by `identity.rs`, which opens files without ever writing one.
 #![cfg(feature = "write")]
 
 //! End-to-end tests over the public API, driven by a payload that has nothing

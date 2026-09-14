@@ -67,6 +67,7 @@ path = "src/bin/measure-compaction.rs"
 required-features = ["test-support"]
 
 [dev-dependencies]
-# Building a legacy-schema fixture by hand, in `tests/legacy_v3.rs`.
+# Raw connections in tests that stage a concurrent writer beside a live
+# reader (`tests/read_seam.rs`), and a hand-built foreign database.
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"

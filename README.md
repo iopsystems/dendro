@@ -271,8 +271,8 @@ anything else holds it. See
 ## Status
 
 Extracted from [rezolus](https://github.com/iopsystems/rezolus), where it was
-the internal `.rez` v3 format. Archives written by that version still open
-read-only; see `LEGACY_SCHEMA_VERSION`.
+the internal `.rez` v3 format. dendro does not read `.rez` recordings;
+rezolus upgrades them to dendro archives.
 
 The format itself, meaning the container, the catalog, the meaning of every
 column, the reserved metadata keys, writer sessions, and what bumps the schema

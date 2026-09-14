@@ -237,7 +237,7 @@ from the archive alone; the same run checkpointing every 200 ms recovers
 the shipped `CHECKPOINT_INTERVAL` of 10 s and a 1 s append cadence, that tail
 is about ten appends.
 
-**dendro never rewrites an archive on its own.** It does not migrate a legacy
+**dendro never rewrites an archive on its own.** It does not migrate an older
 schema in place, and it does not normalize a crashed archive back to one
 file: an open is also how you read a rolling buffer another process is still
 appending to, and a reader that rearranges its subject cannot be pointed at
@@ -383,18 +383,23 @@ Neither choice affects read speed. Query time tracks segment *count*, which is
 
 | version | written by | notes |
 |---|---|---|
-| 4 | dendro | Current. |
-| 3 | rezolus `.rez` | Read-only, through per-connection compatibility views. Names `sources` as `recordings`, `source_id` as `recording_id`, and `stream` as `sampler`. |
+| 4 | dendro | Current, and the only version this build reads. |
+| 1 to 3 | rezolus `.rez` | Not read. rezolus upgrades a `.rez` recording to a dendro archive. |
 
 An archive is stamped in its SQLite header at creation: `application_id` is
-`0x6465_6e64` (`dend`) and `user_version` is the schema version, so `archive::sniff`
-classifies a file from its first 100 bytes without opening it, and every open
-refuses a foreign SQLite database (or a file that is not SQLite at all) as
-`Error::NotAnArchive` *before* applying a single pragma. Archives written
-before the stamp carry `application_id = 0`; for those the `schema_version`
-table decides, as it always did. A file with neither is named for what it
-almost always is: a copy taken from under a writer with its catalog still in
-the sidecar.
+`0x6465_6e64` (`dend`) and `user_version` is the schema version, so
+`archive::sniff` classifies a file from its first 100 bytes without opening
+it, and every open refuses anything else as `Error::NotAnArchive` *before*
+applying a single pragma: a file that is not SQLite, a SQLite database with
+another application's id, or one with SQLite's default id of `0`, which is
+what a `.rez` recording carries. The stamp is the identity. Nothing is
+inferred from the catalog, so there is no version table and no fallback.
+
+dendro's numbering starts at 4 because 1 to 3 were rezolus's formats. They
+stay rezolus's: it still reads them, and upgrading one is a copy into a new
+dendro archive through `ArchiveMut::create` and a transaction, which is the
+same operation as any other assembly. Keeping that path out of dendro is
+what makes "is this file mine" a header comparison rather than a guess.
 
 Every source carries a `uuid`, minted at insert from SQLite's own
 `randomblob` (so the reader build needs no random source) and carried
@@ -403,9 +408,3 @@ identity, and `rewrite::shared_sources` is how an assembly tells "the same
 source again" from "another source with the same labels". `NULL` in archives
 from before the column means unknown, never the same.
 
-v3 archives open through TEMP views, which SQLite resolves before the main
-schema, so every statement in `archive.rs` can name `stream` unconditionally.
-Opening a v3 archive never modifies it, which matters when the file is a
-buffer another process is still appending to. Writes are refused with a
-message that says so, rather than SQLite's
-`cannot modify segments because it is a view`.

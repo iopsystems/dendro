@@ -192,32 +192,3 @@ fn resume_refuses_a_source_that_is_not_there_and_stays_usable() {
     drop(w);
     archive.join().unwrap();
 }
-
-/// A legacy (v3) archive is readable, not writable: reopening it for append
-/// is refused up front, before a writer thread exists.
-#[test]
-fn a_legacy_archive_cannot_be_reopened_for_append() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("legacy.rez");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE recordings(id INTEGER PRIMARY KEY, labels TEXT NOT NULL, \
-         metadata TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0, \
-         clock_anchor_wall_ns INTEGER NOT NULL); \
-         CREATE TABLE segments(recording_id INTEGER NOT NULL, sampler TEXT NOT NULL, \
-         seq INTEGER NOT NULL, rows INTEGER NOT NULL, first_ts INTEGER NOT NULL, \
-         last_ts INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY (recording_id, sampler, seq)); \
-         CREATE TABLE wal(recording_id INTEGER NOT NULL, sampler TEXT NOT NULL, ts INTEGER NOT NULL, \
-         wall_offset INTEGER NOT NULL, row BLOB NOT NULL, PRIMARY KEY (recording_id, sampler, ts)); \
-         CREATE TABLE clock_offsets(recording_id INTEGER NOT NULL, ts INTEGER NOT NULL, offset_ns INTEGER NOT NULL); \
-         CREATE TABLE schema_version(version INTEGER NOT NULL); \
-         INSERT INTO schema_version(version) VALUES (3);",
-    )
-    .unwrap();
-    drop(conn);
-    let err = Writer::open(&path, Box::new(Tags)).unwrap_err();
-    assert!(
-        matches!(err, Error::ReadOnly(dendro::ReadOnly::LegacySchema)),
-        "{err}"
-    );
-}
