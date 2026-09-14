@@ -2,14 +2,16 @@
 
 What a dendro file *is*: the container, the catalog, the meaning of every
 column a reader has to interpret, and the rules that keep two builds agreeing
-about them. It is written so that a reader or writer could be built from it
-without this crate. Where the crate is the ground truth for a detail, the
-path is cited; when the two disagree, the code is what ships and this
-document has a bug.
+about them. It is written so that a reader or writer of the sealed data could
+be built from it without this crate. The live tail is the exception: it is
+rows the caller's `SegmentEncoder` has not yet encoded, and the format does
+not specify that encoding (§4, rule 7). Where the crate is the ground truth
+for a detail, the path is cited; when the two disagree, the code is what ships
+and this document has a bug.
 
 `DESIGN.md` says why the format is shaped this way. This says what it is.
 
-Schema version: **4** (`src/db.rs`, `SCHEMA_VERSION`). See
+Schema version: **4** (`src/archive.rs`, `SCHEMA_VERSION`). See
 [Compatibility](#8-compatibility) for what changes it.
 
 ## 1. The model
@@ -17,17 +19,18 @@ Schema version: **4** (`src/db.rs`, `SCHEMA_VERSION`). See
 An archive is a set of **sources**. A source is one producer observed over
 one span of time: one clock domain, one label set. Each source holds
 **streams**, named sequences of rows that accumulate, seal and expire
-independently. A stream is a sequence of immutable parquet **segments** plus,
+independently. A stream is a sequence of immutable Parquet **segments** plus,
 while the source is live, a tail of **WAL rows** not yet sealed into one. A
-**row** is a timestamp and an opaque payload; what the payload means, and
-what columns a segment has, is the caller's `SegmentEncoder` and no concern of
-the format.
+**row** is a timestamp, a wall-clock offset (§5), and an opaque payload; what
+the payload means, and what columns a segment has, is the caller's
+`SegmentEncoder` and no concern of the format.
 
 Three properties are the reason the format exists, and every rule below
 serves one of them:
 
 - **Valid at every instant.** The file is openable from the moment it is
-  created; an unclean kill loses at most one append per stream.
+  created. An unclean kill loses at most the two ticks in flight (one queued
+  to the writer, one mid-commit), and never a committed row.
 - **Readable while written.** A reader sees a consistent snapshot and never
   blocks the writer.
 - **Sealed on the writer's schedule, not the reader's.** Durability is per
@@ -36,12 +39,12 @@ serves one of them:
 ## 2. The container
 
 One SQLite database file. Detection is by content, never by filename
-(`db::sniff`, `db::sniff_bytes`), from the first 100 bytes:
+(`archive::sniff`, `archive::sniff_bytes`), from the first 100 bytes:
 
 | Bytes | Field | Archive value |
 |---|---|---|
 | `0..16` | magic | `SQLite format 3\0` |
-| `68..72` | `application_id`, big-endian u32 | `0x6465_6e64` (`dend`) — or `0`, see below |
+| `68..72` | `application_id`, big-endian u32 | `0x6465_6e64` (`dend`), or `0`, see below |
 | `60..64` | `user_version`, big-endian u32 | the schema version |
 
 An `application_id` of `0` is SQLite's default and is what every archive
@@ -54,11 +57,11 @@ application's database and is not an archive. A stamped file whose
 
 ### 2.1 Geometry
 
-Set at creation and persistent in the file (`Db::init_created`):
+Set at creation and persistent in the file (`Archive::init_created`):
 
 | Pragma | Value | Why |
 |---|---|---|
-| `page_size` | 4096 | Lowest per-append WAL write amplification; measured. |
+| `page_size` | 4096 | Lowest per-append sidecar write amplification, 3.14x; measured, see `DESIGN.md`. |
 | `auto_vacuum` | `INCREMENTAL` | Retention must not inflate a rolling buffer to its high-water mark. Cannot be enabled after the fact. |
 | `journal_mode` | `WAL` | Readers never block the writer; commits are durable per append. |
 | `application_id`, `user_version` | as above | Format identity, readable without opening. Checkpointed at create so they are in the file itself, not the sidecar. |
@@ -66,22 +69,26 @@ Set at creation and persistent in the file (`Db::init_created`):
 Per connection, not persistent: `synchronous=FULL` on writers,
 `wal_autocheckpoint` denominated as 4 MiB of pages, `foreign_keys=ON`, and a
 `cache_size` that differs for readers and writers. A reader that sets none of
-these still reads correctly; `Db::open_read_only` sets only `cache_size` and
+these still reads correctly; `Archive::open` sets only `cache_size` and
 `query_only`.
+
+WAL mode uses shared memory (`<path>-shm`), so every process that opens a
+live archive must be on one host, on a local filesystem.
 
 ### 2.2 One file, or three
 
 While anyone has it open, SQLite adds `<path>-wal` (commits not yet folded
-in) and `<path>-shm`; a clean close removes them. A plain copy of `<path>`
-alone is a valid SQLite file that may hold none of the recent appends, and
-before the first checkpoint no catalog at all — such a copy is refused as
+in) and `<path>-shm`; a clean close removes them. Creation checkpoints the
+catalog into `<path>`, so a plain copy of `<path>` alone is a valid archive
+that may hold none of the recent appends. A copy of an archive from before
+creation checkpointed can hold no catalog at all; such a copy is refused as
 `NotAnArchive` with a message naming the cause. The writer checkpoints at
 least every `CHECKPOINT_INTERVAL` (10 s), so a plain copy is at most that
-stale; `Db::vacuum_into` is the exact copy.
+stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Five tables (`src/db.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
+Five tables (`src/archive.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -124,8 +131,8 @@ CREATE TABLE schema_version(version INTEGER NOT NULL);
 ```
 
 Every timestamp is an `i64`: SQLite's only integer type, and the reason a
-negative value simply means before 1970 (`DESIGN.md` explains the two bugs
-`u64` cost).
+negative value means before 1970 (`DESIGN.md` explains the two bugs `u64`
+caused).
 
 ### 3.1 `sources`
 
@@ -154,13 +161,13 @@ A stream is identified by `(source_id, stream)`; the name is the caller's
 and carries no structure the format interprets. Segments of one stream are
 ordered by `seq`; a reader splices them in `seq` order and tolerates gaps
 (a filtered copy renumbers densely from 0, a resumed writer continues from
-`MAX(seq) + 1`). `first_ts`/`last_ts` are the segment's own row timestamps —
-what the **encoder reported**, never the input's span — and are what
+`MAX(seq) + 1`). `first_ts`/`last_ts` are the segment's own row timestamps,
+what the **encoder reported** and never the input's span, and are what
 retention and range reads consult; `rows` is the row count. A segment is
 immutable once inserted.
 
 **`caller_index`** is whatever the caller's encoder returned alongside the
-segment, stored verbatim and never interpreted — a name set, a bloom filter,
+segment, stored verbatim and never interpreted: a name set, a bloom filter,
 per-column extremes, anything that answers "could this segment hold what I am
 looking for" without opening it. `NULL` where the caller wrote none, and in
 archives from before the column. A verbatim copy carries it; a **column
@@ -168,9 +175,9 @@ projection drops it**, because an index built over the original columns may
 describe columns the copy no longer has, and a wrong index is worse than
 none.
 
-`bytes` is one parquet file the crate never opens,
-with one exception: `rewrite::project_segment_columns`, an opt-in column
-projection that re-encodes with `segment::writer_props`.
+`bytes` is one Parquet file the crate never opens, with one exception:
+`rewrite::project_segment_columns`, an opt-in column projection that
+re-encodes with `segment::writer_props`.
 
 ### 3.3 `wal`
 
@@ -184,7 +191,7 @@ source_id = ?1 AND stream = ?2
         OR NOT EXISTS (SELECT 1 FROM segments WHERE source_id = ?1 AND stream = ?2) )
 ```
 
-(`src/db.rs`, `LIVE_WAL_PREDICATE`.) This is the recovery rule and the
+(`src/archive.rs`, `LIVE_WAL_PREDICATE`.) This is the recovery rule and the
 reason the prune that follows a seal can run outside the seal transaction: a
 row a segment already covers is shadowed whether or not it has been deleted.
 A reader materializes a stream's live rows through the encoder into one
@@ -194,15 +201,15 @@ sealed segment and live rows is a stream, not an absence.
 A row at or below the watermark can never be read, so a writer **drops** it
 rather than storing it, counts it, and logs once per stream; a resumed source
 refuses it at the call instead. Producers must append monotonically **per
-stream** — the watermark is per `(source, stream)`, so the same timestamp is
-fine on a sibling stream or on another source, and backfilling either is not
-out of order at all. Late samples *within* one stream remain unsupported; see
+stream**. The watermark is per `(source, stream)`, so the same timestamp is
+accepted on a sibling stream or on another source, and backfilling either is
+not out of order. Late samples *within* one stream remain unsupported; see
 [out-of-order appends](docs/journal/2026-09-11-out-of-order-appends.md).
 
 **Retention and live rows.** Eviction deletes by timestamp and does not
-know which rows have been sealed. A live row older than the cutoff — one a
-stream has not sealed yet, because its seal cadence is slower than the
-lookback — is deleted too, and was in no segment. `Evicted::live_rows`
+know which rows have been sealed. A live row older than the cutoff, one a
+stream has not sealed yet because its seal cadence is slower than the
+lookback, is deleted too, and was in no segment. `Evicted::live_rows`
 counts them, and the writer logs it. The invariant is the caller's: seal at
 least as often as you evict (`SealPolicy::max_age` no longer than the
 lookback).
@@ -225,8 +232,8 @@ a stamped file; kept because archives from before the stamp have only this.
 A file whose `schema_version` is 3 (rezolus's `.rez`) names `sources` as
 `recordings`, `source_id` as `recording_id`, and `stream` as `sampler`. It is
 read through per-connection `TEMP` views that rename them, never modified,
-and refused for writing (`Error::ReadOnly(LegacySchema)`) — including by
-`Archive::open`. Copy it forward with `rewrite` to write to it.
+and refused for writing (`Error::ReadOnly(LegacySchema)`), including by
+`Writer::open`. Copy it forward with `rewrite` to write to it.
 
 ## 4. Reading
 
@@ -235,27 +242,33 @@ The rules a reader must follow; `src/read.rs` is the reference.
 1. **Detect** by content (§2). Refuse a foreign `application_id`, a version
    above the one you implement, and a file with no catalog.
 2. **Read the catalog in one snapshot.** Every catalog question about a
-   stream — its segments, its live WAL rows, its span — must be answered
+   stream (its segments, its live WAL rows, its span) must be answered
    from one `BEGIN DEFERRED` transaction. A seal committing between two
    autocommit reads inserts a segment the first read did not see and
    shadows the rows the second would have returned; the seam then reads as
-   a hole. `Db::read_snapshot` is the primitive; `read_archive` holds one
-   snapshot across every stream of every source.
+   a hole. `Archive::read_snapshot` is the primitive; `read_archive` holds one
+   snapshot across every stream of every source. A held snapshot also stops
+   the writer's checkpoints from moving anything, so hold one for one answer,
+   not for the life of a reader.
 3. **A stream's rows** are its segments in `seq` order followed by its
    materialized live tail. §3.3's rule guarantees no duplicate row across
    the seam, so a reader does no de-duplication.
 4. **Materialize through `segment::materialize`**, which runs the encoder
-   and checks its answer against the rows it was given — the same check the
+   and checks its answer against the rows it was given, the same check the
    writer runs at seal, so a reader and the next seal agree about the tail.
 5. **Open lazily.** `read::catalog` answers every catalog question in one
    snapshot with no BLOB read; `read::probe` fetches one segment for a
    schema; `read::stream_range` reads a window; `SegmentBytes` fetches a
    stream's payload only when it is read. Opening every stream to learn
    its names was measured at 91% of a query's time on streams it never read.
-6. **Prefer `Db::open_read_only`.** `Db::open` is a read-write connection,
-   and SQLite checkpoints the archive when the last such connection closes;
-   a reader that must leave its subject alone, or that reads read-only
-   media, uses the read-only open.
+6. **Read with `Archive::open`.** It is read-only and leaves the files as they
+   are. `ArchiveMut::open` is a read-write connection that takes the file
+   exclusively, and SQLite checkpoints the archive when it closes; it is for
+   rewriting and recovery, not for reading.
+7. **A reader without the caller's encoder reads sealed segments only.** The
+   live tail is unencoded rows, and the format does not say what they mean.
+   Such a reader must report the stream's live span (`live_wal_span`) as
+   data it did not read, not as absence.
 
 ## 5. Time
 
@@ -267,42 +280,43 @@ summarizes the same series at seal boundaries for consumers that do not
 decode segments. One source is one clock domain: rows from two producers
 with two clocks belong in two sources.
 
-A source resumed by a later writer session (§7) has a *new* anchor — the
-resuming process's monotonic clock restarted — recorded in
+A source resumed by a later writer session (§7) has a *new* anchor, because
+the resuming process's monotonic clock restarted, recorded in
 `writer_sessions`; `ts + wall_offset = wall` holds in both sessions, and the
-gap between them is real time during which nothing was recorded.
+gap between them is elapsed time during which nothing was recorded.
 
 ## 6. Reserved metadata keys
 
 `sources.metadata` is open, but these keys have an agreed meaning
-(`dendro::keys`). dendro writes only `writer_sessions` itself, plus an
-`events` entry beside it on a resume; the others are conventions a producer
-follows through `SourceWriter::update_metadata`, which lands a patch in order
-with the ticks so it is on disk before any finalize.
+(`dendro::keys`). dendro writes `writer_sessions` and `encoder` itself, plus
+an `events` entry beside `writer_sessions` on a resume; the others are
+conventions a producer follows through `SourceWriter::update_metadata`,
+which lands a patch in order with the ticks so it is on disk before any
+finalize.
 
 | Key | Value |
 |---|---|
-| `producer_epoch` | The producer's current **counter epoch**: an opaque id regenerated whenever *all* its cumulative counters start from zero together. Two sources with equal epochs over overlapping time observe **one** monotonic series — mergeable, never summable. A change mid-source is a restart, and every counter reset with it. Absent means unknown. |
+| `producer_epoch` | The producer's current **counter epoch**: an opaque id regenerated whenever *all* its cumulative counters start from zero together. Two sources with equal epochs over overlapping time observe **one** monotonic series: mergeable, never summable. A change mid-source is a restart, and every counter reset with it. Absent means unknown. |
 | `producer_epochs` | JSON array `[{"epoch": id, "from_ts": ts}, …]`, every epoch observed, in order; the last is the current one. |
+| `writer_sessions` | JSON array `[{"session": uuid, "clock_anchor_wall_ns": n, "resumed_after_ts": ts?}, …]`, one per writer session that appended, in order; the last field only on a resume, naming the newest row the previous session left. One entry means the source was written in one go. |
+| `producer_version` | The version of the software that produced the source's values, as an opaque string: stored, never parsed. Written by the producer. It must distinguish **builds**, not just releases, because the behavior a bisection looks for usually changed in a pre-release build. Not an identity: whose version it is belongs in the source's labels, so compare it only between sources known to share a producer. |
+| `encoder` | The version the caller's `SegmentEncoder::version` reported at `add_source`. Written by dendro, and **enforced**: a reader whose encoder reports a different version is refused. An encoder reporting nothing is never checked. Versions the row *encoding*; `producer_version` versions whatever produced the *values*, which can change while the encoding does not. |
+| `events` | JSON `{"events": [{"timestamp": ts, "description": text, "kind": tag?, "details": text?, "id": stable id?}, …]}`. `kind` `producer_epoch` marks a counter reset, `writer_session` a resume; `id` lets a merge de-duplicate. dendro appends to the array, never replaces it. |
 
 **What the source epoch does not cover.** A single counter that wrapped, or
-that the producer zeroed on read, did not restart the producer — so no
+that the producer zeroed on read, did not restart the producer, so no
 source-level key says anything about it. From the values alone a wrap and a
 reset are identical (`cur < prev`, both), and their arithmetic is not: a
 reset contributes `cur`, a wrap of a `w`-bit counter contributes
 `cur + (2^w - prev)`. Distinguishing them needs a generation **per counter**,
 and a counter's width alongside it. Both are row payload, which is the
-encoder's and opaque to the archive — the container carries them and cannot
+encoder's and opaque to the archive; the container carries them and cannot
 read them. The design, and what each layer would owe, is in
 [the generations entry](docs/journal/2026-09-12-generations-reset-versus-wrap.md).
-| `writer_sessions` | JSON array `[{"session": uuid, "clock_anchor_wall_ns": n, "resumed_after_ts": ts?}, …]`, one per writer session that appended, in order; the last field only on a resume, naming the newest row the previous session left. One entry means the source was written in one go. |
-| `producer_version` | The version of the software that produced the source's values, as an opaque string — stored, never parsed. Written by the producer. Should distinguish **builds**, not just releases, since the behaviour worth bisecting usually changed in a pre-release build. Not an identity: whose version it is belongs in the source's labels, so compare it only between sources known to share a producer. |
-| `encoder` | The version the caller's `SegmentEncoder::version` reported at `add_source`. Written by dendro, and **enforced**: a reader whose encoder reports a different version is refused. An encoder reporting nothing is never checked. Versions the row *encoding*; `producer_version` versions whatever produced the *values*, which can change while the encoding does not. |
-| `events` | JSON `{"events": [{"timestamp": ts, "description": text, "kind": tag?, "details": text?, "id": stable id?}, …]}`. `kind` `producer_epoch` marks a counter reset, `writer_session` a resume; `id` lets a merge de-duplicate. dendro appends to the array, never replaces it. |
 
 ## 7. Writer sessions and reopening
 
-An archive can be reopened by a later writer (`Archive::open`) and a source
+An archive can be reopened by a later writer (`Writer::open`) and a source
 in it resumed (`resume_source`) as a **new writer session**. Nothing about
 the rows changes shape; four things are guaranteed:
 
@@ -325,23 +339,32 @@ the rows changes shape; four things are guaranteed:
   `first_ts`/`last_ts`/`rows` mean, a change to the time model. A reader
   refuses a version above its own.
 - **What does not.** A nullable column an old reader can ignore (`uuid` and
-  `caller_index` were added this way); a new reserved metadata key (`producer_epoch`,
-  `writer_sessions` were); a new event kind. Old copiers drop what they do
-  not know, which degrades to "unknown", never to wrong.
+  `caller_index` were added this way); a new reserved metadata key
+  (`producer_epoch`, `writer_sessions` were); a new event kind. Old copiers
+  drop what they do not know, which degrades to "unknown", never to wrong.
 - **What the format does not version, and whose problem it is.** The row
   payload and the segment's columns are the encoder's: a writer and a reader
   must run the same encoder over the same rows to the same bytes. The file
-  does say which encoder wrote it — `encoder` (§6) carries the version the
+  does say which encoder wrote it: `encoder` (§6) carries the version the
   caller's `SegmentEncoder::version` reported, and a reader whose encoder
   disagrees is refused rather than handed bytes it will misread. An encoder
   that reports no version opts out, and is never checked.
 - **What no key can catch.** `encoder` versions the *encoding*. A producer
   that keeps its encoding and changes what it measures produces different
   values under an identical encoder version, which is why
-  `producer_version` (§6) exists beside it and why it should distinguish
+  `producer_version` (§6) exists beside it and why it must distinguish
   builds. Neither is enforced against values; both exist so a consumer can
   ask the question rather than guess. The remaining generality question is
   the open [encoder boundary](docs/journal/2026-09-11-encoder-boundary.md)
   gap.
 - **Legacy v3 is frozen.** Read through views, never written, never
   extended.
+- **What a release promises.** A build reads its own schema version and the
+  one before it, and writes only its own. A schema bump therefore ships with
+  a reader for the previous version and a copy-forward through `rewrite`,
+  and an archive is never migrated in place. Legacy v3 counts as the version
+  before 4 and stays readable for as long as 4 is current; when 5 arrives, 3
+  drops and 4 becomes the version read through views. Reserved metadata keys
+  are never removed and never change meaning; a key that stops being written
+  keeps its definition here. Within a schema version, a nullable column or a
+  new key is added without a bump and read as unknown by older builds.

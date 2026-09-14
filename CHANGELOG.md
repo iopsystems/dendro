@@ -15,12 +15,12 @@ carries the measurements.
 First release. The crate is a segmented Parquet archive with a write-ahead
 log, in a single SQLite file: rows land in the WAL and are periodically sealed
 into immutable parquet segments, with the catalog, retention, crash recovery
-and rewriting around them. A row is opaque bytes and a timestamp; what a row
-*means* is the caller's, expressed through one trait.
+and rewriting around them. A row is a timestamp, a wall-clock offset and opaque bytes; what the
+bytes *mean* is the caller's, expressed through one trait.
 
 ### Added
 
-- Archive, source, stream, segment and row model, with the WAL readable rather
+- Writer, source, stream, segment and row model, with the WAL readable rather
   than a staging area, and snapshot isolation for readers.
 - `SegmentEncoder`, the whole schema boundary, plus an encoder version marker
   that refuses a reader whose encoder disagrees with the writer's.
@@ -31,7 +31,7 @@ and rewriting around them. A row is opaque bytes and a timestamp; what a row
   source and logged once per stream.
 - An opaque per-segment index slot, so a caller that builds its own index over
   segment contents can keep it in the archive and stay one file.
-- `Db::verify`, reporting every problem it finds in one pass.
+- `Archive::verify`, reporting every problem it finds in one pass.
 - `read::describe`, one call for the whole catalog plus the file's own size.
 - Optional wall-clock alignment for segment boundaries.
 - `rewrite::compact`, merging a stream's small segments and reclaiming the
@@ -40,6 +40,19 @@ and rewriting around them. A row is opaque bytes and a timestamp; what a row
   grew or shrank.
 - Rewriting: combine, trim, range-copy and opt-in column projection.
 - Legacy-schema archives open read-only through compatibility views.
+- `archive::ArchiveMut`, the write handle, beside `Archive`, which now only reads.
+  `Archive::open` is read-only (the former `open_read_only`), works on read-only
+  media and on a file another process is writing, and is the only open the
+  read paths use. `ArchiveMut::create` makes a new archive; `ArchiveMut::open` takes an
+  existing one with SQLite's exclusive locking mode, so it is refused as
+  `Error::InUse` while anything else holds the file, and it refuses read-only
+  media and legacy archives by name. `ArchiveMut` derefs to `Archive`. Before this, a
+  second read-write connection on a file the writer thread held wrote
+  silently and left the writer's cached sequence numbers and watermarks
+  wrong. Seven crate-internal methods (`open_for_write`, `remove_archive`,
+  `next_seqs`, `source_time_span`, `total_wal_rows`, the pragma readers) left
+  the public surface, and `ReadOnly::Handle` is gone because a read handle
+  has nothing to refuse.
 - `keys::PRODUCER_VERSION`, a reserved metadata key for the version of the
   software that produced a source's values. Written by the producer, stored
   opaquely, never parsed. Distinct from `encoder`, which versions the row
@@ -53,6 +66,25 @@ and rewriting around them. A row is opaque bytes and a timestamp; what a row
 - `FORMAT.md` omitted `encoder` from the reserved-keys table and its
   compatibility section still described the key as a convention nobody had
   built. It is built and enforced; both now say so.
+- The read-only open failed on read-only media, where every document said
+  it was the open to use. WAL mode must create the `-shm` sidecar, which
+  read-only media refuses. It now retries with SQLite's `immutable=1` when
+  that happens and no `-wal` sidecar exists, and refuses rather than reads
+  short when one does. `tests/read_only_media.rs`.
+- The documents said an unclean kill loses at most one append. The writer's
+  channel holds one tick while another is mid-commit, so the bound is two
+  ticks, plus whatever the caller has staged. Stated as such.
+- The documents described a killed archive as a 4 KiB file with no tables.
+  Creation has checkpointed the catalog into the archive since the header
+  stamp landed, so the archive alone always opens; the numbers are
+  re-measured (45 KiB archive, 3.3 MB sidecar, 61 KiB after a read-write
+  open folds it in).
+- Two different compaction measurements (the seal-coarse arm at 18.2x and
+  2.38x, the compacted result at 18.6x and 2.37x) were cited as one number.
+  Each site now says which it cites.
+- The 3.14x per-tick write amplification that decided the page size was
+  cited by a test and present in no document. Restored to `DESIGN.md` with
+  the sweep it came from.
 
 ### Notes
 
@@ -72,14 +104,18 @@ These are release commitments tracked here rather than in the journal:
   `SourceMeta` and `SegmentMeta` do not, because marking them requires
   constructors and breaks every struct literal downstream. Each of those
   specification types has already gained a field at least once, so this is
-  the one that will bite.
-- **A stated compatibility policy** for the schema version, the legacy schema,
-  and the reserved metadata keys. `FORMAT.md` specifies the layout precisely
-  and says nothing about what a version bump promises an existing reader, or
-  whether legacy support is permanent.
-- **`#![warn(missing_docs)]`.** Every public type is documented; roughly
-  eighty public *fields* and enum-variant fields are not. Close this before
-  the docs are what people build against.
+  the one most likely to break a downstream build.
+- **`wall_offset` and `clock_offsets` may move.** A row carries a wall-clock
+  offset, and the archive derives a per-source `clock_offsets` series from
+  it. Both are a telemetry concept living in the container, as the
+  encoder-boundary journal entry records. They stay in 0.x because the one
+  caller uses them and the legacy reader needs them, and they may move into
+  the encoder's payload or the source's metadata before 1.0. Build on the
+  timestamp; treat the offset as provisional.
 - **The encoder boundary has one caller.** Recorded as an open journal entry
   rather than a defect: the generality claim is not yet earned by a second
   implementation.
+
+Done since this list was written: every public field is documented
+(`#![warn(missing_docs)]` with warnings denied in CI), and `FORMAT.md` §8
+states the compatibility policy.
