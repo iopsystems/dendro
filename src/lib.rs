@@ -3,22 +3,27 @@
 // this is inert for every ordinary build including the stable one.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-//! A segmented Parquet archive with a write-ahead log in a single file.
+//! dendro is a segmented Parquet archive with a write-ahead log, in a single
+//! SQLite file. It is for append-heavy, time-ordered data that has to stay
+//! readable while it is still being written.
 //!
-//! dendro stores an append-only stream of timestamped rows as parquet, and
-//! solves the problem that makes that hard in practice: parquet is a *batch*
-//! format. A parquet file is only readable once its footer is written, so a
-//! process appending rows continuously has nothing to show for the current
-//! batch, and nothing at all to show if it dies mid-batch. The usual answers
-//! are to shorten the batch — which multiplies files and destroys the
-//! compression parquet exists for — or to accept the loss.
+//! Parquet is a batch format. A file is unreadable until its footer lands, so
+//! a process that stops with a batch still open loses that batch. Shortening
+//! the batches puts less at risk and charges you for it elsewhere: on one body
+//! of data, 400 segments instead of one read 18x slower and took 2.4x the
+//! space, because every segment carries its own footer and compression cannot
+//! cross a segment boundary.
 //!
-//! dendro takes a different approach. Rows land first in a write-ahead log, durable
-//! and *readable* the moment they commit. Periodically a stream's accumulated
-//! rows are **sealed** into one parquet segment. A reader sees the sealed
-//! segments plus the live WAL tail materialized into one more segment, so the
-//! archive reads correctly while it is still being written, and an unclean
-//! kill costs one append rather than the whole open batch.
+//! dendro splits the two apart. Rows land in a write-ahead log, and a
+//! committed row is durable and readable at once — the WAL is not a staging
+//! area you flush before the data counts. When the caller decides a stream has
+//! accumulated enough, it seals those rows into an immutable Parquet segment;
+//! dendro never seals behind your back. Readers union the sealed segments with
+//! the live WAL tail, so they see a consistent view while another process goes
+//! on appending.
+//!
+//! Durability then belongs to the commit and segment size belongs to the seal,
+//! and you can choose them independently.
 //!
 //! # Vocabulary
 //!
