@@ -3,7 +3,7 @@
 // this is inert for every ordinary build including the stable one.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-//! A segmented-parquet archive with a write-ahead log, in a single file.
+//! A segmented Parquet archive with a write-ahead log in a single file.
 //!
 //! dendro stores an append-only stream of timestamped rows as parquet, and
 //! solves the problem that makes that hard in practice: parquet is a *batch*
@@ -13,7 +13,7 @@
 //! are to shorten the batch — which multiplies files and destroys the
 //! compression parquet exists for — or to accept the loss.
 //!
-//! dendro takes neither. Rows land first in a real write-ahead log, durable
+//! dendro takes a different approach. Rows land first in a write-ahead log, durable
 //! and *readable* the moment they commit. Periodically a stream's accumulated
 //! rows are **sealed** into one parquet segment. A reader sees the sealed
 //! segments plus the live WAL tail materialized into one more segment, so the
@@ -22,7 +22,7 @@
 //!
 //! # Vocabulary
 //!
-//! Four things nest, and they are the whole model:
+//! The model has four nested parts:
 //!
 //! **archive → stream → segment → row**
 //!
@@ -45,17 +45,16 @@
 //! | **index** | The caller's, not dendro's: an opaque blob stored beside a segment ([`Segment::index`]) that the archive never reads. The catalog knows a segment's stream and span; anything finer lives here. |
 //! | **encoder** | The caller's [`SegmentEncoder`]. The only thing that knows what a row means. |
 //!
-//! **A source is a namespace, not a box.** It is what makes a stream name
+//! **A source is a namespace.** It makes a stream name
 //! unambiguous and what gives its rows a shared wall-clock anchor — row
 //! timestamps are `anchor + monotonic elapsed`, so one source is one clock. It
 //! is deliberately not a rung on the ladder above: nothing is stored "in" a
 //! source that is not in one of its streams.
 //!
-//! **A stream is not a box either, and it is thinner than it looks.** There is
+//! **A stream is derived from its rows.** There is
 //! no `streams` table: a stream is a name that rows in `segments` and `wal`
 //! carry, and the set of streams is derived by [`Db::all_streams`], which
-//! unions those two columns. Three consequences, all of which a caller will
-//! eventually meet:
+//! unions those two columns. This has three consequences:
 //!
 //! * A stream needs no declaration. It exists from its first row.
 //! * A stream has no lifetime of its own. It can begin partway through a
@@ -72,7 +71,7 @@
 //!
 //! [`Db::all_streams`]: db::Db::all_streams
 //!
-//! Note what is NOT in either list: nothing about metrics, samples, series or
+//! The model contains nothing about metrics, samples, series or
 //! observations. dendro came out of a telemetry agent and is a good fit for
 //! telemetry, but the container does not know that and should not learn it.
 //!
@@ -84,9 +83,9 @@
 //! archive owns storage, cataloguing, retention, checkpointing and segment
 //! mechanics, and the caller owns what is in the columns.
 //!
-//! Two consequences worth stating plainly, because both are load-bearing:
+//! Two consequences are important for implementers:
 //!
-//! * An encoder must work from the rows ALONE. Both the writer (when it seals)
+//! * An encoder must work from the rows alone. Both the writer (when it seals)
 //!   and a completely separate reader (materializing a tail out of an archive
 //!   another *process* is appending to) call it, and the reader has none of the
 //!   writer's in-memory state. Anything an encode needs must travel in the rows.
@@ -122,7 +121,7 @@
 //! # }
 //! ```
 //!
-//! Reading hands back parquet BYTES. dendro does not open them and has no
+//! Reading hands back Parquet bytes. dendro does not open them and has no
 //! opinion about the query engine that will — see [`read::read_archive`].
 //!
 //! # One file, or three
@@ -133,7 +132,7 @@
 //! leave the archive itself holding nothing, with the whole recording in the
 //! sidecar until something opens the set and folds it back in.
 //!
-//! **dendro never rewrites an archive on its own account** — it does not
+//! **dendro does not rewrite an archive on its own**. It does not
 //! migrate a legacy schema in place, and it does not normalize a crashed one.
 //! An open is how you read a buffer another process is still appending to, and
 //! a reader that rearranges its subject is a reader you cannot point at
@@ -169,7 +168,7 @@ pub mod keys {
     /// producer regenerates whenever *all* of its cumulative counters start
     /// from zero together — for a process-scoped producer, once per process.
     /// Two sources with equal epochs over overlapping time are two
-    /// observations of ONE monotonic series: mergeable, never summable.
+    /// observations of one monotonic series: mergeable, never summable.
     /// OpenTelemetry's `start_time_unix_nano` is the precedent. Absent means
     /// unknown.
     ///
@@ -202,6 +201,32 @@ pub mod keys {
     /// shape is open — a viewer's own event schema may carry more fields —
     /// and dendro appends to the array rather than replacing it.
     pub const EVENTS: &str = "events";
+    /// The version of the **software that produced the source's values**, as
+    /// an opaque string — dendro stores it, displays nothing, and never parses
+    /// it. Written by the producer, not by dendro.
+    ///
+    /// What it answers: two recordings from one host disagree about a metric,
+    /// and the first question is whether the thing measuring it changed. That
+    /// question is unanswerable from a file that does not carry this.
+    ///
+    /// **It has to distinguish builds, not releases.** A bare crate version is
+    /// the weak form, because the behaviour worth bisecting usually changed in
+    /// a pre-release build; a version with a commit or build identifier
+    /// alongside it is the useful one. Any stable-per-build string will do.
+    ///
+    /// **It is not the producer's identity.** Two producers' version strings
+    /// are not comparable and this key does not say whose they are; that
+    /// belongs in the source's labels. Compare this key only between sources
+    /// you already know came from the same producer.
+    ///
+    /// Distinct from [`ENCODER`], and both are needed. `encoder` versions the
+    /// **encoding** of a row and dendro enforces it, refusing a reader whose
+    /// encoder disagrees. This versions whatever produced the **values**, and
+    /// dendro enforces nothing — a sampler that starts measuring the same
+    /// quantity differently changes every value while the encoding, and so the
+    /// encoder version, stays identical. That case is invisible to `encoder`
+    /// by construction.
+    pub const PRODUCER_VERSION: &str = "producer_version";
     /// The version of the encoder that wrote the source's rows, as the
     /// caller's [`SegmentEncoder::version`](crate::segment::SegmentEncoder::version)
     /// reported it at `add_source`. A reader whose encoder reports a

@@ -1,23 +1,23 @@
 //! The writer thread. See DESIGN.md.
 //!
-//! One dedicated thread behind a bounded channel, so encoding a large segment
+//! One dedicated thread behind a bounded channel. Encoding a large segment
 //! cannot skew the caller's append cadence and a disk that cannot keep up
 //! applies backpressure instead of growing memory. One bounded exception: a
 //! seal batch is encoded whole before its transaction opens, so its segments'
 //! bytes are all resident at once (see `seal_batch`).
 //!
-//! **A seal batch is one transaction**, and the file at `path` is a valid,
+//! **A seal batch is one transaction.** The file at `path` is a valid,
 //! openable archive from the moment [`Archive::create`](crate::writer::Archive::create) returns. There is no
 //! staging file, no rename, and no separate manifest to keep in step — the
 //! catalog IS the database, so the container gets transactions instead of
 //! imitating them.
 //!
-//! **One writing connection, always.** A second stalls on SQLite's write lock
+//! **There is one writing connection.** A second stalls on SQLite's write lock
 //! for `busy_timeout` before failing, which against a steady append cadence
 //! reads as a hang. Every mutation therefore goes through this thread's
 //! channel, including ones a caller could in principle do itself.
 //!
-//! Contract: PANIC-FREE — every fallible op returns `Err`. A caller that
+//! The writer is panic-free: every fallible operation returns `Err`. A caller that
 //! installs a panic hook exiting the process before unwinding would otherwise
 //! never reach the send-error path here: the source would skip finalize and
 //! the thread would never be joined.
@@ -61,7 +61,7 @@ enum Msg {
         clock_anchor_wall_ns: i64,
         reply: SyncSender<Result<Resumed>>,
     },
-    /// One tick's WAL rows for EVERY source in the archive, across all
+    /// One tick's WAL rows for every source in the archive, across all
     /// their streams — one transaction, and therefore one fsync at
     /// `synchronous=FULL`.
     ///
@@ -100,7 +100,7 @@ enum Msg {
     },
     /// One source's last clock observation; marks *that* source complete.
     ///
-    /// Does NOT stop the writer: an archive may hold several sources and the
+    /// Does not stop the writer: an archive may hold several sources and the
     /// others may still be running. The thread exits when every handle has been
     /// dropped and the channel closes — see `writer_thread`.
     Finalize {
@@ -360,7 +360,7 @@ impl Archive {
     /// [`Error::TimelineBackwards`], not a silent collision or a timeline
     /// that runs backwards. The anchor itself is checked the same way.
     ///
-    /// `clock_anchor_wall_ns` is THIS session's anchor: the resuming process
+    /// `clock_anchor_wall_ns` is this session's anchor: the resuming process
     /// has a fresh monotonic clock, so its rows are `anchor + elapsed` from a
     /// new wall reading, not from the source's original anchor; rows keep
     /// `timestamp + wall_offset = wall` either way, and the gap between
@@ -414,7 +414,7 @@ impl Archive {
     /// block. `Shutdown` is sent below *before* our own sender is released, and
     /// the writer honours it whoever else still holds a clone, so a wrong order
     /// is an error (work queued after the stop is dropped), not a hang. That
-    /// distinction is load-bearing: the guarantee lives in `Msg::Shutdown`, not
+    /// The guarantee comes from `Msg::Shutdown`, not
     /// in the drop order, and removing it would turn every "must drop first"
     /// note in this file into a real deadlock.
     pub fn join(&mut self) -> Result<()> {
@@ -442,14 +442,14 @@ impl Archive {
         take_writer_error(&self.err)
     }
 
-    /// Commit one tick's staged rows for EVERY source, as one transaction.
+    /// Commit one tick's staged rows for every source in one transaction.
     ///
     /// The multi-source counterpart to [`SourceWriter::wal`]. Each
     /// source's rows come from the caller's staging; this hands them
     /// over together so the archive pays one commit — one fsync at
     /// `synchronous=FULL` — per tick rather than one per endpoint.
     ///
-    /// **Why the cost is worth naming:** the hand-off is a blocking send on a
+    /// The hand-off is a blocking send on a
     /// bound-1 channel from inside the append, so a per-source commit
     /// put a linear-in-endpoint-count fsync bill on the loop that has to keep
     /// up with the sampling interval. `seal_batch` already refused exactly this
@@ -604,7 +604,7 @@ impl SourceWriter {
     ///
     /// Reachable only through a caller that stages per source, which no live caller
     /// uses: the recorder asks the archive directly. Kept because a recorder
-    /// naming its own output is the obvious thing to want.
+    /// naming its own output is a natural use case.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn path(&self) -> &Path {
         &self.path
@@ -621,7 +621,7 @@ impl SourceWriter {
         &self.stagger_key
     }
 
-    /// Hand one tick's WAL rows to the writer, for THIS source alone.
+    /// Hand one tick's WAL rows to the writer for this source.
     ///
     /// The single-source spelling.
     /// An archive with several sources should stage each one and commit the
@@ -658,7 +658,8 @@ impl SourceWriter {
     /// How many of this source's appends have been dropped for arriving at
     /// or below their stream's newest sealed row.
     ///
-    /// **Assert this is zero.** Such a row cannot be read — the watermark
+    /// A nonzero value usually indicates a producer error. Such a row cannot
+    /// be read: the watermark
     /// that keeps the seal seam free of duplicates shadows it exactly as it
     /// shadows an already-sealed row — so the writer drops it rather than
     /// spending space on it, and logs once per stream. A non-zero count is a
@@ -873,7 +874,7 @@ const RETRY_BACKOFF: [Duration; 3] = [
 /// How many consecutive ticks the writer may drop before it stops. A lock or
 /// a full disk that clears within a few seconds costs those ticks and nothing
 /// else; one that does not clear is a failure the caller must hear about
-/// rather than an archive that silently holds nothing. A writer that swallows
+/// rather than an archive that holds nothing without reporting it. A writer that swallows
 /// errors to stay up is worse than one that stops.
 const MAX_CONSECUTIVE_DROPPED_TICKS: u32 = 30;
 
@@ -963,7 +964,7 @@ impl WriterHealth {
 ///
 /// The whole tick is one transaction on the happy path (one fsync). When that
 /// fails on a constraint — a source repeating a `(stream, ts)` it already
-/// committed, which the `wal` primary key refuses — the failure is ONE
+/// committed, which the `wal` primary key refuses — the failure is one
 /// source's, so the tick is re-committed per source and only the colliding
 /// source loses its rows. Before this, the batched commit meant one source's
 /// bad tick failed every source in the archive, permanently, and told the
@@ -1225,12 +1226,12 @@ fn writer_thread(
 /// How stale a plain copy of a live archive is allowed to be.
 ///
 /// SQLite commits into a `<file>-wal` sidecar and folds it into the archive at
-/// a checkpoint, so a copy of the archive ALONE — which is what anyone who
+/// a checkpoint, so a copy of the archive alone — which is what anyone who
 /// `cp`s one, or uploads one to a browser, ends up with — is a consistent view
 /// as of the last checkpoint and nothing after it. That copy is not corrupt; it
 /// simply ends early, and nothing about it says so.
 ///
-/// [`crate::db`]'s autocheckpoint bounds how many BYTES can accumulate
+/// [`crate::db`]'s autocheckpoint bounds how many bytes can accumulate
 /// (4 MiB). It cannot bound how much TIME they represent: a busy source
 /// crosses 4 MiB in seconds, a quiet one in hours, and the quiet one is the
 /// case where a copy is silently useless. Measured before this existed: 123
@@ -1240,7 +1241,7 @@ fn writer_thread(
 /// 10s is chosen to be short against the window anyone reasons about (an
 /// incident, a benchmark run) and long against the work: a passive checkpoint
 /// of one interval's frames is a few tens of KiB at a typical cadence,
-/// and it runs on the writer THREAD rather than the append loop. It does not
+/// and it runs on the writer thread rather than the append loop. It does not
 /// make a copy exact — [`Db::vacuum_into`] does that — it makes what a
 /// copy loses bounded and small.
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
@@ -1519,7 +1520,7 @@ pub fn reclaim_if_fragmented(db: &mut Db) -> Result<()> {
 }
 
 /// The guard, as a decision rather than a branch — because it is a decision
-/// about COST, not about outcome: reclaiming an unfragmented file is a no-op
+/// about cost, not outcome: reclaiming an unfragmented file is a no-op
 /// either way, so the only way to test the threshold is to ask it directly.
 #[cfg_attr(not(any(test, feature = "test-support")), doc(hidden))]
 #[doc(hidden)]
@@ -1555,7 +1556,7 @@ fn reclaim_all(db: &mut Db) -> Result<()> {
 }
 
 /// Encode one batch's segments, insert them — with the batch's clock
-/// observation — in ONE transaction, then prune the sealed streams' WAL
+/// observation in one transaction, then prune the sealed streams' WAL
 /// outside it. Returns the timestamp of the observation recorded, if any.
 fn seal_batch(
     db: &mut Db,

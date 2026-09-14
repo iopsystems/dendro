@@ -1,4 +1,4 @@
-//! What can go wrong, as something a caller can branch on.
+//! Errors returned by archive operations.
 //!
 //! Every fallible operation used to return `Result<_, String>`. That is fine
 //! inside one program and costs a library consumer real things: the errors
@@ -8,7 +8,7 @@
 //! offer to upgrade it" and "the disk is full" were the same type and
 //! distinguishable only by substring.
 //!
-//! The enum is `#[non_exhaustive]`: new variants are not a breaking change, and
+//! The enum is `#[non_exhaustive]`: adding variants is not a breaking change, and
 //! a caller that matches must keep a `_` arm.
 
 use std::fmt;
@@ -77,7 +77,7 @@ pub enum Error {
     /// the archive was joined.
     WriterGone,
 
-    /// SQLite said no. `context` names the statement that failed; `source`
+    /// SQLite returned an error. `context` names the statement that failed; `source`
     /// keeps SQLite's own error, and with it the result code — which is what
     /// lets a caller (the writer thread, mostly) tell a lock that will clear
     /// from a constraint that will not from a corrupt file that is fatal. See

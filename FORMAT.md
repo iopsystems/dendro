@@ -296,6 +296,8 @@ encoder's and opaque to the archive — the container carries them and cannot
 read them. The design, and what each layer would owe, is in
 [the generations entry](docs/journal/2026-09-12-generations-reset-versus-wrap.md).
 | `writer_sessions` | JSON array `[{"session": uuid, "clock_anchor_wall_ns": n, "resumed_after_ts": ts?}, …]`, one per writer session that appended, in order; the last field only on a resume, naming the newest row the previous session left. One entry means the source was written in one go. |
+| `producer_version` | The version of the software that produced the source's values, as an opaque string — stored, never parsed. Written by the producer. Should distinguish **builds**, not just releases, since the behaviour worth bisecting usually changed in a pre-release build. Not an identity: whose version it is belongs in the source's labels, so compare it only between sources known to share a producer. |
+| `encoder` | The version the caller's `SegmentEncoder::version` reported at `add_source`. Written by dendro, and **enforced**: a reader whose encoder reports a different version is refused. An encoder reporting nothing is never checked. Versions the row *encoding*; `producer_version` versions whatever produced the *values*, which can change while the encoding does not. |
 | `events` | JSON `{"events": [{"timestamp": ts, "description": text, "kind": tag?, "details": text?, "id": stable id?}, …]}`. `kind` `producer_epoch` marks a counter reset, `writer_session` a resume; `id` lets a merge de-duplicate. dendro appends to the array, never replaces it. |
 
 ## 7. Writer sessions and reopening
@@ -327,11 +329,19 @@ the rows changes shape; four things are guaranteed:
   `writer_sessions` were); a new event kind. Old copiers drop what they do
   not know, which degrades to "unknown", never to wrong.
 - **What the format does not version, and whose problem it is.** The row
-  payload and the segment's columns are the encoder's; a writer and a reader
-  must run the same encoder over the same rows to the same bytes, and
-  nothing in the file says which encoder wrote it. A producer that changes
-  its encoding should say so in metadata (an `encoder` key is the obvious
-  convention) and refuse to read a mismatch — the open
-  [encoder boundary](docs/journal/2026-09-11-encoder-boundary.md) gap.
+  payload and the segment's columns are the encoder's: a writer and a reader
+  must run the same encoder over the same rows to the same bytes. The file
+  does say which encoder wrote it — `encoder` (§6) carries the version the
+  caller's `SegmentEncoder::version` reported, and a reader whose encoder
+  disagrees is refused rather than handed bytes it will misread. An encoder
+  that reports no version opts out, and is never checked.
+- **What no key can catch.** `encoder` versions the *encoding*. A producer
+  that keeps its encoding and changes what it measures produces different
+  values under an identical encoder version, which is why
+  `producer_version` (§6) exists beside it and why it should distinguish
+  builds. Neither is enforced against values; both exist so a consumer can
+  ask the question rather than guess. The remaining generality question is
+  the open [encoder boundary](docs/journal/2026-09-11-encoder-boundary.md)
+  gap.
 - **Legacy v3 is frozen.** Read through views, never written, never
   extended.

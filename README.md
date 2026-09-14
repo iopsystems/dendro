@@ -1,10 +1,10 @@
 # dendro
 
-A segmented-parquet archive with a write-ahead log, in a single file.
+A segmented Parquet archive with a write-ahead log in a single file.
 
 ## The problem
 
-Parquet is a batch format. A file is only readable once its footer is written,
+Parquet is a batch format. A file is readable only after its footer is written,
 which means a process appending rows continuously has nothing to show for the
 batch it is currently filling — and nothing at all to show for it if the
 process dies.
@@ -35,8 +35,8 @@ So:
   on sealing often.
 
 An archive is one file: a SQLite database whose catalog describes sources,
-streams and segments, and whose segments are parquet BLOBs it never looks
-inside. That buys real transactions — a seal is one commit — instead of the
+streams and segments, and whose segments are Parquet BLOBs it never looks
+inside. This provides real transactions: a seal is one commit, rather than the
 staging files, renames and manifest-ordering protocols a directory-shaped
 container needs to imitate them.
 
@@ -65,7 +65,7 @@ boundaries.
   at or below its stream's newest sealed segment cannot be read — the
   watermark that keeps the seal seam free of duplicates shadows it — so the
   writer drops it, counts it
-  (`SourceWriter::dropped_out_of_order`, worth asserting is zero) and logs
+  (`SourceWriter::dropped_out_of_order`, which should normally be zero) and logs
   once per stream. A resumed source refuses such a row outright, at the call.
   dendro is built for producers that append monotonically **per stream**:
   the restriction is per `(source, stream)`, so a sibling stream or another
@@ -92,7 +92,7 @@ boundaries.
   only where the columns they share are identical, metadata included, so a
   caller that re-describes a column in place gets no merging at all — measured
   at zero merges out of twenty segments, not merely fewer. Union-merging fixes
-  a column *set* that comes and goes; it deliberately does not fix this,
+  a column *set* that comes and goes; it does not fix this,
   because a name whose metadata moved may be a different series, and fusing
   two series into one column is undetectable afterwards. The fix is to keep
   identity out of the column.
@@ -171,7 +171,7 @@ for src in read::read_archive(&db, &MyEncoder)? {
 }
 ```
 
-`tests/roundtrip.rs` is a complete worked example, deliberately built on a row
+`tests/roundtrip.rs` is a complete worked example, built on a row
 shape (an integer and a string) that has nothing to do with what dendro was
 extracted from.
 
@@ -180,7 +180,7 @@ extracted from.
 - **Retention, as policy you write.** `SourceWriter::evict_before` drops
   everything wholly older than a cutoff and reports what it removed;
   `evict_streams_before` restricts that to the streams a predicate accepts, so
-  different streams can be worth different amounts of time. `segment_sizes` and
+  different streams can need different retention periods. `segment_sizes` and
   `archive_bytes` are what a size cap walks. Freed pages trickle back to the
   filesystem, which is what bounds a rolling buffer. dendro supplies the
   mechanism and never applies a policy of its own.
@@ -213,7 +213,7 @@ extracted from.
   dangling references, self-contradicting segments, and WAL rows no read path
   can reach. It does not open a segment — the bytes are your encoder's.
 - **Exact copies of a live archive.** SQLite commits into a `-wal` sidecar, so
-  `cp` on an archive someone is writing silently ends early. `Db::vacuum_into`
+  `cp` on an archive someone is writing can omit recent commits. `Db::vacuum_into`
   reads through the sidecar without pausing the writer.
 
 ## One file, or three
@@ -253,5 +253,5 @@ read-only; see `LEGACY_SCHEMA_VERSION`.
 The format itself — container, catalog, the meaning of every column, the
 reserved metadata keys, writer sessions, and what bumps the schema version —
 is specified in [FORMAT.md](FORMAT.md). The design reasoning, including what
-was measured to arrive at it, is in [DESIGN.md](DESIGN.md). Known gaps and the reasoning behind leaving them open
-are in [docs/journal/](docs/journal/README.md).
+was measured to arrive at it, is in [DESIGN.md](DESIGN.md). Known gaps and the
+reasons they remain open are in [docs/journal/](docs/journal/README.md).

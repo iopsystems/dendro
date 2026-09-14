@@ -1,9 +1,9 @@
 //! The container: a single SQLite file. SQLite is used as a
-//! transactional allocator with a queryable catalog, not as a query engine —
+//! transactional allocator with a queryable catalog, rather than as a query engine:
 //! segments stay parquet BLOBs the database never looks inside. See
 //! DESIGN.md § "Why parquet blobs inside a database".
 //!
-//! This is the ONLY module that knows SQL. Everything above it speaks in
+//! This is the only module that knows SQL. Everything above it speaks in
 //! sources, segments, and WAL rows.
 
 use crate::error::{Error, ReadOnly, Result};
@@ -13,7 +13,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
-/// Fixed at file creation and NOT changeable afterwards without leaving WAL
+/// Fixed at file creation and not changeable afterwards without leaving WAL
 /// mode and running a full `VACUUM`, so treat it as permanent.
 ///
 /// Larger pages help operations that are not the binding constraint, and cost
@@ -22,12 +22,12 @@ use rusqlite::{Connection, OpenFlags};
 /// read.
 pub const PAGE_SIZE: u32 = 4096;
 
-/// Cap the `-wal` sidecar by BYTES, not pages. At `PAGE_SIZE` this is close to
+/// Cap the `-wal` sidecar by bytes, not pages. At `PAGE_SIZE` this is close to
 /// SQLite's own ~1000-page default, so it changes nothing today — it exists so
 /// that the sidecar's size, and the checkpoint pause it implies, cannot track a
 /// future page size.
 ///
-/// This bounds the sidecar's SIZE. It does not bound its AGE, and the two come
+/// This bounds the sidecar's size. It does not bound its age, and the two come
 /// apart badly: a source slow enough to take an hour to accumulate 4 MiB
 /// leaves the archive an hour behind the sidecar, and a plain copy of it an
 /// hour short. [`crate::writer::CHECKPOINT_INTERVAL`] is the age bound.
@@ -39,7 +39,7 @@ const WAL_AUTOCHECKPOINT_BYTES: u32 = 4 * 1024 * 1024;
 /// a writing connection must not take this.
 const READER_CACHE_SIZE_KIB: i32 = -262_144;
 
-/// 16 MiB of page cache for a connection that only WRITES.
+/// 16 MiB of page cache for a connection that only writes.
 ///
 /// **Split from the reader's cache because a writer cannot use it.** The
 /// reader's figure buys segment-read throughput; a source writer inserts
@@ -99,7 +99,7 @@ const LEGACY_SCHEMA_VERSION: i64 = 3;
 /// them, which every archive has always had.
 pub const APPLICATION_ID: u32 = 0x6465_6e64;
 
-/// What the first 100 bytes of a file say about it. See [`sniff_bytes`].
+/// The information about a file available from its first 100 bytes. See [`sniff_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Fields are added without a major version; construct one only by
 /// asking dendro for it, and match with a wildcard arm.
@@ -295,7 +295,7 @@ pub enum Depth {
     ///
     /// `quick_check` still walks the whole database and still finds a
     /// damaged page — what it skips is cross-checking each index entry
-    /// against the row it points at, and the `UNIQUE`/`NOT NULL` constraint
+    /// against the row it points at, along with the `UNIQUE`/`NOT NULL` constraint
     /// verification that goes with it. So this is the cheaper pass, not a
     /// structural-only one, and for detecting bit-rot it is very nearly as
     /// good.
@@ -744,7 +744,7 @@ impl Db {
     /// sidecar is not in these bytes and is not read. That is not a new gap —
     /// the sidecar is a separate file that a caller holding one archive blob
     /// never has — and it is not where an archive's own liveness lives: unsealed
-    /// rows are rows of the `wal` TABLE, inside this image, and
+    /// rows are rows of the `wal` table, inside this image, and
     /// the read path materializes them like any other.
     pub fn open_bytes(bytes: Vec<u8>) -> Result<Self> {
         const HEADER: &[u8] = b"SQLite format 3\0";
@@ -807,7 +807,7 @@ impl Db {
     /// * `application_id == APPLICATION_ID` — a stamped archive; its
     ///   `user_version` is the schema version.
     /// * `application_id == 0` — SQLite's default, which every archive
-    ///   written before the stamp carries. The `schema_version` TABLE decides
+    ///   written before the stamp carries. The `schema_version` table decides
     ///   instead. Its absence has one overwhelmingly likely cause worth
     ///   naming: a plain copy of an archive a writer still held, whose pages
     ///   are in a `-wal` sidecar the copy does not carry.
@@ -917,7 +917,7 @@ impl Db {
 
     /// Copy what the `-wal` sidecar holds into the archive itself, best-effort.
     ///
-    /// **PASSIVE, deliberately.** A passive checkpoint moves whatever frames it
+    /// **Passive by design.** A passive checkpoint moves whatever frames it
     /// can and returns; it never waits for a reader, and it never blocks the
     /// writer behind one. `FULL`/`TRUNCATE` would stall until readers finish,
     /// and this runs on the writer thread with a capacity-1 channel behind it —
@@ -1079,7 +1079,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Run `f` inside ONE transaction: it commits when `f` returns `Ok` and
+    /// Run `f` inside one transaction: it commits when `f` returns `Ok` and
     /// rolls back — leaving the database exactly as it was — when `f` returns
     /// `Err` or the commit itself fails.
     ///
@@ -1090,7 +1090,7 @@ impl Db {
     ///
     /// `f` receives a `Tx`, not the connection: SQL stays inside this
     /// module, and `Tx` deliberately exposes only the *writes that belong
-    /// in a seal batch*. `prune_wal` is NOT among them, which is how "the
+    /// in a seal batch*. `prune_wal` is not among them, which is how "the
     /// prune runs outside the seal transaction" is made unrepresentable rather
     /// than merely documented — inside it, a quiet stream's accumulated rows
     /// make the delete long enough to threaten the tick.
@@ -1181,10 +1181,10 @@ impl Db {
 
     /// Every segment for `(source_id, stream)`, in `seq` order.
     ///
-    /// The `ORDER BY seq` is load-bearing, not cosmetic: the reader splices
+    /// The `ORDER BY seq` is required: the reader splices
     /// segment bytes together assuming they arrive in sequence order, and SQL
     /// makes no ordering guarantee without it. Confirmed with
-    /// `EXPLAIN QUERY PLAN`: dropping the clause does NOT fall back to
+    /// `EXPLAIN QUERY PLAN`: dropping the clause does not fall back to
     /// insertion order or to the primary key — the planner instead picks the
     /// `segments_by_time` index for the `(source_id, stream)` equality
     /// filter, which is ordered by `last_ts`, not `seq`, and is not even
@@ -1358,7 +1358,7 @@ impl Db {
         Self::collect_segments(&mut stmt, params, stream)
     }
 
-    /// Run `f` with every read inside ONE transaction, so all of its queries
+    /// Run `f` with every read inside one transaction, so all of its queries
     /// see the same snapshot of the database.
     ///
     /// The dump needs this: without it, retention can evict a segment between
@@ -1438,7 +1438,7 @@ impl Db {
 
     /// Every distinct stream with at least one segment for `source_id`,
     /// alphabetically. A stream with only unsealed WAL rows and no sealed
-    /// segment yet will NOT appear here — use `all_streams` for "every
+    /// segment yet will not appear here — use `all_streams` for "every
     /// stream this source has ever seen".
     pub fn streams(&self, source_id: i64) -> Result<Vec<String>> {
         let mut stmt = self
@@ -1494,7 +1494,7 @@ impl Db {
     /// transaction()` requires `&mut Connection`. An earlier version used
     /// `unchecked_transaction()` to keep `&self`, on the reasoning that this
     /// module never nests transactions — but the hazard `&mut` guards
-    /// against is on the CALLER's side, not this function's: the writer
+    /// against is on the caller's side, not this function's: the writer
     /// thread owns this `Db` outright ("no concurrent writers to one file" is
     /// an explicit non-goal) and does want a transaction
     /// around a whole co-seal batch — `transaction`, which this now goes
@@ -1506,7 +1506,7 @@ impl Db {
         self.transaction(|tx| tx.insert_wal_rows(source_id, rows))
     }
 
-    /// One tick's rows for several sources, in ONE transaction.
+    /// One tick's rows for several sources, in one transaction.
     ///
     /// **The transaction count is the point, not the row count.** At
     /// `synchronous=FULL` every commit is an fsync, and the send that carries
@@ -1559,7 +1559,7 @@ impl Db {
     /// over zero rows is SQL `NULL`, which `COALESCE` turns into `-1`, so
     /// every row there is, is live.
     ///
-    /// **`NOT EXISTS`, not a sentinel.** This was
+    /// **`NOT EXISTS`, rather than a sentinel.** This was
     /// `ts > COALESCE(MAX(last_ts), 0)`, which made a row at ts=0 invisible for
     /// the entire life of a stream that had not yet sealed — durable, never
     /// read, never reported. Lowering the sentinel to -1 fixed that case and
@@ -1714,7 +1714,7 @@ impl Db {
     /// delete an indexed lookup rather than a scan; that index exists for this
     /// statement.
     ///
-    /// ONE transaction, and that is load-bearing rather than tidy. Deleting a
+    /// one transaction, and that is required for correctness. Deleting a
     /// segment lowers `live_wal`'s watermark for its stream, so WAL rows the
     /// segment already covered would become live again — a reader would splice
     /// them back in as a tail. The same-cutoff WAL delete is what stops that,
@@ -1745,7 +1745,7 @@ impl Db {
     /// so a caller whose streams are grouped under some coarser unit can
     /// express retention by that unit.
     ///
-    /// Still ONE transaction, for the reason
+    /// Still one transaction, for the reason
     /// [`evict_before`](Self::evict_before) gives — but note the scope is now
     /// per stream, which is what makes that reason keep holding: the WAL delete
     /// that stops a segment delete from un-shadowing rows has to carry the same
@@ -1824,7 +1824,7 @@ impl Db {
     /// to [`evict_before`](Self::evict_before) — segments are immutable, so a
     /// cutoff is the only granularity there is.
     ///
-    /// **There is deliberately no "drop these segments" primitive.** Dropping
+    /// **There is no "drop these segments" primitive.** Dropping
     /// an arbitrary segment is not safe in the way dropping a prefix is:
     /// removing a stream's NEWEST segment lowers [`live_wal`](Self::live_wal)'s
     /// watermark, and WAL rows that segment already covered become live again —
@@ -1939,9 +1939,9 @@ impl Db {
     /// parks space on the free list permanently. This is the trickle that gives
     /// it back, sized (`pages`) to fit inside a tick.
     ///
-    /// **Stepped to exhaustion, and NOT with `execute_batch`.** This pragma
+    /// **Stepped to exhaustion, rather than using `execute_batch`.** This pragma
     /// reclaims one page per step and `execute_batch` steps a statement once,
-    /// so the obvious spelling silently reclaims exactly ONE page whatever
+    /// so the obvious spelling silently reclaims only one page whatever
     /// `pages` says. That is not a slow reclaim, it is no reclaim at all: at
     /// one page per retention pass a rolling buffer would never work off a
     /// spike.
@@ -1966,7 +1966,7 @@ impl Db {
     /// rebuilds the destination from scratch, so a dump is where a rolling buffer
     /// buffer's free list gets compacted away for free.
     ///
-    /// A plain file copy is NOT an equivalent: in WAL mode the main database
+    /// A plain file copy is not equivalent: in WAL mode the main database
     /// file lags every commit since the last checkpoint, so copying it alone
     /// silently loses the most recent ticks.
     pub fn vacuum_into(&self, dest: &Path) -> Result<()> {
@@ -2389,7 +2389,7 @@ impl Tx<'_> {
 
     /// Insert one sealed segment's bytes and catalog facts.
     ///
-    /// A plain `INSERT` with a `&[u8]` parameter, NOT incremental BLOB I/O
+    /// A plain `INSERT` with a `&[u8]` parameter, rather than incremental BLOB I/O
     /// (`blob_open`). At the sizes a segment reaches, `blob_open`'s two-step
     /// (reserve, then stream) is measurably slower than handing SQLite the
     /// whole buffer, so the simpler API is also the faster one here.
@@ -3422,7 +3422,7 @@ mod tests {
     }
 
     /// `archive_bytes` is the file the filesystem sees, which is what a size
-    /// cap is written against — and it does NOT shrink on eviction alone.
+    /// cap is written against — and it does not shrink on eviction alone.
     #[test]
     fn archive_bytes_counts_the_file_including_pages_not_yet_reclaimed() {
         let dir = tempfile::tempdir().unwrap();

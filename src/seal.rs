@@ -7,7 +7,7 @@
 //! lands in, so a plain source and a rolling buffer use exactly the same
 //! ones.
 //!
-//! The caller decides when to ACT on the answer — dendro never seals behind
+//! The caller decides when to act on the answer; dendro never seals behind
 //! your back. Nothing here writes; it only accounts and advises.
 
 use std::time::{Duration, Instant};
@@ -95,7 +95,7 @@ pub struct SealPolicy {
 /// `max_rows` is what bounds the finalize tail on thin tables, and it is nearly
 /// free precisely because it does not reach the wide ones.
 ///
-/// **These numbers were measured on one workload** — a telemetry agent
+/// **These numbers were measured on one workload**: a telemetry agent
 /// sealing a few dozen streams at a ~46 ms append cadence, on a production
 /// fleet — and are a starting point, not a property of the container. A
 /// caller appending at a very different cadence, or with rows of a very
@@ -150,7 +150,7 @@ impl SegmentAccount {
     /// splits the *wide* tables (see `SealPolicy`), so leaving it unstaggered
     /// left exactly those tables with no phase offset at all. Within one
     /// source that was survivable — different streams fill at different
-    /// rates, so they drift anyway — but two sources of the SAME producer
+    /// rates, so they drift anyway — but two sources of the same producer
     /// carry identical data, so a byte-bound table reached the cap on the same
     /// row in both and they sealed in permanent lockstep. Measured before the
     /// fix: `cpu_usage` 49/49 segment boundaries coincident across two
@@ -181,7 +181,7 @@ impl SegmentAccount {
             // which would seal a one-row segment every tick forever.
             max_rows: policy.max_rows.saturating_sub(row_offset).max(1),
             max_age: policy.max_age.saturating_sub(age_offset),
-            // NOT staggered: the whole point of alignment is that every
+            // Alignment is not staggered: its purpose is for every
             // stream cuts at the same wall-clock instant, so offsetting it
             // per stream would defeat it. The caps are staggered to spread
             // the seal WORK; alignment is about where the edges land.
@@ -375,7 +375,7 @@ pub fn stagger_bucket(stream: &str, source_key: &str) -> u64 {
     h % STAGGER_BUCKETS
 }
 
-/// Whether two source keys draw the SAME stagger bucket for EVERY stream.
+/// Whether two source keys draw the same stagger bucket for every stream.
 ///
 /// Not a string comparison — an exact statement about
 /// [`stagger_bucket`]'s algebra. The absorb is affine in each
@@ -623,7 +623,7 @@ mod tests {
     ///
     /// Plain FNV-1a reduced mod 64 depends only on each byte's low six bits,
     /// so two hostnames agreeing byte-for-byte modulo 0x40 drew the same
-    /// bucket for EVERY stream — complete lockstep between two sources
+    /// bucket for every stream — complete lockstep between two sources
     /// that look nothing alike. The pairs are ordinary: `-`/`m`, `.`/`n`,
     /// digits against `p`-`y`.
     #[test]
@@ -765,7 +765,7 @@ mod tests {
         }
     }
 
-    /// An A/B on ONE host separates only on `arm` — which is why the key is the
+    /// An A/B on one host separates only on `arm` — which is why the key is the
     /// whole label set and not the node name.
     #[test]
     fn same_host_different_arms_still_desync() {
@@ -789,7 +789,7 @@ mod tests {
 
     /// The bucket follows a source's labels, not its position.
     ///
-    /// This is deliberately NOT written as "compute the pair in both orders
+    /// This is deliberately not written as "compute the pair in both orders
     /// and compare". `stagger_bucket` takes two `&str` and no index, and
     /// `source_stagger_key` takes a `BTreeMap` that is sorted before it is
     /// called — so any such assertion reduces to `[f(a), f(b)] == [f(a),

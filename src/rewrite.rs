@@ -105,7 +105,7 @@ pub struct Compacted {
 
 /// Merge a stream's small adjacent segments into larger ones, in place.
 ///
-/// **Why.** Read cost is linear in segment count — measured at 674 µs plus
+/// Read cost is linear in segment count, measured at 674 µs plus
 /// 29 µs per segment on a 50-column stream, an 18.2× difference between 400
 /// segments and one, with the archive 2.38× larger as well (see
 /// `docs/journal/2026-09-11-segment-compaction.md`). Segments are sized when
@@ -385,7 +385,7 @@ fn concat_parquet(
 /// dendro does not know what a column is for, so both halves of the decision
 /// are here. They are separate questions: a segment keeps its structural
 /// columns (timestamps and whatever sidecars the caller's row shape needs)
-/// unconditionally, but a segment left holding ONLY those carries no data and
+/// unconditionally, but a segment left holding only those carries no data and
 /// is dropped rather than written empty.
 pub trait ColumnFilter {
     /// Keep this column in the projected segment?
@@ -411,7 +411,7 @@ pub struct CopySpec<'a> {
     pub metadata_extra: Option<&'a BTreeMap<String, String>>,
     /// When set, project each copied segment's parquet down to the columns
     /// this accepts, decoding and re-encoding it. `None` is the fast path —
-    /// segment BLOBs pass through byte-identical. This is the ONE copy that
+    /// segment BLOBs pass through byte-identical. This is the only copy that
     /// touches segment bytes; see [`project_segment_columns`]. A stream left
     /// with no data column is dropped.
     pub keep_columns: Option<&'a dyn ColumnFilter>,
@@ -451,7 +451,7 @@ impl CopySpec<'_> {
     }
 }
 
-/// The uuids of sources present in BOTH archives — the same source, not two
+/// The UUIDs of sources present in both archives — the same source, not two
 /// sources with the same labels. A caller assembling several archives into
 /// one asks this before copying: the same file given twice, or a copy
 /// alongside its original, would otherwise land twice and double every
@@ -636,7 +636,7 @@ fn copy_sources_snapshotted(
 /// Re-encode one segment with only the columns `keep` accepts, or `None` when
 /// nothing but structural columns survive.
 ///
-/// This is the ONE operation in this module that touches segment bytes; every
+/// This is the only operation in this module that touches segment bytes; every
 /// other copy passes the parquet BLOB through verbatim. Row count, timestamps
 /// and column values are unchanged by a projection, so a projected segment
 /// reuses its source's catalog entry as-is.

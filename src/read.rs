@@ -2,7 +2,7 @@
 //! tail spliced on as the newest one.
 //!
 //! This is the whole read side of the container. What dendro hands back is
-//! parquet BYTES — it does not open them, and it has no opinion about the
+//! Parquet bytes — it does not open them, and it has no opinion about the
 //! query engine that will. Everything above this line is the caller's.
 
 use std::collections::BTreeMap;
@@ -81,7 +81,7 @@ impl SourceCatalog {
     }
 }
 
-/// Everything the catalog knows about the archive, in ONE snapshot and
+/// Everything the catalog knows about the archive, from one snapshot and
 /// without reading a segment.
 ///
 /// This is the open a lazy reader wants: which sources and streams exist,
@@ -195,7 +195,7 @@ pub fn describe(db: &Db) -> Result<Overview> {
     })
 }
 
-/// ONE segment of a stream, for a caller that needs to learn the stream's
+/// One segment of a stream, for a caller that needs to learn the stream's
 /// schema — the columns, the names — before deciding whether to read it.
 ///
 /// The first sealed segment when there is one; otherwise the live tail,
@@ -272,7 +272,7 @@ pub struct SourceSegments {
 ///
 /// Two things differ from a mechanical transcription of the catalog:
 ///
-/// * Streams are enumerated with [`Db::all_streams`], NOT [`Db::streams`]. The
+/// * Streams are enumerated with [`Db::all_streams`], not [`Db::streams`]. The
 ///   latter sees only `segments`, so a stream still inside its first seal
 ///   period — 16 of 26 in production measurement that motivated this container
 ///   — would be invisible, which is precisely the data the WAL exists to keep.
@@ -284,7 +284,7 @@ pub fn read_archive(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec<SourceS
     db.read_snapshot(|db| read_archive_snapshotted(db, encoder))
 }
 
-/// ONE snapshot for the whole archive, so the streams are consistent with each
+/// One snapshot covers the whole archive, so the streams are consistent with each
 /// other as well as with themselves.
 ///
 /// Per stream, the hazard is that a seal landing between the segment read and
@@ -321,7 +321,7 @@ fn read_archive_snapshotted(db: &Db, encoder: &dyn SegmentEncoder) -> Result<Vec
 /// One stream's parquet segments, oldest first: its sealed segments in `seq`
 /// order, then its live WAL tail materialized as the newest segment.
 ///
-/// [`Db::live_wal`], NOT [`Db::read_wal`]: the watermark (`ts > MAX(last_ts)`
+/// [`Db::live_wal`], not [`Db::read_wal`]: the watermark (`ts > MAX(last_ts)`
 /// over that stream's own segments) is the only thing keeping the seam free of
 /// duplicates. The prune runs outside the seal transaction, so `wal` routinely
 /// still holds rows a sealed segment already covers; replaying the raw table
@@ -384,7 +384,7 @@ fn stream_segments_snapshotted(
 ///
 /// `Db::read_segment_indexes` is the cheaper half and answers for sealed
 /// segments alone. This one also materializes the tail, because a tail's
-/// index does not exist until its segment does — so use it when "what is in
+/// index does not exist until its segment does, so use it when "what is in
 /// this stream right now" has to include data that has not sealed yet, and
 /// the catalog version when it does not.
 pub fn stream_indexes(

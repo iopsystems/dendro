@@ -74,15 +74,15 @@ pub struct Segment {
 
 /// Turns a stream's WAL rows into one parquet segment.
 ///
-/// **This is the whole schema boundary.** dendro stores a WAL row as an opaque
+/// **This is the schema boundary.** dendro stores a WAL row as an opaque
 /// BLOB keyed by `(source, stream, ts)`; what those bytes mean, and what
 /// columns they become, is entirely the caller's. Both the writer thread (when
 /// it seals) and any independent reader (materializing a live tail out of an
 /// archive another process is appending to) call this, so an implementation
-/// must work from the rows ALONE — a reader has none of the writer's in-memory
+/// must work from the rows alone: a reader has none of the writer's in-memory
 /// state, so anything an encode needs must travel in the rows.
 ///
-/// `None` means the rows produce no segment.
+/// `None` means that the rows produce no segment.
 ///
 /// **Called with an empty slice**, on every read of a stream with nothing
 /// unsealed — which is every read of a finalized archive. An implementation
@@ -106,8 +106,8 @@ pub trait SegmentEncoder {
     }
 }
 
-/// Run an encoder over a run of WAL rows and check what came back — the ONE
-/// place the encoder contract is enforced, for all three callers: the writer
+/// Run an encoder over a run of WAL rows and validate the result. This is the
+/// shared enforcement point for the writer,
 /// when it seals, a copy when it carries a live tail across, and a reader
 /// materializing a tail. They used to check three different things, and the
 /// reader's was the weakest, so an encoder the seal refused was materialized
@@ -186,8 +186,8 @@ pub fn materialize(
 
 /// What an encoder returns.
 ///
-/// A boxed `std::error::Error` rather than this crate's own: the failure is the
-/// CALLER's, and stringifying it at the boundary threw away whatever type it
+/// A boxed `std::error::Error` rather than this crate's own type. The failure is
+/// the caller's, and stringifying it at the boundary would discard its concrete type.
 /// had. Wrapped in [`Error::Encoder`](crate::Error), which keeps it as
 /// `source()`, so a caller can downcast back to its own error rather than
 /// matching on a message it built.
