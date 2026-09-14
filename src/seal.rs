@@ -39,8 +39,14 @@ pub const SINGLE_SOURCE_KEY: &str = "";
 /// unclean kill loses. It is also what drives segment count, so the trade (loss
 /// window vs segments and read-time merge width) is deliberate.
 pub struct SealPolicy {
+    /// Seal once the open segment's approximate encoded size reaches this.
+    /// The cap that splits the WIDE streams; see [`SealPolicy::default`].
     pub max_bytes: usize,
+    /// Seal once the open segment holds this many rows. The cap that splits
+    /// the THIN streams, which take a long time to reach any byte threshold.
     pub max_rows: usize,
+    /// Seal once the open segment is this old, whatever its size. Bounds how
+    /// much an unclean kill loses, not seal cost.
     pub max_age: Duration,
     /// Seal on a wall-clock boundary as well: no segment spans two multiples
     /// of this, in **the same unit as your row timestamps** (dendro does not

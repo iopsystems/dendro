@@ -2,6 +2,12 @@
 // docs.rs build (see `[package.metadata.docs.rs]`), which runs nightly, so
 // this is inert for every ordinary build including the stable one.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+// Every public item carries its own docs, and CI runs rustdoc with
+// `-D warnings`, so this is a build failure rather than advice. It exists
+// because a moved function leaves its doc block behind: seven of them had
+// fused onto whatever item ended up below them, and five public methods
+// shipped blank before this lint named them.
+#![warn(missing_docs)]
 
 //! dendro is a segmented Parquet archive with a write-ahead log, in a single
 //! SQLite file. It is for append-heavy, time-ordered data that has to stay

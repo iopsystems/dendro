@@ -108,7 +108,10 @@ pub enum Sniff {
     /// A stamped archive; `version` is its `user_version`, which an open
     /// still gates (a version this build does not read is refused there, by
     /// name).
-    Stamped { version: i64 },
+    Stamped {
+        /// The file's `user_version`.
+        version: i64,
+    },
     /// A SQLite file with the default id, which is what every archive
     /// written before the stamp carries — and also what any other unstamped
     /// SQLite database carries. Only an open can tell them apart.
@@ -163,7 +166,11 @@ pub fn sniff(path: &Path) -> Result<Sniff> {
 /// One source's identity: everything known when the source starts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceMeta {
+    /// What distinguishes this source from the others: one producer, one
+    /// clock domain, one label set.
     pub labels: BTreeMap<String, String>,
+    /// The caller's metadata map. dendro reads none of it; see
+    /// [`crate::keys`] for the keys with an agreed meaning across callers.
     pub metadata: BTreeMap<String, String>,
     /// Wall-clock reading (ns since epoch) at source start. Row timestamps
     /// are `anchor + monotonic elapsed`, so this pins the timeline to wall time.
@@ -176,7 +183,9 @@ pub struct SourceMeta {
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct SourceRow {
+    /// The row id, which names this source within one archive.
     pub id: i64,
+    /// The identity the source was started with.
     pub meta: SourceMeta,
     /// The source's identity across files: a v4 UUID minted when the row was
     /// inserted and carried verbatim by every copy, so whether two archives
@@ -194,8 +203,12 @@ pub struct SourceRow {
 /// SQLite is asked to know about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
+    /// How many rows the segment holds.
     pub rows: u64,
+    /// The timestamp of its first row.
     pub first_ts: i64,
+    /// The timestamp of its last row. What the WAL prune and the read
+    /// watermark are computed from.
     pub last_ts: i64,
 }
 
@@ -205,8 +218,11 @@ pub struct SegmentMeta {
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct SegmentRow {
+    /// Position in the stream, oldest first. Segments are read in this order.
     pub seq: u64,
+    /// What the catalog knows about the segment.
     pub meta: SegmentMeta,
+    /// The segment itself: one parquet file.
     pub bytes: Vec<u8>,
     /// The caller's index over this segment, as it was written — see
     /// [`Segment::index`](crate::segment::Segment::index). Carried here so a
@@ -227,9 +243,15 @@ pub struct SegmentRow {
 /// rather than carried every time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalRow {
+    /// The stream the row belongs to.
     pub stream: String,
+    /// The row's timestamp, and with `stream` its key within a source.
     pub ts: i64,
+    /// Wall time minus `ts` at the moment the row was taken, so
+    /// `ts + wall_offset` is the wall clock a monotonic timestamp maps to.
     pub wall_offset: i64,
+    /// The payload. Opaque to dendro; only the caller's
+    /// [`SegmentEncoder`](crate::segment::SegmentEncoder) decodes it.
     pub row: Vec<u8>,
 }
 
@@ -241,7 +263,9 @@ pub struct WalRow {
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct Evicted {
+    /// Sealed segments deleted.
     pub segments: usize,
+    /// WAL rows deleted, live and already-sealed together.
     pub wal_rows: usize,
     /// How many of `wal_rows` were LIVE — past their stream's newest sealed
     /// segment — when they were deleted. Those rows were in no segment: an
@@ -261,8 +285,11 @@ pub struct Evicted {
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct Span {
+    /// How many rows.
     pub rows: u64,
+    /// The oldest row's timestamp; `None` when `rows` is 0.
     pub first_ts: Option<i64>,
+    /// The newest row's timestamp; `None` when `rows` is 0.
     pub last_ts: Option<i64>,
 }
 
@@ -314,11 +341,15 @@ pub enum Depth {
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct Report {
+    /// Sources in the archive.
     pub sources: usize,
+    /// Streams across every source.
     pub streams: usize,
+    /// Sealed segments across every stream.
     pub segments: usize,
     /// WAL rows the archive holds, whether or not a reader can see them.
     pub wal_rows: usize,
+    /// Everything wrong that was found. Empty is a sound archive.
     pub problems: Vec<Problem>,
 }
 
@@ -346,9 +377,13 @@ pub enum Problem {
     ForeignKey(String),
     /// A segment whose catalog entry contradicts itself.
     Segment {
+        /// The source it belongs to.
         source_id: i64,
+        /// The stream it belongs to.
         stream: String,
+        /// Its position in that stream.
         seq: u64,
+        /// How the entry contradicts itself.
         detail: String,
     },
     /// WAL rows that no read path can reach: at or below their stream's
@@ -356,8 +391,11 @@ pub enum Problem {
     /// an already-sealed row. Space spent on nothing. A current writer drops
     /// such an append; an archive written before it did carries them.
     UnreadableWalRows {
+        /// The source holding them.
         source_id: i64,
+        /// The stream holding them.
         stream: String,
+        /// How many.
         rows: usize,
     },
 }

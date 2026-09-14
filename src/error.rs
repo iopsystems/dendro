@@ -31,15 +31,25 @@ pub enum Error {
 
     /// The file's schema is one this build does not know. Carries the version
     /// found, so a caller can tell "too new, upgrade dendro" from "too old".
-    UnsupportedSchema { found: i64, writes: i64, reads: i64 },
+    UnsupportedSchema {
+        /// The `user_version` the file carries.
+        found: i64,
+        /// The schema version this build writes.
+        writes: i64,
+        /// The oldest schema version this build reads.
+        reads: i64,
+    },
 
     /// The archive says its rows were written by one encoder version and the
     /// caller is reading with another. The bytes are the encoder's, so
     /// nothing else can say whether the two agree; refusing is the only
     /// answer that is never silently wrong.
     EncoderMismatch {
+        /// The `sources` row the mismatch was found on.
         source_id: i64,
+        /// The encoder version recorded when the source was written.
         wrote: String,
+        /// The version the reading encoder reports now.
         reading: String,
     },
 
@@ -47,24 +57,44 @@ pub enum Error {
     /// previous writer session left, or a resume anchor at or before it: the
     /// wall clock went backwards across the restart, and writing would make
     /// a timeline that runs backwards or collides with itself.
-    TimelineBackwards { source_id: i64, ts: i64, floor: i64 },
+    TimelineBackwards {
+        /// The resumed source.
+        source_id: i64,
+        /// The timestamp that was refused.
+        ts: i64,
+        /// The newest row the previous writer session left. Every row this
+        /// session commits must be stamped after it.
+        floor: i64,
+    },
 
     /// The file is not a dendro archive: not SQLite, another application's
     /// database, or a copy taken from under a writer that carries no catalog.
     /// `what` names the file (or `<bytes>`), `reason` says which.
-    NotAnArchive { what: String, reason: String },
+    NotAnArchive {
+        /// The file, or `<bytes>` for an archive opened from memory.
+        what: String,
+        /// Which of the three it is.
+        reason: String,
+    },
 
     /// The caller's [`SegmentEncoder`](crate::segment::SegmentEncoder) failed.
     /// Its own error is preserved rather than stringified, so a caller can
     /// downcast back to it.
     Encoder {
+        /// The stream whose rows it was encoding.
         stream: String,
+        /// The encoder's own error, downcastable back to its concrete type.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The encoder returned a segment that does not describe the rows it was
     /// given. An encoder may drop rows; it may not invent coverage.
-    EncoderContract { stream: String, detail: String },
+    EncoderContract {
+        /// The stream whose rows it was encoding.
+        stream: String,
+        /// What the segment claimed against what the rows hold.
+        detail: String,
+    },
 
     /// The writer thread failed, and this is what it failed with.
     ///
@@ -83,7 +113,9 @@ pub enum Error {
     /// from a constraint that will not from a corrupt file that is fatal. See
     /// [`Error::is_retryable`] and [`Error::is_constraint`].
     Sqlite {
+        /// What was being done, for the message. Empty for a bare conversion.
         context: String,
+        /// SQLite's own error, and with it the result code.
         source: rusqlite::Error,
     },
 

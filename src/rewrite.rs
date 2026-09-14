@@ -399,6 +399,9 @@ pub struct CopySpec<'a> {
     /// Row-timestamp bound in nanoseconds. The rewrite tools copy everything;
     /// a ranged dump narrows it to the incident window.
     pub start: i64,
+    /// The other end of that bound, inclusive. A segment is carried whole
+    /// when it overlaps `[start, end]` at all, so a copy holds a little more
+    /// than it asked for at each edge.
     pub end: i64,
     /// Keep only the streams this accepts; `None` keeps every stream.
     ///

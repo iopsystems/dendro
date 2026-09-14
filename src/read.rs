@@ -20,6 +20,7 @@ use crate::segment::SegmentEncoder;
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct StreamCatalog {
+    /// The stream's name, as its rows carry it.
     pub name: String,
     /// How many sealed segments the stream has.
     pub segments: u64,
@@ -61,12 +62,25 @@ impl StreamCatalog {
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct SourceCatalog {
+    /// The `sources` row id, which names this source within one archive.
     pub id: i64,
+    /// The source's identity ACROSS files, carried verbatim by every copy.
+    /// `None` for an archive written before the column existed.
     pub uuid: Option<String>,
+    /// What distinguishes this source from the others: one producer, one
+    /// clock domain, one label set.
     pub labels: BTreeMap<String, String>,
+    /// The caller's metadata map. dendro reads none of it; see
+    /// [`crate::keys`] for the keys with an agreed meaning across callers.
     pub metadata: BTreeMap<String, String>,
+    /// False when the source was never cleanly finalized, so data after the
+    /// last row may be missing. Survives a copy: it describes the DATA.
     pub complete: bool,
+    /// Wall-clock reading (ns since epoch) at source start. Row timestamps
+    /// are `anchor + monotonic elapsed`, so this pins the timeline to wall
+    /// time.
     pub clock_anchor_wall_ns: i64,
+    /// Every stream the source currently holds, alphabetically.
     pub streams: Vec<StreamCatalog>,
 }
 
@@ -143,7 +157,9 @@ pub struct Overview {
     /// The archive's size on disk, as SQLite accounts it. Excludes the
     /// `-wal` sidecar, which is not part of the artifact.
     pub bytes: u64,
+    /// How the archive's pages stand: how many, how many free, how big one is.
     pub pages: crate::db::PageStats,
+    /// Every source in the file, with every stream each currently holds.
     pub sources: Vec<SourceCatalog>,
 }
 
@@ -259,7 +275,10 @@ pub fn stream_range(
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct SourceSegments {
+    /// What distinguishes this source from the others: one producer, one
+    /// clock domain, one label set.
     pub labels: BTreeMap<String, String>,
+    /// The caller's metadata map, as stored. See [`crate::keys`].
     pub metadata: BTreeMap<String, String>,
     /// False when the source was never cleanly finalized, so data after the
     /// last row may be missing. Survives a copy: it describes the DATA.
@@ -419,10 +438,15 @@ pub fn stream_indexes(
 /// Named for the bytes rather than the origin because `source` already means
 /// something else here: one producer, one clock domain, one label set.
 pub enum SegmentBytes {
+    /// Already resolved: the segments, oldest first, live tail included.
     Bytes(Vec<Vec<u8>>),
+    /// A stream in an archive on disk, reopened read-only per fetch.
     Db {
+        /// The archive holding it.
         path: PathBuf,
+        /// The source the stream belongs to.
         source_id: i64,
+        /// The stream to fetch.
         stream: String,
     },
     /// A catalog that exists only in memory, shared by every stream of the
@@ -435,8 +459,12 @@ pub enum SegmentBytes {
     /// legal: `rusqlite::Connection` is `Send` but not `Sync`, and a reader is
     /// read from several threads on the native probe path.
     SharedDb {
+        /// The one open connection every stream of this archive fetches
+        /// through.
         db: Arc<std::sync::Mutex<Db>>,
+        /// The source the stream belongs to.
         source_id: i64,
+        /// The stream to fetch.
         stream: String,
     },
 }
