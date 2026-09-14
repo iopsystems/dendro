@@ -226,10 +226,13 @@ pub mod keys {
     pub const PRODUCER_EPOCHS: &str = "producer_epochs";
     /// Every writer session that appended to the source, in order: a JSON
     /// array of `{"session": <uuid>, "clock_anchor_wall_ns": <anchor>,
-    /// "resumed_after_ts": <ts>}`, with the last field only on a session that
-    /// reopened the archive, naming the newest row the previous session
-    /// left. One entry means the source was written in one go. Written by
-    /// dendro.
+    /// "dendro": <crate version>, "resumed_after_ts": <ts>}`. `dendro` is
+    /// the version of this crate that appended, so a defect found later can
+    /// be traced to the sessions that had it; it is provenance, never a gate,
+    /// since readability is decided by the header's schema version alone.
+    /// `resumed_after_ts` appears only on a session that reopened the
+    /// archive, naming the newest row the previous session left. One entry
+    /// means the source was written in one go. Written by dendro.
     pub const WRITER_SESSIONS: &str = "writer_sessions";
     /// Timeline events: JSON `{"events": [ { "timestamp": <ts>,
     /// "description": <text>, "kind": <tag>?, "details": <text>?, "id":

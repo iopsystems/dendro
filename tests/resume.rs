@@ -99,6 +99,13 @@ fn a_source_resumes_and_continues_its_sequence() {
         assert_eq!(sessions[1]["clock_anchor_wall_ns"], 10_000);
         assert_eq!(sessions[1]["resumed_after_ts"], 2_000);
         assert_ne!(sessions[0]["session"], sessions[1]["session"]);
+        for session in sessions {
+            assert_eq!(
+                session["dendro"],
+                env!("CARGO_PKG_VERSION"),
+                "each session records the crate version that appended"
+            );
+        }
         let md = db.source_metadata(id).unwrap();
         let events: serde_json::Value = serde_json::from_str(&md[keys::EVENTS]).unwrap();
         let events = events["events"].as_array().unwrap();

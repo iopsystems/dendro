@@ -84,7 +84,8 @@ const _: () = assert!(
 const SCHEMA_VERSION: i64 = 4;
 
 /// `PRAGMA application_id`, stamped into the SQLite file header at creation:
-/// the ASCII bytes `dend`. It is what makes an archive recognizable as one
+/// the ASCII bytes `dend`, four because the field is a 32-bit integer and the
+/// crate's name does not fit. It is what makes an archive recognizable as one
 /// and not merely as a SQLite database. [`sniff_bytes`] reads it from the
 /// first 100 bytes without opening the file, and every open refuses a file
 /// that does not carry it, SQLite's default `0` included. An archive is

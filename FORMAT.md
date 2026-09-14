@@ -47,7 +47,9 @@ One SQLite database file. Detection is by content, never by filename
 | `68..72` | `application_id`, big-endian u32 | `0x6465_6e64` (`dend`) |
 | `60..64` | `user_version`, big-endian u32 | the schema version |
 
-Any other `application_id` is not an archive: SQLite's default of `0`,
+The id is four ASCII bytes because the field is a 32-bit integer; `dendro`
+does not fit, and the value is what `file(1)` reports once it is registered
+with SQLite. Any other `application_id` is not an archive: SQLite's default of `0`,
 which is what a `.rez` recording from before dendro carries, or another
 application's. The stamp is the identity, and nothing is inferred from the
 catalog. A stamped file whose `user_version` is not one this build reads is
@@ -282,7 +284,7 @@ finalize.
 |---|---|
 | `producer_epoch` | The producer's current **counter epoch**: an opaque id regenerated whenever *all* its cumulative counters start from zero together. Two sources with equal epochs over overlapping time observe **one** monotonic series: mergeable, never summable. A change mid-source is a restart, and every counter reset with it. Absent means unknown. |
 | `producer_epochs` | JSON array `[{"epoch": id, "from_ts": ts}, …]`, every epoch observed, in order; the last is the current one. |
-| `writer_sessions` | JSON array `[{"session": uuid, "clock_anchor_wall_ns": n, "resumed_after_ts": ts?}, …]`, one per writer session that appended, in order; the last field only on a resume, naming the newest row the previous session left. One entry means the source was written in one go. |
+| `writer_sessions` | JSON array `[{"session": uuid, "clock_anchor_wall_ns": n, "dendro": version, "resumed_after_ts": ts?}, …]`, one per writer session that appended, in order. `dendro` is the crate version that appended, for tracing a defect to the sessions that had it; it is provenance, never a gate, since readability is decided by the header's `user_version` alone. `resumed_after_ts` appears only on a resume, naming the newest row the previous session left. One entry means the source was written in one go. |
 | `producer_version` | The version of the software that produced the source's values, as an opaque string: stored, never parsed. Written by the producer. It must distinguish **builds**, not just releases, because the behavior a bisection looks for usually changed in a pre-release build. Not an identity: whose version it is belongs in the source's labels, so compare it only between sources known to share a producer. |
 | `encoder` | The version the caller's `SegmentEncoder::version` reported at `add_source`. Written by dendro, and **enforced**: a reader whose encoder reports a different version is refused. An encoder reporting nothing is never checked. Versions the row *encoding*; `producer_version` versions whatever produced the *values*, which can change while the encoding does not. |
 | `events` | JSON `{"events": [{"timestamp": ts, "description": text, "kind": tag?, "details": text?, "id": stable id?}, …]}`. `kind` `producer_epoch` marks a counter reset, `writer_session` a resume; `id` lets a merge de-duplicate. dendro appends to the array, never replaces it. |

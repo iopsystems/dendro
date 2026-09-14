@@ -1105,9 +1105,13 @@ fn record_session(
         .get(keys::WRITER_SESSIONS)
         .and_then(|v| serde_json::from_str(v).ok())
         .unwrap_or_default();
+    // Which build of this crate appended, for tracing a defect found later
+    // to the sessions that had it. Provenance, not a gate: readability is
+    // decided by the schema version in the header alone.
     let mut entry = serde_json::json!({
         "session": session,
         "clock_anchor_wall_ns": clock_anchor_wall_ns,
+        "dendro": env!("CARGO_PKG_VERSION"),
     });
     let mut patch = BTreeMap::new();
     if let Some(after) = resumed_after_ts {

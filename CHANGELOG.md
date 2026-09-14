@@ -55,6 +55,9 @@ bytes *mean* is the caller's, expressed through one trait.
   `next_seqs`, `source_time_span`, `total_wal_rows`, the pragma readers) left
   the public surface, and `ReadOnly::Handle` is gone because a read handle
   has nothing to refuse.
+- Each `writer_sessions` entry records the dendro crate version that
+  appended, under `dendro`. Provenance for tracing a defect to the sessions
+  that had it, never a gate: readability is the header's schema version.
 - `keys::PRODUCER_VERSION`, a reserved metadata key for the version of the
   software that produced a source's values. Written by the producer, stored
   opaquely, never parsed. Distinct from `encoder`, which versions the row
