@@ -59,6 +59,7 @@
 //! | **tail** | The live WAL rows past a stream's newest segment, materialized on read. |
 //! | **catalog** | The SQLite tables describing sources, streams and segments. It is what makes retention and range reads indexed lookups rather than scans. |
 //! | **index** | The caller's, not dendro's: an opaque blob stored beside a segment ([`Segment::index`]) that the archive never reads. The catalog knows a segment's stream and span; anything finer lives here. |
+//! | **caller store** | Also the caller's: opaque rows kept against `(stream, ts)` ([`archive::CallerRow`]), read by range, evicted with the segments, and untouched by compaction. For what must survive a merge, which a per-segment index cannot. |
 //! | **encoder** | The caller's [`SegmentEncoder`]. The only thing that knows what a row means. |
 //!
 //! **A source is a namespace.** It makes a stream name unambiguous and gives

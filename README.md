@@ -213,6 +213,12 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   time span. Anything finer, such as which series or which labels, is yours,
   and a segment has an opaque slot to keep it in, so "which segments could
   hold X" need not mean opening Parquet footers.
+- **Somewhere for what you keep against time.** A per-segment index is
+  dropped by a merge, since an index over one input cannot describe two. The
+  caller store holds opaque rows against `(stream, ts)` instead: read by
+  range, evicted by the same cutoff as segments, carried by every copy, and
+  untouched by compaction. Column-slot transitions live here; see
+  `CallerRow`.
 - **Compaction.** Read cost is linear in segment count. Measured between 400
   segments and one, the fine archive read 18.2x slower and was 2.38x larger;
   compacting it with `rewrite::compact` recovered 18.6x and 2.37x, landing

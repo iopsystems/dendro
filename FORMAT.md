@@ -88,7 +88,7 @@ stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Four tables (`src/archive.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
+Five tables (`src/archive.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -127,6 +127,13 @@ CREATE TABLE clock_offsets(
   offset_ns INTEGER NOT NULL,
   PRIMARY KEY (source_id, ts)
 );
+CREATE TABLE caller_rows(
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  stream TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  blob BLOB NOT NULL                   -- opaque, the caller's
+);
+CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
 ```
 
 Every timestamp is an `i64`: SQLite's only integer type, and the reason a
@@ -220,6 +227,29 @@ own `(ts, wall_offset)`, and one at finalize. At most one per `(source, ts)`
 (`INSERT OR IGNORE`, first wins). Bounded by retention: whole-source eviction
 cuts it at the cutoff, per-stream eviction at the oldest row the source
 still holds. See §5.
+
+### 3.5 `caller_rows`
+
+The caller's time-keyed store: rows of `(stream, ts, blob)` per source that
+the archive writes, reads back by range, copies verbatim, and never decodes.
+It exists for what a caller needs to keep against *time* rather than against
+a segment, such as which series a column slot meant from when: the
+per-segment `caller_index` is dropped by a merge and a projection because an
+index over one input cannot describe two, and this table is what compaction
+cannot destroy. The rules:
+
+- No primary key. Several rows may share a timestamp, and `rowid` is their
+  insertion order; a ranged read returns `ORDER BY ts, rowid`.
+- `stream` is a name the caller chooses, normally a stream this source has.
+  A row here does not make a stream exist: the set of streams is still
+  `segments ∪ wal`. A series kept under a name no stream uses appears in no
+  stream listing and is reached by name alone.
+- Retention evicts it by the same cutoff as segments: whole-source eviction
+  by `ts`, per-stream eviction by `(stream, ts)` for every name the predicate
+  accepts, store-only names included.
+- A copy carries it verbatim within the copy's time bound and under the
+  copy's stream filter. Compaction and column projection do not touch it.
+- `verify` does not read it, and no read path interprets it.
 
 ## 4. Reading
 

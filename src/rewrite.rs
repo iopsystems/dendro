@@ -117,6 +117,9 @@ pub struct Compacted {
 /// Segments whose schemas differ: a run stops at a schema change, because
 /// dendro concatenates parquet rather than reconciling it, and a stream's
 /// schema may drift. And any run of one.
+/// The caller's time-keyed store ([`CallerRow`](crate::archive::CallerRow))
+/// is keyed by time, not by segment, so a merge leaves it exactly as it was;
+/// that is the property it exists for.
 ///
 /// **The caller's index is dropped** on a merged segment, for the same
 /// reason a column projection drops it: the index described one of the
@@ -634,6 +637,20 @@ fn copy_sources_snapshotted(
         for (ts, offset) in src.read_clock_offsets(rec.id)? {
             tx.insert_clock_offset(id, ts, offset)?;
         }
+
+        // The caller's time-keyed store, verbatim and within the range. By
+        // its own names rather than the streams', because a series kept
+        // under a name no stream uses is still the caller's to keep; the
+        // stream filter applies to those names the same way.
+        for name in src.caller_row_streams(rec.id)? {
+            if let Some(keep) = spec.keep_streams {
+                if !keep(name.as_str()) {
+                    continue;
+                }
+            }
+            let rows = src.read_caller_rows(rec.id, &name, spec.start, spec.end)?;
+            tx.insert_caller_rows(id, &name, &rows)?;
+        }
     }
     Ok(copied)
 }
@@ -727,7 +744,7 @@ mod tests {
     #[test]
     fn every_schema_table_is_either_copied_or_deliberately_dropped() {
         /// Carried across by [`copy_sources_into`].
-        const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets"];
+        const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets", "caller_rows"];
         /// Not carried, and correct not to be. Empty today: the schema version
         /// lives in the header stamp, not in a table.
         const NOT_CARRIED: &[&str] = &[];

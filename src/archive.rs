@@ -282,6 +282,32 @@ pub struct WalRow {
     pub row: Vec<u8>,
 }
 
+/// A row of the `caller_rows` table: one timestamped payload on one stream
+/// that the archive stores and never decodes.
+///
+/// The caller's time-keyed store. The archive knows a segment's stream and
+/// span and nothing about what is inside it, and the per-segment
+/// [`Segment::index`](crate::segment::Segment::index) is dropped by a merge
+/// and by a column projection because an index over one input cannot
+/// describe two. Anything a caller needs to keep against *time* rather than
+/// against a segment, such as which series a column slot meant from when,
+/// lives here: keyed by `(source, stream, ts)`, unaffected by compaction and
+/// projection, carried verbatim by every copy, and evicted by the same
+/// cutoff that evicts segments. Several rows may share a timestamp; they
+/// read back in insertion order.
+///
+/// A row here does not make a stream exist. `all_streams` is still the
+/// union of `segments` and `wal`, so a series kept under a name no stream
+/// uses appears in no stream listing and is evicted by whole-source
+/// retention only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerRow {
+    /// The row's timestamp, in the unit the caller's row timestamps use.
+    pub ts: i64,
+    /// The payload. Opaque to dendro.
+    pub blob: Vec<u8>,
+}
+
 /// What one retention pass removed. Returned rather than logged so a caller
 /// can tell "the window moved" from "nothing was old enough yet" — and so a
 /// test can assert the WAL rows went with their segments.
@@ -302,6 +328,8 @@ pub struct Evicted {
     /// reported rather than hidden: a caller seeing this non-zero must seal at
     /// least as often as it evicts.
     pub live_rows: usize,
+    /// Rows of the caller's time-keyed store deleted; see [`CallerRow`].
+    pub caller_rows: usize,
 }
 
 /// How many rows a table holds and what time span they cover, answered from
@@ -1631,8 +1659,10 @@ impl Archive {
     /// catalog invariants the container is responsible for, collected into a
     /// [`Report`] instead of an `Err`, because a caller wants the list.
     ///
-    /// `Err` is still returned for a failure to *run* the check — a database
-    /// too damaged to query at all.
+    /// `Err` is still returned for a failure to *run* the check: a database
+    /// too damaged to query at all. A later check that runs into damage the
+    /// integrity check already reported is a finding, not an `Err`, and the
+    /// counts in the report are then zero.
     ///
     /// **What it cannot tell you.** Nothing here opens a segment. The bytes
     /// are the encoder's and the archive has no opinion about them, so a
@@ -1663,29 +1693,47 @@ impl Archive {
             }
         }
 
-        let mut stmt = self
-            .conn
-            .prepare("PRAGMA foreign_key_check")
-            .map_err(Error::sqlite("failed to check references"))?;
-        let violations = stmt
-            .query_map([], |row| {
-                Ok(format!(
-                    "{} row {:?} -> {}",
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, String>(2)?
-                ))
-            })
-            .map_err(Error::sqlite("failed to check references"))?;
-        for v in violations {
-            problems.push(Problem::ForeignKey(
-                v.map_err(Error::sqlite("failed to read a reference violation"))?,
-            ));
+        // Every check after the first can run into the damage the first one
+        // reported, and SQLite then fails the statement with
+        // `SQLITE_CORRUPT`. That is a finding about the file, not a failure to
+        // run the check, so it joins the report; `Err` stays reserved for a
+        // database the checks cannot be run against at all.
+        let corrupt = |e: Error, problems: &mut Vec<Problem>| -> Result<()> {
+            if e.sqlite_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+                problems.push(Problem::Corrupt(e.to_string()));
+                Ok(())
+            } else {
+                Err(e)
+            }
+        };
+
+        let references = (|| -> Result<Vec<String>> {
+            let mut stmt = self
+                .conn
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(Error::sqlite("failed to check references"))?;
+            let violations = stmt
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{} row {:?} -> {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?
+                    ))
+                })
+                .map_err(Error::sqlite("failed to check references"))?;
+            violations
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::sqlite("failed to read a reference violation"))
+        })();
+        match references {
+            Ok(violations) => problems.extend(violations.into_iter().map(Problem::ForeignKey)),
+            Err(e) => corrupt(e, &mut problems)?,
         }
 
         // The catalog's own invariants, in one snapshot so the counts and the
         // findings describe the same instant.
-        let (sources, streams, segments, wal_rows) = self.read_snapshot(|db| {
+        let walked = self.read_snapshot(|db| {
             let rows = db.read_sources()?;
             let mut streams = 0usize;
             let mut segments = 0usize;
@@ -1730,7 +1778,14 @@ impl Archive {
                 }
             }
             Ok((rows.len(), streams, segments, wal_rows))
-        })?;
+        });
+        let (sources, streams, segments, wal_rows) = match walked {
+            Ok(counts) => counts,
+            Err(e) => {
+                corrupt(e, &mut problems)?;
+                (0, 0, 0, 0)
+            }
+        };
 
         Ok(Report {
             sources,
@@ -1887,6 +1942,58 @@ impl Archive {
             out.push((ts, offset));
         }
         Ok(out)
+    }
+
+    /// The caller's rows for `(source_id, stream)` with `start <= ts <= end`,
+    /// oldest first and in insertion order within a timestamp. See
+    /// [`CallerRow`].
+    pub fn read_caller_rows(
+        &self,
+        source_id: i64,
+        stream: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<CallerRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts, blob FROM caller_rows \
+                 WHERE source_id = ?1 AND stream = ?2 AND ts >= ?3 AND ts <= ?4 \
+                 ORDER BY ts, rowid",
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to query caller rows for {stream}"
+            )))?;
+        let rows = stmt
+            .query_map(rusqlite::params![source_id, stream, start, end], |row| {
+                Ok(CallerRow {
+                    ts: row.get::<_, i64>(0)?,
+                    blob: row.get::<_, Vec<u8>>(1)?,
+                })
+            })
+            .map_err(Error::sqlite(format!(
+                "failed to query caller rows for {stream}"
+            )))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::sqlite(format!(
+                "failed to read caller rows for {stream}"
+            )))
+    }
+
+    /// Every stream name the caller's store holds rows under for
+    /// `source_id`, alphabetically. Separate from [`all_streams`](Self::all_streams)
+    /// on purpose: a store row does not make a stream exist, and a copy has
+    /// to find the series kept under names no stream uses.
+    pub fn caller_row_streams(&self, source_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT stream FROM caller_rows WHERE source_id = ?1 ORDER BY stream")
+            .map_err(Error::sqlite("failed to query caller row streams"))?;
+        let rows = stmt
+            .query_map([source_id], |row| row.get::<_, String>(0))
+            .map_err(Error::sqlite("failed to query caller row streams"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::sqlite("failed to read a caller row stream name"))
     }
 
     #[cfg(test)]
@@ -2151,12 +2258,15 @@ impl ArchiveMut {
         cutoff_ts: i64,
         evict: &dyn Fn(&str) -> bool,
     ) -> Result<Evicted> {
-        let streams: Vec<String> = self
-            .db
-            .all_streams(source_id)?
-            .into_iter()
-            .filter(|s| evict(s))
-            .collect();
+        // Every name the predicate can see: the streams, and the names the
+        // caller's store holds rows under that are not streams.
+        let mut streams: Vec<String> = self.db.all_streams(source_id)?;
+        for name in self.db.caller_row_streams(source_id)? {
+            if !streams.contains(&name) {
+                streams.push(name);
+            }
+        }
+        let streams: Vec<String> = streams.into_iter().filter(|s| evict(s)).collect();
         self.transaction(|tx| {
             let mut total = Evicted::default();
             for stream in &streams {
@@ -2187,6 +2297,16 @@ impl ArchiveMut {
                         params,
                     )
                     .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
+                total.caller_rows += tx
+                    .tx
+                    .execute(
+                        "DELETE FROM caller_rows \
+                         WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
+                        params,
+                    )
+                    .map_err(Error::sqlite(format!(
+                        "failed to evict {stream} caller rows"
+                    )))?;
             }
             // The clock-offset series is per SOURCE, and a per-stream pass
             // has no single cutoff for it: the streams it left alone may
@@ -2254,12 +2374,33 @@ impl ArchiveMut {
                     rusqlite::params![source_id, cutoff_ts],
                 )
                 .map_err(Error::sqlite("failed to evict clock offsets"))?;
+            // The caller's store goes by the same cutoff: it is keyed by
+            // time and nothing else, which is what lets retention touch it
+            // without knowing what a row says.
+            let caller_rows = tx
+                .tx
+                .execute(
+                    "DELETE FROM caller_rows WHERE source_id = ?1 AND ts < ?2",
+                    params,
+                )
+                .map_err(Error::sqlite("failed to evict caller rows"))?;
             Ok(Evicted {
                 segments,
                 wal_rows,
                 live_rows: live_rows as usize,
+                caller_rows,
             })
         })
+    }
+
+    /// [`Transaction::insert_caller_rows`] as its own commit.
+    pub fn insert_caller_rows(
+        &mut self,
+        source_id: i64,
+        stream: &str,
+        rows: &[CallerRow],
+    ) -> Result<()> {
+        self.transaction(|tx| tx.insert_caller_rows(source_id, stream, rows))
     }
 
     /// Mark a source cleanly finalized, outside any batch. The dump uses
@@ -2551,6 +2692,27 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    /// Append rows to the caller's time-keyed store for `(source_id,
+    /// stream)`, in the order given. See [`CallerRow`].
+    pub fn insert_caller_rows(
+        &self,
+        source_id: i64,
+        stream: &str,
+        rows: &[CallerRow],
+    ) -> Result<()> {
+        let mut stmt = self
+            .tx
+            .prepare("INSERT INTO caller_rows(source_id, stream, ts, blob) VALUES (?1, ?2, ?3, ?4)")
+            .map_err(Error::sqlite("failed to prepare caller row insert"))?;
+        for r in rows {
+            stmt.execute(rusqlite::params![source_id, stream, r.ts, r.blob])
+                .map_err(Error::sqlite(format!(
+                    "failed to insert a caller row for {stream}"
+                )))?;
+        }
+        Ok(())
+    }
+
     /// The inverse of `mark_complete`, for a source a new writer session is
     /// about to append to: it is no longer finished. `Err` if there is no
     /// such source.
@@ -2768,6 +2930,16 @@ CREATE TABLE clock_offsets(
   offset_ns INTEGER NOT NULL,
   PRIMARY KEY (source_id, ts)
 );
+-- The caller's time-keyed store: never decoded, never merged, evicted by
+-- timestamp. No primary key, so several rows may share a timestamp and
+-- rowid keeps their insertion order.
+CREATE TABLE caller_rows(
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  stream TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  blob BLOB NOT NULL
+);
+CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
 ";
 
 #[cfg(test)]

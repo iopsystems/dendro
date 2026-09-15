@@ -29,6 +29,15 @@ bytes *mean* is the caller's, expressed through one trait.
   and a floor that refuses an append behind where the previous session stopped.
 - Out-of-order appends are dropped rather than silently stored, counted per
   source and logged once per stream.
+- The caller's time-keyed store, `caller_rows`: opaque rows against
+  `(source, stream, ts)` that the archive reads by range, evicts by the same
+  cutoff as segments, carries verbatim in every copy, and never decodes or
+  merges. `Transaction::insert_caller_rows`, `ArchiveMut::insert_caller_rows`,
+  `SourceWriter::caller_rows`, `Archive::read_caller_rows` and
+  `Archive::caller_row_streams`; `Evicted::caller_rows` counts what
+  retention removed. A store row does not make a stream exist. This is the
+  store the schema-churn journal entry owed to a caller that keeps column
+  identity in a secondary index.
 - An opaque per-segment index slot, so a caller that builds its own index over
   segment contents can keep it in the archive and stay one file.
 - `Archive::verify`, reporting every problem it finds in one pass.
@@ -71,6 +80,10 @@ bytes *mean* is the caller's, expressed through one trait.
 - `FORMAT.md` omitted `encoder` from the reserved-keys table and its
   compatibility section still described the key as a convention nobody had
   built. It is built and enforced; both now say so.
+- `Archive::verify` returned `Err` when a check after the integrity check
+  ran into the damage it had just reported. Such a failure is now a
+  `Problem::Corrupt` finding in the report, and `Err` is reserved for a file
+  the checks cannot run against at all.
 - The read-only open failed on read-only media, where every document said
   it was the open to use. WAL mode must create the `-shm` sidecar, which
   read-only media refuses. It now retries with SQLite's `immutable=1` when

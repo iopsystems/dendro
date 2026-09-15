@@ -240,10 +240,13 @@ anyone starts.
   policy costs.~~ **NO-GO, measured**: churn produces sparse columns, not
   empty ones, so there is nothing for it to drop. Reopen only if a caller
   turns up whose columns really do go entirely silent across a merge range.
-- **A time-keyed caller store.** Reopen when a caller commits to the secondary
+- ~~**A time-keyed caller store.** Reopen when a caller commits to the secondary
   index above. The design constraint is fixed: segment-independent, so
   compaction and projection cannot destroy it, and evictable on timestamp
-  alone.
+  alone.~~ **Landed 2026-09-15** as the `caller_rows` table, keyed by
+  `(source, stream, ts)`, after rezolus committed to the index. Segment-
+  independent, evicted by both retention paths, carried by every copy, and
+  untouched by compaction; `tests/caller_rows.rs`.
 - **Identity churn stays unmerged** until such an index exists. No merge
   policy can fix it, and this entry exists so nobody adds one that pretends to.
 - Related: [compaction](2026-09-11-segment-compaction.md) owns the merge and

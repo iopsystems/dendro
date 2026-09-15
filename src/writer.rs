@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::archive::{Archive, ArchiveMut, Evicted, SegmentMeta, SourceMeta, WalRow};
+use crate::archive::{Archive, ArchiveMut, CallerRow, Evicted, SegmentMeta, SourceMeta, WalRow};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -97,6 +97,14 @@ enum Msg {
     UpdateMetadata {
         source_id: i64,
         patch: BTreeMap<String, String>,
+    },
+    /// Rows for the caller's time-keyed store, in order with the ticks
+    /// around them and committed on their own. See
+    /// [`CallerRow`](crate::archive::CallerRow).
+    CallerRows {
+        source_id: i64,
+        stream: String,
+        rows: Vec<CallerRow>,
     },
     /// One source's last clock observation; marks *that* source complete.
     ///
@@ -705,6 +713,22 @@ impl SourceWriter {
         self.send(Msg::UpdateMetadata {
             source_id: self.source_id,
             patch,
+        })
+    }
+
+    /// Append rows to the caller's time-keyed store for `stream`, ordered
+    /// with the ticks around them and committed on their own. Fire-and-forget
+    /// like [`wal`](Self::wal): a transient failure is retried, and a run of
+    /// dropped commits stops the writer the way dropped ticks do. See
+    /// [`CallerRow`] for what the store is.
+    pub fn caller_rows(&mut self, stream: impl Into<String>, rows: Vec<CallerRow>) -> Result<()> {
+        if rows.is_empty() {
+            return self.check_alive();
+        }
+        self.send(Msg::CallerRows {
+            source_id: self.source_id,
+            stream: stream.into(),
+            rows,
         })
     }
 
@@ -1437,6 +1461,22 @@ fn writer_loop(
                         "metadata update for source {source_id} dropped ({e}); keys: {:?}",
                         patch.keys().collect::<Vec<_>>()
                     );
+                }
+            }
+            Ok(Msg::CallerRows {
+                source_id,
+                stream,
+                rows,
+            }) => {
+                // Data, not metadata: a commit that fails after retries is
+                // counted like a dropped tick, and a run of them stops the
+                // writer.
+                match with_retries("committing caller rows", || {
+                    db.insert_caller_rows(source_id, &stream, &rows)
+                }) {
+                    Ok(()) => health.committed(),
+                    Err(e) if e.is_retryable() => health.dropped(e)?,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(Msg::Finalize {
