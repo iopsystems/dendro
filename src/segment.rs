@@ -85,6 +85,18 @@ pub struct Segment {
 ///
 /// `None` means that the rows produce no segment.
 ///
+/// **A column must mean one thing for the life of a stream.** Its name, its
+/// type and its field metadata are the column's identity, and the archive
+/// treats two segments whose columns share all three as holding one series:
+/// compaction concatenates them, and a reader reads them end to end. A fact
+/// that changes over time, such as which task a slot currently stands for,
+/// must not be carried in field metadata. Rows that span such a change fuse
+/// two series into one column, the segment that results is valid parquet
+/// with nothing to show it happened, and nothing can separate them
+/// afterward. Keep such facts in the caller's time-keyed store instead
+/// ([`CallerRow`](crate::archive::CallerRow)), keyed by the time they
+/// changed, and keep the column static.
+///
 /// **Called with an empty slice**, on every read of a stream with nothing
 /// unsealed — which is every read of a finalized archive. An implementation
 /// that indexes `rows[0]` without checking panics inside the reader, and on the

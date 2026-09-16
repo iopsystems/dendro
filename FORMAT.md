@@ -373,6 +373,12 @@ the rows changes shape; four things are guaranteed:
   ask the question rather than guess. The remaining generality question is
   the open [encoder boundary](docs/journal/2026-09-11-encoder-boundary.md)
   gap.
+- **A column means one thing for the life of a stream.** Its name, type and
+  field metadata are its identity, and segments whose columns agree on all
+  three are one series to compaction and to a reader. A fact that changes
+  over time belongs in `caller_rows` (§3.5), keyed by the time it changed,
+  never in field metadata: rows that span such a change fuse two series into
+  one column, and the segment carries no evidence of it.
 - **Versions 1 to 3 are not dendro's.** They are rezolus's `.rez` formats,
   never read here; rezolus upgrades them by copying into a new archive.
 - **What a release promises.** A build reads its own schema version and the
