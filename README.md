@@ -286,3 +286,10 @@ version, is specified in [FORMAT.md](FORMAT.md). The design reasoning,
 including what was measured to arrive at it, is in [DESIGN.md](DESIGN.md).
 Known gaps and the reasons they remain open are in
 [docs/journal/](docs/journal/README.md).
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
+or the [MIT license](LICENSE-MIT), at your option. Unless you state
+otherwise, any contribution you submit for inclusion in this crate is
+dual-licensed the same way, without additional terms.

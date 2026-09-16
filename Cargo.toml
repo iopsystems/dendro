@@ -13,6 +13,8 @@ repository = "https://github.com/iopsystems/dendro"
 description = "A segmented-parquet archive with a write-ahead log, in a single SQLite file"
 keywords = ["parquet", "sqlite", "wal", "timeseries", "archive"]
 categories = ["database-implementations", "encoding"]
+# Repository housekeeping that serves nobody who downloads the crate.
+exclude = [".github/", ".gitignore"]
 
 # docs.rs builds with default features, which hides the whole writer half and
 # every `test-support` item. `all-features` documents the real surface, and
