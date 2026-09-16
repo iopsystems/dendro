@@ -24,6 +24,8 @@ as its notes. A version with no section here is refused.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-16
+
 First release. The crate is a segmented Parquet archive with a write-ahead
 log, in a single SQLite file: rows land in the WAL and are periodically sealed
 into immutable parquet segments, with the catalog, retention, crash recovery
@@ -86,35 +88,6 @@ bytes *mean* is the caller's, expressed through one trait.
   changes what it measures moves every value while the encoder version stays
   identical, which is the case `encoder` cannot see.
   (rezolus [#1195](https://github.com/iopsystems/rezolus/issues/1195).)
-
-### Fixed
-
-- `FORMAT.md` omitted `encoder` from the reserved-keys table and its
-  compatibility section still described the key as a convention nobody had
-  built. It is built and enforced; both now say so.
-- `Archive::verify` returned `Err` when a check after the integrity check
-  ran into the damage it had just reported. Such a failure is now a
-  `Problem::Corrupt` finding in the report, and `Err` is reserved for a file
-  the checks cannot run against at all.
-- The read-only open failed on read-only media, where every document said
-  it was the open to use. WAL mode must create the `-shm` sidecar, which
-  read-only media refuses. It now retries with SQLite's `immutable=1` when
-  that happens and no `-wal` sidecar exists, and refuses rather than reads
-  short when one does. `tests/read_only_media.rs`.
-- The documents said an unclean kill loses at most one append. The writer's
-  channel holds one tick while another is mid-commit, so the bound is two
-  ticks, plus whatever the caller has staged. Stated as such.
-- The documents described a killed archive as a 4 KiB file with no tables.
-  Creation has checkpointed the catalog into the archive since the header
-  stamp landed, so the archive alone always opens; the numbers are
-  re-measured (45 KiB archive, 3.3 MB sidecar, 61 KiB after a read-write
-  open folds it in).
-- Two different compaction measurements (the seal-coarse arm at 18.2x and
-  2.38x, the compacted result at 18.6x and 2.37x) were cited as one number.
-  Each site now says which it cites.
-- The 3.14x per-tick write amplification that decided the page size was
-  cited by a test and present in no document. Restored to `DESIGN.md` with
-  the sweep it came from.
 
 ### Notes
 
