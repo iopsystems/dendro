@@ -51,16 +51,17 @@ jobs:
           esac
 
       # The release notes are the CHANGELOG section for this version: from its
-      # `## [X.Y.Z]` heading to the next `## ` heading. A release without a
-      # section is refused, because an empty release page is how a changelog
-      # stops being kept.
+      # `## [X.Y.Z]` heading to the next `## ` heading of any kind, since the
+      # heading after the newest release is "Before 1.0", not a version. A
+      # release without a section is refused, because an empty release page
+      # is how a changelog stops being kept.
       - name: CHANGELOG.md has a section for this version
         id: notes
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           awk -v v="$VERSION" '
-            /^## \[/ { if (found) exit; found = ($0 ~ "^## \\[" v "\\]") ; next }
+            /^## / { if (found) exit; found = ($0 ~ "^## \\[" v "\\]") ; next }
             found { print }
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
