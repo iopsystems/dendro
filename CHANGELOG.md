@@ -20,7 +20,10 @@ the commit names the manifest version, creates the tag `vX.Y.Z`, and pushes
 the next development version (`X.Y.(Z+1)-alpha.0`) to `main`. The tag runs
 `release.yml`, which runs the checks CI runs, publishes the crate to
 crates.io, and creates the GitHub release with this file's `[X.Y.Z]` section
-as its notes. A version with no section here is refused.
+as its notes. A version with no section here is refused. If that run fails,
+fix the cause on `main` and run `release.yml` by hand with the tag as its
+input; a tag push runs the workflow as it was at the tagged commit, so a fix
+cannot reach a failed release any other way.
 
 ## [Unreleased]
 

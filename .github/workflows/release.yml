@@ -5,6 +5,11 @@
 # same checks CI runs, publishes the crate, and creates the GitHub release
 # with that section as its notes. A tag pushed by hand runs it too.
 #
+# It can also be run by hand for an existing tag. A tag push runs the
+# workflow file as it was at the tagged commit, so a fix to this file cannot
+# reach a release that already failed; the manual run uses the file on main
+# and checks out the tag.
+#
 # Publishing authenticates with CRATES_IO_TOKEN, a crates.io API token with
 # publish scope for this crate, set as a repository secret.
 
@@ -14,6 +19,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to release, such as v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,17 +35,19 @@ env:
 jobs:
   release:
     if: github.repository == 'iopsystems/dendro'
-    name: Publish ${{ github.ref_name }}
+    name: Publish ${{ inputs.tag || github.ref_name }}
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       # Section-aware, like the tag-release workflow: a `version` under
       # [dependencies] must not be mistaken for the package's.
       - name: The tag names the manifest version
         id: version
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           VERSION=$(awk -F' *= *' '
             /^\[/  { inpkg = ($0 ~ /^\[package\]/); next }
@@ -55,20 +68,24 @@ jobs:
       # heading after the newest release is "Before 1.0", not a version. A
       # release without a section is refused, because an empty release page
       # is how a changelog stops being kept.
+      # Written outside the checkout: `cargo publish` refuses a working tree
+      # with an uncommitted file in it, and this file is not part of the crate.
       - name: CHANGELOG.md has a section for this version
         id: notes
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          NOTES="$RUNNER_TEMP/release-notes.md"
           awk -v v="$VERSION" '
             /^## / { if (found) exit; found = ($0 ~ "^## \\[" v "\\]") ; next }
             found { print }
-          ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
+          ' CHANGELOG.md > "$NOTES"
+          if [ ! -s "$NOTES" ]; then
             echo "::error::CHANGELOG.md has no '## [${VERSION}]' section"
             exit 1
           fi
-          echo "Release notes:"; cat release-notes.md
+          echo "notes=$NOTES" >> "$GITHUB_OUTPUT"
+          echo "Release notes:"; cat "$NOTES"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,13 +115,13 @@ jobs:
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          NOTES: ${{ steps.notes.outputs.notes }}
         run: |
           FLAGS=""
           if [ "$PRERELEASE" = "true" ]; then FLAGS="--prerelease"; fi
           gh release create "$TAG" \
             --title "dendro $TAG" \
-            --notes-file release-notes.md \
+            --notes-file "$NOTES" \
             --verify-tag \
             $FLAGS
