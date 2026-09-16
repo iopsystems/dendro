@@ -10,6 +10,18 @@ The reasoning behind a change lives in [`docs/journal/`](docs/journal/README.md)
 one entry per effort. This file says what changed; the journal says why, and
 carries the measurements.
 
+## Releasing
+
+A release is one pull request and two workflows. The pull request, titled
+`release: prepare vX.Y.Z`, sets `version` in `Cargo.toml`, renames the
+`[Unreleased]` section below to `[X.Y.Z] - YYYY-MM-DD`, and adds a new empty
+`[Unreleased]` above it. Merging it runs `tag-release.yml`, which checks that
+the commit names the manifest version, creates the tag `vX.Y.Z`, and pushes
+the next development version (`X.Y.(Z+1)-alpha.0`) to `main`. The tag runs
+`release.yml`, which runs the checks CI runs, publishes the crate to
+crates.io, and creates the GitHub release with this file's `[X.Y.Z]` section
+as its notes. A version with no section here is refused.
+
 ## [Unreleased]
 
 First release. The crate is a segmented Parquet archive with a write-ahead
