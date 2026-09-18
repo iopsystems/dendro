@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-18
+
 ### Changed
 
 - `Frame::Rows.seq` is a **plain sequence number** — strictly increasing,
