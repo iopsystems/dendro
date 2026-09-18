@@ -14,7 +14,9 @@ description = "A segmented-parquet archive with a write-ahead log, in a single S
 keywords = ["parquet", "sqlite", "wal", "timeseries", "archive"]
 categories = ["database-implementations", "encoding"]
 # Repository housekeeping that serves nobody who downloads the crate.
-exclude = [".github/", ".gitignore"]
+# `WIRE.md` is NOT here: it specifies the replication wire format the way
+# `FORMAT.md` specifies the file, and both are part of what the crate is.
+exclude = [".github/", ".gitignore", "scripts/"]
 
 # docs.rs builds with default features, which hides the whole writer half and
 # every `test-support` item. `all-features` documents the real surface, and
