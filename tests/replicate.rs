@@ -1,5 +1,5 @@
-// Drives the writer through a subscriber, so it needs both.
-#![cfg(all(feature = "replicate", feature = "write"))]
+// Drives the writer through a subscriber, so it needs the append side.
+#![cfg(feature = "write")]
 
 //! Replication, end to end, over a payload that has nothing to do with
 //! metrics.

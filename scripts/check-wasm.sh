@@ -101,12 +101,9 @@ if ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknow
     rustup target add wasm32-unknown-unknown
 fi
 
-# Both configurations the reader build ships in. `replicate` deliberately does
-# not imply `write`, so the publishing half is part of the reader build and has
-# to hold this line too.
-for features in "" "--features replicate"; do
-    # shellcheck disable=SC2086 # deliberate word splitting: empty means no flag
-    set -- cargo check --no-default-features $features --target wasm32-unknown-unknown
-    echo "+ $*"
-    "$@"
-done
+# The reader build, which is what has to reach wasm32. Replication is part of
+# it rather than a feature: publishing is a read, so `ArchivePublisher` and the
+# codec build here, and only `Subscriber` is gated on `write` for the thread.
+set -- cargo check --no-default-features --target wasm32-unknown-unknown
+echo "+ $*"
+"$@"
