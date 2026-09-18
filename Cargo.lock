@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "dendro"
-version = "0.2.1"
+version = "0.2.2-alpha.0"
 dependencies = [
  "arrow",
  "bytes",
