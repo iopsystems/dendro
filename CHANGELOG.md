@@ -35,34 +35,21 @@ cannot reach a failed release any other way.
 
 ### Changed
 
-- `Frame::Rows.seq` is documented as **strictly increasing, one per interval,
-  need not start at zero** — what the subscriber's gap check actually requires —
-  rather than "counts from zero". The doc was narrower than the code: `last_seq`
-  starts `None`, so a first value is never compared, and only the step between
-  consecutive frames is checked.
+- `Frame::Rows.seq` is a **plain sequence number** — strictly increasing,
+  contiguous, one per frame, not a timestamp — and a gap means **frames lost in
+  transit**. This reverses guidance added earlier in this section, which
+  recommended an interval index; that recommendation was wrong and is removed.
 
-  The relaxation matters because a frame counter is the weaker choice. It
-  increments by one whether or not an interval was skipped, so a skipped
-  interval arrives as a contiguous sequence with an undetectable hole. An
-  interval index says the thing rule 6 is trying to say. Raised by a consumer
-  whose publisher was doing the better thing and read as non-conforming.
+  It contradicted rule 6, in the same sentence. Rule 6 already requires a frame
+  per interval, empty when nothing was observed, so there is no skipped interval
+  for a counter to miss — the empty frame is how "nothing was observed" is
+  stated. An interval index merges that fact with "a frame did not arrive",
+  losing the distinction, and aliases on sub-interval jitter: a reading taken
+  slightly early lands in the previous bucket, which invents gaps that did not
+  happen and hides gaps that did.
 
-  No code change; a publisher that counted from zero still conforms.
-
-## [0.2.0] - 2026-09-18
-
-**This is 0.2.0, not 0.1.1.** The root re-exports below are removed public
-items, which Cargo's SemVer reference calls a major change, and for a `0.x`
-crate the minor is the major position. `0.1.1-alpha.0` was the automated
-post-release bump (`chore: begin next development iteration`) rather than a
-decision, and shipping under it would break `dendro = "0.1"` callers on a
-`cargo update`. The replication work on its own would have been a legitimate
-`0.1.1`.
-
-**The crate version and the schema version answer different questions.** The
-archive schema version is unchanged at **4** -- nothing on disk moves, existing
-archives are unaffected, and `FORMAT.md` section 8 governs that surface alone.
-The Rust API broke separately. Neither implies the other.
+  What survives from that guidance is that `seq` **need not start at zero**,
+  which the code never required.
 
 ### Added
 

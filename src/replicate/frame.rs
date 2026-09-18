@@ -113,28 +113,27 @@ pub enum Frame {
     Rows {
         /// Which source, by handshake ordinal.
         source: u32,
-        /// **Strictly increasing, one per interval, per source per
-        /// connection.** Consecutive values mean consecutive intervals, so a
-        /// jump means an interval produced no frame. Every interval produces
-        /// one, empty when nothing was observed; the empty frame is also the
-        /// keepalive.
+        /// **A sequence number, in the TCP sense: strictly increasing and
+        /// contiguous, incremented by exactly one per frame.** It is not a
+        /// timestamp and carries no time semantics.
         ///
-        /// **It need not start at zero, and a frame counter is the weaker
-        /// choice.** A subscriber checks that consecutive frames differ by one;
-        /// what it is trying to learn is whether an interval it expected
-        /// produced no reading. A counter cannot say that — it increments by
-        /// one whether or not an interval was skipped, so a skipped interval
-        /// arrives as a contiguous sequence with a hole in the middle, which is
-        /// undetectable. An **interval index** — the observation's timestamp
-        /// divided by the interval — answers the question that is being asked,
-        /// and satisfies the same check.
+        /// It need not start at zero — only the step between consecutive
+        /// frames is ever compared, so any starting value works.
         ///
-        /// Derive it from the row timestamp rather than from the wall clock.
-        /// `ts` is anchored (FORMAT.md §5) and therefore strictly increasing
-        /// through a wall-clock step; an index taken from the wall clock
-        /// inherits the step and can go backwards, and a value that goes
-        /// backwards is **not** currently reported — see
-        /// [`Applied::gap`](crate::replicate::Applied).
+        /// **A gap therefore means frames lost in transit, and nothing else.**
+        /// That is sharper than it sounds, and it rests on rule 6: an interval
+        /// that observed nothing still produces a frame, an empty one. So
+        /// "nothing was observed" and "a frame did not arrive" are different
+        /// facts and stay different — the empty frame states the first, a gap
+        /// states the second.
+        ///
+        /// **Do not derive it from a clock.** An interval index
+        /// (`timestamp / interval`) merges those two facts into one signal,
+        /// because a skipped emission and a dropped frame then look identical.
+        /// It also aliases on sub-interval jitter: a reading taken slightly
+        /// early lands in the previous bucket, which invents gaps that did not
+        /// happen and hides gaps that did. A plain counter has neither problem,
+        /// and rule 6 already covers what the index was reaching for.
         seq: u64,
         /// The index state these rows were built against. A subscriber whose
         /// accumulated state differs **skips the rows**: misattribution is

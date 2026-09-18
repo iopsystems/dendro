@@ -162,19 +162,21 @@ count × {
 
 Each row carries its own stream name, so one frame may span a source's streams.
 
-`seq` is **strictly increasing, one value per interval, per source per
-connection.** Consecutive values mean consecutive intervals, so a jump means an
-interval produced no frame.
+`seq` is a **sequence number in the TCP sense: strictly increasing and
+contiguous, incremented by exactly one per frame.** It is not a timestamp and
+carries no time semantics. It need not start at zero — only the step between
+consecutive frames is ever compared.
 
-It need not start at zero, and a frame counter is the weaker choice: a counter
-increments by one whether or not an interval was skipped, so a skipped interval
-arrives as a contiguous sequence with an undetectable hole in it. An **interval
-index** — the observation's timestamp divided by the interval — answers the
-question a subscriber is actually asking, and satisfies the same check.
+**A gap therefore means frames lost in transit, and nothing else.** That rests
+on rule 6: an interval that observed nothing still produces a frame, an empty
+one. "Nothing was observed" and "a frame did not arrive" are different facts and
+stay different — the empty frame states the first, a gap states the second.
 
-Derive it from the row timestamp rather than the wall clock. `ts` is anchored
-(`FORMAT.md` §5) and strictly increasing through a wall-clock step; an index
-taken from the wall clock inherits the step and can go backwards.
+**Do not derive it from a clock.** An interval index (`timestamp / interval`)
+merges those two facts into one signal, since a skipped emission and a dropped
+frame become indistinguishable. It also aliases on sub-interval jitter: a
+reading taken slightly early lands in the previous bucket, inventing gaps that
+did not happen and hiding gaps that did.
 
 `index_state` is the state the rows were built against. A subscriber whose
 accumulated state differs skips the rows; see rule 9 below.

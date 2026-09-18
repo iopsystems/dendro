@@ -54,11 +54,12 @@
 //!    Time is the ordering axis; both already carry timestamps and
 //!    `caller_rows` is already time-keyed.
 //! 6. Every interval produces a `Rows` frame, empty when nothing was observed,
-//!    so a gap in [`seq`](crate::replicate::Frame::Rows) means a lost reading and nothing else.
-//!    The empty frame is also the keepalive. `seq` is strictly increasing with
-//!    one value per interval and need not start at zero; an **interval index**
-//!    is the better choice, because a frame counter cannot distinguish a
-//!    skipped interval from a contiguous one.
+//!    so a gap in [`seq`](crate::replicate::Frame::Rows) means frames lost in
+//!    transit and nothing else. The empty frame is also the keepalive.
+//!    `seq` is a plain sequence number in the TCP sense — strictly increasing,
+//!    contiguous, one per frame — and need not start at zero. It is not a
+//!    timestamp: an interval that observed nothing is stated by the empty
+//!    frame, not by skipping a number.
 //! 7. `Index` is re-emitted [`Full`](crate::replicate::IndexKind::Full) periodically, so
 //!    retention cannot orphan it: `caller_rows` is evicted on the same cutoff
 //!    as segments, and state written once at the start would be deleted while
