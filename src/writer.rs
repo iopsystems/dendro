@@ -51,6 +51,10 @@ enum Msg {
     /// as a hang. The reply channel is the same shape `Sync` already uses.
     AddSource {
         seed: Box<SourceMeta>,
+        /// The identity the source already has, when it comes from somewhere
+        /// else. `None` mints a fresh one, which is what an ordinary
+        /// `add_source` does.
+        uuid: Option<String>,
         reply: SyncSender<Result<i64>>,
     },
     /// Reopen an existing source for a new writer session: verify it, refuse
@@ -74,6 +78,21 @@ enum Msg {
     Wal { ticks: Vec<(i64, Vec<WalRow>)> },
     /// One seal batch for one source = one transaction.
     Seal { source_id: i64, batch: Vec<String> },
+    /// One segment built elsewhere, to be inserted at the stream's next
+    /// `seq`. The seal path's other entrance: `Seal` says "encode what is in
+    /// the WAL", this says "here are the bytes". Replies, unlike `Seal`,
+    /// because the sender is applying a stream of them and an overlap it must
+    /// stop on is not something to find out about one frame later.
+    AdoptSegment {
+        source_id: i64,
+        /// Boxed for the reason `AddSource`'s seed is: every message shares
+        /// the size of the largest variant, and this one carries a whole
+        /// segment.
+        segment: Box<Adopted>,
+        /// Whether it was inserted. `false` is a segment the stream's
+        /// watermark already covers, which a reconnect produces normally.
+        reply: SyncSender<Result<bool>>,
+    },
     /// Retention: drop everything wholly older than `cutoff_ts`, then trickle
     /// freed pages back if the free list has grown. Only a caller with a
     /// retention policy sends this.
@@ -324,6 +343,32 @@ impl Writer {
     /// own segment sequences, its own clock-offset series, and its own
     /// `complete` flag.
     pub fn add_source(&mut self, seed: SourceMeta) -> Result<SourceWriter> {
+        self.add_source_with_uuid(seed, None)
+    }
+
+    /// [`add_source`](Self::add_source), for a source whose identity was
+    /// minted somewhere else.
+    ///
+    /// `add_source` mints a fresh uuid, which is right for a source this
+    /// process is starting. This one carries an existing identity across, so
+    /// that the row here **is** that source rather than another one with the
+    /// same labels — the property `SourceRow::uuid` exists for, and what makes
+    /// "do these two archives hold the same source" a comparison instead of a
+    /// guess (FORMAT.md §3.1).
+    ///
+    /// `None` mints a fresh one, exactly as `add_source` does. That is the
+    /// right answer for a source from an archive written before the column
+    /// existed: a fresh id claims only that two copies are not *known* to
+    /// differ, where reusing a `NULL` would claim they are the same.
+    ///
+    /// Nothing checks that the uuid is unique in this archive, or that it is a
+    /// UUID at all. It is the caller's identity to assign, and the archive
+    /// stores it the way it stores labels.
+    pub fn add_source_with_uuid(
+        &mut self,
+        seed: SourceMeta,
+        uuid: Option<&str>,
+    ) -> Result<SourceWriter> {
         // Derived before the seed is sent, since the seed moves.
         let stagger_key = crate::seal::source_stagger_key(&seed.labels);
         let Some(tx) = self.tx.as_ref() else {
@@ -333,6 +378,7 @@ impl Writer {
         if tx
             .send(Msg::AddSource {
                 seed: Box::new(seed),
+                uuid: uuid.map(str::to_string),
                 reply: reply_tx,
             })
             .is_err()
@@ -696,6 +742,70 @@ impl SourceWriter {
             source_id: self.source_id,
             batch,
         })
+    }
+
+    /// Insert a segment built elsewhere at this stream's next `seq`.
+    ///
+    /// The other entrance to the seal path. [`seal`](Self::seal) says "encode
+    /// what is in the WAL"; this says "here are the bytes". It is what makes a
+    /// replication catch-up cheap — shipping a sealed segment costs far less
+    /// than replaying the rows that built it — and it is equally the way to
+    /// splice a segment from another archive into a live one.
+    ///
+    /// **The bytes are not checked against anything.** A seal runs
+    /// [`segment::materialize`](crate::segment::materialize) because it has the
+    /// input rows to check the encoder's answer against; here there are none,
+    /// and `meta` is taken on trust exactly as
+    /// [`rewrite::copy_sources_into`](crate::rewrite::copy_sources_into) takes
+    /// a segment it carries across. `meta` must describe the **segment**, never
+    /// some other rows — see [`Segment`](crate::segment::Segment).
+    ///
+    /// What *is* checked is where the segment lands:
+    ///
+    /// * A segment wholly at or below the stream's newest sealed row is
+    ///   **already held**, and this returns `Ok(false)`. That is the normal
+    ///   outcome of a reconnect, not a failure.
+    /// * A segment *straddling* it is refused. Its rows below the watermark
+    ///   could never be read (FORMAT.md §3.3), and splitting it would mean
+    ///   decoding it.
+    /// * A segment whose span reaches an unsealed row already in the WAL is
+    ///   refused. A seal earns the right to prune by having encoded exactly
+    ///   the rows it covers; this one proves nothing about those rows, so
+    ///   adopting it would shadow rows no segment holds.
+    ///
+    /// Unlike `wal` and `seal` this is **not** fire-and-forget: it waits for
+    /// the writer. A caller applying a stream of segments cannot usefully learn
+    /// about a refusal several segments later, and the bytes are in the message
+    /// rather than in the WAL, so there is nothing to retry from.
+    pub fn adopt_segment(
+        &mut self,
+        stream: &str,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+        caller_index: Option<&[u8]>,
+    ) -> Result<bool> {
+        let (reply_tx, reply_rx) = sync_channel(0);
+        if self
+            .tx
+            .send(Msg::AdoptSegment {
+                source_id: self.source_id,
+                segment: Box::new(Adopted {
+                    stream: stream.to_string(),
+                    meta: *meta,
+                    bytes: bytes.to_vec(),
+                    caller_index: caller_index.map(<[u8]>::to_vec),
+                }),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(take_writer_error(&self.err));
+        }
+        match reply_rx.recv() {
+            Ok(adopted) => adopted,
+            // The writer died between accepting the message and replying.
+            Err(_) => Err(take_writer_error(&self.err)),
+        }
     }
 
     /// Merge `patch` into this source's metadata, ordered with the ticks
@@ -1214,6 +1324,16 @@ struct Encoded {
     caller_index: Option<Vec<u8>>,
 }
 
+/// One segment built elsewhere, on its way to `adopt_segment`. `Encoded`
+/// without the `seq`: the sender does not know the stream's numbering, and the
+/// writer thread is the only thing that does.
+pub(crate) struct Adopted {
+    stream: String,
+    meta: SegmentMeta,
+    bytes: Vec<u8>,
+    caller_index: Option<Vec<u8>>,
+}
+
 /// The writer thread body. Every fallible operation returns `Err`; the loop
 /// exits on the first error so the failure surfaces on the next hand-off
 /// instead of accumulating against a broken source.
@@ -1341,18 +1461,20 @@ fn writer_loop(
             Ok(Msg::Sync(reply)) => {
                 let _ = reply.send(());
             }
-            Ok(Msg::AddSource { seed, reply }) => {
-                let inserted = db.insert_source(&seed).and_then(|id| {
-                    record_session(db, id, seed.clock_anchor_wall_ns, None)?;
-                    // The encoder that will write this source's rows, so a
-                    // reader can tell whether its own would decode them.
-                    if let Some(version) = encoder.version() {
-                        let mut patch = BTreeMap::new();
-                        patch.insert(crate::keys::ENCODER.to_string(), version.to_string());
-                        db.patch_source_metadata(id, &patch)?;
-                    }
-                    Ok(id)
-                });
+            Ok(Msg::AddSource { seed, uuid, reply }) => {
+                let inserted = db
+                    .insert_source_with_uuid(&seed, uuid.as_deref())
+                    .and_then(|id| {
+                        record_session(db, id, seed.clock_anchor_wall_ns, None)?;
+                        // The encoder that will write this source's rows, so a
+                        // reader can tell whether its own would decode them.
+                        if let Some(version) = encoder.version() {
+                            let mut patch = BTreeMap::new();
+                            patch.insert(crate::keys::ENCODER.to_string(), version.to_string());
+                            db.patch_source_metadata(id, &patch)?;
+                        }
+                        Ok(id)
+                    });
                 // A failed insert is reported to the caller and does NOT kill
                 // the writer: an archive's other sources are still valid,
                 // and the caller decides whether to give up.
@@ -1411,6 +1533,22 @@ fn writer_loop(
                     ),
                     Err(e) => return Err(e),
                 }
+            }
+            Ok(Msg::AdoptSegment {
+                source_id,
+                segment,
+                reply,
+            }) => {
+                // Retried like a seal, and for the same reason: a lock that
+                // will clear must not cost the frame. Unlike a seal it cannot
+                // be DEFERRED — there is no WAL row holding the data for a
+                // later attempt, the bytes are in this message — so a failure
+                // that outlasts the retries goes back to the sender, which is
+                // applying a stream and can stop.
+                let adopted = with_retries("adopting a segment", || {
+                    adopt_segment(db, source_id, &mut next_seq, &mut watermarks, &segment)
+                });
+                let _ = reply.send(adopted);
             }
             Ok(Msg::Evict {
                 source_id,
@@ -1597,6 +1735,106 @@ fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
 /// Encode one batch's segments, insert them — with the batch's clock
 /// observation in one transaction, then prune the sealed streams' WAL
 /// outside it. Returns the timestamp of the observation recorded, if any.
+/// Insert a segment built elsewhere at this stream's next `seq`.
+///
+/// The other entrance to the seal path. `seal_batch` encodes what is in the
+/// WAL; this takes bytes somebody else already encoded, which is what makes a
+/// replication catch-up cheap — shipping a sealed segment costs far less than
+/// replaying the rows that built it.
+///
+/// **It does not run [`segment::materialize`](crate::segment::materialize).**
+/// There are no input rows to check the segment against: the sender's own seal
+/// already ran that contract, and the bytes arrived opaque. This is the same
+/// trust `rewrite::copy_sources_into` places in a segment it carries across.
+/// What it checks instead is where the segment lands.
+///
+/// Returns whether it inserted. `false` means the stream's watermark already
+/// covers the segment, which is the **normal** outcome of a reconnect: a
+/// subscriber that reconnects and asks for the last hour is re-sent segments it
+/// already holds, and refusing those would make an ordinary reconnect an error.
+fn adopt_segment(
+    db: &mut ArchiveMut,
+    source_id: i64,
+    next_seq: &mut BTreeMap<(i64, String), u64>,
+    watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
+    segment: &Adopted,
+) -> Result<bool> {
+    let Adopted {
+        stream,
+        meta,
+        bytes,
+        caller_index,
+    } = segment;
+    let stream = stream.as_str();
+    // The catalog facts have to describe a segment that could exist. A
+    // zero-row segment has no span to compare against anything, and an
+    // inverted one would set a watermark below its own first row.
+    if meta.rows == 0 || meta.first_ts > meta.last_ts {
+        return Err(Error::Message(format!(
+            "source {source_id}: the segment offered for `{stream}` claims {} row(s) over              [{}, {}], which is not a segment that can exist",
+            meta.rows, meta.first_ts, meta.last_ts
+        )));
+    }
+
+    let watermark = watermarks
+        .get(&source_id)
+        .and_then(|m| m.get(stream))
+        .copied();
+    if let Some(w) = watermark {
+        // Wholly at or below the watermark: this stream already has these
+        // rows. A reconnect re-sends them, so it is a skip and not a failure.
+        if meta.last_ts <= w {
+            return Ok(false);
+        }
+        // Straddling it is a different thing, and there is nothing sound to do
+        // with it. Inserting would put the rows below `w` behind the read
+        // watermark, where `LIVE_WAL_PREDICATE` shadows them and no read can
+        // ever return them (FORMAT.md §3.3) — the same failure the
+        // out-of-order rule exists to prevent, arriving as a segment instead of
+        // a row. Splitting the segment would mean decoding it, which is the
+        // one thing this layer cannot do.
+        if meta.first_ts <= w {
+            return Err(Error::Message(format!(
+                "source {source_id}: the segment offered for `{stream}` spans [{}, {}], which                  straddles the stream's newest sealed row ({w}); its rows at or below {w}                  could never be read, and splitting it would mean decoding it",
+                meta.first_ts, meta.last_ts
+            )));
+        }
+    }
+
+    // Nothing unsealed may be inside the span either. A seal earns the right
+    // to prune by having encoded exactly the rows it covers; this segment
+    // proves nothing about the subscriber's own WAL rows, so pruning them
+    // would delete rows that end up in no segment. Refusing instead keeps
+    // `adopt_segment` a pure insert: it never deletes anything.
+    //
+    // In a well-formed stream this cannot fire — catch-up segments arrive
+    // before the tail they precede — so it fires when the sender interleaved
+    // the two, which is a protocol error worth naming.
+    let live = db.live_wal_span(source_id, stream)?;
+    if let Some(first) = live.first_ts {
+        if first <= meta.last_ts {
+            return Err(Error::Message(format!(
+                "source {source_id}: the segment offered for `{stream}` ends at {}, at or                  after an unsealed row already in the WAL ({first}); adopting it would                  shadow rows no segment holds",
+                meta.last_ts
+            )));
+        }
+    }
+
+    let seq = next_seq
+        .get(&(source_id, stream.to_string()))
+        .copied()
+        .unwrap_or(0);
+    db.insert_segment_with_index(source_id, stream, seq, meta, bytes, caller_index.as_deref())?;
+    // After the commit, like `seal_batch`: a failed attempt must reuse the
+    // same number, or the stream's sequence carries a hole per retry.
+    next_seq.insert((source_id, stream.to_string()), seq + 1);
+    watermarks
+        .entry(source_id)
+        .or_default()
+        .insert(stream.to_string(), meta.last_ts);
+    Ok(true)
+}
+
 fn seal_batch(
     db: &mut ArchiveMut,
     source_id: i64,

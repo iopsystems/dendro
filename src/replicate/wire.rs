@@ -69,8 +69,12 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
 /// [`MAX_FRAME_BYTES`] bounds the whole frame well below 4 GiB anyway, and a
 /// `usize` above `u32::MAX` here is a bug rather than a big payload.
 fn put_bytes(out: &mut Vec<u8>, v: &[u8]) -> Result<()> {
-    let len = u32::try_from(v.len())
-        .map_err(|_| Error::Message(format!("a replication field of {} bytes is too large to encode", v.len())))?;
+    let len = u32::try_from(v.len()).map_err(|_| {
+        Error::Message(format!(
+            "a replication field of {} bytes is too large to encode",
+            v.len()
+        ))
+    })?;
     put_u32(out, len);
     out.extend_from_slice(v);
     Ok(())
@@ -318,7 +322,9 @@ impl<'a> Cursor<'a> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
-            other => Err(malformed(&format!("{other} is not a boolean; it is 0 or 1"))),
+            other => Err(malformed(&format!(
+                "{other} is not a boolean; it is 0 or 1"
+            ))),
         }
     }
 
