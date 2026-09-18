@@ -51,6 +51,21 @@ cannot reach a failed release any other way.
   What survives from that guidance is that `seq` **need not start at zero**,
   which the code never required.
 
+## [0.2.0] - 2026-09-18
+
+**This is 0.2.0, not 0.1.1.** The root re-exports below are removed public
+items, which Cargo's SemVer reference calls a major change, and for a `0.x`
+crate the minor is the major position. `0.1.1-alpha.0` was the automated
+post-release bump (`chore: begin next development iteration`) rather than a
+decision, and shipping under it would break `dendro = "0.1"` callers on a
+`cargo update`. The replication work on its own would have been a legitimate
+`0.1.1`.
+
+**The crate version and the schema version answer different questions.** The
+archive schema version is unchanged at **4** -- nothing on disk moves, existing
+archives are unaffected, and `FORMAT.md` section 8 governs that surface alone.
+The Rust API broke separately. Neither implies the other.
+
 ### Added
 
 - `replicate::wire::LENGTH_PREFIX_BYTES`, the offset at which a frame's payload
