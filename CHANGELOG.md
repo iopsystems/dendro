@@ -27,6 +27,27 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- **Replication**, behind the `replicate` feature: frame types and a wire codec,
+  `Subscriber` (apply frames to an archive) and `ArchivePublisher` (tail one).
+  Transport is not included. One frame kind per table that `rewrite` carries, so
+  the set has a completeness check rather than a guess; a live tail ships rows
+  and the subscriber seals its own, while a catch-up ships sealed segments. An
+  index entry stays opaque — the state hash a subscriber needs travels outside
+  the blob. The wire format is specified in `WIRE.md`. The feature does not imply
+  `write`: publishing is a read.
+- `Writer::add_source_with_uuid`, which carries an identity minted elsewhere so
+  a copy **is** the source rather than another one with the same labels.
+- `SourceWriter::adopt_segment`, which inserts a segment built elsewhere at a
+  stream's next `seq`. Refuses one that straddles the stream's watermark or
+  reaches an unsealed row, and reports one the watermark already covers as
+  already held rather than as a failure.
+- `SourceWriter::clock_offset` and `ArchiveMut::insert_source_with_uuid`, for
+  carrying a clock-drift series and an identity that were observed elsewhere.
+
+The archive schema version is unchanged at 4.
+
 ## [0.1.0] - 2026-09-16
 
 First release. The crate is a segmented Parquet archive with a write-ahead

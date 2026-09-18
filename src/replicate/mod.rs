@@ -31,7 +31,7 @@
 //! entries.
 //!
 //! Any **publisher that is not an archive**. [`ArchivePublisher`](crate::replicate::ArchivePublisher) tails an
-//! archive. A producer with no archive to tail synthesises frames itself, and
+//! archive. A producer with no archive to tail synthesizes frames itself, and
 //! that is the one piece that cannot live here.
 //!
 //! # The protocol
