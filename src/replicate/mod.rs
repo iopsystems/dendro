@@ -30,7 +30,7 @@
 //! comparing two hashes is all it needs in order to order rows against
 //! entries.
 //!
-//! Any **publisher that is not an archive**. `ArchivePublisher` tails an
+//! Any **publisher that is not an archive**. [`ArchivePublisher`](crate::replicate::ArchivePublisher) tails an
 //! archive. A producer with no archive to tail synthesises frames itself, and
 //! that is the one piece that cannot live here.
 //!
@@ -85,6 +85,9 @@ mod frame;
 pub mod wire;
 
 pub use frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
+
+mod publisher;
+pub use publisher::ArchivePublisher;
 
 #[cfg(feature = "write")]
 mod subscriber;

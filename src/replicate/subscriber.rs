@@ -25,8 +25,9 @@ pub struct Applied {
     /// WAL rows written.
     pub rows: usize,
     /// Rows **not** written, because the index state they were built against
-    /// is not the one this subscriber has accumulated, or because no
-    /// [`Full`](IndexKind::Full) entry has arrived yet for their source. A
+    /// is not the one this subscriber has accumulated, or because they name an
+    /// index and no [`Full`](IndexKind::Full) entry has arrived yet for their
+    /// source. A
     /// non-zero count is a gap in the copy, and a deliberate one: misattributing
     /// a row to the wrong slot is worse than not having it.
     pub rows_skipped: usize,
@@ -206,7 +207,16 @@ impl Subscriber {
                 // same judgement: a row whose identity cannot be resolved is
                 // dropped, because attributing it to the wrong slot is worse
                 // than not having it.
-                if !st.seen_full || index_state != st.index_state {
+                //
+                // `NO_INDEX_STATE` is exempt from the second. It means the rows
+                // were built against no index at all, which is always
+                // resolvable and is what a publisher whose caller keeps no
+                // secondary index sends forever — without the exemption such a
+                // stream would wait for a `Full` that is never coming and drop
+                // every row. A publisher that HAS an index must not declare
+                // `NO_INDEX_STATE`; see [`NO_INDEX_STATE`].
+                let unresolvable = index_state != NO_INDEX_STATE && !st.seen_full;
+                if unresolvable || index_state != st.index_state {
                     return Ok(Applied {
                         rows_skipped: rows.len(),
                         gap,

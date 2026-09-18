@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use dendro::archive::{Archive, SegmentMeta, SourceMeta, WalRow};
+use dendro::archive::{Archive, CallerRow, SegmentMeta, SourceMeta, WalRow};
 use dendro::replicate::{Frame, IndexKind, Subscriber, NO_INDEX_STATE};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
@@ -439,4 +439,264 @@ fn two_sources_on_one_connection_keep_their_own_state() {
     assert_eq!(sources.len(), 2);
     assert_eq!(wal_ts(&db, sources[0].id, "s"), vec![1_000]);
     assert_eq!(wal_ts(&db, sources[1].id, "s"), vec![2_000]);
+}
+
+// ------------------------------------------------------------ round trip
+
+/// What a comparison of two archives can actually assert.
+///
+/// Not raw table equality. `sources.id` is local to a file and renumbered by
+/// every copy (FORMAT.md §3.1); `segments.seq` is renumbered by a copy; and a
+/// subscriber lands rows in its own WAL and seals on its own cadence, so the
+/// same rows sit in different tables on the two sides at any given moment.
+/// What must match is what READS BACK, which is the property the format is
+/// for.
+#[derive(Debug, PartialEq, Eq)]
+struct Readable {
+    uuid: Option<String>,
+    labels: BTreeMap<String, String>,
+    complete: bool,
+    clock_anchor_wall_ns: i64,
+    /// Per stream, every row's `(ts, wall_offset, payload)`, segments and live
+    /// tail spliced the way a reader splices them.
+    streams: BTreeMap<String, Vec<(i64, i64, Vec<u8>)>>,
+    clock_offsets: Vec<(i64, i64)>,
+    caller_rows: BTreeMap<String, Vec<(i64, Vec<u8>)>>,
+}
+
+/// Read every source of an archive into the comparable form above.
+fn readable(path: &std::path::Path) -> Vec<Readable> {
+    let db = Archive::open(path).unwrap();
+    db.read_snapshot(|db| {
+        let mut out = Vec::new();
+        for rec in db.read_sources()? {
+            let mut streams = BTreeMap::new();
+            for stream in db.all_streams(rec.id)? {
+                let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+                // Sealed segments in `seq` order, then the live tail: §4 rule
+                // 3. The test encoder writes timestamps, so a segment decodes
+                // back to the rows that went into it.
+                for segment in db.read_segments(rec.id, &stream)? {
+                    for ts in String::from_utf8(segment.bytes).unwrap().split(',') {
+                        rows.push((
+                            ts.parse().unwrap(),
+                            7,
+                            ts.parse::<i64>().unwrap().to_le_bytes().to_vec(),
+                        ));
+                    }
+                }
+                for r in db.live_wal(rec.id, &stream)? {
+                    rows.push((r.ts, r.wall_offset, r.row));
+                }
+                streams.insert(stream, rows);
+            }
+            let mut caller_rows = BTreeMap::new();
+            for name in db.caller_row_streams(rec.id)? {
+                caller_rows.insert(
+                    name.clone(),
+                    db.read_caller_rows(rec.id, &name, i64::MIN, i64::MAX)?
+                        .into_iter()
+                        .map(|r| (r.ts, r.blob))
+                        .collect(),
+                );
+            }
+            out.push(Readable {
+                uuid: rec.uuid,
+                labels: rec.meta.labels,
+                complete: rec.complete,
+                clock_anchor_wall_ns: rec.meta.clock_anchor_wall_ns,
+                streams,
+                clock_offsets: db.read_clock_offsets(rec.id)?,
+                caller_rows,
+            });
+        }
+        Ok(out)
+    })
+    .unwrap()
+}
+
+/// Build a publisher-side archive with something in all five tables.
+fn build_publisher_archive(path: &std::path::Path) {
+    let mut archive = Writer::create(path, Box::new(Tags)).unwrap();
+
+    for name in ["a", "b"] {
+        let mut w = archive.add_source(source_meta(name)).unwrap();
+
+        // The caller's secondary index, which is what `caller_rows` is for.
+        w.caller_rows(
+            "s",
+            vec![
+                CallerRow {
+                    ts: 500,
+                    blob: format!("{name}:slots@500").into_bytes(),
+                },
+                // Two at one timestamp, which the table allows and which a
+                // cursor keyed on timestamp alone would resume wrongly.
+                CallerRow {
+                    ts: 500,
+                    blob: format!("{name}:more@500").into_bytes(),
+                },
+            ],
+        )
+        .unwrap();
+        // A name no stream uses: still the caller's to keep, and still copied.
+        w.caller_rows(
+            "notes",
+            vec![CallerRow {
+                ts: 600,
+                blob: b"a note".to_vec(),
+            }],
+        )
+        .unwrap();
+
+        // Two streams, one of them sealed and one left entirely in the tail.
+        w.wal(vec![row("s", 1_000), row("s", 2_000), row("t", 1_500)])
+            .unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+        w.sync().unwrap();
+        w.wal(vec![row("s", 3_000), row("t", 3_500)]).unwrap();
+        w.sync().unwrap();
+        w.finalize((3_500, 7)).unwrap();
+    }
+    archive.join().unwrap();
+}
+
+/// **The test this whole module exists for.** Publish an archive, subscribe
+/// into a fresh one, and compare what reads back across all five tables
+/// `rewrite` calls an archive.
+///
+/// It is the strongest available test of a replication format, and being able
+/// to write it with no caller involved is the reason the format lives in this
+/// crate rather than in a consumer.
+#[test]
+fn round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin.dendro");
+    let copy = dir.path().join("copy.dendro");
+    build_publisher_archive(&origin);
+
+    {
+        let db = Archive::open(&origin).unwrap();
+        // From the beginning of time: a full copy is a catch-up with no floor.
+        let (mut pub_, opening) =
+            dendro::replicate::ArchivePublisher::catching_up(&db, i64::MIN).unwrap();
+        let mut sub = subscriber(&copy);
+        sub.apply_all(opening).unwrap();
+        // One more poll, which ships the live tail the opening batch's
+        // segments did not cover.
+        sub.apply_all(pub_.next(&db).unwrap()).unwrap();
+        sub.sync().unwrap();
+        sub.finish().unwrap();
+    }
+
+    let before = readable(&origin);
+    let after = readable(&copy);
+    assert_eq!(before.len(), 2, "two sources");
+    assert_eq!(
+        before, after,
+        "an archive published and subscribed back is the archive"
+    );
+}
+
+/// Frames survive the wire on the way, which is the only way a real
+/// publisher and subscriber are ever connected.
+#[test]
+fn round_trip_through_the_codec() {
+    use dendro::replicate::wire::{encode_frame, write_preamble, FrameReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin.dendro");
+    let copy = dir.path().join("copy.dendro");
+    build_publisher_archive(&origin);
+
+    let mut bytes = Vec::new();
+    write_preamble(&mut bytes).unwrap();
+    {
+        let db = Archive::open(&origin).unwrap();
+        let (mut pub_, opening) =
+            dendro::replicate::ArchivePublisher::catching_up(&db, i64::MIN).unwrap();
+        for frame in opening.iter().chain(&pub_.next(&db).unwrap()) {
+            encode_frame(frame, &mut bytes).unwrap();
+        }
+    }
+
+    let mut sub = subscriber(&copy);
+    let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
+    while let Some(frame) = reader.next_frame().unwrap() {
+        sub.apply(frame).unwrap();
+    }
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    assert_eq!(readable(&origin), readable(&copy));
+}
+
+/// A tailing publisher starts at the archive's present: the rows already there
+/// are not re-shipped, and the ones that arrive after are.
+#[test]
+fn a_tailing_publisher_ships_only_what_arrives_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("s", 1_000), row("s", 2_000)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // Nothing new yet: one empty `Rows` frame, which is the keepalive.
+    let idle = publisher.next(&db).unwrap();
+    assert_eq!(idle.len(), 1);
+    assert_eq!(sub.apply_all(idle).unwrap().rows, 0);
+
+    w.wal(vec![row("s", 3_000)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(sub.apply_all(publisher.next(&db).unwrap()).unwrap().rows, 1);
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    let dst = Archive::open(&copy).unwrap();
+    assert_eq!(
+        wal_ts(&dst, 1, "s"),
+        vec![3_000],
+        "the archive's past was not re-shipped"
+    );
+}
+
+/// A seal carries rows out of the live tail. A publisher polling more slowly
+/// than the source seals says so rather than shipping a stream with a hole in
+/// it — the caller reconnects with a catch-up, which is what the segment
+/// frames are for.
+#[test]
+fn a_publisher_outrun_by_a_seal_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("outrun.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("s", 1_000)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, _) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+
+    // Rows arrive and are sealed before the publisher ever reads them.
+    w.wal(vec![row("s", 2_000), row("s", 3_000)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.sync().unwrap();
+
+    let err = publisher.next(&db).unwrap_err().to_string();
+    assert!(err.contains("sealed past this publisher's cursor"), "{err}");
+    assert!(err.contains("catching_up"), "{err}");
+
+    drop(w);
+    archive.join().unwrap();
 }

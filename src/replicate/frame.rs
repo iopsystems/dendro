@@ -21,7 +21,14 @@ pub type IndexState = (u64, u64);
 ///
 /// A publisher whose caller keeps no secondary index emits this on every
 /// frame, and a subscriber matches it trivially, so replicating an archive
-/// with no index needs no index.
+/// with no index needs no index. It is also the one state exempt from the
+/// "wait for a [`Full`](IndexKind::Full)" rule, because rows built against no
+/// index are always resolvable — without that exemption such a stream would
+/// wait for a `Full` that is never coming.
+///
+/// **A publisher that has an index must never declare this.** Doing so claims
+/// its rows reference nothing, and a subscriber will apply them against
+/// whatever it happens to hold.
 pub const NO_INDEX_STATE: IndexState = (0, 0);
 
 /// Whether an [`Index`](Frame::Index) frame carries the whole slot set or a
