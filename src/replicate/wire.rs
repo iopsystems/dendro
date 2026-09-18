@@ -34,6 +34,34 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// caller that seals larger than this is asking for a bound it chose.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// The bytes a frame's length prefix occupies, and therefore the offset at
+/// which its payload begins.
+///
+/// [`encode`] returns a **whole frame** — length prefix, kind byte, payload —
+/// while [`decode_payload`] takes the **payload alone**, because
+/// [`FrameReader`] has already consumed the prefix in order to know how much to
+/// read. That asymmetry is right for the reader and awkward for a caller
+/// pairing the two by hand, which is what this is for:
+///
+/// ```
+/// # use dendro::replicate::{Frame, NO_INDEX_STATE};
+/// # use dendro::replicate::wire::{encode, decode_payload, LENGTH_PREFIX_BYTES};
+/// let frame = Frame::Rows {
+///     source: 0,
+///     seq: 0,
+///     index_state: NO_INDEX_STATE,
+///     rows: Vec::new(),
+/// };
+/// let bytes = encode(&frame)?;
+/// let back = decode_payload(&bytes[LENGTH_PREFIX_BYTES..])?;
+/// assert_eq!(back, frame);
+/// # Ok::<(), dendro::Error>(())
+/// ```
+///
+/// A bare `4` at the call site is the kind of constant that is right until
+/// somebody changes the framing, so this is what the code below counts in too.
+pub const LENGTH_PREFIX_BYTES: usize = 4;
+
 const KIND_HANDSHAKE: u8 = 1;
 const KIND_INDEX: u8 = 2;
 const KIND_ROWS: u8 = 3;
@@ -213,6 +241,11 @@ pub fn encode_frame(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
         }
     }
 
+    debug_assert_eq!(
+        body_at - len_at,
+        LENGTH_PREFIX_BYTES,
+        "the reserved prefix and the exported offset must be the same thing"
+    );
     let body = out.len() - body_at;
     if body > MAX_FRAME_BYTES {
         out.truncate(len_at);
@@ -482,7 +515,7 @@ impl<R: Read> FrameReader<R> {
     /// truncated frame is a lost frame, and reporting it as the end would
     /// silently shorten the recording.
     pub fn next_frame(&mut self) -> Result<Option<Frame>> {
-        let mut len = [0u8; 4];
+        let mut len = [0u8; LENGTH_PREFIX_BYTES];
         match self.inner.read_exact(&mut len) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -599,9 +632,13 @@ mod tests {
 
         for frame in &frames {
             let bytes = encode(frame).unwrap();
-            let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-            assert_eq!(len, bytes.len() - 4, "the length prefix covers the payload");
-            let back = decode_payload(&bytes[4..]).unwrap();
+            let len = u32::from_le_bytes(bytes[..LENGTH_PREFIX_BYTES].try_into().unwrap()) as usize;
+            assert_eq!(
+                len,
+                bytes.len() - LENGTH_PREFIX_BYTES,
+                "the length prefix covers the payload"
+            );
+            let back = decode_payload(&bytes[LENGTH_PREFIX_BYTES..]).unwrap();
             assert_eq!(&back, frame);
         }
     }
@@ -656,8 +693,8 @@ mod tests {
             let a = encode(&absent).unwrap();
             let b = encode(&empty).unwrap();
             assert_ne!(a, b, "absent and empty must not encode alike");
-            assert_eq!(decode_payload(&a[4..]).unwrap(), absent);
-            assert_eq!(decode_payload(&b[4..]).unwrap(), empty);
+            assert_eq!(decode_payload(&a[LENGTH_PREFIX_BYTES..]).unwrap(), absent);
+            assert_eq!(decode_payload(&b[LENGTH_PREFIX_BYTES..]).unwrap(), empty);
         }
     }
 
@@ -671,7 +708,10 @@ mod tests {
             rows: Vec::new(),
         };
         let bytes = encode(&frame).unwrap();
-        assert_eq!(decode_payload(&bytes[4..]).unwrap(), frame);
+        assert_eq!(
+            decode_payload(&bytes[LENGTH_PREFIX_BYTES..]).unwrap(),
+            frame
+        );
     }
 
     /// Bytes off a wire are not to be trusted: every truncation of every frame
@@ -690,7 +730,7 @@ mod tests {
             }],
         };
         let bytes = encode(&frame).unwrap();
-        let payload = &bytes[4..];
+        let payload = &bytes[LENGTH_PREFIX_BYTES..];
         for cut in 0..payload.len() {
             assert!(
                 decode_payload(&payload[..cut]).is_err(),
@@ -710,7 +750,7 @@ mod tests {
             offset_ns: 2,
         };
         let bytes = encode(&frame).unwrap();
-        let mut payload = bytes[4..].to_vec();
+        let mut payload = bytes[LENGTH_PREFIX_BYTES..].to_vec();
         payload.push(0);
         assert!(decode_payload(&payload).is_err());
     }

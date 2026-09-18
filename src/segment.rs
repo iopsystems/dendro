@@ -107,7 +107,28 @@ pub trait SegmentEncoder {
     /// may claim, and for the empty slice this is called with.
     fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
 
-    /// A version string for this encoding, or `None` to opt out.
+    /// A version for this encoding, or `None` to opt out.
+    ///
+    /// **A string, and borrowed.** The value lands in `sources.metadata`, which
+    /// the format defines as a JSON object of string to string (FORMAT.md §3),
+    /// so a number would be stringified on the way in whatever this returned.
+    /// dendro only ever compares it for **equality** — it does not parse it,
+    /// order it, or ask whether one version is newer — so any string that is
+    /// stable per encoding works: `"3"`, `"v3"`, a git sha, a hash of the
+    /// schema. `&str` rather than `String` because an implementation almost
+    /// always has one already:
+    ///
+    /// ```
+    /// # use dendro::archive::WalRow;
+    /// # use dendro::segment::{EncodeResult, SegmentEncoder};
+    /// # struct MyEncoder;
+    /// impl SegmentEncoder for MyEncoder {
+    ///     # fn encode(&self, _: &str, _: &[WalRow]) -> EncodeResult { Ok(None) }
+    ///     fn version(&self) -> Option<&str> {
+    ///         Some("3")
+    ///     }
+    /// }
+    /// ```
     ///
     /// The bytes in a row and the columns in a segment are this encoder's,
     /// and the archive cannot tell whether a different build of it would
