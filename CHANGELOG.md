@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-18
+
 **This is 0.2.0, not 0.1.1.** The root re-exports below are removed public
 items, which Cargo's SemVer reference calls a major change, and for a `0.x`
 crate the minor is the major position. `0.1.1-alpha.0` was the automated
