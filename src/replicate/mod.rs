@@ -55,7 +55,10 @@
 //!    `caller_rows` is already time-keyed.
 //! 6. Every interval produces a `Rows` frame, empty when nothing was observed,
 //!    so a gap in [`seq`](crate::replicate::Frame::Rows) means a lost reading and nothing else.
-//!    The empty frame is also the keepalive.
+//!    The empty frame is also the keepalive. `seq` is strictly increasing with
+//!    one value per interval and need not start at zero; an **interval index**
+//!    is the better choice, because a frame counter cannot distinguish a
+//!    skipped interval from a contiguous one.
 //! 7. `Index` is re-emitted [`Full`](crate::replicate::IndexKind::Full) periodically, so
 //!    retention cannot orphan it: `caller_rows` is evicted on the same cutoff
 //!    as segments, and state written once at the start would be deleted while

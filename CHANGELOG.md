@@ -33,6 +33,22 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- `Frame::Rows.seq` is documented as **strictly increasing, one per interval,
+  need not start at zero** — what the subscriber's gap check actually requires —
+  rather than "counts from zero". The doc was narrower than the code: `last_seq`
+  starts `None`, so a first value is never compared, and only the step between
+  consecutive frames is checked.
+
+  The relaxation matters because a frame counter is the weaker choice. It
+  increments by one whether or not an interval was skipped, so a skipped
+  interval arrives as a contiguous sequence with an undetectable hole. An
+  interval index says the thing rule 6 is trying to say. Raised by a consumer
+  whose publisher was doing the better thing and read as non-conforming.
+
+  No code change; a publisher that counted from zero still conforms.
+
 ## [0.2.0] - 2026-09-18
 
 **This is 0.2.0, not 0.1.1.** The root re-exports below are removed public
