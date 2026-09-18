@@ -313,9 +313,21 @@ pub mod segment;
 pub use error::{Error, ReadOnly, Result};
 /// The writer thread.
 ///
-/// Behind the `write` feature: it spawns a thread, and `std::thread::spawn`
-/// compiles for `wasm32-unknown-unknown` and then panics at runtime. With the
-/// feature off the crate is a reader, which is the configuration that works in
-/// a browser.
+/// Behind the `write` feature, which is the one gate in this crate with a
+/// hard technical reason: the writer runs on a thread, and
+/// `wasm32-unknown-unknown` has none. With the feature off the crate is a
+/// reader, which is the configuration that works in a browser.
+///
+/// The failure is clean rather than a trap. This crate uses
+/// `std::thread::Builder::spawn`, which returns `io::Result`, and reports the
+/// error — a `wasm32` build that pulled in `write` anyway would see
+/// `Writer::create` fail by name, not panic. `std::thread::spawn` is the one
+/// that panics, and is deliberately not used here.
+///
+/// **A compile check cannot verify this.** `cargo check --target
+/// wasm32-unknown-unknown` passes on code that creates threads, because the
+/// call compiles and only fails when reached. That is why
+/// `scripts/check-wasm.sh` checks the reader configuration and never this one:
+/// an instrument that cannot fail on the hazard proves nothing by passing.
 #[cfg(feature = "write")]
 pub mod writer;

@@ -33,6 +33,30 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- `Frame::Rows.seq` **counts intervals, not frames**, and a gap means intervals
+  the subscriber did not receive — *not* "frames lost in transit and nothing
+  else", which 0.2.1 said and which no publisher that declines to buffer can
+  hold.
+
+  Rule 6 assumed a publisher can always emit. One that refuses to buffer without
+  bound for a stalled consumer cannot, and buffering without bound is the worse
+  failure. So an interval may legitimately go unserved, and the contract now has
+  three states rather than two: served with data, served with nothing (the empty
+  frame), and not served (a gap).
+
+  This does **not** reinstate the interval index. A per-interval counter kept by
+  the producer's own loop needs no clock and does not alias; dividing an
+  observation timestamp still does.
+
+- The `write` feature's description said `std::thread::spawn` "panics at
+  runtime" on wasm32. This crate uses
+  `std::thread::Builder::spawn`, which returns `io::Result` and is reported by
+  name, so the failure is diagnosable rather than a trap. Also records why a
+  compile check cannot verify the reader configuration's thread-freedom.
+
+
 ## [0.2.1] - 2026-09-18
 
 ### Changed

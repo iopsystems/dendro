@@ -113,27 +113,40 @@ pub enum Frame {
     Rows {
         /// Which source, by handshake ordinal.
         source: u32,
-        /// **A sequence number, in the TCP sense: strictly increasing and
-        /// contiguous, incremented by exactly one per frame.** It is not a
-        /// timestamp and carries no time semantics.
+        /// **A counter over intervals, not over frames.** The producer
+        /// advances it once for every interval it was meant to serve, whether
+        /// or not a frame went out. It is not a timestamp and is not derived
+        /// from one.
         ///
         /// It need not start at zero — only the step between consecutive
-        /// frames is ever compared, so any starting value works.
+        /// frames is ever compared.
         ///
-        /// **A gap therefore means frames lost in transit, and nothing else.**
-        /// That is sharper than it sounds, and it rests on rule 6: an interval
-        /// that observed nothing still produces a frame, an empty one. So
-        /// "nothing was observed" and "a frame did not arrive" are different
-        /// facts and stay different — the empty frame states the first, a gap
-        /// states the second.
+        /// Three states, and the second against the third is why this is not
+        /// simply a frame counter:
         ///
-        /// **Do not derive it from a clock.** An interval index
-        /// (`timestamp / interval`) merges those two facts into one signal,
-        /// because a skipped emission and a dropped frame then look identical.
-        /// It also aliases on sub-interval jitter: a reading taken slightly
-        /// early lands in the previous bucket, which invents gaps that did not
-        /// happen and hides gaps that did. A plain counter has neither problem,
-        /// and rule 6 already covers what the index was reaching for.
+        /// | the interval | frame | `seq` |
+        /// |---|---|---|
+        /// | served, something observed | non-empty | `+1` |
+        /// | served, nothing observed | **empty** | `+1` |
+        /// | **not served** — the publisher would have had to buffer | none | jumps |
+        ///
+        /// **A gap therefore means intervals the subscriber did not receive,
+        /// and does not say why.** Frames lost in transit and intervals a
+        /// publisher declined to buffer are both real causes. A publisher that
+        /// refuses to buffer without bound, rather than slow its own sampling
+        /// for a slow reader, is behaving correctly — so a gap is not by itself
+        /// evidence of a fault anywhere.
+        ///
+        /// What a gap does **not** mean is "the interval produced nothing".
+        /// That is the empty frame, and keeping the two apart is what rule 6
+        /// is for.
+        ///
+        /// **Count intervals; do not divide a clock.** An interval index
+        /// (`timestamp / interval`) aliases on sub-interval jitter: a reading
+        /// taken slightly early lands in the previous bucket, which both
+        /// invents gaps that did not happen and hides gaps that did. A counter
+        /// the producer's own loop advances has neither problem and needs no
+        /// clock at all.
         seq: u64,
         /// The index state these rows were built against. A subscriber whose
         /// accumulated state differs **skips the rows**: misattribution is
