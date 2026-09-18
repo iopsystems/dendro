@@ -117,6 +117,23 @@ enum Msg {
         source_id: i64,
         patch: BTreeMap<String, String>,
     },
+    /// One clock-drift observation, committed on its own.
+    ///
+    /// The writer records these itself at every seal and at finalize
+    /// (FORMAT.md §5), derived from the rows it sealed, so an ordinary
+    /// recording needs this never. It exists for a caller carrying a series
+    /// somebody else observed — a replication subscriber, which must land the
+    /// publisher's observations rather than invent its own from where its own
+    /// seals happened to fall.
+    ///
+    /// At most one observation per `(source, ts)`: the table is keyed that
+    /// way and inserted `OR IGNORE`, so the first at a timestamp wins and a
+    /// second is dropped by the schema rather than by this.
+    ClockOffset {
+        source_id: i64,
+        ts: i64,
+        offset_ns: i64,
+    },
     /// Rows for the caller's time-keyed store, in order with the ticks
     /// around them and committed on their own. See
     /// [`CallerRow`](crate::archive::CallerRow).
@@ -823,6 +840,27 @@ impl SourceWriter {
         self.send(Msg::UpdateMetadata {
             source_id: self.source_id,
             patch,
+        })
+    }
+
+    /// Record one clock-drift observation for this source, ordered with the
+    /// ticks around it and committed on its own. Fire-and-forget like
+    /// [`wal`](Self::wal).
+    ///
+    /// The writer already records these at every seal and at finalize
+    /// (FORMAT.md §5), so a recording needs this never. It is for a caller
+    /// carrying a series somebody else observed: a replication subscriber has
+    /// to land the publisher's observations, because its own seals fall in
+    /// different places and would summarize the same rows at different
+    /// timestamps.
+    ///
+    /// At most one observation per `(source, ts)`, first one wins — the
+    /// schema decides that, not this call.
+    pub fn clock_offset(&mut self, ts: i64, offset_ns: i64) -> Result<()> {
+        self.send(Msg::ClockOffset {
+            source_id: self.source_id,
+            ts,
+            offset_ns,
         })
     }
 
@@ -1599,6 +1637,21 @@ fn writer_loop(
                         "metadata update for source {source_id} dropped ({e}); keys: {:?}",
                         patch.keys().collect::<Vec<_>>()
                     );
+                }
+            }
+            Ok(Msg::ClockOffset {
+                source_id,
+                ts,
+                offset_ns,
+            }) => {
+                // Data, like the caller store: retried, and a run of failures
+                // stops the writer rather than quietly thinning the series.
+                match with_retries("committing a clock offset", || {
+                    db.transaction(|tx| tx.insert_clock_offset(source_id, ts, offset_ns))
+                }) {
+                    Ok(()) => health.committed(),
+                    Err(e) if e.is_retryable() => health.dropped(e)?,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(Msg::CallerRows {

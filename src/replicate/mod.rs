@@ -85,3 +85,8 @@ mod frame;
 pub mod wire;
 
 pub use frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
+
+#[cfg(feature = "write")]
+mod subscriber;
+#[cfg(feature = "write")]
+pub use subscriber::{Applied, Subscriber};
