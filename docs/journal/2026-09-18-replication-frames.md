@@ -295,6 +295,30 @@ boundary, and that is not obvious from either side on its own.
 
 ## Deferred or Reopen Items
 
+The proposal closed with three open questions. Two are answered here and the
+third is not built; recording all three, because an issue is the task layer and
+this is where the decision belongs.
+
+- **`Publisher` is concrete, not a trait.** Answered by building it.
+  `ArchivePublisher` is a struct, and a producer with no archive to tail
+  constructs [`Frame`] values directly rather than implementing something. The
+  frame types already *are* the interface between the two halves, and a trait
+  over "yields frames" would be a second one describing the same boundary — with
+  nothing on the subscriber side able to tell the implementations apart, since
+  [`Subscriber::apply`] takes a `Frame` either way. Reopen if a caller turns up
+  that needs to be generic over the source of its frames, which the one known
+  consumer is not: its agent synthesizes frames from live metrics and hands them
+  straight to the codec.
+- **A subscriber cannot request a subset of streams.** Not built, and the
+  proposal's suggested substrate does not apply: that idea rested on SQLite's
+  session extension carrying `Changeset::apply`'s filter, and the publisher does
+  not use the session extension for the reasons above. A filter would be an
+  ordinary predicate instead, and `CopySpec::keep_streams` is the precedent for
+  its shape — the caller's decision, because it is about what rows *mean*.
+  Nothing needs it yet: an archive publisher ships what the archive holds, and a
+  producer-side publisher simply does not emit what it does not want to send.
+  Reopen when a subscriber needs less than a publisher is willing to send, which
+  is a transport-bandwidth problem before it is a format one.
 - **A tailing publisher must poll faster than the source seals.** It reads the
   live WAL tail, so a seal carries rows out of view. `next` detects a watermark
   past its cursor and returns an error naming the stream and the timestamp to
