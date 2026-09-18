@@ -33,12 +33,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # zstd and SQLite are compiled from C, so the wasm build needs a clang
-      # that can target wasm32. Ubuntu's can.
-      - run: cargo check --no-default-features --target wasm32-unknown-unknown
-      # `replicate` deliberately does not imply `write`, so the publishing half
-      # is part of the reader build and has to hold this line too. Without this
-      # a `std::thread` reaching `ArchivePublisher` would ship.
-      - run: cargo check --no-default-features --features replicate --target wasm32-unknown-unknown
+      # that can target wasm32. Ubuntu's can; Apple's cannot, which is why the
+      # script exists and why CI runs it rather than the bare cargo commands.
+      # A check nobody can run locally is one nobody runs before pushing, and a
+      # script CI does not run is one that rots.
+      - run: ./scripts/check-wasm.sh
 
   # `write` off must also work natively: the reader build is a supported
   # configuration, not merely a wasm artifact.

@@ -253,7 +253,18 @@ live-WAL rule or the time model, and an adopted segment writes the same
 
 Verified by `cargo test --all-features` and `cargo clippy --all-features
 --all-targets`, with `cargo test --no-default-features --features replicate` for
-the publisher without a writer. `tests/replicate.rs` carries 13 cases and
+the publisher without a writer, and `./scripts/check-wasm.sh` for the same
+configuration on wasm32.
+
+That last one did not exist and could not be run on macOS at all: Apple's clang
+has no WebAssembly backend, and the failure arrives from inside cc-rs as a bare
+exit status several hundred lines into a build of zstd and SQLite, which reads
+like a broken dependency rather than a missing toolchain. So the claim that
+publishing works in the reader build was untested on the machine it was written
+on, and CI would have been the first to know. `scripts/check-wasm.sh` finds a
+clang that has the backend — Homebrew's, on macOS — and CI now runs the script
+rather than the bare cargo commands, so it cannot rot into something only one
+machine can execute. `tests/replicate.rs` carries 13 cases and
 `src/replicate/wire.rs` 10 codec unit tests; six new cases in
 `tests/writer_policy.rs` pin the writer APIs.
 

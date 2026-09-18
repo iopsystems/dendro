@@ -287,6 +287,13 @@ anything else holds it. See
 | `replicate` | off | Frame types, the wire codec, `ArchivePublisher` and `Subscriber`. It does **not** imply `write`: publishing is a read, so the reader build publishes and only the subscriber needs a writer. |
 | `test-support` | off | Test-only accessors that downstream crates' tests need. |
 
+To check the reader build against wasm32, run `./scripts/check-wasm.sh`. It is
+what CI runs, and it exists because the C dependencies need a clang with the
+WebAssembly backend: Ubuntu's has it, Apple's does not, and without the script
+a macOS checkout fails several hundred lines into a build of zstd and SQLite
+with a bare exit status that reads like a broken dependency. On macOS,
+`brew install llvm` is the whole fix; the script finds it.
+
 ## Status
 
 Extracted from [rezolus](https://github.com/iopsystems/rezolus), where it was
