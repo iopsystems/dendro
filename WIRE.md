@@ -172,9 +172,16 @@ arrives as a contiguous sequence with an undetectable hole in it. An **interval
 index** — the observation's timestamp divided by the interval — answers the
 question a subscriber is actually asking, and satisfies the same check.
 
-Derive it from the row timestamp rather than the wall clock. `ts` is anchored
-(`FORMAT.md` §5) and strictly increasing through a wall-clock step; an index
-taken from the wall clock inherits the step and can go backwards.
+**Base it on a monotonic clock, never on the wall clock.** `CLOCK_REALTIME`
+steps, and an index computed from it steps with it; `CLOCK_MONOTONIC` cannot go
+backwards, which is the property this needs and the only one. A row's own `ts`
+already satisfies it and is the convenient source — `FORMAT.md` §5 defines it as
+`clock_anchor_wall_ns + monotonic elapsed` with the anchor read once, so its only
+varying component is the monotonic clock.
+
+Where the producer can suspend, prefer a clock that counts suspended time
+(`CLOCK_BOOTTIME`). One that stops while the machine sleeps hides intervals that
+genuinely passed, which is the failure an interval index exists to catch.
 
 `index_state` is the state the rows were built against. A subscriber whose
 accumulated state differs skips the rows; see rule 9 below.

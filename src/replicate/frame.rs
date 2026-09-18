@@ -129,11 +129,23 @@ pub enum Frame {
         /// divided by the interval — answers the question that is being asked,
         /// and satisfies the same check.
         ///
-        /// Derive it from the row timestamp rather than from the wall clock.
-        /// `ts` is anchored (FORMAT.md §5) and therefore strictly increasing
-        /// through a wall-clock step; an index taken from the wall clock
-        /// inherits the step and can go backwards, and a value that goes
-        /// backwards is **not** currently reported — see
+        /// **Base it on a monotonic clock, never on the wall clock.**
+        /// `CLOCK_REALTIME` steps — NTP moves it, an operator moves it — and an
+        /// index computed from it steps with it. `CLOCK_MONOTONIC` cannot go
+        /// backwards, which is the property this needs and the only one.
+        ///
+        /// A row's own `ts` already satisfies that and is the convenient
+        /// source: FORMAT.md §5 defines it as `clock_anchor_wall_ns + monotonic
+        /// elapsed` with the anchor read **once**, so its only varying
+        /// component is the monotonic clock.
+        ///
+        /// One wrinkle if the producer can suspend: a clock that stops while
+        /// the machine is asleep (`CLOCK_MONOTONIC` on Linux) hides intervals
+        /// that genuinely passed, which is the failure an interval index exists
+        /// to catch, returning in a narrower case. `CLOCK_BOOTTIME` counts
+        /// suspended time and does not.
+        ///
+        /// A value that goes backwards is **not** currently reported — see
         /// [`Applied::gap`](crate::replicate::Applied).
         seq: u64,
         /// The index state these rows were built against. A subscriber whose

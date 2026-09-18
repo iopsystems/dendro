@@ -35,6 +35,15 @@ cannot reach a failed release any other way.
 
 ### Changed
 
+- `Frame::Rows.seq` must be based on a **monotonic clock**, stated directly
+  rather than as "derive it from the row timestamp". `CLOCK_REALTIME` steps and
+  an index computed from it steps with it; `CLOCK_MONOTONIC` cannot go
+  backwards, which is the property this needs and the only one. A row's `ts`
+  satisfies it because FORMAT.md §5 reads the anchor once, so its only varying
+  component is the monotonic clock. Where a producer can suspend,
+  `CLOCK_BOOTTIME` is stricter: a clock that stops while the machine sleeps
+  hides intervals that genuinely passed, which is the failure an interval index
+  exists to catch.
 - `Frame::Rows.seq` is documented as **strictly increasing, one per interval,
   need not start at zero** — what the subscriber's gap check actually requires —
   rather than "counts from zero". The doc was narrower than the code: `last_seq`
