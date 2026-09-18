@@ -68,6 +68,9 @@ no opinion about your query engine: reads hand back Parquet bytes.
 **It does not span hosts.** SQLite's WAL mode needs shared memory, so the
 writer and every reader of a live archive must be on one machine and on a
 local filesystem. An archive at rest is one file and can be copied anywhere.
+Replication moves an archive's *contents* to a second archive on another host,
+which is a copy with the clock running; each side still has one writer and one
+file, and there is no cluster, no consensus and no second writer.
 
 **It does not make the live tail readable without your encoder.** Sealed
 segments are Parquet, and any Parquet reader opens them. The unsealed tail is
@@ -227,6 +230,15 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   stream's schema changes; `CompactSpec::unioning_fields` opts into merging
   across a column *set* that grew or shrank, null-filling the rows that
   predate a column.
+- **Replication, as frames you move yourself.** `ArchivePublisher` turns an
+  archive's changes into frames and `Subscriber` applies them to another
+  archive; `WIRE.md` specifies the bytes. There is one frame kind per table
+  that a copy carries, so the set has a completeness check rather than a
+  guess, and a round trip is tested here rather than asserted. **Transport is
+  not included** — HTTP, a Unix socket or a file is yours, which is what keeps
+  this storage-shaped. A live tail ships rows and the subscriber seals its
+  own; a catch-up ships sealed segments, so "give me the last hour" needs no
+  second mechanism. Behind the `replicate` feature.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment: the Parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
@@ -272,7 +284,15 @@ anything else holds it. See
 | feature | default | what it gates |
 |---|---|---|
 | `write` | on | The writer thread. Off, the crate is a reader, which is the configuration that compiles for `wasm32-unknown-unknown`: `std::thread::spawn` builds for wasm32 and then panics at runtime. |
+| `replicate` | off | Frame types, the wire codec, `ArchivePublisher` and `Subscriber`. It does **not** imply `write`: publishing is a read, so the reader build publishes and only the subscriber needs a writer. |
 | `test-support` | off | Test-only accessors that downstream crates' tests need. |
+
+To check the reader build against wasm32, run `./scripts/check-wasm.sh`. It is
+what CI runs, and it exists because the C dependencies need a clang with the
+WebAssembly backend: Ubuntu's has it, Apple's does not, and without the script
+a macOS checkout fails several hundred lines into a build of zstd and SQLite
+with a bare exit status that reads like a broken dependency. On macOS,
+`brew install llvm` is the whole fix; the script finds it.
 
 ## Status
 
@@ -282,7 +302,9 @@ rezolus upgrades them to dendro archives.
 
 The format itself, meaning the container, the catalog, the meaning of every
 column, the reserved metadata keys, writer sessions, and what bumps the schema
-version, is specified in [FORMAT.md](FORMAT.md). The design reasoning,
+version, is specified in [FORMAT.md](FORMAT.md); the replication wire format is
+specified separately in [WIRE.md](WIRE.md), because it is the same contents in
+flight rather than the file. The design reasoning,
 including what was measured to arrive at it, is in [DESIGN.md](DESIGN.md).
 Known gaps and the reasons they remain open are in
 [docs/journal/](docs/journal/README.md).

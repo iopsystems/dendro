@@ -14,7 +14,9 @@ description = "A segmented-parquet archive with a write-ahead log, in a single S
 keywords = ["parquet", "sqlite", "wal", "timeseries", "archive"]
 categories = ["database-implementations", "encoding"]
 # Repository housekeeping that serves nobody who downloads the crate.
-exclude = [".github/", ".gitignore"]
+# `WIRE.md` is NOT here: it specifies the replication wire format the way
+# `FORMAT.md` specifies the file, and both are part of what the crate is.
+exclude = [".github/", ".gitignore", "scripts/"]
 
 # docs.rs builds with default features, which hides the whole writer half and
 # every `test-support` item. `all-features` documents the real surface, and
@@ -48,6 +50,12 @@ default = ["write"]
 # materialization — which is the configuration that compiles for
 # `wasm32-unknown-unknown`.
 write = []
+# Replication: the frame types, the wire codec, `ArchivePublisher` and
+# `Subscriber`. Off by default because it is a second format to keep working
+# and most callers write archives without ever shipping one. It does NOT imply
+# `write`: publishing is a read, so a reader-only build (the wasm one) can
+# publish, and only the subscriber needs a writer.
+replicate = []
 # Test-only accessors (commit counters, fixture builders) that downstream
 # crates' tests need. Not `#[cfg(test)]`: a `#[cfg(test)]` item here is
 # invisible to a crate that depends on dendro.

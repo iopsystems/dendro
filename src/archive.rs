@@ -2104,6 +2104,18 @@ impl ArchiveMut {
         insert_source_sql(&self.db.conn, meta, None)
     }
 
+    /// Start a source that already has an identity, committing on its own.
+    /// The autocommit spelling of
+    /// [`Transaction::insert_source_with_uuid`](Transaction::insert_source_with_uuid);
+    /// see it for what `None` means.
+    pub fn insert_source_with_uuid(
+        &mut self,
+        meta: &SourceMeta,
+        uuid: Option<&str>,
+    ) -> Result<i64> {
+        insert_source_sql(&self.db.conn, meta, uuid)
+    }
+
     /// Insert one sealed segment's bytes and catalog facts, committing on its
     /// own. Batch writers must use `transaction` instead.
     pub fn insert_segment(

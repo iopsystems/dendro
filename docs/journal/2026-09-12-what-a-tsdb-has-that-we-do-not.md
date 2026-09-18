@@ -1,7 +1,7 @@
 ---
 status: implemented
 opened: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-18
 ---
 
 # What a TSDB has that we do not, and which of it is ours to build
@@ -102,8 +102,9 @@ A fifth, smaller: introspection is spread across five entry points
   learn. See [the encoder boundary](2026-09-11-encoder-boundary.md).
 - *Belongs to the engine above.* PromQL, query caching, planning, predicate
   pushdown, rate and alignment semantics.
-- *Contradicts a non-goal.* Replication, sharding, clustering. One writer,
-  one file, stated from the start.
+- *Contradicts a non-goal.* Sharding and clustering. One writer, one file,
+  stated from the start. **Replication was on this line and has moved**: see
+  the amendment below.
 - *Chosen differently, on purpose.* Gorilla-style float encodings beat
   parquet's generic ones on time series; parquet is the segment format for
   its ecosystem and for the blob model, and `CopySpec::writer_props` now lets
@@ -215,9 +216,33 @@ gap had gone unnoticed.
 One claim in this effort was wrong and a test caught it, which is recorded
 under item 3: `quick_check` does not skip reading pages.
 
+## Amendment, 2026-09-18: replication is ours after all
+
+Replication was classified above as contradicting the one-writer, one-file
+non-goal, and [its own entry](2026-09-18-replication-frames.md) reverses that.
+The reason the classification was wrong is that two things share the word and
+not the mechanism.
+
+What this survey ruled out is a **cluster**: several writers, a consensus
+protocol, a partitioned key space. What was built is a **serialization of an
+archive's contents plus an applier**. Each side still has exactly one writer and
+one file; the wire carries no locks, no acknowledgements and no resume token,
+and a reconnect is a fresh handshake. The non-goal is intact.
+
+It also passes this entry's own scope test, which is what settles it. The frames
+carry opaque rows and an opaque index blob, and the one thing a subscriber needs
+in order to order rows against index entries — a state hash — travels outside
+the blob precisely so that nothing is decoded. Two callers with completely
+different row shapes can both use it.
+
+Sharding and clustering stay out, and for the original reason.
+
 ## Deferred or Reopen Items
 
-- Nothing. Compaction, the last item, is
+- **Replication moved from "not ours" to implemented** on 2026-09-18; the
+  amendment above says why, and
+  [its entry](2026-09-18-replication-frames.md) carries the design.
+- Nothing else. Compaction, the last item, is
   [built](2026-09-11-segment-compaction.md); its own entry carries the
   measurement and what it found.
 - The out-of-scope list above is the deferral for everything else; each line

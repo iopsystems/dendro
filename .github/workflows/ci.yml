@@ -33,8 +33,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # zstd and SQLite are compiled from C, so the wasm build needs a clang
-      # that can target wasm32. Ubuntu's can.
-      - run: cargo check --no-default-features --target wasm32-unknown-unknown
+      # that can target wasm32. Ubuntu's can; Apple's cannot, which is why the
+      # script exists and why CI runs it rather than the bare cargo commands.
+      # A check nobody can run locally is one nobody runs before pushing, and a
+      # script CI does not run is one that rots.
+      - run: ./scripts/check-wasm.sh
 
   # `write` off must also work natively: the reader build is a supported
   # configuration, not merely a wasm artifact.
@@ -49,6 +52,10 @@ jobs:
       # actually using the reader build.
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo test --no-default-features
+      # And with the publishing half on, which is the configuration that claim
+      # is about.
+      - run: cargo clippy --all-targets --no-default-features --features replicate -- -D warnings
+      - run: cargo test --no-default-features --features replicate
 
   # The documentation is a deliverable: it is what a reader sees on docs.rs,
   # and a broken intra-doc link ships silently without this. `-D warnings`
