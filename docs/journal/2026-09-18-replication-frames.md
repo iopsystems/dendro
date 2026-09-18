@@ -101,10 +101,10 @@ splices them; the clock-offset series; and the caller store by name and
 timestamp. That is the property the format is for, and the one a consumer would
 notice losing.
 
-### Two defects the implementation found
+### Three defects the implementation found
 
-Both were found by tests rather than by review, and both were in rules that read
-correctly on paper.
+All three were found by tests rather than by review, and all three were in rules
+that read correctly on paper.
 
 **A publisher with no secondary index had every row dropped.** The subscriber
 waits for a `Full` index entry before applying rows, which is what bounds a
@@ -113,6 +113,17 @@ waited forever for a frame that was not coming. `NO_INDEX_STATE` is now exempt:
 rows built against no index are always resolvable. The cost is that a publisher
 which *has* an index must never declare `NO_INDEX_STATE`, which is now stated on
 the constant.
+
+**An index that appeared after the publisher attached never sent a `Full`.**
+The archive publisher marks the opening batch of index entries `Full` and
+everything after it `Delta`, which is the truth for an archive: the opening
+batch is everything it holds. But an archive with no index entries yet has an
+*empty* opening batch, and the code marked the source as having sent its `Full`
+on the strength of it. A caller that started keeping an index afterwards then
+sent only `Delta`s, and the rule above — wait for a `Full` — skipped every row
+for the life of the connection. Found while reviewing for the pull request, by
+asking what happens when the opening batch is empty; `Full` is now keyed on
+having emitted an entry rather than on a batch having finished.
 
 **The publisher's seal detection required a watermark that need not exist.** A
 tailing publisher reads the live WAL tail, so a seal in the source carries rows

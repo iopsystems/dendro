@@ -103,10 +103,17 @@ struct SourceCursor {
 ///
 /// # Index entries
 ///
-/// The opening batch's index frames are [`Full`](IndexKind::Full) and every
-/// later one is [`Delta`](IndexKind::Delta). For an archive that is the truth:
-/// the opening batch is everything the archive holds, so a subscriber that
-/// applies it holds everything the publisher does.
+/// The first entry a source ever sends is [`Full`](IndexKind::Full) and every
+/// one after it is [`Delta`](IndexKind::Delta). For an archive that is the
+/// truth: the batch carrying that first entry is everything the archive holds,
+/// so a subscriber that applies it holds everything the publisher does.
+///
+/// Keyed on having emitted an entry rather than on the opening batch having
+/// finished, because an archive with no index entries yet has an **empty**
+/// opening batch. Counting that as the `Full` would leave every later entry a
+/// `Delta`, and a subscriber waits for a `Full` before it will attribute rows
+/// to an index — so a caller that starts keeping one after the publisher
+/// attached would have every row skipped for the life of the connection.
 ///
 /// It does **not** re-emit `Full` periodically (rule 7). `caller_rows` has no
 /// primary key, so re-sending entries would duplicate them in the subscriber's
@@ -222,7 +229,6 @@ impl ArchivePublisher {
                 cursor.streams.entry(name.clone()).or_default();
                 cursor.emit_index(db, &name, since.unwrap_or(i64::MIN), &mut frames)?;
             }
-            cursor.sent_full = true;
 
             for stream in db.all_streams(rec.id)? {
                 let entry = cursor.streams.entry(stream.clone()).or_default();
@@ -321,18 +327,28 @@ impl SourceCursor {
                 at_last = 1;
             }
             self.index_state = fold_index_state(self.index_state, row.ts, &row.blob);
+            // The first entry a source ever sends is its complete state, and
+            // everything after it is a change to what the subscriber already
+            // holds. Keyed on having EMITTED one, not on having finished the
+            // opening batch: an archive with no index entries yet has an empty
+            // opening batch, and treating that as a `Full` would leave every
+            // later entry a `Delta`. A subscriber waits for a `Full` before it
+            // will attribute rows to an index, so it would then skip every row
+            // for the life of the connection.
+            //
+            // See `ArchivePublisher` for why `Full` is never re-emitted after
+            // this one.
+            let kind = if self.sent_full {
+                IndexKind::Delta
+            } else {
+                IndexKind::Full
+            };
+            self.sent_full = true;
             out.push(Frame::Index {
                 source: self.ordinal,
                 stream: stream.to_string(),
                 ts: row.ts,
-                // Only the opening batch is complete state; everything after it
-                // is a change to what the subscriber already holds. See
-                // `ArchivePublisher` for why `Full` is not re-emitted.
-                kind: if self.sent_full {
-                    IndexKind::Delta
-                } else {
-                    IndexKind::Full
-                },
+                kind,
                 state: self.index_state,
                 blob: row.blob,
             });

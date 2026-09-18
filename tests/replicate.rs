@@ -700,3 +700,73 @@ fn a_publisher_outrun_by_a_seal_says_so() {
     drop(w);
     archive.join().unwrap();
 }
+
+/// An archive that has no index entries when the publisher attaches, and
+/// gains them later, must still send a `Full` for the first of them.
+///
+/// The opening batch is `Full` and everything after it is `Delta`, which is
+/// the truth for an archive — the opening batch is everything it holds. But an
+/// archive holding *nothing* has an empty opening batch, and marking the
+/// source as having sent its `Full` on the strength of an empty batch leaves
+/// every later entry a `Delta`. A subscriber waits for a `Full` before it will
+/// attribute rows to an index, so it would then skip every row for the life of
+/// the connection.
+#[test]
+fn an_index_that_appears_after_the_publisher_attached_still_opens_with_a_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("late-index.dendro");
+    let copy = dir.path().join("late-index-copy.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    // Rows, but no index entries at all when the publisher attaches.
+    w.wal(vec![row("s", 1_000)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // The caller starts keeping an index, and then observes.
+    w.caller_rows(
+        "s",
+        vec![CallerRow {
+            ts: 1_500,
+            blob: b"slots@1500".to_vec(),
+        }],
+    )
+    .unwrap();
+    w.wal(vec![row("s", 2_000)]).unwrap();
+    w.sync().unwrap();
+
+    let frames = publisher.next(&db).unwrap();
+    let kinds: Vec<IndexKind> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Index { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![IndexKind::Full],
+        "the first entry a source ever sends is its complete state"
+    );
+
+    let applied = sub.apply_all(frames).unwrap();
+    assert_eq!(applied.index_entries, 1);
+    assert_eq!(
+        applied.rows, 1,
+        "and the rows that reference it are applied, not skipped"
+    );
+    assert_eq!(applied.rows_skipped, 0);
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    let dst = Archive::open(&copy).unwrap();
+    assert_eq!(wal_ts(&dst, 1, "s"), vec![2_000]);
+}
