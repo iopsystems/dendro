@@ -283,6 +283,14 @@ pub mod archive;
 pub mod error;
 /// Resolving an archive to segment bytes, live tail included.
 pub mod read;
+/// An archive's contents as a stream of frames, and the applier that turns
+/// them back into an archive.
+///
+/// Behind the `replicate` feature. The publishing half needs no writer, so it
+/// is part of the reader-only build; the subscriber additionally needs
+/// `write`.
+#[cfg(feature = "replicate")]
+pub mod replicate;
 /// Combining, trimming and time-bounding archives without decoding a segment.
 pub mod rewrite;
 /// When to seal.
