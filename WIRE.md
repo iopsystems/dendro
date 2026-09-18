@@ -162,7 +162,19 @@ count × {
 
 Each row carries its own stream name, so one frame may span a source's streams.
 
-`seq` counts from zero per source per connection.
+`seq` is **strictly increasing, one value per interval, per source per
+connection.** Consecutive values mean consecutive intervals, so a jump means an
+interval produced no frame.
+
+It need not start at zero, and a frame counter is the weaker choice: a counter
+increments by one whether or not an interval was skipped, so a skipped interval
+arrives as a contiguous sequence with an undetectable hole in it. An **interval
+index** — the observation's timestamp divided by the interval — answers the
+question a subscriber is actually asking, and satisfies the same check.
+
+Derive it from the row timestamp rather than the wall clock. `ts` is anchored
+(`FORMAT.md` §5) and strictly increasing through a wall-clock step; an index
+taken from the wall clock inherits the step and can go backwards.
 
 `index_state` is the state the rows were built against. A subscriber whose
 accumulated state differs skips the rows; see rule 9 below.
