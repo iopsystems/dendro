@@ -349,6 +349,13 @@ the rows changes shape; four things are guaranteed:
 
 ## 8. Compatibility
 
+**This section is about the schema version and nothing else.** An archive's
+readability is decided by the `user_version` in its header; the crate's own
+version is a separate surface answering a separate question. A release can break
+the Rust API without touching the schema, and it can bump the schema without
+breaking the API. "No schema bump" therefore does not mean "not a breaking
+release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
+
 - **What bumps the schema version.** Any change a reader of the current
   version would misread silently: a catalog column a reader must understand
   to be correct, a change to the live-WAL rule, a change to what

@@ -3,8 +3,14 @@
 Notable changes per release. This file follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this crate follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with the caveat
-that while the major version is 0 **any release may break**, as permitted by
-Cargo's convention; see *Before 1.0* below.
+that while the major version is 0 **any minor release may break**; see
+*Before 1.0* below.
+
+The minor is where a break goes, and that is Cargo's rule rather than a
+preference: `dendro = "0.1"` resolves to `>=0.1.0, <0.2.0`, so every `0.1.z` is
+compatible with every other and a patch release reaches existing callers on
+their next `cargo update`. A removed public item therefore goes to `0.2.0`, not
+`0.1.1` -- otherwise the break arrives as an upgrade nobody asked for.
 
 The reasoning behind a change lives in [`docs/journal/`](docs/journal/README.md),
 one entry per effort. This file says what changed; the journal says why, and
@@ -26,6 +32,19 @@ input; a tag push runs the workflow as it was at the tagged commit, so a fix
 cannot reach a failed release any other way.
 
 ## [Unreleased]
+
+**This is 0.2.0, not 0.1.1.** The root re-exports below are removed public
+items, which Cargo's SemVer reference calls a major change, and for a `0.x`
+crate the minor is the major position. `0.1.1-alpha.0` was the automated
+post-release bump (`chore: begin next development iteration`) rather than a
+decision, and shipping under it would break `dendro = "0.1"` callers on a
+`cargo update`. The replication work on its own would have been a legitimate
+`0.1.1`.
+
+**The crate version and the schema version answer different questions.** The
+archive schema version is unchanged at **4** -- nothing on disk moves, existing
+archives are unaffected, and `FORMAT.md` section 8 governs that surface alone.
+The Rust API broke separately. Neither implies the other.
 
 ### Added
 
