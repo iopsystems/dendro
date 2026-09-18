@@ -298,10 +298,20 @@ pub mod seal;
 /// Segments, and the encoder boundary.
 pub mod segment;
 
-pub use archive::{Archive, ArchiveMut, Transaction};
+/// The error type and its `Result`, at the crate root.
+///
+/// **The only types re-exported here, and deliberately.** The modules above are
+/// this crate's vocabulary rather than its plumbing — the docs, `FORMAT.md` and
+/// sixty intra-doc links all name types by their module — so a type's module
+/// path is its one canonical path, and a second one at the root is a way for
+/// two files in the same crate to disagree about how to spell `Archive`.
+///
+/// These earn the exception the way
+/// [C-REEXPORT](https://rust-lang.github.io/api-guidelines/naming.html) intends:
+/// they are what callers actually reach for, they are needed by every caller of
+/// every module, and a crate-level `Error` and `Result` at the root is the
+/// near-universal convention.
 pub use error::{Error, ReadOnly, Result};
-#[cfg(feature = "write")]
-pub use writer::{SourceWriter, Writer};
 /// The writer thread.
 ///
 /// Behind the `write` feature: it spawns a thread, and `std::thread::spawn`

@@ -29,6 +29,30 @@ cannot reach a failed release any other way.
 
 ### Added
 
+- `replicate::wire::LENGTH_PREFIX_BYTES`, the offset at which a frame's payload
+  begins. `encode` returns a whole frame and `decode_payload` takes the payload
+  alone, because `FrameReader` has already consumed the prefix; a caller pairing
+  the two by hand needed a bare `4`.
+
+### Removed
+
+- **Breaking:** the crate-root re-exports of `Archive`, `ArchiveMut`,
+  `Transaction`, `Writer` and `SourceWriter`. Spell them by their module —
+  `dendro::archive::Archive`, `dendro::writer::Writer` — which is what this
+  crate's own tests, doc examples and intra-doc links already did; nothing
+  inside dendro used the root path for any of them. `Error`, `Result` and
+  `ReadOnly` stay at the root, which is what callers actually reach for.
+
+  The rule is now statable: the error type and `Result` live at the crate root,
+  every other type lives in its module. `replicate` already followed it and
+  stops being an exception.
+
+### Changed
+
+- `SegmentEncoder::version` documents why it is a borrowed string: the value
+  lands in `sources.metadata`, which the format defines as string to string, and
+  dendro compares it for equality only. No signature change.
+
 - **Replication**, behind the `replicate` feature: frame types and a wire codec,
   `Subscriber` (apply frames to an archive) and `ArchivePublisher` (tail one).
   Transport is not included. One frame kind per table that `rewrite` carries, so
