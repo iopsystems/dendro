@@ -238,7 +238,9 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   not included** — HTTP, a Unix socket or a file is yours, which is what keeps
   this storage-shaped. A live tail ships rows and the subscriber seals its
   own; a catch-up ships sealed segments, so "give me the last hour" needs no
-  second mechanism. Behind the `replicate` feature.
+  second mechanism. Not behind a feature: it adds no dependency and builds
+  wherever the crate does. `Subscriber` needs `write`, because it drives the
+  writer; publishing is a read and works in the reader build.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment: the Parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
@@ -284,7 +286,6 @@ anything else holds it. See
 | feature | default | what it gates |
 |---|---|---|
 | `write` | on | The writer thread. Off, the crate is a reader, which is the configuration that compiles for `wasm32-unknown-unknown`: `std::thread::spawn` builds for wasm32 and then panics at runtime. |
-| `replicate` | off | Frame types, the wire codec, `ArchivePublisher` and `Subscriber`. It does **not** imply `write`: publishing is a read, so the reader build publishes and only the subscriber needs a writer. |
 | `test-support` | off | Test-only accessors that downstream crates' tests need. |
 
 To check the reader build against wasm32, run `./scripts/check-wasm.sh`. It is

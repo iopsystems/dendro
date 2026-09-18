@@ -286,10 +286,9 @@ pub mod read;
 /// An archive's contents as a stream of frames, and the applier that turns
 /// them back into an archive.
 ///
-/// Behind the `replicate` feature. The publishing half needs no writer, so it
-/// is part of the reader-only build; the subscriber additionally needs
-/// `write`.
-#[cfg(feature = "replicate")]
+/// Not behind a feature. It adds no dependency and compiles wherever the crate
+/// does, so gating it would buy nothing and cost discoverability. The
+/// subscriber alone needs `write`, because it needs the writer's thread.
 pub mod replicate;
 /// Combining, trimming and time-bounding archives without decoding a segment.
 pub mod rewrite;
