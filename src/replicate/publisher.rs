@@ -121,6 +121,19 @@ struct SourceCursor {
 /// producer-side publisher, whose subscriber can lose state to retention; an
 /// archive publisher's subscriber keeps everything it was sent.
 ///
+/// **What a late subscriber receives is bounded by what the archive still
+/// holds.** Retention evicts `caller_rows` on the same cutoff as segments
+/// (FORMAT.md §3.5), so an entry written once at the start of a recording is
+/// gone while rows referencing it remain. The `Full` this publisher sends means
+/// "everything the archive holds from the requested point", which is *complete
+/// state* only if whatever wrote the archive kept it so — by writing complete
+/// entries into `caller_rows` periodically. Rule 7 is that discipline, and for
+/// an archive publisher it has to have been obeyed by the **writer**; nothing
+/// here can reconstruct what retention removed.
+///
+/// Archive-to-archive copying with no retention in play is unaffected, which is
+/// the case this publisher was built for.
+///
 /// # Polling and the seal
 ///
 /// A tailing publisher reads the **live** WAL tail, which is by definition the
