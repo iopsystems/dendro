@@ -162,21 +162,27 @@ count × {
 
 Each row carries its own stream name, so one frame may span a source's streams.
 
-`seq` is a **sequence number in the TCP sense: strictly increasing and
-contiguous, incremented by exactly one per frame.** It is not a timestamp and
-carries no time semantics. It need not start at zero — only the step between
-consecutive frames is ever compared.
+`seq` is a **counter over intervals, not over frames.** The producer advances
+it once for every interval it was meant to serve, whether or not a frame went
+out. It is not a timestamp and is not derived from one. It need not start at
+zero — only the step between consecutive frames is ever compared.
 
-**A gap therefore means frames lost in transit, and nothing else.** That rests
-on rule 6: an interval that observed nothing still produces a frame, an empty
-one. "Nothing was observed" and "a frame did not arrive" are different facts and
-stay different — the empty frame states the first, a gap states the second.
+| the interval | frame | `seq` |
+|---|---|---|
+| served, something observed | non-empty | `+1` |
+| served, nothing observed | **empty** | `+1` |
+| **not served** — the publisher would have had to buffer | none | jumps |
 
-**Do not derive it from a clock.** An interval index (`timestamp / interval`)
-merges those two facts into one signal, since a skipped emission and a dropped
-frame become indistinguishable. It also aliases on sub-interval jitter: a
-reading taken slightly early lands in the previous bucket, inventing gaps that
-did not happen and hiding gaps that did.
+**A gap therefore means intervals the subscriber did not receive, and does not
+say why.** Frames lost in transit and intervals a publisher declined to buffer
+are both real causes; a publisher that refuses to buffer without bound rather
+than slow its own sampling for a slow reader is behaving correctly. What a gap
+does *not* mean is "the interval produced nothing" — that is the empty frame.
+
+**Count intervals; do not divide a clock.** An interval index
+(`timestamp / interval`) aliases on sub-interval jitter: a reading taken
+slightly early lands in the previous bucket, inventing gaps that did not happen
+and hiding gaps that did.
 
 `index_state` is the state the rows were built against. A subscriber whose
 accumulated state differs skips the rows; see rule 9 below.
@@ -230,9 +236,11 @@ seal — and part of the source's identity.
 5. A row is interpreted against index entries at or before its timestamp. Time
    is the ordering axis; both carry timestamps and `caller_rows` is already
    time-keyed.
-6. Every interval produces a `Rows` frame, empty when nothing was observed, so
-   a gap in `seq` means a lost reading and nothing else. The empty frame is
-   also the keepalive.
+6. Every interval the publisher **serves** produces a `Rows` frame, empty when
+   nothing was observed; the empty frame is also the keepalive. `seq` counts
+   intervals rather than frames, so an interval the publisher could not serve
+   leaves a gap. A gap means intervals the subscriber did not receive, whether
+   lost in transit or never sent.
 7. `Index` is re-emitted `Full` periodically, so retention cannot orphan it.
    `caller_rows` is evicted on the same cutoff as segments, so state written
    once at the start of a recording would be deleted while later rows still
