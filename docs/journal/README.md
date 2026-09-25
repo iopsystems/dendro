@@ -9,7 +9,7 @@ as ours or not ours, and links the entries that own each one.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
-| 2026-09-24 | [Two forms of one archive: live for the writer, finalized for range reads](2026-09-24-two-forms-live-and-finalized.md) | proposed |
+| 2026-09-24 | [Two forms of one archive: live for the writer, finalized for range reads](2026-09-24-two-forms-live-and-finalized.md) | open |
 | 2026-09-18 | [Replication: an archive's contents as frames, and the applier that reverses it](2026-09-18-replication-frames.md) | implemented |
 | 2026-09-13 | [Schema churn becomes segment churn, and where column identity should live](2026-09-13-schema-churn-and-column-identity.md) | partly resolved (column-set churn fixed; identity churn open) |
 | 2026-09-12 | [What a TSDB has that we do not, and which of it is ours to build](2026-09-12-what-a-tsdb-has-that-we-do-not.md) | implemented (all five) |

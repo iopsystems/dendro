@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: open
 opened: 2026-09-24
 updated: 2026-09-24
 ---
@@ -113,7 +113,11 @@ because the layout underneath it is the wrong shape for the question.
 live archive and the right one. It also rewrites every page of a buffer
 whose segments have not changed since they were sealed.
 
-## Design
+## Design and Implementation
+
+Intent-first: this record lands before any implementation. Nothing below
+has been built; the three live-form additions are the first work, in the
+order given under Outcome.
 
 ### The two forms
 
@@ -298,7 +302,7 @@ moves. Its complement is a digest check: the header's catalog digest is
 verified on open, and `verify` for a finalized archive checks every segment's
 declared length against the parquet footer it points at.
 
-## Cost
+### Cost
 
 **The three live-form additions**: a few days. `stream_summary` is a table,
 a writer message, and two reader accessors, plus the export/copy paths in
@@ -315,13 +319,13 @@ that finalizes a fixture and compares every read against the live original.
 Two containers to maintain, with a clear rule for which is which, which the
 tar and SQLite pair never had.
 
-**Risks.** The page-3 argument rests on SQLite allocation behaviour that is
+**Risks.** The page-3 argument rests on SQLite allocation behavior that is
 stable but not a documented guarantee; the test pins it, and the sniff falls
 back rather than guessing. The finalized form doubles the on-disk shape a
 consumer might receive, so every tool that opens an archive must sniff
 first; the ones in this crate already do.
 
-## Alternatives considered
+### Alternatives considered
 
 **SQLite over an async VFS.** Reads any archive, live or not, with no format
 work. Every read is page-granular at the writer's 4 KiB, so a 4 MB segment
@@ -350,7 +354,13 @@ browser uploads whole files, snapshots are rare. The three additions are
 worth doing regardless because their costs were measured on real archives;
 the finalized form waits for its GO.
 
-## What would change the analysis
+## Outcome
+
+Open. Nothing is built. The three live-form additions are ready to build in
+the order given: `stream_summary`, the `header` table, incremental blob
+reads. The finalized form is designed and gated on its GO criterion.
+
+## Deferred or Reopen Items
 
 - A consumer that must query an archive it did not download, with a
   measurement of what the whole-file fetch costs it. That is the GO.
@@ -364,8 +374,10 @@ the finalized form waits for its GO.
   release. The header sniff's test would fail and the sniff would fall back;
   the finalized form's header does not depend on it.
 
-## Outcome
+## Appendix: Skills Invoked
 
-Proposed. The three live-form additions are ready to build in the order
-given: `stream_summary`, the header table, incremental blob reads. The
-finalized form is designed and gated.
+- `engineering-journal` — this entry's shape and lifecycle.
+- `propose-design` — loaded for its questions (approach, why, what it looks
+  like, cost, alternatives, what changes the analysis), which the sections
+  above answer; its vault brief workflow was not used, since this repository
+  keeps design records here.
