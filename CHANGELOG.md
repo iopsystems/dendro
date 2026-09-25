@@ -33,6 +33,31 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- **`caller_rows` floors on retention.** `ArchiveMut::evict_before_with_floor`
+  and `evict_streams_before_with_floor`, and the `SourceWriter` methods of the
+  same names, take a floor function (`CallerRowFloor`, boxed as
+  `writer::CallerRowFloorFn`). The pass calls it once per name it touches,
+  inside its transaction and after the segment and WAL deletes, with the
+  oldest row that name still holds, and deletes the name's caller rows only
+  below `min(floor, cutoff)`. The existing eviction methods are unchanged.
+
+  Retention cut a stream's `caller_rows` at the segment cutoff, in the same
+  transaction as the segments, with no way for the caller to keep more. For an
+  identity log of `Full` and `Delta` entries, a cutoff between a `Full` and
+  the deltas after it deleted the `Full` while the deltas and the rows they
+  describe remained, so a reader could not attribute those rows. The caller
+  knows which entry is a `Full` and dendro does not read the blobs, so the
+  caller supplies the floor: the latest `Full` at or before the oldest row the
+  stream still holds, or `i64::MIN` for a stream with none. The oldest row
+  rather than the cutoff, because a segment spanning the cutoff is kept with
+  rows older than it; and asked inside the pass, because a seal between a
+  caller's own query and the pass can create such a segment.
+
+- `SourceWriter::evict_before` was documented as fire-and-forget. It waits for
+  the pass and returns its result; the doc now says so.
+
 ### Changed
 
 - `Frame::Rows.seq` **counts intervals, not frames**, and a gap means intervals

@@ -64,8 +64,13 @@
 //!    frame, not a gap. `seq` need not start at zero.
 //! 7. `Index` is re-emitted [`Full`](crate::replicate::IndexKind::Full) periodically, so
 //!    retention cannot orphan it: `caller_rows` is evicted on the same cutoff
-//!    as segments, and state written once at the start would be deleted while
-//!    later rows still referenced it.
+//!    as segments by default, and state written once at the start would be
+//!    deleted while later rows still referenced it. Re-emission alone does not
+//!    make retention on the receiving side safe, since a cutoff can fall
+//!    between a `Full` and its deltas; an archive writer that knows which rows
+//!    are `Full` keeps them with a
+//!    [`CallerRowFloor`](crate::archive::CallerRowFloor). [`Subscriber`](crate::replicate::Subscriber)
+//!    records no entry kinds and has no retention of its own.
 //! 8. A reconnect is a new handshake and full state. There is no resume token.
 //! 9. A row carries the [`IndexState`](crate::replicate::IndexState) it was built against, and a subscriber
 //!    that cannot match it **skips the row**. Misattribution is worse than a

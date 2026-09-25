@@ -41,6 +41,12 @@ use crate::segment::SegmentEncoder;
 /// channel to the writer thread.
 pub type StreamFilter = Box<dyn Fn(&str) -> bool + Send>;
 
+/// A [`CallerRowFloor`](crate::archive::CallerRowFloor) the writer thread
+/// can own: boxed and `Send` for the same reason as [`StreamFilter`]. It runs
+/// on the writer thread while the pass holds the write lock, so it must not
+/// call back into the writer.
+pub type CallerRowFloorFn = Box<dyn Fn(&str, Option<i64>) -> i64 + Send>;
+
 enum Msg {
     /// Insert a `sources` row and hand its id back.
     ///
@@ -106,6 +112,7 @@ enum Msg {
         source_id: i64,
         cutoff_ts: i64,
         streams: Option<StreamFilter>,
+        floor: Option<CallerRowFloorFn>,
         reply: SyncSender<Result<Evicted>>,
     },
     /// Merge keys into one source's metadata, in order with the ticks around
@@ -888,10 +895,23 @@ impl SourceWriter {
     /// as `InUse`. Readers are unaffected either way; WAL mode
     /// lets them proceed while this commits.
     ///
-    /// Fire-and-forget, like `wal` and `seal`: a failure surfaces on the next
-    /// hand-off, which is the convention the whole writer follows.
+    /// Not fire-and-forget, unlike `wal` and `seal`: it waits for the writer
+    /// thread to run the pass and returns what it removed, or its error.
     pub fn evict_before(&mut self, cutoff_ts: i64) -> Result<Evicted> {
-        self.evict(cutoff_ts, None)
+        self.evict(cutoff_ts, None, None)
+    }
+
+    /// [`evict_before`](Self::evict_before), cutting each name's caller rows
+    /// where `floor` says rather than at the cutoff. The writer-side spelling
+    /// of
+    /// [`ArchiveMut::evict_before_with_floor`](crate::archive::ArchiveMut::evict_before_with_floor);
+    /// see [`CallerRowFloor`](crate::archive::CallerRowFloor).
+    pub fn evict_before_with_floor(
+        &mut self,
+        cutoff_ts: i64,
+        floor: CallerRowFloorFn,
+    ) -> Result<Evicted> {
+        self.evict(cutoff_ts, None, Some(floor))
     }
 
     /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
@@ -907,7 +927,18 @@ impl SourceWriter {
     /// and the one to use while the writer runs: a `ArchiveMut::open` on a file
     /// this thread holds is refused as `InUse`.
     pub fn evict_streams_before(&mut self, cutoff_ts: i64, keep: StreamFilter) -> Result<Evicted> {
-        self.evict(cutoff_ts, Some(keep))
+        self.evict(cutoff_ts, Some(keep), None)
+    }
+
+    /// [`evict_streams_before`](Self::evict_streams_before) with a
+    /// [`CallerRowFloorFn`], asked only for the names `evict` accepts.
+    pub fn evict_streams_before_with_floor(
+        &mut self,
+        cutoff_ts: i64,
+        evict: StreamFilter,
+        floor: CallerRowFloorFn,
+    ) -> Result<Evicted> {
+        self.evict(cutoff_ts, Some(evict), Some(floor))
     }
 
     /// Both spellings, and the reply that makes the count reachable.
@@ -916,12 +947,18 @@ impl SourceWriter {
     /// append path, and a caller running one wants to know what it did — that
     /// is the difference between "the window moved" and "nothing was old enough
     /// yet", and a size-bounded policy needs it to decide whether to cut again.
-    fn evict(&mut self, cutoff_ts: i64, streams: Option<StreamFilter>) -> Result<Evicted> {
+    fn evict(
+        &mut self,
+        cutoff_ts: i64,
+        streams: Option<StreamFilter>,
+        floor: Option<CallerRowFloorFn>,
+    ) -> Result<Evicted> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::Evict {
             source_id: self.source_id,
             cutoff_ts,
             streams,
+            floor,
             reply: tx,
         })?;
         rx.recv().map_err(|_| take_writer_error(&self.err))?
@@ -929,9 +966,8 @@ impl SourceWriter {
 
     /// Block until everything handed off so far has been committed.
     ///
-    /// **The one place the writer is not fire-and-forget, and it exists because
-    /// the file lags the caller.** Every other hand-off queues work and returns
-    /// immediately, so a caller that hands off an ingest or an eviction and
+    /// **It exists because the file lags the caller.** The append hand-offs
+    /// queue work and return immediately, so a caller that hands off an ingest and
     /// then opens a SECOND connection to look at the file, for a status report
     /// or a dump, can observe the state from before its own last call. That is
     /// fine for a status reading and fatal for an assertion.
@@ -1592,6 +1628,7 @@ fn writer_loop(
                 source_id,
                 cutoff_ts,
                 streams,
+                floor,
                 reply,
             }) => {
                 // Reported, not swallowed. `Evicted` exists so a caller can
@@ -1599,8 +1636,16 @@ fn writer_loop(
                 // and the writer used to throw it away - which made it
                 // unreachable through the only supported path.
                 let evicted = match streams {
-                    Some(keep) => db.evict_streams_before(source_id, cutoff_ts, &*keep),
-                    None => db.evict_before(source_id, cutoff_ts),
+                    Some(keep) => match &floor {
+                        Some(floor) => db.evict_streams_before_with_floor(
+                            source_id, cutoff_ts, &*keep, &**floor,
+                        ),
+                        None => db.evict_streams_before(source_id, cutoff_ts, &*keep),
+                    },
+                    None => match &floor {
+                        Some(floor) => db.evict_before_with_floor(source_id, cutoff_ts, &**floor),
+                        None => db.evict_before(source_id, cutoff_ts),
+                    },
                 };
                 if let Ok(e) = &evicted {
                     if e.live_rows > 0 {

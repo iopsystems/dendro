@@ -123,8 +123,9 @@ struct SourceCursor {
 ///
 /// **What a late subscriber receives is bounded by what the archive still
 /// holds.** Retention evicts `caller_rows` on the same cutoff as segments
-/// (FORMAT.md §3.5), so an entry written once at the start of a recording is
-/// gone while rows referencing it remain. The `Full` this publisher sends means
+/// unless the writer supplied a floor (FORMAT.md §3.5), so without one an entry
+/// written once at the start of a recording is gone while rows referencing it
+/// remain. The `Full` this publisher sends means
 /// "everything the archive holds from the requested point", which is *complete
 /// state* only if whatever wrote the archive kept it so — by writing complete
 /// entries into `caller_rows` periodically. Rule 7 is that discipline, and for
