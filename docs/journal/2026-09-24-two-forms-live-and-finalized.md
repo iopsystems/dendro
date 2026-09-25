@@ -24,7 +24,8 @@ a measured need rather than building it now.
 
 ## Decision Criteria
 
-**GO on the three live-form additions** (§Design, items 1 to 3) now. Each is
+**GO on the three live-form additions** (§Design: `stream_summary`, the
+`header` table, incremental blob reads) now. Each is
 additive under FORMAT.md §8, each removes a read cost that was measured, and
 each is wanted whether or not the finalized form is ever built.
 
@@ -149,7 +150,9 @@ version the live form would carry as `user_version`, and a 32-byte
 digest of the catalog so a truncated or spliced file is refused by name
 rather than read short. It is fixed-size so `sniff_bytes` needs the same 100
 bytes it needs today, and so the sniff can say *finalized, schema 4* where
-the live form's header can only say *dendro*.
+the live form's header can only say *dendro*. The digest is known only after
+the catalog is written, so the writer seeks back to fill it in; a finalized
+archive is written to a seekable file, never streamed.
 
 The footer is the parquet pattern: read the last 16 bytes, then the catalog,
 then whatever the query needs. Two range requests to open, and the second is
