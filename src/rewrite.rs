@@ -638,6 +638,22 @@ fn copy_sources_snapshotted(
             tx.insert_clock_offset(id, ts, offset)?;
         }
 
+        // Stream summaries describe the whole stream and every column it has,
+        // so only a copy that keeps both carries them: a time-bounded copy
+        // holds a subset of the segments, and a projection a subset of the
+        // columns, and a summary of more than the copy holds is worse than
+        // none. Same rule as a segment's `caller_index` under a projection.
+        if spec.keep_columns.is_none() && spec.start == i64::MIN && spec.end == i64::MAX {
+            for (name, summary) in src.read_stream_summaries(rec.id)? {
+                if let Some(keep) = spec.keep_streams {
+                    if !keep(name.as_str()) {
+                        continue;
+                    }
+                }
+                tx.set_stream_summary(id, &name, summary.as_of_ts, &summary.blob)?;
+            }
+        }
+
         // The caller's time-keyed store, verbatim and within the range. By
         // its own names rather than the streams', because a series kept
         // under a name no stream uses is still the caller's to keep; the
@@ -744,7 +760,14 @@ mod tests {
     #[test]
     fn every_schema_table_is_either_copied_or_deliberately_dropped() {
         /// Carried across by [`copy_sources_into`].
-        const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets", "caller_rows"];
+        const COPIED: &[&str] = &[
+            "sources",
+            "segments",
+            "wal",
+            "clock_offsets",
+            "caller_rows",
+            "stream_summary",
+        ];
         /// Not carried, and correct not to be. Empty today: the schema version
         /// lives in the header stamp, not in a table.
         const NOT_CARRIED: &[&str] = &[];

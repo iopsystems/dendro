@@ -134,6 +134,13 @@ CREATE TABLE caller_rows(
   blob BLOB NOT NULL                   -- opaque, the caller's
 );
 CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
+CREATE TABLE stream_summary(           -- absent in archives before it existed
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  stream TEXT NOT NULL,
+  as_of_ts INTEGER NOT NULL,
+  blob BLOB NOT NULL,                  -- opaque, the caller's
+  PRIMARY KEY (source_id, stream)
+);
 ```
 
 Every timestamp is an `i64`: SQLite's only integer type, and the reason a
@@ -257,6 +264,41 @@ cannot destroy. The rules:
 - A copy carries it verbatim within the copy's time bound and under the
   copy's stream filter. Compaction and column projection do not touch it.
 - `verify` does not read it, and no read path interprets it.
+
+### 3.6 `stream_summary`
+
+The caller's description of one stream as a whole: one opaque blob per
+`(source, stream)` and `as_of_ts`, the `last_ts` of the newest segment it
+describes. It is what lets a reader learn what a stream holds (its columns
+and their metadata, or anything else the caller keeps per stream) from the
+catalog, without reading a segment. The rules:
+
+- One row per stream, replaced in place. A caller writes it after a seal or
+  at finalize.
+- `as_of_ts` is a timestamp rather than a `seq`, because a filtered copy
+  renumbers `seq` from zero and retention evicts below it.
+- It can be stale in two directions. Rows newer than `as_of_ts` (segments
+  sealed since, and the live tail) may hold what it does not describe, so a
+  reader of a live archive combines it with a probe of what is newer. After
+  retention evicts old segments it may describe columns no segment holds any
+  more, until the caller replaces it.
+- A stream with no row here has no summary; a reader probes its segments.
+- An archive written before the table existed has none. A writable open
+  creates the table; a read-only open reads as "no summaries".
+- `verify` does not read it, and no read path interprets it.
+
+The three caller-owned slots differ in what they are keyed by and so in what
+each copy and retention does to them:
+
+| slot | keyed by | compaction | projection or ranged copy | retention |
+|---|---|---|---|---|
+| `segments.caller_index` | segment | dropped | dropped | with its segment |
+| `caller_rows` | time | untouched | carried within the range | by `ts`, or from a caller's floor |
+| `stream_summary` | stream | untouched | dropped | when its stream holds no rows |
+
+A full copy carries all three. A projection or a time-bounded copy drops a
+summary for the same reason it drops an index: the copy holds less than the
+summary describes.
 
 ## 4. Reading
 

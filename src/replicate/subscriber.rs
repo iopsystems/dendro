@@ -40,6 +40,8 @@ pub struct Applied {
     pub index_entries: usize,
     /// Clock-drift observations recorded.
     pub clock_offsets: usize,
+    /// Stream summaries set.
+    pub stream_summaries: usize,
     /// Sources opened.
     pub sources: usize,
     /// Whether this frame's sequence number skipped one, which means a `Rows`
@@ -263,6 +265,20 @@ impl Subscriber {
                 st.last_offset = Some((ts, offset_ns));
                 Ok(Applied {
                     clock_offsets: 1,
+                    ..Applied::default()
+                })
+            }
+
+            Frame::StreamSummary {
+                source,
+                stream,
+                as_of_ts,
+                blob,
+            } => {
+                let st = Self::source_mut(&mut self.sources, source)?;
+                st.writer.stream_summary(stream, as_of_ts, blob)?;
+                Ok(Applied {
+                    stream_summaries: 1,
                     ..Applied::default()
                 })
             }

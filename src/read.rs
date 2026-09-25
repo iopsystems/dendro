@@ -33,6 +33,12 @@ pub struct StreamCatalog {
     /// not counted: it has no segment yet, and what it will encode to is not
     /// known until it seals.
     pub bytes: u64,
+    /// The `as_of_ts` of the stream's summary, or `None` when it has none.
+    /// Read the blob with
+    /// [`Archive::read_stream_summary`](crate::archive::Archive::read_stream_summary).
+    /// Rows newer than this (segments sealed since, and the live tail) are
+    /// not described by it; see [`StreamSummary`](crate::archive::StreamSummary).
+    pub summary_as_of: Option<i64>,
 }
 
 impl StreamCatalog {
@@ -120,12 +126,14 @@ fn catalog_snapshotted(db: &Archive) -> Result<Vec<SourceCatalog>> {
             let (segments, sealed) = db.segment_span(src.id, &name)?;
             let live = db.live_wal_span(src.id, &name)?;
             let bytes = db.stream_bytes(src.id, &name)?;
+            let summary_as_of = db.stream_summary_as_of(src.id, &name)?;
             streams.push(StreamCatalog {
                 name,
                 segments,
                 sealed,
                 live,
                 bytes,
+                summary_as_of,
             });
         }
         out.push(SourceCatalog {

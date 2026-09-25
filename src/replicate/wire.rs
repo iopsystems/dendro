@@ -67,6 +67,7 @@ const KIND_INDEX: u8 = 2;
 const KIND_ROWS: u8 = 3;
 const KIND_SEGMENT: u8 = 4;
 const KIND_CLOCK_OFFSET: u8 = 5;
+const KIND_STREAM_SUMMARY: u8 = 6;
 
 const INDEX_FULL: u8 = 0;
 const INDEX_DELTA: u8 = 1;
@@ -239,6 +240,18 @@ pub fn encode_frame(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
             put_i64(out, *ts);
             put_i64(out, *offset_ns);
         }
+        Frame::StreamSummary {
+            source,
+            stream,
+            as_of_ts,
+            blob,
+        } => {
+            put_u8(out, KIND_STREAM_SUMMARY);
+            put_u32(out, *source);
+            put_str(out, stream)?;
+            put_i64(out, *as_of_ts);
+            put_bytes(out, blob)?;
+        }
     }
 
     debug_assert_eq!(
@@ -378,6 +391,20 @@ impl<'a> Cursor<'a> {
 /// Decode one frame from a payload: the bytes after the length prefix, kind
 /// byte included.
 pub fn decode_payload(payload: &[u8]) -> Result<Frame> {
+    match decode_known(payload)? {
+        Some(frame) => Ok(frame),
+        None => Err(malformed(&format!(
+            "{} is not a frame kind this build reads",
+            payload[0]
+        ))),
+    }
+}
+
+/// [`decode_payload`], with a kind this build does not know returned as
+/// `None` rather than an error, so [`FrameReader`] can skip it (WIRE.md §7).
+/// Only the kind byte of an unknown frame is read: its layout is not known,
+/// and the length prefix already says where it ends.
+fn decode_known(payload: &[u8]) -> Result<Option<Frame>> {
     let mut c = Cursor::new(payload);
     let kind = c.u8()?;
     let frame = match kind {
@@ -447,14 +474,16 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame> {
             ts: c.i64()?,
             offset_ns: c.i64()?,
         },
-        other => {
-            return Err(malformed(&format!(
-                "{other} is not a frame kind this build reads"
-            )))
-        }
+        KIND_STREAM_SUMMARY => Frame::StreamSummary {
+            source: c.u32()?,
+            stream: c.string()?,
+            as_of_ts: c.i64()?,
+            blob: c.bytes()?,
+        },
+        _ => return Ok(None),
     };
     c.finish()?;
-    Ok(frame)
+    Ok(Some(frame))
 }
 
 /// Reads frames off a byte stream.
@@ -465,6 +494,7 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame> {
 pub struct FrameReader<R> {
     inner: R,
     buf: Vec<u8>,
+    skipped: u64,
 }
 
 /// Hand-written so the reader is printable over a transport that is not, which
@@ -473,6 +503,7 @@ impl<R> std::fmt::Debug for FrameReader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrameReader")
             .field("buffered", &self.buf.len())
+            .field("skipped", &self.skipped)
             .finish_non_exhaustive()
     }
 }
@@ -506,7 +537,15 @@ impl<R: Read> FrameReader<R> {
         Ok(FrameReader {
             inner,
             buf: Vec::new(),
+            skipped: 0,
         })
+    }
+
+    /// How many frames of a kind this build does not know have been skipped.
+    /// A publisher newer than this subscriber sends them; the subscriber
+    /// holds everything else and lacks only what those frames carried.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
     }
 
     /// The next frame, or `None` at a clean end of stream.
@@ -514,7 +553,25 @@ impl<R: Read> FrameReader<R> {
     /// A stream that ends **inside** a frame is an error, not a `None`: a
     /// truncated frame is a lost frame, and reporting it as the end would
     /// silently shorten the recording.
+    ///
+    /// A frame of a kind this build does not know is skipped and counted in
+    /// [`skipped`](Self::skipped), not returned and not an error (WIRE.md
+    /// §7): the length prefix says where it ends, and a subscriber older than
+    /// its publisher should lose only what the new kind carries.
     pub fn next_frame(&mut self) -> Result<Option<Frame>> {
+        loop {
+            let Some(()) = self.read_payload()? else {
+                return Ok(None);
+            };
+            match decode_known(&self.buf)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => self.skipped += 1,
+            }
+        }
+    }
+
+    /// Read one length-prefixed payload into `buf`, or `None` at a clean end.
+    fn read_payload(&mut self) -> Result<Option<()>> {
         let mut len = [0u8; LENGTH_PREFIX_BYTES];
         match self.inner.read_exact(&mut len) {
             Ok(()) => {}
@@ -541,7 +598,7 @@ impl<R: Read> FrameReader<R> {
                 "failed to read a {len}-byte replication frame: {e}"
             ))
         })?;
-        decode_payload(&self.buf).map(Some)
+        Ok(Some(()))
     }
 }
 
@@ -627,6 +684,18 @@ mod tests {
                 source: 4,
                 ts: i64::MIN,
                 offset_ns: i64::MAX,
+            },
+            Frame::StreamSummary {
+                source: 5,
+                stream: "cpu_usage/task".to_string(),
+                as_of_ts: 1_700_000_000_000_000_000,
+                blob: b"columns".to_vec(),
+            },
+            Frame::StreamSummary {
+                source: 5,
+                stream: String::new(),
+                as_of_ts: -1,
+                blob: Vec::new(),
             },
         ];
 

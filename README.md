@@ -223,6 +223,10 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   computes per name, for a log of deltas), carried by every copy, and
   untouched by compaction. Column-slot transitions live here; see
   `CallerRow`.
+- **What a stream holds, without opening it.** One opaque summary per stream
+  in the catalog, with the newest sealed row it describes, so a reader can
+  learn a stream's columns and their metadata without reading a segment
+  footer. See `StreamSummary`.
 - **Compaction.** Read cost is linear in segment count. Measured between 400
   segments and one, the fine archive read 18.2x slower and was 2.38x larger;
   compacting it with `rewrite::compact` recovered 18.6x and 2.37x, landing
