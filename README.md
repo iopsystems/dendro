@@ -219,7 +219,8 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
 - **Somewhere for what you keep against time.** A per-segment index is
   dropped by a merge, since an index over one input cannot describe two. The
   caller store holds opaque rows against `(stream, ts)` instead: read by
-  range, evicted by the same cutoff as segments, carried by every copy, and
+  range, evicted by the same cutoff as segments (or from a per-name floor the
+  caller sets, for a log of deltas), carried by every copy, and
   untouched by compaction. Column-slot transitions live here; see
   `CallerRow`.
 - **Compaction.** Read cost is linear in segment count. Measured between 400

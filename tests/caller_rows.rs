@@ -3,13 +3,16 @@
 //!
 //! What it must do, and what it must leave alone: read back in order within
 //! a range, survive compaction untouched, travel with a copy under the same
-//! stream and range filters, go with retention at the same cutoff, and never
+//! stream and range filters, go with retention at the same cutoff or from a
+//! caller's floor, and never
 //! make a stream exist.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use dendro::archive::{Archive, ArchiveMut, CallerRow, SegmentMeta, SourceMeta, WalRow};
+use dendro::archive::{
+    Archive, ArchiveMut, CallerRow, CallerRowFloors, SegmentMeta, SourceMeta, WalRow,
+};
 use dendro::rewrite::{compact, copy_sources_into, CompactSpec, CopySpec};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
@@ -225,6 +228,101 @@ fn per_stream_retention_evicts_only_the_named_streams_and_sees_store_only_names(
     );
 }
 
+fn floors(entries: &[(&str, i64)]) -> CallerRowFloors {
+    entries.iter().map(|&(n, ts)| (n.to_string(), ts)).collect()
+}
+
+/// A delta log keeps the full statement before the cutoff: `s` is floored at
+/// 3, so `b` and `c` survive a cutoff of 4 that would have taken them, and
+/// `notes`, which has no floor, is cut at the cutoff as before.
+#[test]
+fn a_floor_keeps_a_names_rows_from_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let id = fixture(&path);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let evicted = db
+        .evict_before_with_floors(id, 4, &floors(&[("s", 3)]))
+        .unwrap();
+    assert_eq!(evicted.caller_rows, 2, "a on `s` and n2 on `notes`");
+    assert_eq!(evicted.segments, 1, "the floor does not keep segments");
+    assert_eq!(
+        blobs(&db.read_caller_rows(id, "s", i64::MIN, i64::MAX).unwrap()),
+        vec![
+            (3, "b".to_string()),
+            (3, "c".to_string()),
+            (5, "d".to_string())
+        ]
+    );
+    assert_eq!(
+        blobs(
+            &db.read_caller_rows(id, "notes", i64::MIN, i64::MAX)
+                .unwrap()
+        ),
+        vec![(4, "n4".to_string())]
+    );
+}
+
+#[test]
+fn a_floor_above_the_cutoff_deletes_no_more_than_the_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let id = fixture(&path);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let evicted = db
+        .evict_before_with_floors(id, 4, &floors(&[("s", 100)]))
+        .unwrap();
+    assert_eq!(evicted.caller_rows, 4, "the same as `evict_before` at 4");
+    assert_eq!(
+        blobs(&db.read_caller_rows(id, "s", i64::MIN, i64::MAX).unwrap()),
+        vec![(5, "d".to_string())]
+    );
+}
+
+#[test]
+fn a_floor_of_min_keeps_a_names_whole_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let id = fixture(&path);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    db.evict_before_with_floors(id, i64::MAX, &floors(&[("s", i64::MIN)]))
+        .unwrap();
+    assert_eq!(
+        db.read_caller_rows(id, "s", i64::MIN, i64::MAX)
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(db
+        .read_caller_rows(id, "notes", i64::MIN, i64::MAX)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn per_stream_retention_applies_floors_only_to_the_names_it_touches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let id = fixture(&path);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let evicted = db
+        .evict_streams_before_with_floors(
+            id,
+            4,
+            &|name| name == "s",
+            &floors(&[("s", 3), ("notes", i64::MIN)]),
+        )
+        .unwrap();
+    assert_eq!(evicted.caller_rows, 1, "only a, on `s`");
+    assert_eq!(
+        db.read_caller_rows(id, "notes", i64::MIN, i64::MAX)
+            .unwrap()
+            .len(),
+        2,
+        "`notes` was not named, and its floor changes nothing"
+    );
+}
+
 #[test]
 fn a_copy_carries_the_store_under_the_same_filters() {
     let dir = tempfile::tempdir().unwrap();
@@ -355,5 +453,44 @@ fn the_writer_lands_rows_in_order_with_the_ticks() {
         "the ticks around the store writes landed too"
     );
     w.finalize((2, 0)).unwrap();
+    writer.join().unwrap();
+}
+
+/// The case floors exist for, through the writer: a stream's identity log is
+/// a full statement followed by deltas, and a retention pass whose cutoff
+/// falls after the full statement must not take it while deltas that depend
+/// on it remain.
+#[cfg(feature = "write")]
+#[test]
+fn the_writer_keeps_a_full_statement_a_retained_delta_depends_on() {
+    use dendro::writer::Writer;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.dendro");
+    let mut writer = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = writer.add_source(source()).unwrap();
+    let id = w.source_id();
+    for ts in 1..=4 {
+        w.wal(vec![wal_row("s", ts)]).unwrap();
+    }
+    w.caller_rows(
+        "s",
+        vec![row(1, b"full"), row(2, b"delta"), row(4, b"delta")],
+    )
+    .unwrap();
+
+    let evicted = w.evict_before_with_floors(3, floors(&[("s", 1)])).unwrap();
+    assert_eq!(evicted.caller_rows, 0);
+    assert_eq!(evicted.wal_rows, 2, "rows 1 and 2 still go");
+    w.sync().unwrap();
+    let db = Archive::open(&path).unwrap();
+    assert_eq!(
+        blobs(&db.read_caller_rows(id, "s", i64::MIN, i64::MAX).unwrap()),
+        vec![
+            (1, "full".to_string()),
+            (2, "delta".to_string()),
+            (4, "delta".to_string())
+        ]
+    );
+    w.finalize((4, 0)).unwrap();
     writer.join().unwrap();
 }

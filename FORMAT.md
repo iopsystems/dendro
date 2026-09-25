@@ -246,7 +246,11 @@ cannot destroy. The rules:
   stream listing and is reached by name alone.
 - Retention evicts it by the same cutoff as segments: whole-source eviction
   by `ts`, per-stream eviction by `(stream, ts)` for every name the predicate
-  accepts, store-only names included.
+  accepts, store-only names included. A caller may give a name a floor, and
+  that name's rows are then deleted only below `min(floor, cutoff)`. A floor
+  exists for a log of deltas, whose last full statement before the cutoff
+  must survive while later deltas depend on it; the archive does not read
+  the rows, so which row is a full statement is the caller's to say.
 - A copy carries it verbatim within the copy's time bound and under the
   copy's stream filter. Compaction and column projection do not touch it.
 - `verify` does not read it, and no read path interprets it.

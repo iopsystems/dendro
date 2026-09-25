@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::archive::{Archive, ArchiveMut, CallerRow, Evicted, SegmentMeta, SourceMeta, WalRow};
+use crate::archive::{
+    Archive, ArchiveMut, CallerRow, CallerRowFloors, Evicted, SegmentMeta, SourceMeta, WalRow,
+};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -106,6 +108,7 @@ enum Msg {
         source_id: i64,
         cutoff_ts: i64,
         streams: Option<StreamFilter>,
+        floors: CallerRowFloors,
         reply: SyncSender<Result<Evicted>>,
     },
     /// Merge keys into one source's metadata, in order with the ticks around
@@ -891,7 +894,18 @@ impl SourceWriter {
     /// Fire-and-forget, like `wal` and `seal`: a failure surfaces on the next
     /// hand-off, which is the convention the whole writer follows.
     pub fn evict_before(&mut self, cutoff_ts: i64) -> Result<Evicted> {
-        self.evict(cutoff_ts, None)
+        self.evict(cutoff_ts, None, CallerRowFloors::new())
+    }
+
+    /// [`evict_before`](Self::evict_before), keeping each named stream's
+    /// caller rows from its floor rather than from the cutoff. See
+    /// [`CallerRowFloors`].
+    pub fn evict_before_with_floors(
+        &mut self,
+        cutoff_ts: i64,
+        floors: CallerRowFloors,
+    ) -> Result<Evicted> {
+        self.evict(cutoff_ts, None, floors)
     }
 
     /// [`evict_before`](Self::evict_before), restricted to the streams `evict`
@@ -907,7 +921,18 @@ impl SourceWriter {
     /// and the one to use while the writer runs: a `ArchiveMut::open` on a file
     /// this thread holds is refused as `InUse`.
     pub fn evict_streams_before(&mut self, cutoff_ts: i64, keep: StreamFilter) -> Result<Evicted> {
-        self.evict(cutoff_ts, Some(keep))
+        self.evict(cutoff_ts, Some(keep), CallerRowFloors::new())
+    }
+
+    /// [`evict_streams_before`](Self::evict_streams_before) with
+    /// [`CallerRowFloors`]. A floor for a name `evict` rejects is ignored.
+    pub fn evict_streams_before_with_floors(
+        &mut self,
+        cutoff_ts: i64,
+        evict: StreamFilter,
+        floors: CallerRowFloors,
+    ) -> Result<Evicted> {
+        self.evict(cutoff_ts, Some(evict), floors)
     }
 
     /// Both spellings, and the reply that makes the count reachable.
@@ -916,12 +941,18 @@ impl SourceWriter {
     /// append path, and a caller running one wants to know what it did — that
     /// is the difference between "the window moved" and "nothing was old enough
     /// yet", and a size-bounded policy needs it to decide whether to cut again.
-    fn evict(&mut self, cutoff_ts: i64, streams: Option<StreamFilter>) -> Result<Evicted> {
+    fn evict(
+        &mut self,
+        cutoff_ts: i64,
+        streams: Option<StreamFilter>,
+        floors: CallerRowFloors,
+    ) -> Result<Evicted> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::Evict {
             source_id: self.source_id,
             cutoff_ts,
             streams,
+            floors,
             reply: tx,
         })?;
         rx.recv().map_err(|_| take_writer_error(&self.err))?
@@ -1592,6 +1623,7 @@ fn writer_loop(
                 source_id,
                 cutoff_ts,
                 streams,
+                floors,
                 reply,
             }) => {
                 // Reported, not swallowed. `Evicted` exists so a caller can
@@ -1599,8 +1631,10 @@ fn writer_loop(
                 // and the writer used to throw it away - which made it
                 // unreachable through the only supported path.
                 let evicted = match streams {
-                    Some(keep) => db.evict_streams_before(source_id, cutoff_ts, &*keep),
-                    None => db.evict_before(source_id, cutoff_ts),
+                    Some(keep) => {
+                        db.evict_streams_before_with_floors(source_id, cutoff_ts, &*keep, &floors)
+                    }
+                    None => db.evict_before_with_floors(source_id, cutoff_ts, &floors),
                 };
                 if let Ok(e) = &evicted {
                     if e.live_rows > 0 {

@@ -37,8 +37,9 @@ pub const NO_INDEX_STATE: IndexState = (0, 0);
 pub enum IndexKind {
     /// Every live slot. Two purposes: completeness for a subscriber that just
     /// connected, and eviction safety. `caller_rows` is evicted on the same
-    /// cutoff as segments (FORMAT.md §3.5), so state written once at the start
-    /// of a recording is deleted while later rows still reference it.
+    /// cutoff as segments unless the writer sets floors (FORMAT.md §3.5), so
+    /// without them state written once at the start of a recording is deleted
+    /// while later rows still reference it.
     /// Re-emitting this periodically — segment-seal cadence is the natural
     /// one — bounds that.
     Full,

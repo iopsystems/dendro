@@ -250,7 +250,7 @@ slot is a row in it rather than a fourth table:
 | slot | keyed by | compaction | projection | retention |
 |---|---|---|---|---|
 | `caller_index` | segment | dropped | dropped | with its segment |
-| `caller_rows` | time | untouched | untouched | by `ts` |
+| `caller_rows` | time | untouched | untouched | by `ts`, or from a caller's floor |
 | `stream_summary` | stream | untouched | dropped | with its stream |
 
 **Staleness on a live archive.** The summary describes segments up to
