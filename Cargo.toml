@@ -1,6 +1,6 @@
 [package]
 name = "dendro"
-version = "0.2.2-alpha.0"
+version = "0.2.2"
 edition = "2021"
 # The floor the dependency graph sets (arrow/parquet 58 require 1.85). CI
 # builds on it, so raising it is a deliberate act rather than a drift. Note

@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-25
+
 ### Added
 
 - **`caller_rows` floors on retention.** `ArchiveMut::evict_before_with_floor`
