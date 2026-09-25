@@ -10,9 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use dendro::archive::{
-    Archive, ArchiveMut, CallerRow, CallerRowFloors, SegmentMeta, SourceMeta, WalRow,
-};
+use dendro::archive::{Archive, ArchiveMut, CallerRow, SegmentMeta, SourceMeta, WalRow};
 use dendro::rewrite::{compact, copy_sources_into, CompactSpec, CopySpec};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
 
@@ -228,22 +226,93 @@ fn per_stream_retention_evicts_only_the_named_streams_and_sees_store_only_names(
     );
 }
 
-fn floors(entries: &[(&str, i64)]) -> CallerRowFloors {
-    entries.iter().map(|&(n, ts)| (n.to_string(), ts)).collect()
+/// The floor a log of full statements and deltas asks for: the latest full
+/// statement at or before the oldest row the name still holds, or its whole
+/// history when it has none.
+fn latest_full_at_or_before(fulls: &[i64], oldest: Option<i64>) -> i64 {
+    let Some(oldest) = oldest else {
+        return i64::MAX;
+    };
+    fulls
+        .iter()
+        .rev()
+        .find(|&&ts| ts <= oldest)
+        .copied()
+        .unwrap_or(i64::MIN)
 }
 
-/// A delta log keeps the full statement before the cutoff: `s` is floored at
-/// 3, so `b` and `c` survive a cutoff of 4 that would have taken them, and
-/// `notes`, which has no floor, is cut at the cutoff as before.
+/// A segment spanning the cutoff keeps rows older than it, and the floor is
+/// asked with that segment's `first_ts`, so the full statement those rows
+/// depend on survives. Flooring at "the latest full statement at or before
+/// the cutoff" (3 here) would have deleted `full@1` and `delta@2` while rows 1
+/// and 2 stayed readable.
+#[test]
+fn the_floor_is_asked_with_the_oldest_row_that_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db.insert_source(&source()).unwrap();
+    db.transaction(|tx| {
+        tx.insert_segment(
+            id,
+            "s",
+            0,
+            &SegmentMeta {
+                rows: 4,
+                first_ts: 1,
+                last_ts: 4,
+            },
+            b"1,2,3,4",
+        )?;
+        tx.insert_caller_rows(
+            id,
+            "s",
+            &[
+                row(1, b"full"),
+                row(2, b"delta"),
+                row(3, b"full"),
+                row(4, b"delta"),
+            ],
+        )
+    })
+    .unwrap();
+
+    let asked = std::cell::RefCell::new(Vec::new());
+    let evicted = db
+        .evict_before_with_floor(id, 3, &|name, oldest| {
+            asked.borrow_mut().push((name.to_string(), oldest));
+            latest_full_at_or_before(&[1, 3], oldest)
+        })
+        .unwrap();
+    assert_eq!(asked.into_inner(), vec![("s".to_string(), Some(1))]);
+    assert_eq!(evicted.segments, 0, "the segment spans the cutoff");
+    assert_eq!(evicted.caller_rows, 0);
+}
+
+/// Once the spanning segment goes, the floor moves up to the full statement
+/// the surviving rows need, and `notes`, which holds no rows, is asked with
+/// `None`.
 #[test]
 fn a_floor_keeps_a_names_rows_from_the_floor() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
     let id = fixture(&path);
     let mut db = ArchiveMut::open(&path).unwrap();
+    let asked = std::cell::RefCell::new(Vec::new());
     let evicted = db
-        .evict_before_with_floors(id, 4, &floors(&[("s", 3)]))
+        .evict_before_with_floor(id, 4, &|name, oldest| {
+            asked.borrow_mut().push((name.to_string(), oldest));
+            match name {
+                "s" => 3,
+                _ => i64::MAX,
+            }
+        })
         .unwrap();
+    assert_eq!(
+        asked.into_inner(),
+        vec![("notes".to_string(), None), ("s".to_string(), Some(4))],
+        "the segment (1..=3) went, so `s` holds rows from the WAL row at 4"
+    );
     assert_eq!(evicted.caller_rows, 2, "a on `s` and n2 on `notes`");
     assert_eq!(evicted.segments, 1, "the floor does not keep segments");
     assert_eq!(
@@ -269,9 +338,7 @@ fn a_floor_above_the_cutoff_deletes_no_more_than_the_cutoff() {
     let path = dir.path().join("a.dendro");
     let id = fixture(&path);
     let mut db = ArchiveMut::open(&path).unwrap();
-    let evicted = db
-        .evict_before_with_floors(id, 4, &floors(&[("s", 100)]))
-        .unwrap();
+    let evicted = db.evict_before_with_floor(id, 4, &|_, _| i64::MAX).unwrap();
     assert_eq!(evicted.caller_rows, 4, "the same as `evict_before` at 4");
     assert_eq!(
         blobs(&db.read_caller_rows(id, "s", i64::MIN, i64::MAX).unwrap()),
@@ -285,8 +352,11 @@ fn a_floor_of_min_keeps_a_names_whole_history() {
     let path = dir.path().join("a.dendro");
     let id = fixture(&path);
     let mut db = ArchiveMut::open(&path).unwrap();
-    db.evict_before_with_floors(id, i64::MAX, &floors(&[("s", i64::MIN)]))
-        .unwrap();
+    db.evict_before_with_floor(id, i64::MAX, &|name, _| match name {
+        "s" => i64::MIN,
+        _ => i64::MAX,
+    })
+    .unwrap();
     assert_eq!(
         db.read_caller_rows(id, "s", i64::MIN, i64::MAX)
             .unwrap()
@@ -300,26 +370,26 @@ fn a_floor_of_min_keeps_a_names_whole_history() {
 }
 
 #[test]
-fn per_stream_retention_applies_floors_only_to_the_names_it_touches() {
+fn per_stream_retention_asks_the_floor_only_for_the_names_it_touches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
     let id = fixture(&path);
     let mut db = ArchiveMut::open(&path).unwrap();
+    let asked = std::cell::RefCell::new(Vec::new());
     let evicted = db
-        .evict_streams_before_with_floors(
-            id,
-            4,
-            &|name| name == "s",
-            &floors(&[("s", 3), ("notes", i64::MIN)]),
-        )
+        .evict_streams_before_with_floor(id, 4, &|name| name == "s", &|name, _| {
+            asked.borrow_mut().push(name.to_string());
+            3
+        })
         .unwrap();
+    assert_eq!(asked.into_inner(), vec!["s".to_string()]);
     assert_eq!(evicted.caller_rows, 1, "only a, on `s`");
     assert_eq!(
         db.read_caller_rows(id, "notes", i64::MIN, i64::MAX)
             .unwrap()
             .len(),
         2,
-        "`notes` was not named, and its floor changes nothing"
+        "`notes` was not named"
     );
 }
 
@@ -459,7 +529,8 @@ fn the_writer_lands_rows_in_order_with_the_ticks() {
 /// The case floors exist for, through the writer: a stream's identity log is
 /// a full statement followed by deltas, and a retention pass whose cutoff
 /// falls after the full statement must not take it while deltas that depend
-/// on it remain.
+/// on it remain. The rows are sealed first, as a rolling buffer seals before
+/// it evicts.
 #[cfg(feature = "write")]
 #[test]
 fn the_writer_keeps_a_full_statement_a_retained_delta_depends_on() {
@@ -469,18 +540,25 @@ fn the_writer_keeps_a_full_statement_a_retained_delta_depends_on() {
     let mut writer = Writer::create(&path, Box::new(Tags)).unwrap();
     let mut w = writer.add_source(source()).unwrap();
     let id = w.source_id();
-    for ts in 1..=4 {
-        w.wal(vec![wal_row("s", ts)]).unwrap();
-    }
+    w.wal(vec![wal_row("s", 1), wal_row("s", 2)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.wal(vec![wal_row("s", 3), wal_row("s", 4)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
     w.caller_rows(
         "s",
         vec![row(1, b"full"), row(2, b"delta"), row(4, b"delta")],
     )
     .unwrap();
 
-    let evicted = w.evict_before_with_floors(3, floors(&[("s", 1)])).unwrap();
-    assert_eq!(evicted.caller_rows, 0);
-    assert_eq!(evicted.wal_rows, 2, "rows 1 and 2 still go");
+    let evicted = w
+        .evict_before_with_floor(
+            3,
+            Box::new(|_, oldest| latest_full_at_or_before(&[1], oldest)),
+        )
+        .unwrap();
+    assert_eq!(evicted.segments, 1, "the segment holding 1 and 2");
+    assert_eq!(evicted.live_rows, 0, "everything evicted was sealed");
+    assert_eq!(evicted.caller_rows, 0, "delta@4 still depends on full@1");
     w.sync().unwrap();
     let db = Archive::open(&path).unwrap();
     assert_eq!(

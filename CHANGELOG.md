@@ -35,12 +35,13 @@ cannot reach a failed release any other way.
 
 ### Added
 
-- **`caller_rows` floors on retention.** `ArchiveMut::evict_before_with_floors`
-  and `evict_streams_before_with_floors`, and the `Writer` methods of the same
-  names, take a `CallerRowFloors` map from name to timestamp. A named stream's
-  caller rows are deleted only below `min(floor, cutoff)`. Names absent from
-  the map are cut at the cutoff as before, and the existing eviction methods
-  are unchanged.
+- **`caller_rows` floors on retention.** `ArchiveMut::evict_before_with_floor`
+  and `evict_streams_before_with_floor`, and the `SourceWriter` methods of the
+  same names, take a floor function (`CallerRowFloor`, boxed as
+  `writer::CallerRowFloorFn`). The pass calls it once per name it touches,
+  inside its transaction and after the segment and WAL deletes, with the
+  oldest row that name still holds, and deletes the name's caller rows only
+  below `min(floor, cutoff)`. The existing eviction methods are unchanged.
 
   Retention cut a stream's `caller_rows` at the segment cutoff, in the same
   transaction as the segments, with no way for the caller to keep more. For an
@@ -48,10 +49,14 @@ cannot reach a failed release any other way.
   the deltas after it deleted the `Full` while the deltas and the rows they
   describe remained, so a reader could not attribute those rows. The caller
   knows which entry is a `Full` and dendro does not read the blobs, so the
-  caller supplies the floor: the timestamp of the latest `Full` at or before
-  the cutoff, or `i64::MIN` for a stream with none. rezolus's own `.rez` writer
-  already cuts its index this way (rezolus #1281); this makes a dendro archive
-  able to do the same.
+  caller supplies the floor: the latest `Full` at or before the oldest row the
+  stream still holds, or `i64::MIN` for a stream with none. The oldest row
+  rather than the cutoff, because a segment spanning the cutoff is kept with
+  rows older than it; and asked inside the pass, because a seal between a
+  caller's own query and the pass can create such a segment.
+
+- `SourceWriter::evict_before` was documented as fire-and-forget. It waits for
+  the pass and returns its result; the doc now says so.
 
 ### Changed
 

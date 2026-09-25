@@ -245,11 +245,12 @@ seal — and part of the source's identity.
    `caller_rows` is evicted on the same cutoff as segments by default, so
    state written once at the start of a recording would be deleted while
    later rows still referenced it; re-emitting at the segment-seal cadence
-   bounds that. A subscriber whose archive has retention should also floor
-   each stream's `caller_rows` at its latest `Full` at or before the cutoff
-   (FORMAT.md §3.5): the cutoff can fall between a `Full` and the deltas
-   after it, and the periodic `Full` is what keeps that floor from holding
-   the whole history.
+   bounds that. Re-emission does not make retention on the receiving side
+   safe by itself: a cutoff can fall between a `Full` and the deltas after
+   it. An archive writer that knows which rows are `Full` can keep them with
+   a floor (FORMAT.md §3.5). This crate's `Subscriber` does not record an
+   entry's kind and has no retention of its own, so a subscriber archive has
+   no retention path yet.
 8. A reconnect is a new handshake and full state. There is no resume token.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.

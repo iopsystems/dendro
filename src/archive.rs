@@ -293,8 +293,8 @@ pub struct WalRow {
 /// against a segment, such as which series a column slot meant from when,
 /// lives here: keyed by `(source, stream, ts)`, unaffected by compaction and
 /// projection, carried verbatim by every copy, and evicted by the same
-/// cutoff that evicts segments unless the caller sets a floor for the name
-/// ([`CallerRowFloors`]). Several rows may share a timestamp; they
+/// cutoff that evicts segments unless the caller supplies a floor
+/// ([`CallerRowFloor`]). Several rows may share a timestamp; they
 /// read back in insertion order.
 ///
 /// A row here does not make a stream exist. `all_streams` is still the
@@ -309,32 +309,70 @@ pub struct CallerRow {
     pub blob: Vec<u8>,
 }
 
-/// Per name in the caller's store, the oldest [`CallerRow`] timestamp a
-/// retention pass must keep, for a caller whose rows depend on earlier rows.
+/// Where a retention pass may cut one name's caller rows, for a caller whose
+/// rows depend on earlier rows.
 ///
 /// A retention pass cuts a name's caller rows at the row cutoff by default.
 /// That is right for rows that stand alone and wrong for a log of deltas: a
 /// delta means nothing without the full statement before it, and that full
-/// statement can be older than the cutoff while rows it describes are not. A
-/// caller that writes such a log names, for each affected name, the
-/// timestamp of the latest full statement at or before the cutoff, and the
-/// pass deletes that name's caller rows only below it. `i64::MIN` keeps the
-/// name's whole history, which is what a caller with no full statement at or
-/// before the cutoff wants.
+/// statement can be older than the cutoff while rows it describes are not.
 ///
-/// A floor can only keep more: the pass deletes below
-/// `min(floor, cutoff_ts)`, so caller rows at or after the cutoff are kept
-/// whatever the floor says. A name the map omits is cut at the cutoff, and a
-/// floor for a name the pass does not touch is ignored. dendro does not read
-/// the rows to check the floor; which row is a full statement is the
-/// caller's knowledge.
-pub type CallerRowFloors = BTreeMap<String, i64>;
+/// The pass calls this once for every name it touches, inside its
+/// transaction and after the segment and WAL deletes, with the name and the
+/// timestamp of the oldest row that name still holds (the older of its
+/// oldest segment's `first_ts` and its oldest WAL row), or `None` when it
+/// holds none. That timestamp can be older than the cutoff: a segment is
+/// deleted only when its newest row is, so a segment spanning the cutoff
+/// keeps older rows. The function returns the floor, and the pass deletes the
+/// name's caller rows only below `min(floor, cutoff_ts)`.
+///
+/// A log of deltas returns the timestamp of its latest full statement at or
+/// before the oldest surviving row, or `i64::MIN` when it has none, which
+/// keeps the name's whole history. Returning `i64::MAX` gives the default
+/// cut. dendro does not read the rows; which row is a full statement is the
+/// caller's knowledge, so the function holds it.
+///
+/// It runs on the thread doing the eviction (the writer thread, for
+/// [`SourceWriter`](crate::writer::SourceWriter)) while the pass holds the
+/// write lock, so it should be a lookup, and it must not call back into the
+/// writer.
+pub type CallerRowFloor<'a> = &'a dyn Fn(&str, Option<i64>) -> i64;
 
-/// Where a retention pass cuts `name`'s caller rows: see [`CallerRowFloors`].
-fn caller_row_cutoff(floors: &CallerRowFloors, name: &str, cutoff_ts: i64) -> i64 {
-    floors
-        .get(name)
-        .map_or(cutoff_ts, |&floor| floor.min(cutoff_ts))
+/// The oldest row `stream` still holds, segments and WAL together.
+fn oldest_row(tx: &rusqlite::Transaction<'_>, source_id: i64, stream: &str) -> Result<Option<i64>> {
+    tx.query_row(
+        "SELECT MIN(oldest) FROM ( \
+           SELECT MIN(first_ts) AS oldest FROM segments WHERE source_id = ?1 AND stream = ?2 \
+           UNION ALL \
+           SELECT MIN(ts) FROM wal WHERE source_id = ?1 AND stream = ?2)",
+        rusqlite::params![source_id, stream],
+        |row| row.get(0),
+    )
+    .map_err(Error::sqlite(format!(
+        "failed to find the oldest {stream} row"
+    )))
+}
+
+/// Delete `stream`'s caller rows below the cutoff, or below the caller's
+/// floor for it when there is one and it is older. See [`CallerRowFloor`].
+fn evict_caller_rows(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: i64,
+    stream: &str,
+    cutoff_ts: i64,
+    floor: Option<CallerRowFloor<'_>>,
+) -> Result<usize> {
+    let cut = match floor {
+        Some(floor) => floor(stream, oldest_row(tx, source_id, stream)?).min(cutoff_ts),
+        None => cutoff_ts,
+    };
+    tx.execute(
+        "DELETE FROM caller_rows WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
+        rusqlite::params![source_id, stream, cut],
+    )
+    .map_err(Error::sqlite(format!(
+        "failed to evict {stream} caller rows"
+    )))
 }
 
 /// What one retention pass removed. Returned rather than logged so a caller
@@ -2265,28 +2303,34 @@ impl ArchiveMut {
     /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
     /// the segment delete un-shadows.
     pub fn evict_before(&mut self, source_id: i64, cutoff_ts: i64) -> Result<Evicted> {
-        self.evict_before_with_floors(source_id, cutoff_ts, &CallerRowFloors::new())
+        self.evict(
+            source_id,
+            "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
+            "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
+            cutoff_ts,
+            None,
+        )
     }
 
-    /// [`evict_before`](Self::evict_before), keeping each named stream's
-    /// caller rows from its floor rather than from the cutoff. See
-    /// [`CallerRowFloors`].
+    /// [`evict_before`](Self::evict_before), cutting each name's caller rows
+    /// where `floor` says rather than at the cutoff. See [`CallerRowFloor`].
     ///
-    /// The floors apply in the same transaction as the segment delete. A
-    /// caller that evicted first and restored its caller rows afterwards could
-    /// not restore them: the rows are gone once the pass commits.
-    pub fn evict_before_with_floors(
+    /// The floor is asked inside the pass's transaction, after the segment
+    /// and WAL deletes, because the oldest surviving row it needs is only
+    /// known then: a seal between a caller's own query and the pass can leave
+    /// a segment spanning the cutoff.
+    pub fn evict_before_with_floor(
         &mut self,
         source_id: i64,
         cutoff_ts: i64,
-        floors: &CallerRowFloors,
+        floor: CallerRowFloor<'_>,
     ) -> Result<Evicted> {
         self.evict(
             source_id,
             "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
             "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
             cutoff_ts,
-            floors,
+            Some(floor),
         )
     }
 
@@ -2316,20 +2360,30 @@ impl ArchiveMut {
         cutoff_ts: i64,
         evict: &dyn Fn(&str) -> bool,
     ) -> Result<Evicted> {
-        self.evict_streams_before_with_floors(source_id, cutoff_ts, evict, &CallerRowFloors::new())
+        self.evict_streams(source_id, cutoff_ts, evict, None)
     }
 
-    /// [`evict_streams_before`](Self::evict_streams_before) with
-    /// [`CallerRowFloors`], as
-    /// [`evict_before_with_floors`](Self::evict_before_with_floors) is to
-    /// [`evict_before`](Self::evict_before). A floor for a name `evict`
-    /// rejects is ignored, since the pass does not touch that name.
-    pub fn evict_streams_before_with_floors(
+    /// [`evict_streams_before`](Self::evict_streams_before) with a
+    /// [`CallerRowFloor`], as
+    /// [`evict_before_with_floor`](Self::evict_before_with_floor) is to
+    /// [`evict_before`](Self::evict_before). `floor` is asked only for the
+    /// names `evict` accepts.
+    pub fn evict_streams_before_with_floor(
         &mut self,
         source_id: i64,
         cutoff_ts: i64,
         evict: &dyn Fn(&str) -> bool,
-        floors: &CallerRowFloors,
+        floor: CallerRowFloor<'_>,
+    ) -> Result<Evicted> {
+        self.evict_streams(source_id, cutoff_ts, evict, Some(floor))
+    }
+
+    fn evict_streams(
+        &mut self,
+        source_id: i64,
+        cutoff_ts: i64,
+        evict: &dyn Fn(&str) -> bool,
+        floor: Option<CallerRowFloor<'_>>,
     ) -> Result<Evicted> {
         // Every name the predicate can see: the streams, and the names the
         // caller's store holds rows under that are not streams.
@@ -2370,20 +2424,8 @@ impl ArchiveMut {
                         params,
                     )
                     .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
-                total.caller_rows += tx
-                    .tx
-                    .execute(
-                        "DELETE FROM caller_rows \
-                         WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
-                        rusqlite::params![
-                            source_id,
-                            stream,
-                            caller_row_cutoff(floors, stream, cutoff_ts)
-                        ],
-                    )
-                    .map_err(Error::sqlite(format!(
-                        "failed to evict {stream} caller rows"
-                    )))?;
+                total.caller_rows +=
+                    evict_caller_rows(&tx.tx, source_id, stream, cutoff_ts, floor)?;
             }
             // The clock-offset series is per SOURCE, and a per-stream pass
             // has no single cutoff for it: the streams it left alone may
@@ -2414,15 +2456,14 @@ impl ArchiveMut {
         segments_sql: &str,
         wal_sql: &str,
         cutoff_ts: i64,
-        floors: &CallerRowFloors,
+        floor: Option<CallerRowFloor<'_>>,
     ) -> Result<Evicted> {
-        // With no floors every name is cut at the cutoff and one statement
-        // covers the store. With floors each name has its own cutoff, so the
-        // names are listed first, as `evict_streams_before` lists them.
-        let names = if floors.is_empty() {
-            Vec::new()
-        } else {
-            self.db.caller_row_streams(source_id)?
+        // With no floor every name is cut at the cutoff and one statement
+        // covers the store. With one each name has its own cut, so the names
+        // are listed first, as `evict_streams` lists them.
+        let names = match floor {
+            Some(_) => self.db.caller_row_streams(source_id)?,
+            None => Vec::new(),
         };
         self.transaction(|tx| {
             let params = rusqlite::params![source_id, cutoff_ts];
@@ -2461,32 +2502,23 @@ impl ArchiveMut {
                 )
                 .map_err(Error::sqlite("failed to evict clock offsets"))?;
             // The caller's store goes by the same cutoff unless the caller
-            // gave a name a floor: it is keyed by time and nothing else, which
+            // supplied a floor: it is keyed by time and nothing else, which
             // is what lets retention touch it without knowing what a row says.
-            let caller_rows = if floors.is_empty() {
-                tx.tx
+            let caller_rows = match floor {
+                None => tx
+                    .tx
                     .execute(
                         "DELETE FROM caller_rows WHERE source_id = ?1 AND ts < ?2",
                         params,
                     )
-                    .map_err(Error::sqlite("failed to evict caller rows"))?
-            } else {
-                let mut deleted = 0;
-                for name in &names {
-                    deleted += tx
-                        .tx
-                        .execute(
-                            "DELETE FROM caller_rows \
-                             WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
-                            rusqlite::params![
-                                source_id,
-                                name,
-                                caller_row_cutoff(floors, name, cutoff_ts)
-                            ],
-                        )
-                        .map_err(Error::sqlite(format!("failed to evict {name} caller rows")))?;
+                    .map_err(Error::sqlite("failed to evict caller rows"))?,
+                Some(_) => {
+                    let mut deleted = 0;
+                    for name in &names {
+                        deleted += evict_caller_rows(&tx.tx, source_id, name, cutoff_ts, floor)?;
+                    }
+                    deleted
                 }
-                deleted
             };
             Ok(Evicted {
                 segments,
