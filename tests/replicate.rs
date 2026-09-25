@@ -462,6 +462,7 @@ struct Readable {
     streams: BTreeMap<String, Vec<(i64, i64, Vec<u8>)>>,
     clock_offsets: Vec<(i64, i64)>,
     caller_rows: BTreeMap<String, Vec<(i64, Vec<u8>)>>,
+    stream_summaries: Vec<(String, i64, Vec<u8>)>,
 }
 
 /// Read every source of an archive into the comparable form above.
@@ -508,6 +509,11 @@ fn readable(path: &std::path::Path) -> Vec<Readable> {
                 streams,
                 clock_offsets: db.read_clock_offsets(rec.id)?,
                 caller_rows,
+                stream_summaries: db
+                    .read_stream_summaries(rec.id)?
+                    .into_iter()
+                    .map(|(name, s)| (name, s.as_of_ts, s.blob))
+                    .collect(),
             });
         }
         Ok(out)
@@ -515,7 +521,7 @@ fn readable(path: &std::path::Path) -> Vec<Readable> {
     .unwrap()
 }
 
-/// Build a publisher-side archive with something in all five tables.
+/// Build a publisher-side archive with something in all six tables.
 fn build_publisher_archive(path: &std::path::Path) {
     let mut archive = Writer::create(path, Box::new(Tags)).unwrap();
 
@@ -553,6 +559,10 @@ fn build_publisher_archive(path: &std::path::Path) {
         w.wal(vec![row("s", 1_000), row("s", 2_000), row("t", 1_500)])
             .unwrap();
         w.seal(vec!["s".to_string()]).unwrap();
+        // What the caller knows about the sealed stream, after the seal it
+        // describes.
+        w.stream_summary("s", 2_000, format!("{name}:s summary").into_bytes())
+            .unwrap();
         w.sync().unwrap();
         w.wal(vec![row("s", 3_000), row("t", 3_500)]).unwrap();
         w.sync().unwrap();
@@ -562,7 +572,7 @@ fn build_publisher_archive(path: &std::path::Path) {
 }
 
 /// **The test this whole module exists for.** Publish an archive, subscribe
-/// into a fresh one, and compare what reads back across all five tables
+/// into a fresh one, and compare what reads back across all six tables
 /// `rewrite` calls an archive.
 ///
 /// It is the strongest available test of a replication format, and being able

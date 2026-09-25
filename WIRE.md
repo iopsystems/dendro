@@ -85,8 +85,8 @@ only integer type, and the reason a negative value means before 1970.
 ## 4. Frames
 
 One kind per table in the set `rewrite` copies (`src/rewrite.rs`, `COPIED`) —
-`sources`, `caller_rows`, `wal`, `segments`, `clock_offsets` — so the frame set
-has a completeness check rather than a guess.
+`sources`, `caller_rows`, `wal`, `segments`, `clock_offsets`, `stream_summary`
+— so the frame set has a completeness check rather than a guess.
 
 | `kind` | frame | lands in |
 |---|---|---|
@@ -95,6 +95,7 @@ has a completeness check rather than a guess.
 | 3 | `Rows` | `wal` |
 | 4 | `Segment` | `segments` |
 | 5 | `ClockOffset` | `clock_offsets` |
+| 6 | `StreamSummary` | `stream_summary` |
 
 ### 4.1 `Handshake` (kind 1)
 
@@ -222,6 +223,22 @@ i64          offset_ns
 One drift observation (`FORMAT.md` §5). Cheap to carry — a handful of rows per
 seal — and part of the source's identity.
 
+### 4.6 `StreamSummary` (kind 6)
+
+```
+u32          source
+str          stream
+i64          as_of_ts
+bytes        blob
+```
+
+One stream's summary (`FORMAT.md` §3.6), replacing the subscriber's. A
+publisher sends it only to a subscriber that received the stream's whole
+history, from a catch-up that starts at or before the stream's first
+segment, and sends it again when its `as_of_ts` moves. A tailing subscriber,
+or one that caught up from a later point, holds less than the summary
+describes and gets none; it writes its own from what it seals.
+
 ## 5. Protocol rules
 
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
@@ -283,7 +300,9 @@ is handed, so whatever decides who may hand it anything is the transport's.
   current version would misread silently.
 - **What does not.** A new frame kind. The length prefix makes an unknown kind
   skippable, so an older subscriber degrades to not applying it rather than to
-  misreading it. Adding a field to an existing frame *does* bump the version,
+  misreading it. `FrameReader` skips one and counts it (`skipped()`); before
+  dendro 0.3.0 it returned an error instead, so a 0.2.x subscriber fails on
+  kind 6. Adding a field to an existing frame *does* bump the version,
   because §2 refuses a payload with trailing bytes.
 - **What this does not version.** The row payload, the segment's columns and
   the index blob are the caller's. `Handshake.metadata` carries the archive's

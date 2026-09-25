@@ -61,6 +61,9 @@ struct StreamCursor {
     /// back in insertion order (FORMAT.md §3.5), so a timestamp alone cannot
     /// say where to resume.
     index_after: Option<(i64, usize)>,
+    /// The `as_of_ts` of the summary last emitted, so a summary is sent again
+    /// only when the publisher's changes.
+    summary_as_of: Option<i64>,
 }
 
 /// One source, and everything the publisher remembers about it between polls.
@@ -75,6 +78,10 @@ struct SourceCursor {
     /// Whether the opening batch has sent its `Full`. Only the first index
     /// batch is `Full`; see [`ArchivePublisher`].
     sent_full: bool,
+    /// Streams whose whole history the subscriber received, so their
+    /// summaries describe what it holds. Only those get
+    /// [`StreamSummary`](Frame::StreamSummary) frames.
+    whole: std::collections::BTreeSet<String>,
 }
 
 /// Publishes an archive's contents as frames.
@@ -232,6 +239,7 @@ impl ArchivePublisher {
                 seq: 0,
                 index_state: NO_INDEX_STATE,
                 sent_full: false,
+                whole: std::collections::BTreeSet::new(),
             };
 
             // Index entries first, so nothing below can reference identity that
@@ -268,6 +276,14 @@ impl ArchivePublisher {
                         // nothing is what lets the seal check below work the
                         // same way in both modes.
                         entry.wal_after = watermark;
+                        // The whole stream went across when the window starts
+                        // at or before its first segment, and only then does
+                        // its summary describe what the subscriber holds.
+                        let (_, sealed) = db.segment_span(rec.id, &stream)?;
+                        if sealed.first_ts.is_none_or(|first| since <= first) {
+                            cursor.whole.insert(stream.clone());
+                            cursor.emit_summary(db, &stream, &mut frames)?;
+                        }
                     }
                     // Tailing: start past everything the archive already holds,
                     // so the first poll ships only what arrived after this.
@@ -309,6 +325,29 @@ impl ArchivePublisher {
 }
 
 impl SourceCursor {
+    /// Emit `stream`'s summary if it has one the subscriber has not been
+    /// sent, and only for a stream whose whole history went across.
+    fn emit_summary(&mut self, db: &Archive, stream: &str, out: &mut Vec<Frame>) -> Result<()> {
+        if !self.whole.contains(stream) {
+            return Ok(());
+        }
+        let Some(summary) = db.read_stream_summary(self.source_id, stream)? else {
+            return Ok(());
+        };
+        let entry = self.streams.entry(stream.to_string()).or_default();
+        if entry.summary_as_of == Some(summary.as_of_ts) {
+            return Ok(());
+        }
+        entry.summary_as_of = Some(summary.as_of_ts);
+        out.push(Frame::StreamSummary {
+            source: self.ordinal,
+            stream: stream.to_string(),
+            as_of_ts: summary.as_of_ts,
+            blob: summary.blob,
+        });
+        Ok(())
+    }
+
     /// Emit every index entry at or after `from` that has not been sent,
     /// advancing both the cursor and the declared state.
     fn emit_index(
@@ -376,8 +415,8 @@ impl SourceCursor {
         Ok(())
     }
 
-    /// One poll of one source: index entries, then clock offsets, then exactly
-    /// one `Rows` frame.
+    /// One poll of one source: index entries, then clock offsets, then
+    /// changed stream summaries, then exactly one `Rows` frame.
     fn poll(&mut self, db: &Archive, out: &mut Vec<Frame>) -> Result<()> {
         for name in db.caller_row_streams(self.source_id)? {
             self.emit_index(db, &name, i64::MIN, out)?;
@@ -393,6 +432,11 @@ impl SourceCursor {
                 offset_ns: offset,
             });
             self.clock_after = Some(ts);
+        }
+
+        let whole: Vec<String> = self.whole.iter().cloned().collect();
+        for stream in &whole {
+            self.emit_summary(db, stream, out)?;
         }
 
         let watermarks = db.sealed_watermarks()?;

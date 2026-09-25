@@ -33,6 +33,47 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- **Stream summaries** (`FORMAT.md` §3.6). A `stream_summary` table holds one
+  opaque blob per `(source, stream)` and `as_of_ts`, the `last_ts` of the
+  newest segment it describes, so a reader can learn what a stream holds from
+  the catalog without reading a segment footer. `SourceWriter::stream_summary`
+  (ordered with ticks and seals), `Transaction::set_stream_summary` and
+  `ArchiveMut::set_stream_summary` write it; `Archive::read_stream_summary`,
+  `read_stream_summaries` and `stream_summary_as_of` read it, and
+  `read::catalog` reports `StreamCatalog::summary_as_of`. Compaction leaves it
+  alone, a full copy carries it, a projection or a time-bounded copy drops it,
+  and retention drops it once its stream holds no rows
+  (`Evicted::stream_summaries`). An archive from 0.2.x gains the table on its
+  first writable open; no schema version bump.
+
+  Measured on two real recordings converted from `.rez`, reading every
+  segment's footer at open pulled 1,272 MB (a 1.28 GB archive) and 579 MB (a
+  581 MB one), and footers were 42% and 73% of the segment bytes: on a wide
+  per-task stream the embedded Arrow schema alone was 27.5 MB of a 35.6 MB
+  segment. A summary written once per stream replaces those reads. See the
+  two-forms journal entry.
+- **`Frame::StreamSummary`** (kind 6, `WIRE.md` §4.6), sent only to a
+  subscriber that received the stream's whole history, and again when its
+  `as_of_ts` moves. `Applied::stream_summaries` counts them.
+
+### Changed
+
+- **Breaking:** `Frame` is `#[non_exhaustive]`, and gains `StreamSummary`. A
+  `match` on it needs a wildcard arm. Later kinds are then not breaking.
+- `FrameReader::next_frame` skips a frame of a kind it does not know and counts
+  it in `FrameReader::skipped`, as `WIRE.md` §7 already said it did. It
+  returned an error, so a 0.2.x subscriber stops on a kind-6 frame.
+  `decode_payload` on a single payload still refuses an unknown kind.
+
+### Fixed
+
+- `verify` returned an error when SQLite's own integrity check ran into the
+  damage it was walking and failed partway. That is the check finding
+  corruption, and it is now reported as `Problem::Corrupt` like any other
+  line. Adding a table moved a test's scribbled page onto such a spot.
+
 ## [0.2.2] - 2026-09-25
 
 ### Added

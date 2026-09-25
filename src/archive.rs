@@ -309,6 +309,42 @@ pub struct CallerRow {
     pub blob: Vec<u8>,
 }
 
+/// What the caller has recorded about one stream as a whole, from the
+/// `stream_summary` table: an opaque blob and the newest sealed row it
+/// describes.
+///
+/// The stream analog of a segment's `caller_index`, with the opposite
+/// lifetime. An index describes one segment, so a merge or a projection
+/// drops it. A summary describes the stream, so compaction keeps it; a
+/// column projection or a time-bounded copy drops it, because it would
+/// describe columns or segments the copy does not have; and retention drops
+/// it once its stream holds no rows. A caller replaces it whenever what the
+/// stream holds changes, typically after a seal or at finalize.
+///
+/// It exists so a reader can learn what a stream holds (its columns, their
+/// metadata, the caller's identity history as intervals) from the catalog,
+/// without reading a segment. dendro never reads `blob`.
+///
+/// **It can be stale in two directions.** Rows newer than `as_of_ts` (the
+/// live tail, or segments sealed since the caller last wrote it) may hold
+/// columns it does not list, so a reader of a live archive combines the
+/// summary with a probe of what is newer. And after retention evicts old
+/// segments it may list columns no remaining segment has, until the caller
+/// replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Fields are added without a major version; construct one only by
+/// asking dendro for it, and match with a wildcard arm.
+#[non_exhaustive]
+pub struct StreamSummary {
+    /// The `last_ts` of the newest segment the summary describes. A
+    /// timestamp rather than a segment `seq`: a filtered copy renumbers
+    /// `seq` from zero and retention evicts below it, while a timestamp
+    /// means the same thing in every copy.
+    pub as_of_ts: i64,
+    /// The caller's summary. Opaque to dendro.
+    pub blob: Vec<u8>,
+}
+
 /// Where a retention pass may cut one name's caller rows, for a caller whose
 /// rows depend on earlier rows.
 ///
@@ -351,6 +387,25 @@ fn oldest_row(tx: &rusqlite::Transaction<'_>, source_id: i64, stream: &str) -> R
     .map_err(Error::sqlite(format!(
         "failed to find the oldest {stream} row"
     )))
+}
+
+/// Delete the summaries of streams left with no segment and no WAL row: all
+/// of `source_id`'s, or only `stream`'s. A summary goes with its stream.
+fn evict_orphaned_summaries(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: i64,
+    stream: Option<&str>,
+) -> Result<usize> {
+    tx.execute(
+        "DELETE FROM stream_summary \
+         WHERE source_id = ?1 AND (?2 IS NULL OR stream = ?2) \
+           AND NOT EXISTS (SELECT 1 FROM segments s \
+                           WHERE s.source_id = ?1 AND s.stream = stream_summary.stream) \
+           AND NOT EXISTS (SELECT 1 FROM wal w \
+                           WHERE w.source_id = ?1 AND w.stream = stream_summary.stream)",
+        rusqlite::params![source_id, stream],
+    )
+    .map_err(Error::sqlite("failed to evict stream summaries"))
 }
 
 /// Delete `stream`'s caller rows below the cutoff, or below the caller's
@@ -397,6 +452,9 @@ pub struct Evicted {
     pub live_rows: usize,
     /// Rows of the caller's time-keyed store deleted; see [`CallerRow`].
     pub caller_rows: usize,
+    /// Stream summaries deleted because their stream was left with no rows;
+    /// see [`StreamSummary`].
+    pub stream_summaries: usize,
 }
 
 /// How many rows a table holds and what time span they cover, answered from
@@ -1753,7 +1811,18 @@ impl Archive {
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(Error::sqlite("failed to check the archive"))?;
         for line in lines {
-            let line = line.map_err(Error::sqlite("failed to read a check result"))?;
+            // The check can itself run into the damage it is walking and fail
+            // partway with `SQLITE_CORRUPT`, depending on which page the
+            // damage is on. That is the check finding corruption, so it is
+            // reported like any other line, and the check stops there.
+            let line = match line {
+                Ok(line) => line,
+                Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) => {
+                    problems.push(Problem::Corrupt(e.to_string()));
+                    break;
+                }
+                Err(e) => return Err(Error::sqlite("failed to read a check result")(e)),
+            };
             // SQLite says exactly "ok" when it is happy.
             if line != "ok" {
                 problems.push(Problem::Corrupt(line));
@@ -2047,6 +2116,89 @@ impl Archive {
             )))
     }
 
+    /// One stream's summary, or `None` when the caller wrote none (or the
+    /// archive predates the table). See [`StreamSummary`].
+    pub fn read_stream_summary(
+        &self,
+        source_id: i64,
+        stream: &str,
+    ) -> Result<Option<StreamSummary>> {
+        if !has_table(&self.conn, "stream_summary")? {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT as_of_ts, blob FROM stream_summary WHERE source_id = ?1 AND stream = ?2",
+            )
+            .map_err(Error::sqlite("failed to query a stream summary"))?;
+        let mut rows = stmt
+            .query(rusqlite::params![source_id, stream])
+            .map_err(Error::sqlite("failed to query a stream summary"))?;
+        match rows
+            .next()
+            .map_err(Error::sqlite("failed to read a stream summary"))?
+        {
+            Some(row) => Ok(Some(StreamSummary {
+                as_of_ts: row
+                    .get(0)
+                    .map_err(Error::sqlite("failed to read a stream summary"))?,
+                blob: row
+                    .get(1)
+                    .map_err(Error::sqlite("failed to read a stream summary"))?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Every stream summary of `source_id`, by stream name, alphabetically.
+    pub fn read_stream_summaries(&self, source_id: i64) -> Result<Vec<(String, StreamSummary)>> {
+        if !has_table(&self.conn, "stream_summary")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT stream, as_of_ts, blob FROM stream_summary \
+                 WHERE source_id = ?1 ORDER BY stream",
+            )
+            .map_err(Error::sqlite("failed to query stream summaries"))?;
+        let rows = stmt
+            .query_map([source_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    StreamSummary {
+                        as_of_ts: row.get(1)?,
+                        blob: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(Error::sqlite("failed to query stream summaries"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::sqlite("failed to read a stream summary"))
+    }
+
+    /// The `as_of_ts` of one stream's summary, without reading its blob.
+    /// What the catalog carries.
+    pub fn stream_summary_as_of(&self, source_id: i64, stream: &str) -> Result<Option<i64>> {
+        if !has_table(&self.conn, "stream_summary")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT as_of_ts FROM stream_summary WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, stream],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::sqlite("failed to read a stream summary's as_of_ts")(
+                    other,
+                )),
+            })
+    }
+
     /// Every stream name the caller's store holds rows under for
     /// `source_id`, alphabetically. Separate from [`all_streams`](Self::all_streams)
     /// on purpose: a store row does not make a stream exist, and a copy has
@@ -2129,6 +2281,9 @@ impl ArchiveMut {
     /// deletes it. [`Archive::open`] leaves the files as they are.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Archive::open_with_cache(path, READER_CACHE_SIZE_KIB, true)?;
+        db.conn
+            .execute_batch(STREAM_SUMMARY_SQL)
+            .map_err(Error::sqlite("failed to add the stream_summary table"))?;
         Ok(ArchiveMut::wrap(db))
     }
 
@@ -2426,6 +2581,8 @@ impl ArchiveMut {
                     .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
                 total.caller_rows +=
                     evict_caller_rows(&tx.tx, source_id, stream, cutoff_ts, floor)?;
+                total.stream_summaries +=
+                    evict_orphaned_summaries(&tx.tx, source_id, Some(stream))?;
             }
             // The clock-offset series is per SOURCE, and a per-stream pass
             // has no single cutoff for it: the streams it left alone may
@@ -2520,11 +2677,13 @@ impl ArchiveMut {
                     deleted
                 }
             };
+            let stream_summaries = evict_orphaned_summaries(&tx.tx, source_id, None)?;
             Ok(Evicted {
                 segments,
                 wal_rows,
                 live_rows: live_rows as usize,
                 caller_rows,
+                stream_summaries,
             })
         })
     }
@@ -2537,6 +2696,17 @@ impl ArchiveMut {
         rows: &[CallerRow],
     ) -> Result<()> {
         self.transaction(|tx| tx.insert_caller_rows(source_id, stream, rows))
+    }
+
+    /// [`Transaction::set_stream_summary`] as its own commit.
+    pub fn set_stream_summary(
+        &mut self,
+        source_id: i64,
+        stream: &str,
+        as_of_ts: i64,
+        blob: &[u8],
+    ) -> Result<()> {
+        self.transaction(|tx| tx.set_stream_summary(source_id, stream, as_of_ts, blob))
     }
 
     /// Mark a source cleanly finalized, outside any batch. The dump uses
@@ -2828,6 +2998,26 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    /// Set `stream`'s summary, replacing the one it had. See
+    /// [`StreamSummary`]. `as_of_ts` is the `last_ts` of the newest segment
+    /// the blob describes.
+    pub fn set_stream_summary(
+        &self,
+        source_id: i64,
+        stream: &str,
+        as_of_ts: i64,
+        blob: &[u8],
+    ) -> Result<()> {
+        self.tx
+            .execute(
+                "INSERT OR REPLACE INTO stream_summary(source_id, stream, as_of_ts, blob) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![source_id, stream, as_of_ts, blob],
+            )
+            .map(|_| ())
+            .map_err(Error::sqlite(format!("failed to set the {stream} summary")))
+    }
+
     /// Append rows to the caller's time-keyed store for `(source_id,
     /// stream)`, in the order given. See [`CallerRow`].
     pub fn insert_caller_rows(
@@ -2924,6 +3114,23 @@ fn mint_uuid(conn: &Connection) -> Result<String> {
 
 /// Whether `table` (or view) has a column named `column`, per this
 /// connection's schema.
+/// Whether `table` exists. For a table added after archives were already
+/// written: a read-only open of such an archive cannot create it.
+fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |_| Ok(()),
+    )
+    .map(|()| true)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(false),
+        other => Err(Error::sqlite(format!("failed to look for table {table}"))(
+            other,
+        )),
+    })
+}
+
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -3076,6 +3283,27 @@ CREATE TABLE caller_rows(
   blob BLOB NOT NULL
 );
 CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
+CREATE TABLE stream_summary(
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  stream TEXT NOT NULL,
+  as_of_ts INTEGER NOT NULL,
+  blob BLOB NOT NULL,
+  PRIMARY KEY (source_id, stream)
+);
+";
+
+/// `stream_summary` for an archive written before the table existed (dendro
+/// 0.2.x). Run on every writable open; an archive that has it is unchanged.
+/// A reader of such an archive sees no summaries until something opens it
+/// for writing, which is what a missing summary means anyway.
+const STREAM_SUMMARY_SQL: &str = "
+CREATE TABLE IF NOT EXISTS stream_summary(
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  stream TEXT NOT NULL,
+  as_of_ts INTEGER NOT NULL,
+  blob BLOB NOT NULL,
+  PRIMARY KEY (source_id, stream)
+);
 ";
 
 #[cfg(test)]

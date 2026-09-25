@@ -149,6 +149,14 @@ enum Msg {
         stream: String,
         rows: Vec<CallerRow>,
     },
+    /// Replace one stream's summary, in order with the ticks and seals
+    /// around it. See [`StreamSummary`](crate::archive::StreamSummary).
+    StreamSummary {
+        source_id: i64,
+        stream: String,
+        as_of_ts: i64,
+        blob: Vec<u8>,
+    },
     /// One source's last clock observation; marks *that* source complete.
     ///
     /// Does not stop the writer: an archive may hold several sources and the
@@ -884,6 +892,25 @@ impl SourceWriter {
             source_id: self.source_id,
             stream: stream.into(),
             rows,
+        })
+    }
+
+    /// Replace `stream`'s summary, in order with the ticks and seals handed
+    /// off before it, so a summary sent after a seal describes that seal.
+    /// `as_of_ts` is the `last_ts` of the newest segment the blob describes.
+    /// Fire-and-forget like [`caller_rows`](Self::caller_rows). See
+    /// [`StreamSummary`](crate::archive::StreamSummary).
+    pub fn stream_summary(
+        &mut self,
+        stream: impl Into<String>,
+        as_of_ts: i64,
+        blob: Vec<u8>,
+    ) -> Result<()> {
+        self.send(Msg::StreamSummary {
+            source_id: self.source_id,
+            stream: stream.into(),
+            as_of_ts,
+            blob,
         })
     }
 
@@ -1713,6 +1740,22 @@ fn writer_loop(
                     Ok(()) => health.committed(),
                     Err(e) if e.is_retryable() => health.dropped(e)?,
                     Err(e) => return Err(e),
+                }
+            }
+            Ok(Msg::StreamSummary {
+                source_id,
+                stream,
+                as_of_ts,
+                blob,
+            }) => {
+                // Metadata about the rows, not rows: a failure after retries
+                // leaves the previous summary (or none), which a reader
+                // already treats as stale, so it is logged and the recording
+                // goes on.
+                if let Err(e) = with_retries("setting a stream summary", || {
+                    db.set_stream_summary(source_id, &stream, as_of_ts, &blob)
+                }) {
+                    warn!("failed to set the {stream} summary ({e}); the previous one stays");
                 }
             }
             Ok(Msg::Finalize {

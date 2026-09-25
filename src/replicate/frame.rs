@@ -58,6 +58,9 @@ pub enum IndexKind {
 /// FIFO. The logical split survives as the variants below, which demultiplex
 /// to `caller_rows` and `wal`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Variants are added without a major version: match with a wildcard arm.
+/// A subscriber that meets a kind it does not know skips it (WIRE.md §7).
+#[non_exhaustive]
 pub enum Frame {
     /// A source's identity, and the ordinal every later frame for it carries.
     /// Applied with
@@ -198,6 +201,25 @@ pub enum Frame {
         /// Wall time minus `ts` at that moment.
         offset_ns: i64,
     },
+
+    /// One stream's summary, bound for `stream_summary`: an opaque blob and
+    /// the newest sealed row it describes. See
+    /// [`StreamSummary`](crate::archive::StreamSummary).
+    ///
+    /// Sent only to a subscriber that received the stream's whole history,
+    /// since a summary describes every segment the stream has and a
+    /// subscriber holding fewer would be told about columns it lacks. Sent
+    /// again whenever the publisher's changes.
+    StreamSummary {
+        /// Which source, by handshake ordinal.
+        source: u32,
+        /// The stream the summary describes.
+        stream: String,
+        /// The `last_ts` of the newest segment it describes.
+        as_of_ts: i64,
+        /// The summary. Stored verbatim and never decoded.
+        blob: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -208,7 +230,8 @@ impl Frame {
             | Frame::Index { source, .. }
             | Frame::Rows { source, .. }
             | Frame::Segment { source, .. }
-            | Frame::ClockOffset { source, .. } => *source,
+            | Frame::ClockOffset { source, .. }
+            | Frame::StreamSummary { source, .. } => *source,
         }
     }
 }
