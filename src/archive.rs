@@ -1753,7 +1753,18 @@ impl Archive {
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(Error::sqlite("failed to check the archive"))?;
         for line in lines {
-            let line = line.map_err(Error::sqlite("failed to read a check result"))?;
+            // The check can itself run into the damage it is walking and fail
+            // partway with `SQLITE_CORRUPT`, depending on which page the
+            // damage is on. That is the check finding corruption, so it is
+            // reported like any other line, and the check stops there.
+            let line = match line {
+                Ok(line) => line,
+                Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) => {
+                    problems.push(Problem::Corrupt(e.to_string()));
+                    break;
+                }
+                Err(e) => return Err(Error::sqlite("failed to read a check result")(e)),
+            };
             // SQLite says exactly "ok" when it is happy.
             if line != "ok" {
                 problems.push(Problem::Corrupt(line));

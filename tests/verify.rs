@@ -211,3 +211,55 @@ fn damage_inside_the_file_is_found_at_either_depth() {
         quick.problems
     );
 }
+
+/// Damage anywhere in the file is a finding, never an `Err`.
+///
+/// SQLite's integrity check can itself run into the damage it is walking and
+/// fail partway with `SQLITE_CORRUPT`, depending on which page is hit; that
+/// used to escape `verify` as an `Err` instead of a `Problem::Corrupt`. Which
+/// page does it depends on the file's layout, so rather than one scribble this
+/// sweeps a damaged page across the file.
+#[test]
+fn damage_on_any_page_is_reported_not_returned_as_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let clean = dir.path().join("clean.dendro");
+    {
+        let mut db = ArchiveMut::create(&clean).unwrap();
+        let id = db.insert_source(&meta()).unwrap();
+        for seq in 0..40u64 {
+            db.insert_segment(
+                id,
+                "s",
+                seq,
+                &SegmentMeta {
+                    rows: 1,
+                    first_ts: seq as i64,
+                    last_ts: seq as i64,
+                },
+                &vec![seq as u8; 8192],
+            )
+            .unwrap();
+        }
+        db.checkpoint_passive().unwrap();
+    }
+    let bytes = std::fs::read(&clean).unwrap();
+    let pages = bytes.len() / 4096;
+
+    let damaged = dir.path().join("damaged.dendro");
+    // Every page but the first, whose header an open refuses outright.
+    for page in 1..pages {
+        let mut copy = bytes.clone();
+        for b in &mut copy[page * 4096..(page + 1) * 4096] {
+            *b ^= 0xff;
+        }
+        std::fs::write(&damaged, &copy).unwrap();
+        let Ok(db) = Archive::open(&damaged) else {
+            continue;
+        };
+        for depth in [Depth::Quick, Depth::Full] {
+            if let Err(e) = db.verify(depth) {
+                panic!("damage on page {page} of {pages} made verify({depth:?}) fail: {e}");
+            }
+        }
+    }
+}
