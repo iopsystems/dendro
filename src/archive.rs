@@ -2058,6 +2058,52 @@ impl Archive {
             )))
     }
 
+    /// The newest caller row for `(source_id, stream)` with `ts <= upto`
+    /// that `pred` accepts, walking back from `upto` (newest first, and
+    /// last-inserted first within a timestamp).
+    ///
+    /// Where a caller's rows are a log that periodically restates its whole
+    /// state, this is how a reader finds the restatement to replay from
+    /// without reading the log from its start: `pred` recognizes one, and
+    /// rows are decoded only until it does.
+    pub fn last_caller_row_at_or_before(
+        &self,
+        source_id: i64,
+        stream: &str,
+        upto: i64,
+        mut pred: impl FnMut(&[u8]) -> bool,
+    ) -> Result<Option<CallerRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts, blob FROM caller_rows \
+                 WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3 \
+                 ORDER BY ts DESC, rowid DESC",
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to query caller rows for {stream}"
+            )))?;
+        let mut rows = stmt
+            .query(rusqlite::params![source_id, stream, upto])
+            .map_err(Error::sqlite(format!(
+                "failed to query caller rows for {stream}"
+            )))?;
+        while let Some(row) = rows.next().map_err(Error::sqlite(format!(
+            "failed to read a caller row for {stream}"
+        )))? {
+            let blob: Vec<u8> = row.get(1).map_err(Error::sqlite(format!(
+                "failed to read a caller row for {stream}"
+            )))?;
+            if pred(&blob) {
+                let ts: i64 = row.get(0).map_err(Error::sqlite(format!(
+                    "failed to read a caller row for {stream}"
+                )))?;
+                return Ok(Some(CallerRow { ts, blob }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Every stream name the caller's store holds rows under for
     /// `source_id`, alphabetically. Separate from [`all_streams`](Self::all_streams)
     /// on purpose: a store row does not make a stream exist, and a copy has

@@ -156,6 +156,43 @@ fn rows_read_back_in_range_in_order_and_several_per_timestamp() {
 }
 
 #[test]
+fn the_last_row_a_predicate_accepts_walks_back_from_a_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let id = fixture(&path);
+    let db = Archive::open(&path).unwrap();
+    let last = |upto: i64, want: &[u8]| {
+        db.last_caller_row_at_or_before(id, "s", upto, |b| b == want)
+            .unwrap()
+            .map(|r| (r.ts, String::from_utf8_lossy(&r.blob).to_string()))
+    };
+    // `upto` is inclusive, and a later row is never returned.
+    assert_eq!(last(5, b"d"), Some((5, "d".to_string())));
+    assert_eq!(last(4, b"d"), None);
+    // The walk passes rows the predicate refuses, across timestamps.
+    assert_eq!(last(5, b"a"), Some((1, "a".to_string())));
+    // Within a timestamp, the last inserted is met first.
+    let mut seen = Vec::new();
+    db.last_caller_row_at_or_before(id, "s", 3, |b| {
+        seen.push(String::from_utf8_lossy(b).to_string());
+        false
+    })
+    .unwrap();
+    assert_eq!(seen, vec!["c", "b", "a"]);
+    // Streams are separate, and a missing stream has none.
+    assert_eq!(
+        db.last_caller_row_at_or_before(id, "notes", i64::MAX, |_| true)
+            .unwrap()
+            .map(|r| r.ts),
+        Some(4)
+    );
+    assert!(db
+        .last_caller_row_at_or_before(id, "missing", i64::MAX, |_| true)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn a_store_row_does_not_make_a_stream_exist() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");

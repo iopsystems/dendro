@@ -33,6 +33,14 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `Archive::last_caller_row_at_or_before(source_id, stream, upto, pred)`:
+  the newest caller row at or before `upto` that `pred` accepts, walking
+  back and decoding rows only until one matches. A reader of a log that
+  restates its state periodically finds the restatement to replay from
+  without reading the log from its start.
+
 ## [0.3.0] - 2026-09-27
 
 ### Changed
