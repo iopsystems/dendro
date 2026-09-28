@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-28
+
 ### Added
 
 - `Archive::last_caller_row_at_or_before(source_id, stream, upto, pred)`:
