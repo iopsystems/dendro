@@ -1656,14 +1656,35 @@ impl Archive {
     /// A plain file copy is not equivalent: in WAL mode the main database
     /// file lags every commit since the last checkpoint, so copying it alone
     /// silently loses the most recent ticks.
+    ///
+    /// **Works on the read handle**, which is the only handle a live archive
+    /// allows a second party. [`Archive::open`] sets `query_only`, and SQLite
+    /// refuses `VACUUM INTO` under it ("attempt to write a readonly
+    /// database") although the statement writes only `dest`. So `query_only`
+    /// is lifted for this one statement and restored on every path. The
+    /// archive itself stays unwritable: the connection is
+    /// `SQLITE_OPEN_READ_ONLY`, and SQLite refuses a write to it regardless.
     pub fn vacuum_into(&self, dest: &Path) -> Result<()> {
         let dest = dest
             .to_str()
             .ok_or_else(|| format!("dump destination {} is not valid UTF-8", dest.display()))?;
-        self.conn
+        let query_only = self.pragma_u32("query_only")? != 0;
+        if query_only {
+            self.set_pragma("query_only", 0)?;
+        }
+        let dumped = self
+            .conn
             .execute("VACUUM INTO ?1", [dest])
-            .map_err(Error::sqlite(format!("failed to write the dump to {dest}")))?;
-        Ok(())
+            .map(|_| ())
+            .map_err(Error::sqlite(format!("failed to write the dump to {dest}")));
+        // Restored before the dump's result is looked at, so a failed dump
+        // still leaves the handle as it was. A failure to restore is the
+        // error that matters more: it leaves the handle less guarded than
+        // its caller believes.
+        if query_only {
+            self.set_pragma("query_only", 1)?;
+        }
+        dumped
     }
 
     /// The whole source's time span — every stream, segments and live WAL
@@ -3138,6 +3159,31 @@ CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `vacuum_into` works on the read handle, whose `query_only` refused it,
+    /// and leaves `query_only` set afterwards, after a failed dump too.
+    #[test]
+    fn vacuum_into_works_on_the_read_handle_and_restores_query_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.dendro");
+        drop(ArchiveMut::create(&path).unwrap());
+
+        let db = Archive::open(&path).unwrap();
+        assert_eq!(db.pragma_u32("query_only").unwrap(), 1, "the read handle");
+        let copy = dir.path().join("copy.dendro");
+        db.vacuum_into(&copy).unwrap();
+        assert_eq!(db.pragma_u32("query_only").unwrap(), 1, "restored");
+        Archive::open(&copy).unwrap();
+
+        // `dest` must not exist, so this dump fails; the guard comes back
+        // all the same.
+        assert!(db.vacuum_into(&copy).is_err());
+        assert_eq!(
+            db.pragma_u32("query_only").unwrap(),
+            1,
+            "restored on failure"
+        );
+    }
 
     #[test]
     fn create_applies_the_one_way_pragmas() {

@@ -33,6 +33,16 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Fixed
+
+- `Archive::vacuum_into` works on the read handle. `Archive::open` sets
+  `query_only`, and SQLite refused `VACUUM INTO` under it ("attempt to write
+  a readonly database") although the statement writes only the
+  destination, so a live archive, which allows a second party no other
+  handle, could not be dumped this way. `query_only` is lifted for the one
+  statement and restored on every path; the connection is still
+  `SQLITE_OPEN_READ_ONLY`, so the archive stays unwritable.
+
 ## [0.3.1] - 2026-09-28
 
 ### Added
