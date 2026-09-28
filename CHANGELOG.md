@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-27
+
 ### Changed
 
 - **Breaking:** `Frame` is `#[non_exhaustive]`. A `match` on it needs a
