@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-09-24
-updated: 2026-09-24
+updated: 2026-09-27
 ---
 
 # Read-optimized finished archives: a ladder from today's file to a flat layout
@@ -164,6 +164,36 @@ allocation and the parquet parse, and not the thousand page reads.
 exact copy of a live archive and the right one; it rewrites every page. It is
 not fsynced, per the `VACUUM INTO` documentation.
 
+**Footers are most of a wide segment, and the embedded Arrow schema is most
+of the footer** (*measured*, 2026-09-25). Two real recordings, converted from
+`.rez` with rezolus's `recording upgrade --to dendro` (segment bytes copied
+unchanged), read with dendro's API in release mode, warm page cache, three
+runs each:
+
+| | 1.28 GB, 9.6 h, older agent | 581 MB, 2.3 h, rezolus 5.22.0 |
+|---|---|---|
+| segments | 5,874 | 1,467 |
+| `read::catalog` | 7 ms, 28 MB peak RSS | 2 ms, 13 MB peak |
+| `probe` every stream | 8 ms, 4.5 MB pulled | 5 ms, 5.6 MB pulled |
+| every segment's footer | 0.43 s, 1,272 MB pulled, 110 MB peak | 0.28 s, 579 MB pulled, 329 MB peak |
+| footer bytes of those | 529 MB (42%) | 423 MB (73%) |
+
+The share is set by width. The per-task stream was 49% footer at 2,325
+columns per segment in the older recording and 88% at 13,941 in the 5.22.0
+one; narrow streams were 1–3%. The largest 5.22.0 segment held 37,644
+columns and 301 rows: 35.6 MB, of which the footer was 32.1 MB and its
+`ARROW:schema` key-value entry 27.5 MB. That entry is the serialized Arrow
+schema with every field's metadata, which for this stream is every task's
+labels, repeated in every segment. None of those columns was a relabelling
+generation: the stream's slot is the PID, so its width is the number of
+distinct PIDs a segment saw (396,117 over the recording, 10.6% of cells
+non-null on a host with heavy process churn).
+
+Identifying the archive needed little: on both files, and on the `.rez`
+files they came from, the `sources` row sat on page 3 with overflow pages up
+to 15 or 17, so a 60–68 KB prefix held it. The row itself was 14–21 KB,
+mostly the caller's system description and metric help text.
+
 **The review that reordered this entry.** The first draft led with a flat
 layout and argued against an HTTP VFS on the live file's 4 KiB fragmented
 chains, without pricing a VFS over a defragmented 64 KiB copy. The review
@@ -260,9 +290,22 @@ tail therefore uses summary ∪ tail probe, and `read::probe` on the sealed
 segments is what a reader does only for a stream with no summary. On a
 finished archive the summary is complete.
 
-What rezolus would put in it: metric names and kinds, column count, the
-series count its composition catalog wants, cadence, and its identity history
-as occupancy intervals. The caller replays its own event log once, at seal or
+**Shelved (2026-09-25).** Built as iopsystems/dendro#20 and not merged. The
+blob rezolus meant to put in it, every column's field metadata, is a
+timestamped change log for any stream whose slots change hands: it grows
+with every occupant a stream has had, must be rewritten whole after each
+seal inside a rolling buffer's tick, and after retention describes columns
+no segment holds any more. Keeping it true would make it `caller_rows`,
+which already is that log, and FORMAT.md §8 already says a fact that
+changes over time belongs there, never in field metadata. Rezolus's layout
+does that instead (rezolus `docs/journal/2026-09-25-dendro-archive-layout.md`):
+identity labels move to `caller_rows`, field metadata keeps what is fixed
+for the column's life, and the per-task stream becomes a long table keyed
+by an occupant number. With that, a stream's schema is small and rarely
+changes, and a reader learns it from one segment, so there is nothing left
+for a summary to save. What was originally meant to go in it: metric names
+and kinds, column count, the series count its composition catalog wants,
+cadence, and its identity history as occupancy intervals. The caller replays its own event log once, at seal or
 at finalize, and stores the intervals where every reader finds them; the log
 stays the source of truth and the restatement mechanism stays for the rolling
 buffer. No reader of a finished archive runs the replay.
@@ -321,7 +364,14 @@ a stream's payload list). A footer read needs a per-segment handle:
 `SegmentHandle::tail(n)` and `range(offset, len)` over `blob_open`, with
 `probe` using the first. On a contiguous chain this is a few page reads; on a
 fragmented one it still follows the chain but skips the allocation and the
-parse (Evidence). The writer keeps its plain `INSERT` (`rez_sqlite.rs:1558`
+parse (Evidence).
+
+**Worth less than this entry first assumed** (Evidence, 2026-09-25). A
+footer read skips the data section and keeps the footer, and on wide
+streams the footer is most of the segment: reading every footer of the
+581 MB recording would pull 423 MB instead of 579 MB. It matters for narrow
+streams, and for wide ones only until a caller stops putting per-column
+identity in field metadata. The writer keeps its plain `INSERT` (`rez_sqlite.rs:1558`
 records why `blob_open` is the wrong tool at write time). The rusqlite `blob`
 feature is already on.
 
@@ -486,9 +536,22 @@ Set aside, with why, so they are not re-derived:
 
 ## Outcome
 
-Open. Nothing is built. The order is: the consumer precondition, then steps
-1 and 2 together (they share the `SCHEMA_SQL` and completeness-test
-changes), then 3, then 4 when its gate is met, then 5 only on its own gate.
+Open. Step 1 is shelved (above): built as #20, not merged. Three fixes found
+while building it are kept and merged on their own: `Frame` is
+`#[non_exhaustive]`, `FrameReader` skips an unknown frame kind as `WIRE.md`
+§7 already said it did, and `verify` reports SQLite's integrity check
+failing partway on damage as a finding instead of an error.
+
+Steps 2 and 3 are revised by the 2026-09-25 evidence. Step 2 saves no bytes
+on the recordings measured, whose `sources` row already sits in the first
+17 pages; what it would add is a fixed offset readable without SQLite, and
+the row is 14–21 KB, so a 2 KiB header holds a subset of it, not a copy.
+Step 3 saves less than assumed, since footers are most of a wide segment.
+The largest lever the evidence shows is outside this crate: per-column
+labels in every segment's `ARROW:schema`, which rezolus's layout removes.
+Steps 4 and 5 keep their gates. The consumer precondition is being met
+from the other side: rezolus's reader for dendro archives is planned on
+this crate's API.
 
 ## Deferred or Reopen Items
 

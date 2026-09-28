@@ -33,6 +33,24 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Frame` is `#[non_exhaustive]`. A `match` on it needs a
+  wildcard arm; adding a frame kind is then not a breaking change.
+- `FrameReader::next_frame` skips a frame of a kind it does not know and counts
+  it in the new `FrameReader::skipped`, as `WIRE.md` §7 already said it did. It
+  returned an error, so a subscriber older than its publisher stopped at the
+  first new kind rather than losing only what that kind carried.
+  `decode_payload` on a single payload still refuses an unknown kind.
+
+### Fixed
+
+- `verify` returned an error when SQLite's integrity check ran into the damage
+  it was walking and failed partway with `SQLITE_CORRUPT`. That is the check
+  finding corruption, and it is now reported as `Problem::Corrupt` like any
+  other line. Damage to page 2, the first pointer-map page, reproduced it on
+  every archive; a new test sweeps a damaged page across the file.
+
 ## [0.2.2] - 2026-09-25
 
 ### Added

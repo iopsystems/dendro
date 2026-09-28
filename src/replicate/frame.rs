@@ -58,6 +58,9 @@ pub enum IndexKind {
 /// FIFO. The logical split survives as the variants below, which demultiplex
 /// to `caller_rows` and `wal`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Variants are added without a major version: match with a wildcard arm.
+/// A subscriber that meets a kind it does not know skips it (WIRE.md §7).
+#[non_exhaustive]
 pub enum Frame {
     /// A source's identity, and the ordinal every later frame for it carries.
     /// Applied with

@@ -770,3 +770,37 @@ fn an_index_that_appears_after_the_publisher_attached_still_opens_with_a_full() 
     let dst = Archive::open(&copy).unwrap();
     assert_eq!(wal_ts(&dst, 1, "s"), vec![2_000]);
 }
+
+/// A subscriber meeting a frame kind it does not know skips it and counts it
+/// (WIRE.md §7), and the frames around it still arrive. Before this the
+/// reader returned an error, so a subscriber older than its publisher stopped
+/// at the first new kind rather than losing only what that kind carried.
+#[test]
+fn an_unknown_frame_kind_is_skipped_not_fatal() {
+    use dendro::replicate::wire::{encode, write_preamble, FrameReader};
+
+    let before = Frame::ClockOffset {
+        source: 0,
+        ts: 1,
+        offset_ns: 2,
+    };
+    let after = Frame::ClockOffset {
+        source: 0,
+        ts: 3,
+        offset_ns: 4,
+    };
+    let mut stream = Vec::new();
+    write_preamble(&mut stream).unwrap();
+    stream.extend(encode(&before).unwrap());
+    // A kind no build has yet: a length prefix and a payload of kind 200.
+    let unknown = [200u8, 9, 9, 9];
+    stream.extend((unknown.len() as u32).to_le_bytes());
+    stream.extend(unknown);
+    stream.extend(encode(&after).unwrap());
+
+    let mut reader = FrameReader::new(stream.as_slice()).unwrap();
+    assert_eq!(reader.next_frame().unwrap(), Some(before));
+    assert_eq!(reader.next_frame().unwrap(), Some(after));
+    assert_eq!(reader.next_frame().unwrap(), None);
+    assert_eq!(reader.skipped(), 1);
+}

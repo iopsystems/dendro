@@ -283,7 +283,9 @@ is handed, so whatever decides who may hand it anything is the transport's.
   current version would misread silently.
 - **What does not.** A new frame kind. The length prefix makes an unknown kind
   skippable, so an older subscriber degrades to not applying it rather than to
-  misreading it. Adding a field to an existing frame *does* bump the version,
+  misreading it. `FrameReader` skips one and counts it (`skipped()`). Before
+  dendro 0.3.0 it returned an error instead, so a subscriber built on 0.2.x
+  stops at the first kind it does not know. Adding a field to an existing frame *does* bump the version,
   because §2 refuses a payload with trailing bytes.
 - **What this does not version.** The row payload, the segment's columns and
   the index blob are the caller's. `Handshake.metadata` carries the archive's
