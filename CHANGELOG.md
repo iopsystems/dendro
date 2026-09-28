@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-28
+
 ### Fixed
 
 - `Archive::vacuum_into` works on the read handle. `Archive::open` sets
