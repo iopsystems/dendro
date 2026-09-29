@@ -370,3 +370,78 @@ fn projection_trims_columns_and_drops_a_stream_left_with_none() {
     let rec_id = db.read_sources().unwrap()[0].id;
     assert!(db.all_streams(rec_id).unwrap().is_empty());
 }
+
+/// A stream the filter declines to project is copied byte for byte beside
+/// one it trims.
+#[test]
+fn a_stream_the_filter_does_not_project_is_copied_whole() {
+    struct KeepValueExceptNames;
+    impl ColumnFilter for KeepValueExceptNames {
+        fn keep(&self, field: &Field) -> bool {
+            matches!(field.name().as_str(), "timestamp" | "value")
+        }
+        fn is_data(&self, field: &Field) -> bool {
+            field.name() != "timestamp"
+        }
+        fn projects(&self, stream: &str) -> bool {
+            stream != "names"
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let dst_path = dir.path().join("dst.dendro");
+    let mut archive = Writer::create(&src_path, Box::new(ReadingEncoder)).unwrap();
+    let mut rec = archive.add_source(seed("probe")).unwrap();
+    rec.wal(vec![row("temps", 10, 7, "a"), row("names", 10, 1, "b")])
+        .unwrap();
+    rec.seal(vec!["temps".to_string(), "names".to_string()])
+        .unwrap();
+    // A tail too, which goes through the same choice: finalize leaves it in
+    // the WAL, and the copy encodes it.
+    rec.wal(vec![row("names", 20, 2, "c")]).unwrap();
+    rec.finalize((20, 0)).unwrap();
+    archive.join().unwrap();
+
+    let spec = CopySpec {
+        keep_columns: Some(&KeepValueExceptNames),
+        ..CopySpec::everything()
+    };
+    let src = Archive::open(&src_path).unwrap();
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    dst.transaction(|tx| rewrite::copy_sources_into(&src, tx, &spec, &ReadingEncoder))
+        .unwrap();
+
+    let src_id = src.read_sources().unwrap()[0].id;
+    let db = Archive::open(&dst_path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    let names: Vec<Vec<u8>> = db
+        .read_segments(id, "names")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    let original: Vec<Vec<u8>> = src
+        .read_segments(src_id, "names")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    assert_eq!(
+        original.len(),
+        1,
+        "one sealed segment; the last row is in the WAL"
+    );
+    assert_eq!(names.len(), 2, "the sealed segment, and the tail encoded");
+    assert_eq!(
+        names[0], original[0],
+        "the sealed segment is copied as it is"
+    );
+    assert_eq!(
+        decode(&names[1]),
+        vec![(20, 2, "c".to_string())],
+        "the tail keeps every column"
+    );
+    let temps = &db.read_segments(id, "temps").unwrap()[0].bytes;
+    assert_eq!(decode(temps), vec![(10, 7, String::new())], "trimmed");
+}
