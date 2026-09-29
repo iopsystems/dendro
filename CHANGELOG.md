@@ -33,6 +33,21 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `ColumnFilter::projects(stream)`, default `true`: a stream it returns
+  `false` for is copied as it is by a `keep_columns` pass, sealed segments
+  byte for byte and its tail unprojected. For a companion stream whose
+  columns a field-by-field filter cannot tell from the data's.
+
+### Fixed
+
+- `project_segment_columns` keeps the source file's key-value metadata
+  (all but `ARROW:schema`, which the writer writes for the projected
+  schema). It wrote the projection with only the caller's properties, so a
+  segment marked by its caller (a layout, a list of what its rows refer to)
+  lost the mark and could read back as another kind of segment.
+
 ## [0.3.2] - 2026-09-28
 
 ### Fixed

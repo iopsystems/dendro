@@ -395,6 +395,19 @@ pub trait ColumnFilter {
     fn keep(&self, field: &arrow::datatypes::Field) -> bool;
     /// Does this column carry data, as opposed to being structural?
     fn is_data(&self, field: &arrow::datatypes::Field) -> bool;
+    /// Project this stream's segments at all? A stream this returns `false`
+    /// for is copied as it is, byte for byte, like a copy with no
+    /// `keep_columns`.
+    ///
+    /// For a stream whose columns mean something other than the data
+    /// streams' do, which one field-by-field filter cannot tell apart: a
+    /// caller whose table has a companion stream (a list of what the table's
+    /// rows refer to, say) keeps that stream whole while trimming the table.
+    /// Every stream is projected by default.
+    fn projects(&self, stream: &str) -> bool {
+        let _ = stream;
+        true
+    }
 }
 
 /// What one copy pass carries across.
@@ -551,8 +564,9 @@ fn copy_sources_snapshotted(
             // numbering, and the reader splices segments in `seq` order, so
             // the copy's own numbering has to be dense and start at zero.
             let mut seq = 0u64;
+            let keep_columns = spec.keep_columns.filter(|k| k.projects(&table));
             for segment in src.segments_overlapping(rec.id, &table, spec.start, spec.end)? {
-                match spec.keep_columns {
+                match keep_columns {
                     // Column trim re-encodes; a stream with none of the kept
                     // columns projects to no data column and is dropped (its
                     // segments never inserted). Row count, timestamps
@@ -610,7 +624,7 @@ fn copy_sources_snapshotted(
                     // input catalogs a row the bytes do not contain.
                     last_ts: materialized.last_ts,
                 };
-                match spec.keep_columns {
+                match keep_columns {
                     Some(keep) => {
                         if let Some(projected) =
                             project_segment_columns(&materialized.bytes, keep, spec.props())?
@@ -679,6 +693,32 @@ pub fn project_segment_columns(
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
         .map_err(|e| Error::Message(format!("failed to open a segment for projection: {e}")))?;
     let schema = builder.schema().clone();
+    // The file's own key-value metadata travels with the projection: it is
+    // the caller's description of the segment (a layout marker, a list of
+    // what its rows refer to), and dropping it can make the copy read as a
+    // different kind of segment. Arrow's schema entry is left out; the
+    // writer writes the projected one.
+    let carried: Vec<parquet::file::metadata::KeyValue> = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .map(|kv| {
+            kv.iter()
+                .filter(|e| e.key != "ARROW:schema")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let props = if carried.is_empty() {
+        props
+    } else {
+        let mut kv = props.key_value_metadata().cloned().unwrap_or_default();
+        kv.extend(carried);
+        props
+            .into_builder()
+            .set_key_value_metadata(Some(kv))
+            .build()
+    };
 
     let mut indices: Vec<usize> = Vec::new();
     let mut has_value = false;
@@ -726,6 +766,84 @@ pub fn project_segment_columns(
 
 #[cfg(test)]
 mod tests {
+
+    /// A projection carries the source file's own key-value metadata, so a
+    /// segment the caller marked (a layout, a list of what its rows refer
+    /// to) is still marked after columns are dropped.
+    #[test]
+    fn a_projection_keeps_the_file_metadata() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        struct KeepA;
+        impl super::ColumnFilter for KeepA {
+            fn keep(&self, f: &Field) -> bool {
+                f.name() != "b"
+            }
+            fn is_data(&self, f: &Field) -> bool {
+                f.name() == "a"
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![5, 6])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                "layout".to_string(),
+                "long".to_string(),
+            )]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let projected =
+            super::project_segment_columns(&bytes, &KeepA, crate::segment::writer_props())
+                .unwrap()
+                .unwrap();
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(projected)).unwrap();
+        let kv = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        assert!(kv
+            .iter()
+            .any(|e| e.key == "layout" && e.value.as_deref() == Some("long")));
+        assert_eq!(
+            kv.iter().filter(|e| e.key == "ARROW:schema").count(),
+            1,
+            "one arrow schema, the projected one"
+        );
+        let fields: Vec<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(fields, vec!["timestamp", "a"]);
+    }
+
     use crate::archive::ArchiveMut;
 
     /// Every table in the schema is either copied by
