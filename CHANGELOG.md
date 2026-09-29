@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-29
+
 ### Added
 
 - `ColumnFilter::projects(stream)`, default `true`: a stream it returns
