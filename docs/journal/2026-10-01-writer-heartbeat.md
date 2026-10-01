@@ -64,7 +64,17 @@ Implemented with `tests/heartbeat.rs`: an idle writer beats and reads live;
 a writer that goes away without finalizing reads stopped; a copy of a
 running source reads stopped while the original stays live; a file without
 the columns reads unknown until a writer reopens it, adds them and beats.
-Cost: one `UPDATE` per open source every 5 s.
+Cost: one commit per writer every 5 s (an fsync at `synchronous=FULL`),
+holding one `UPDATE` per open source.
+
+A review (2026-10-01) found and the same PR fixed: a resume that reset the
+counter to 1, which a reader that had seen 1 would not notice; a copy into
+an existing older archive failing on the missing columns; the two column
+additions committed separately, so a crash between them left a file no
+reader could open; and a failed heartbeat start failing an add or resume
+that had already committed. `WriterState::Stopped` is documented as
+reversible: a writer blocked for three intervals reads as stopped until its
+next beat.
 
 ## Reopen
 

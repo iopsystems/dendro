@@ -247,7 +247,8 @@ pub struct SourceRow {
 ///
 /// A watch serves one source. The first observation of a source that is not
 /// complete is [`WriterState::Live`] until the heartbeat has had time to
-/// change.
+/// change. The caller supplies the time; on `wasm32-unknown-unknown`, where
+/// `Instant::now` panics, it has to come from the host.
 #[derive(Clone, Debug, Default)]
 pub struct HeartbeatWatch {
     seen: Option<(i64, std::time::Instant)>,
@@ -255,13 +256,17 @@ pub struct HeartbeatWatch {
 
 /// What [`HeartbeatWatch::observe`] concludes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriterState {
     /// The source was finalized; nothing more will be appended.
     Complete,
-    /// The heartbeat changed within the last few intervals.
+    /// The heartbeat changed, or has been watched for fewer than
+    /// [`STOPPED_AFTER_INTERVALS`] intervals.
     Live,
     /// The heartbeat has not changed for [`STOPPED_AFTER_INTERVALS`]
-    /// intervals: the writer was killed, or this file is a copy.
+    /// intervals: the writer was killed, this file is a copy, or a writer
+    /// is blocked for that long (a stalled disk). A later observation that
+    /// finds the heartbeat changed returns [`Live`](Self::Live) again.
     Stopped,
     /// The source has no heartbeat: no writer since the columns existed has
     /// written it.
@@ -286,6 +291,9 @@ impl HeartbeatWatch {
         let (Some(beat), Some(interval)) = (source.heartbeat, source.heartbeat_interval_ns) else {
             return WriterState::Unknown;
         };
+        if interval <= 0 {
+            return WriterState::Unknown;
+        }
         match self.seen {
             Some((seen, since)) if seen == beat => {
                 let interval = std::time::Duration::from_nanos(interval.max(0) as u64);
@@ -1150,16 +1158,21 @@ impl Archive {
         } else {
             "NULL"
         };
-        let heartbeat_cols = if has_column(&self.conn, "sources", "heartbeat")? {
-            "heartbeat, heartbeat_interval_ns"
+        let heartbeat_col = if has_column(&self.conn, "sources", "heartbeat")? {
+            "heartbeat"
         } else {
-            "NULL, NULL"
+            "NULL"
+        };
+        let interval_col = if has_column(&self.conn, "sources", "heartbeat_interval_ns")? {
+            "heartbeat_interval_ns"
+        } else {
+            "NULL"
         };
         let mut stmt = self
             .conn
             .prepare(&format!(
                 "SELECT id, labels, metadata, complete, clock_anchor_wall_ns, {uuid_col}, \
-                 {heartbeat_cols} FROM sources ORDER BY id"
+                 {heartbeat_col}, {interval_col} FROM sources ORDER BY id"
             ))
             .map_err(Error::sqlite("failed to query sources"))?;
         let rows = stmt
@@ -2280,14 +2293,21 @@ impl ArchiveMut {
     /// A nullable column an older reader ignores, so the schema version is
     /// unchanged (FORMAT.md §8).
     pub fn ensure_heartbeat_columns(&self) -> Result<()> {
-        if has_column(&self.conn, "sources", "heartbeat")? {
+        let mut sql = String::new();
+        for column in ["heartbeat", "heartbeat_interval_ns"] {
+            if !has_column(&self.conn, "sources", column)? {
+                sql.push_str(&format!(
+                    "ALTER TABLE sources ADD COLUMN {column} INTEGER; "
+                ));
+            }
+        }
+        if sql.is_empty() {
             return Ok(());
         }
+        // One transaction: SQLite's DDL is transactional, so a failure
+        // leaves neither column added rather than one.
         self.conn
-            .execute_batch(
-                "ALTER TABLE sources ADD COLUMN heartbeat INTEGER; \
-                 ALTER TABLE sources ADD COLUMN heartbeat_interval_ns INTEGER;",
-            )
+            .execute_batch(&format!("BEGIN; {sql}COMMIT;"))
             .map_err(Error::sqlite("failed to add the heartbeat columns"))?;
         Ok(())
     }
@@ -3059,12 +3079,17 @@ impl Transaction<'_> {
     }
 
     /// Set a source's heartbeat and its interval, as a copy carries them.
+    /// Does nothing in an archive without the columns: its sources read as
+    /// [`WriterState::Unknown`].
     pub fn set_heartbeat(
         &self,
         source_id: i64,
         heartbeat: Option<i64>,
         interval_ns: Option<i64>,
     ) -> Result<()> {
+        if !has_column(&self.tx, "sources", "heartbeat_interval_ns")? {
+            return Ok(());
+        }
         self.tx
             .execute(
                 "UPDATE sources SET heartbeat = ?2, heartbeat_interval_ns = ?3 WHERE id = ?1",
@@ -3076,8 +3101,23 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    /// Set the interval a writer bumps `source_id`'s heartbeat at, keeping
+    /// the count it has.
+    pub fn set_heartbeat_interval(&self, source_id: i64, interval_ns: i64) -> Result<()> {
+        self.tx
+            .execute(
+                "UPDATE sources SET heartbeat_interval_ns = ?2 WHERE id = ?1",
+                rusqlite::params![source_id, interval_ns],
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to set the heartbeat interval of source {source_id}"
+            )))?;
+        Ok(())
+    }
+
     /// Bump the heartbeat of each source in `source_ids`. A source whose
-    /// heartbeat is unset starts from 1.
+    /// heartbeat is unset starts from 1, and one that has a count continues
+    /// it, so a resumed source's heartbeat changes at its first beat.
     pub fn beat(&self, source_ids: &[i64]) -> Result<()> {
         for id in source_ids {
             self.tx

@@ -47,6 +47,11 @@ cannot reach a failed release any other way.
   `WriterState`: `Complete`, `Live`, `Stopped` (the heartbeat has not
   changed for `STOPPED_AFTER_INTERVALS` = 3 intervals: a killed writer or a
   copy) or `Unknown` (no heartbeat).
+- `writer::HEARTBEAT_INTERVAL`, `archive::STOPPED_AFTER_INTERVALS`,
+  `Transaction::set_heartbeat`, `Transaction::set_heartbeat_interval`,
+  `Transaction::beat` and `ArchiveMut::ensure_heartbeat_columns`.
+  `WriterState` is `#[non_exhaustive]`. A resumed source continues its
+  heartbeat count; an interval of zero or less reads as `Unknown`.
 - `Writer::create_beating_every` (feature `test-support`) chooses the
   heartbeat interval.
 

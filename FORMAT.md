@@ -171,10 +171,16 @@ caused).
   intervals of its own clock reads the writer as stopped
   (`archive::HeartbeatWatch`). The rule compares two values the file held,
   never the writer's clock with the reader's. A writer sets
-  `heartbeat_interval_ns` when it adds or resumes the source; copies carry
-  both columns unchanged, so a copy reads as stopped. `NULL` means no writer
-  since the columns existed has written the source; a reader treats that as
-  unknown.
+  `heartbeat_interval_ns` when it adds or resumes the source and continues
+  the count a previous session left. Copies carry both columns unchanged,
+  so a copy reads as stopped once a reader has seen it unchanged for three
+  intervals. A writer blocked for longer than that (a stalled disk) also
+  reads as stopped until its next beat, so a reader that acts on stopped
+  should keep looking. The heartbeat follows whoever has the source open for
+  writing, not whether data is arriving: a replication subscriber's copy of
+  a source beats for as long as the subscriber runs. `NULL` means no
+  heartbeat was recorded (an older archive or copier, or a source assembled
+  offline); a reader treats it as unknown.
 
 ### 3.2 `segments`
 
@@ -356,7 +362,7 @@ read them. The design, and what each layer would owe, is in
 
 An archive can be reopened by a later writer (`Writer::open`) and a source
 in it resumed (`resume_source`) as a **new writer session**. Nothing about
-the rows changes shape; four things are guaranteed:
+the rows changes shape; five things are guaranteed:
 
 - Segment numbering continues from `MAX(seq) + 1` per stream; the
   clock-offset series keeps what it had and cannot gain a second offset at
@@ -391,6 +397,9 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   way); a new reserved metadata key
   (`producer_epoch`, `writer_sessions` were); a new event kind. Old copiers
   drop what they do not know, which degrades to "unknown", never to wrong.
+  One exception: a writer older than the heartbeat that resumes a source a
+  newer writer left does not bump `heartbeat`, so a newer reader reads that
+  source as stopped while it is being appended to.
 - **What the format does not version, and whose problem it is.** The row
   payload and the segment's columns are the encoder's: a writer and a reader
   must run the same encoder over the same rows to the same bytes. The file

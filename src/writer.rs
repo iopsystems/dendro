@@ -1614,7 +1614,7 @@ fn writer_loop(
                     .insert_source_with_uuid(&seed, uuid.as_deref())
                     .and_then(|id| {
                         record_session(db, id, seed.clock_anchor_wall_ns, None)?;
-                        start_heartbeat(db, id, heartbeat_every)?;
+                        start_heartbeat(db, id, heartbeat_every);
                         // The encoder that will write this source's rows, so a
                         // reader can tell whether its own would decode them.
                         if let Some(version) = encoder.version() {
@@ -1638,11 +1638,10 @@ fn writer_loop(
                 clock_anchor_wall_ns,
                 reply,
             }) => {
-                let resumed =
-                    resume_source(db, source_id, clock_anchor_wall_ns, encoder).and_then(|r| {
-                        start_heartbeat(db, source_id, heartbeat_every)?;
-                        Ok(r)
-                    });
+                let resumed = resume_source(db, source_id, clock_anchor_wall_ns, encoder);
+                if resumed.is_ok() {
+                    start_heartbeat(db, source_id, heartbeat_every);
+                }
                 if let Ok(Resumed {
                     last_ts: Some(floor),
                     ..
@@ -1861,13 +1860,17 @@ fn writer_loop(
 }
 
 /// Record that this writer beats `source_id` every `every`, and give it its
-/// first beat.
-fn start_heartbeat(db: &mut ArchiveMut, source_id: i64, every: Duration) -> Result<()> {
+/// first beat. Best-effort, like the beats that follow: the source has
+/// already been added or resumed, and a source whose interval could not be
+/// set reads as unknown rather than as stopped.
+fn start_heartbeat(db: &mut ArchiveMut, source_id: i64, every: Duration) {
     let interval_ns = i64::try_from(every.as_nanos()).unwrap_or(i64::MAX);
-    db.transaction(|tx| {
-        tx.set_heartbeat(source_id, None, Some(interval_ns))?;
+    if let Err(e) = db.transaction(|tx| {
+        tx.set_heartbeat_interval(source_id, interval_ns)?;
         tx.beat(&[source_id])
-    })
+    }) {
+        warn!("failed to start the heartbeat of source {source_id}: {e}");
+    }
 }
 
 /// Hand freed pages back to the filesystem, but only once the free list is a
