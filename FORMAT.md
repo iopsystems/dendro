@@ -99,7 +99,9 @@ CREATE TABLE sources(
   metadata TEXT NOT NULL,             -- JSON object, string -> string
   complete INTEGER NOT NULL DEFAULT 0,
   clock_anchor_wall_ns INTEGER NOT NULL,
-  uuid TEXT                            -- absent in archives before it existed
+  uuid TEXT,                           -- absent in archives before it existed
+  heartbeat INTEGER,                   -- absent in archives before it existed
+  heartbeat_interval_ns INTEGER        -- absent in archives before it existed
 );
 CREATE TABLE segments(
   source_id INTEGER NOT NULL REFERENCES sources(id),
@@ -160,6 +162,19 @@ caused).
   archive and resumes the source (§7) clears it, and its own finalize sets
   it again.
 - **`clock_anchor_wall_ns`** pins the timeline, §5.
+- **`heartbeat`** is a counter the writer that has the source open bumps
+  every `heartbeat_interval_ns` nanoseconds, whether or not it has rows to
+  commit. It says whether a writer is running, which `complete` cannot: a
+  source with `complete = 0` may be still being written, or its writer may
+  have been killed, or the file may be a copy of a running archive. A reader
+  that reads the catalog again and finds `heartbeat` unchanged for three
+  intervals of its own clock reads the writer as stopped
+  (`archive::HeartbeatWatch`). The rule compares two values the file held,
+  never the writer's clock with the reader's. A writer sets
+  `heartbeat_interval_ns` when it adds or resumes the source; copies carry
+  both columns unchanged, so a copy reads as stopped. `NULL` means no writer
+  since the columns existed has written the source; a reader treats that as
+  unknown.
 
 ### 3.2 `segments`
 
@@ -353,6 +368,9 @@ the rows changes shape; four things are guaranteed:
 - The session is recorded under `writer_sessions` and as a
   `writer_session` event at its anchor.
 - `complete` is cleared at resume and set by the session's finalize.
+- The session sets `heartbeat_interval_ns` and bumps `heartbeat` (§3.1)
+  until it finalizes the source. A writer that reopens an archive without
+  those columns adds them.
 
 ## 8. Compatibility
 
@@ -368,8 +386,9 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   to be correct, a change to the live-WAL rule, a change to what
   `first_ts`/`last_ts`/`rows` mean, a change to the time model. A reader
   refuses a version above its own.
-- **What does not.** A nullable column an old reader can ignore (`uuid` and
-  `caller_index` were added this way); a new reserved metadata key
+- **What does not.** A nullable column an old reader can ignore (`uuid`,
+  `caller_index`, `heartbeat` and `heartbeat_interval_ns` were added this
+  way); a new reserved metadata key
   (`producer_epoch`, `writer_sessions` were); a new event kind. Old copiers
   drop what they do not know, which degrades to "unknown", never to wrong.
 - **What the format does not version, and whose problem it is.** The row
