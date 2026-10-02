@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-02
+
 ### Added
 
 - A writer heartbeat. `sources` gains two nullable columns, `heartbeat` and
