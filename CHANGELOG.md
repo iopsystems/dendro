@@ -33,6 +33,28 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- A writer heartbeat. `sources` gains two nullable columns, `heartbeat` and
+  `heartbeat_interval_ns` (no schema version change, FORMAT.md §3.1 and §8).
+  The writer sets the interval when it adds or resumes a source and bumps
+  the heartbeat of every source it has open every `HEARTBEAT_INTERVAL`
+  (5 s), whether or not it has rows to commit, until the source is
+  finalized. A writer that reopens an older archive adds the columns.
+  Copies carry both values unchanged.
+- `SourceRow::heartbeat` and `SourceRow::heartbeat_interval_ns`, and
+  `archive::HeartbeatWatch`, which turns successive reads of a source into a
+  `WriterState`: `Complete`, `Live`, `Stopped` (the heartbeat has not
+  changed for `STOPPED_AFTER_INTERVALS` = 3 intervals: a killed writer or a
+  copy) or `Unknown` (no heartbeat).
+- `writer::HEARTBEAT_INTERVAL`, `archive::STOPPED_AFTER_INTERVALS`,
+  `Transaction::set_heartbeat`, `Transaction::set_heartbeat_interval`,
+  `Transaction::beat` and `ArchiveMut::ensure_heartbeat_columns`.
+  `WriterState` is `#[non_exhaustive]`. A resumed source continues its
+  heartbeat count; an interval of zero or less reads as `Unknown`.
+- `Writer::create_beating_every` (feature `test-support`) chooses the
+  heartbeat interval.
+
 ## [0.3.3] - 2026-09-29
 
 ### Added

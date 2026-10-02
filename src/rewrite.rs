@@ -551,6 +551,12 @@ fn copy_sources_snapshotted(
         if rec.complete {
             tx.mark_complete(id)?;
         }
+        // Carried as it stands: no writer bumps the copy's heartbeat, so a
+        // reader of the copy sees it stop changing and reads the source as
+        // stopped, which a copy of a running source is.
+        if rec.heartbeat.is_some() || rec.heartbeat_interval_ns.is_some() {
+            tx.set_heartbeat(id, rec.heartbeat, rec.heartbeat_interval_ns)?;
+        }
         copied += 1;
 
         for table in src.all_streams(rec.id)? {

@@ -255,7 +255,30 @@ impl Writer {
         checkpoint_every: Duration,
     ) -> Result<Self> {
         let db = ArchiveMut::create(path)?;
-        Self::spawn(db, path, encoder, checkpoint_every, true)
+        Self::spawn(
+            db,
+            path,
+            encoder,
+            Cadence::checkpointing_every(checkpoint_every),
+            true,
+        )
+    }
+
+    /// [`create`](Self::create) with the heartbeat cadence chosen by the
+    /// caller, so a reader's liveness rule is testable without waiting
+    /// [`HEARTBEAT_INTERVAL`]s.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn create_beating_every(
+        path: &Path,
+        encoder: Box<dyn SegmentEncoder + Send>,
+        heartbeat_every: Duration,
+    ) -> Result<Self> {
+        let db = ArchiveMut::create(path)?;
+        let cadence = Cadence {
+            checkpoint_every: CHECKPOINT_INTERVAL,
+            heartbeat_every,
+        };
+        Self::spawn(db, path, encoder, cadence, true)
     }
 
     /// Reopen an existing archive to append to it.
@@ -276,7 +299,14 @@ impl Writer {
         checkpoint_every: Duration,
     ) -> Result<Self> {
         let db = ArchiveMut::open_for_write(path)?;
-        Self::spawn(db, path, encoder, checkpoint_every, false)
+        db.ensure_heartbeat_columns()?;
+        Self::spawn(
+            db,
+            path,
+            encoder,
+            Cadence::checkpointing_every(checkpoint_every),
+            false,
+        )
     }
 
     /// [`create_checkpointing_every`](Self::create_checkpointing_every) with
@@ -294,7 +324,13 @@ impl Writer {
     ) -> Result<Self> {
         let db = ArchiveMut::create(path)?;
         db.set_busy_timeout(busy_timeout)?;
-        Self::spawn(db, path, encoder, checkpoint_every, true)
+        Self::spawn(
+            db,
+            path,
+            encoder,
+            Cadence::checkpointing_every(checkpoint_every),
+            true,
+        )
     }
 
     /// Start the writer thread over an open connection. `created` says
@@ -304,7 +340,7 @@ impl Writer {
         db: ArchiveMut,
         path: &Path,
         encoder: Box<dyn SegmentEncoder + Send>,
-        checkpoint_every: Duration,
+        cadence: Cadence,
         created: bool,
     ) -> Result<Self> {
         // Bound 1: the hand-off blocks while the writer is busy,
@@ -327,16 +363,8 @@ impl Writer {
         // fallout from the spawn failure that actually happened.
         let thread = match std::thread::Builder::new()
             .name("dendro-writer".to_string())
-            .spawn(move || {
-                writer_thread(
-                    rx,
-                    db,
-                    thread_err,
-                    thread_shadowed,
-                    checkpoint_every,
-                    encoder,
-                )
-            }) {
+            .spawn(move || writer_thread(rx, db, thread_err, thread_shadowed, cadence, encoder))
+        {
             Ok(thread) => thread,
             Err(e) => {
                 // The closure was dropped with the failed spawn, and the
@@ -1416,7 +1444,7 @@ fn writer_thread(
     mut db: ArchiveMut,
     err_slot: ErrorSlot,
     shadowed: ShadowCounts,
-    checkpoint_every: Duration,
+    cadence: Cadence,
     encoder: Box<dyn SegmentEncoder + Send>,
 ) -> Result<()> {
     // `rx` is BORROWED by the loop, not moved into it, so the receiver outlives
@@ -1425,7 +1453,7 @@ fn writer_thread(
     // that moment the handle would report a generic "writer exited" instead of
     // the writer's own error. Holding `rx` here means the channel is still open
     // while the slot is written, so any send that fails afterwards finds it.
-    match writer_loop(&rx, &mut db, &shadowed, checkpoint_every, encoder.as_ref()) {
+    match writer_loop(&rx, &mut db, &shadowed, cadence, encoder.as_ref()) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Shared, not stringified: every handle reports this same failure,
@@ -1463,13 +1491,43 @@ fn writer_thread(
 /// copy loses bounded and small.
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often a writer bumps each open source's heartbeat (FORMAT.md §3.1),
+/// whether or not it has rows to commit. A reader decides a writer stopped
+/// after [`STOPPED_AFTER_INTERVALS`](crate::archive::STOPPED_AFTER_INTERVALS)
+/// of these without a change. One small transaction per interval.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The writer thread's timers.
+#[derive(Clone, Copy, Debug)]
+struct Cadence {
+    checkpoint_every: Duration,
+    heartbeat_every: Duration,
+}
+
+impl Cadence {
+    fn checkpointing_every(checkpoint_every: Duration) -> Self {
+        Self {
+            checkpoint_every,
+            heartbeat_every: HEARTBEAT_INTERVAL,
+        }
+    }
+}
+
 fn writer_loop(
     rx: &Receiver<Msg>,
     db: &mut ArchiveMut,
     shadowed: &ShadowCounts,
-    checkpoint_every: Duration,
+    cadence: Cadence,
     encoder: &(dyn SegmentEncoder + Send),
 ) -> Result<()> {
+    let Cadence {
+        checkpoint_every,
+        heartbeat_every,
+    } = cadence;
+    // Sources added or resumed and not yet finalized: the ones whose
+    // heartbeat this writer bumps.
+    let mut beating: BTreeSet<i64> = BTreeSet::new();
+    let mut last_beat = Instant::now();
     // Next segment sequence number, per (source, stream). Keyed by both
     // because `seq` is scoped to a source's stream in the `segments` table:
     // two sources of the same host have the same stream names and each
@@ -1510,7 +1568,23 @@ fn writer_loop(
         // `recv_timeout`, not `recv`: a writer with nothing to do still has to
         // wake and checkpoint. A source that has gone quiet is exactly when
         // someone copies it.
-        let waited = rx.recv_timeout(checkpoint_every.saturating_sub(last_checkpoint.elapsed()));
+        let waited = rx.recv_timeout(
+            checkpoint_every
+                .saturating_sub(last_checkpoint.elapsed())
+                .min(heartbeat_every.saturating_sub(last_beat.elapsed())),
+        );
+        if last_beat.elapsed() >= heartbeat_every {
+            // Best-effort, like the checkpoint: a missed beat is one a reader
+            // tolerates (it waits several intervals), and failing the writer
+            // over one would cost the recording.
+            if !beating.is_empty() {
+                let ids: Vec<i64> = beating.iter().copied().collect();
+                if let Err(e) = db.transaction(|tx| tx.beat(&ids)) {
+                    warn!("failed to bump the heartbeat: {e}");
+                }
+            }
+            last_beat = Instant::now();
+        }
         if last_checkpoint.elapsed() >= checkpoint_every {
             // Best-effort: a checkpoint that cannot proceed (a reader is
             // holding an older snapshot) is not an error, and failing the
@@ -1540,6 +1614,7 @@ fn writer_loop(
                     .insert_source_with_uuid(&seed, uuid.as_deref())
                     .and_then(|id| {
                         record_session(db, id, seed.clock_anchor_wall_ns, None)?;
+                        start_heartbeat(db, id, heartbeat_every);
                         // The encoder that will write this source's rows, so a
                         // reader can tell whether its own would decode them.
                         if let Some(version) = encoder.version() {
@@ -1552,8 +1627,9 @@ fn writer_loop(
                 // A failed insert is reported to the caller and does NOT kill
                 // the writer: an archive's other sources are still valid,
                 // and the caller decides whether to give up.
-                if inserted.is_ok() {
+                if let Ok(id) = &inserted {
                     added += 1;
+                    beating.insert(*id);
                 }
                 let _ = reply.send(inserted);
             }
@@ -1563,6 +1639,9 @@ fn writer_loop(
                 reply,
             }) => {
                 let resumed = resume_source(db, source_id, clock_anchor_wall_ns, encoder);
+                if resumed.is_ok() {
+                    start_heartbeat(db, source_id, heartbeat_every);
+                }
                 if let Ok(Resumed {
                     last_ts: Some(floor),
                     ..
@@ -1572,6 +1651,7 @@ fn writer_loop(
                 }
                 if resumed.is_ok() {
                     added += 1;
+                    beating.insert(source_id);
                 }
                 let _ = reply.send(resumed);
             }
@@ -1739,6 +1819,7 @@ fn writer_loop(
                     })
                 })?;
                 finalized += 1;
+                beating.remove(&source_id);
                 // Deliberately NOT returning here, and not reclaiming yet. An
                 // archive may hold several sources; this one is complete,
                 // the others may still be writing. The reclaim is a
@@ -1775,6 +1856,20 @@ fn writer_loop(
                 return Ok(());
             }
         }
+    }
+}
+
+/// Record that this writer beats `source_id` every `every`, and give it its
+/// first beat. Best-effort, like the beats that follow: the source has
+/// already been added or resumed, and a source whose interval could not be
+/// set reads as unknown rather than as stopped.
+fn start_heartbeat(db: &mut ArchiveMut, source_id: i64, every: Duration) {
+    let interval_ns = i64::try_from(every.as_nanos()).unwrap_or(i64::MAX);
+    if let Err(e) = db.transaction(|tx| {
+        tx.set_heartbeat_interval(source_id, interval_ns)?;
+        tx.beat(&[source_id])
+    }) {
+        warn!("failed to start the heartbeat of source {source_id}: {e}");
     }
 }
 
