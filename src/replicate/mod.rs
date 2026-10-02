@@ -8,7 +8,7 @@
 //!
 //! # Why this lives in dendro
 //!
-//! [`rewrite`](crate::rewrite) already copies an archive into another one, and
+//! [`rewrite`] already copies an archive into another one, and
 //! the fixed set of tables it carries — `sources`, `segments`, `wal`,
 //! `clock_offsets`, `caller_rows` — is this crate's own statement of what an
 //! archive is. Replication is that same copy with the clock running, so the
