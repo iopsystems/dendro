@@ -33,19 +33,27 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-11
+
 ### Changed
 
 - **Breaking:** a feature `archive`, on by default, gates the container and
   everything that reads or writes it: `archive`'s SQLite part, `read`,
   `rewrite`, `segment`, `replicate::ArchivePublisher`, the `Error::Sqlite`
-  variant, `Error::sqlite`, `Error::sqlite_code` and `From<rusqlite::Error> for Error`,
-  and the arrow, bytes,
-  parquet, rusqlite, serde_json and tracing dependencies. `write` implies it.
-  With no features the crate is the replication wire (`replicate::{Frame,
-  wire}`, `keys`, `archive::{WalRow, SegmentMeta}`, `seal`) and has no
-  dependencies. A user that sets `default-features = false` and reads archives
-  adds `features = ["archive"]`. `Error::is_retryable` and
-  `Error::is_constraint` are false without it.
+  variant, `Error::sqlite`, `Error::sqlite_code` and
+  `From<rusqlite::Error> for Error`, and the arrow, bytes, parquet, rusqlite,
+  serde_json and tracing dependencies. `write` implies it. With no features
+  the crate is the replication wire (`replicate::{Frame, wire, IndexKind,
+  IndexState, NO_INDEX_STATE}`, `keys`, `archive::{WalRow, SegmentMeta}`,
+  `seal`, `Error`) and has no dependencies. A user that sets
+  `default-features = false` and reads archives adds
+  `features = ["archive"]`. `Error::is_retryable` and `Error::is_constraint`
+  are false without it.
+
+### Fixed
+
+- The docs.rs build. It failed for 0.3.3 and 0.3.4 because nightly removed
+  `feature(doc_auto_cfg)`; the crate now enables `feature(doc_cfg)`.
 
 ## [0.3.4] - 2026-10-02
 
