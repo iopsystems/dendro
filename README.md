@@ -239,9 +239,9 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   not included** — HTTP, a Unix socket or a file is yours, which is what keeps
   this storage-shaped. A live tail ships rows and the subscriber seals its
   own; a catch-up ships sealed segments, so "give me the last hour" needs no
-  second mechanism. Not behind a feature: it adds no dependency and builds
-  wherever the crate does. `Subscriber` needs `write`, because it drives the
-  writer; publishing is a read and works in the reader build.
+  second mechanism. `Frame` and `wire` need no feature and no dependency.
+  `ArchivePublisher` reads an archive, so it needs `archive`; `Subscriber`
+  needs `write`, because it drives the writer.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
   segment: the Parquet BLOBs pass through byte-identical and only the catalog
   changes. Column projection is the one exception, and it is opt-in.
@@ -286,10 +286,11 @@ anything else holds it. See
 
 | feature | default | what it gates |
 |---|---|---|
-| `write` | on | The writer thread. Off, the crate is a reader, which is the configuration that compiles for `wasm32-unknown-unknown`: `std::thread::spawn` builds for wasm32 and then panics at runtime. |
+| `archive` | on | The SQLite container and everything that reads or writes it: `archive::{Archive, ArchiveMut, ...}`, `read`, `rewrite`, `segment`, `replicate::ArchivePublisher`. Off, the crate is the replication wire (`replicate::{Frame, wire}`, `keys`, `seal`, `archive::{WalRow, SegmentMeta}`) and has no dependencies. |
+| `write` | on | The writer thread. Implies `archive`. Off with `archive` on, the crate is a reader, which is the configuration that compiles for `wasm32-unknown-unknown`: `std::thread::spawn` builds for wasm32 and then panics at runtime. |
 | `test-support` | off | Test-only accessors that downstream crates' tests need. |
 
-To check the reader build against wasm32, run `./scripts/check-wasm.sh`. It is
+To check the reader and wire builds against wasm32, run `./scripts/check-wasm.sh`. It is
 what CI runs, and it exists because the C dependencies need a clang with the
 WebAssembly backend: Ubuntu's has it, Apple's does not, and without the script
 a macOS checkout fails several hundred lines into a build of zstd and SQLite

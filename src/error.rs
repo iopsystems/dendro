@@ -279,6 +279,7 @@ impl Error {
     /// full disk, an interrupted call, memory pressure, a schema change under
     /// a prepared statement — so a retry before giving up on the work can
     /// succeed.
+    ///
     /// Always false without the `archive` feature, which is the only source of
     /// such errors.
     pub fn is_retryable(&self) -> bool {
@@ -304,6 +305,8 @@ impl Error {
     /// A uniqueness or other constraint violation: the row is wrong, the
     /// database is fine. For a tick batched across sources, that means one
     /// source's rows are bad and the others' are not.
+    ///
+    /// Always false without the `archive` feature.
     pub fn is_constraint(&self) -> bool {
         #[cfg(not(feature = "archive"))]
         return false;

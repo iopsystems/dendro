@@ -38,7 +38,8 @@ cannot reach a failed release any other way.
 - **Breaking:** a feature `archive`, on by default, gates the container and
   everything that reads or writes it: `archive`'s SQLite part, `read`,
   `rewrite`, `segment`, `replicate::ArchivePublisher`, the `Error::Sqlite`
-  variant, `Error::sqlite` and `Error::sqlite_code`, and the arrow, bytes,
+  variant, `Error::sqlite`, `Error::sqlite_code` and `From<rusqlite::Error> for Error`,
+  and the arrow, bytes,
   parquet, rusqlite, serde_json and tracing dependencies. `write` implies it.
   With no features the crate is the replication wire (`replicate::{Frame,
   wire}`, `keys`, `archive::{WalRow, SegmentMeta}`, `seal`) and has no

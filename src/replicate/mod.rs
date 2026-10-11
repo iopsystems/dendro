@@ -84,17 +84,14 @@
 //! less than replaying the rows that built them. "Give me the last hour"
 //! therefore needs no second mechanism.
 //!
-//! # Always here
+//! # Features
 //!
-//! This is not behind a feature. It adds no dependency — it is built from the
-//! `archive`, `error` and `segment` types that already ship — and it compiles
-//! wherever the crate does, including `wasm32-unknown-unknown`. Gating it would
-//! have cost discoverability and bought nothing.
-//!
-//! [`Subscriber`](crate::replicate::Subscriber) alone needs the `write`
-//! feature, and for the reason that feature exists at all: it drives a
+//! `Frame` and `wire` need no feature. They are built from `WalRow`,
+//! `SegmentMeta` and `Error`, which compile without SQLite, so a producer that
+//! serves frames depends on dendro with `default-features = false`.
+//! `ArchivePublisher` reads an archive and needs `archive`.
+//! [`Subscriber`](crate::replicate::Subscriber) needs `write`: it drives a
 //! [`Writer`](crate::writer::Writer), which spawns a thread.
-//! `ArchivePublisher` needs no writer, because publishing is a read.
 //!
 //! # The wire
 //!

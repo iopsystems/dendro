@@ -1,7 +1,7 @@
 // Feature annotations in the rendered docs. `docsrs` is set only by the
 // docs.rs build (see `[package.metadata.docs.rs]`), which runs nightly, so
 // this is inert for every ordinary build including the stable one.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Every public item carries its own docs, and CI runs rustdoc with
 // `-D warnings`, so this is a build failure rather than advice. It exists
 // because a moved function leaves its doc block behind: seven of them had
@@ -322,8 +322,8 @@ pub use error::{Error, ReadOnly, Result};
 ///
 /// Behind the `write` feature, which is the one gate in this crate with a
 /// hard technical reason: the writer runs on a thread, and
-/// `wasm32-unknown-unknown` has none. With the feature off the crate is a
-/// reader, which is the configuration that works in a browser.
+/// `wasm32-unknown-unknown` has none. With it off and `archive` on, the crate
+/// is a reader, which is the configuration that works in a browser.
 ///
 /// The failure is clean rather than a trap. This crate uses
 /// `std::thread::Builder::spawn`, which returns `io::Result`, and reports the
@@ -334,7 +334,8 @@ pub use error::{Error, ReadOnly, Result};
 /// **A compile check cannot verify this.** `cargo check --target
 /// wasm32-unknown-unknown` passes on code that creates threads, because the
 /// call compiles and only fails when reached. That is why
-/// `scripts/check-wasm.sh` checks the reader configuration and never this one:
-/// an instrument that cannot fail on the hazard proves nothing by passing.
+/// `scripts/check-wasm.sh` checks the reader and wire configurations and never
+/// this one: an instrument that cannot fail on the hazard proves nothing by
+/// passing.
 #[cfg(feature = "write")]
 pub mod writer;
