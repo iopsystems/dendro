@@ -1,6 +1,6 @@
 [package]
 name = "dendro"
-version = "0.3.5-alpha.0"
+version = "0.4.0-alpha.0"
 edition = "2021"
 # The floor the dependency graph sets (arrow/parquet 58 require 1.85). CI
 # builds on it, so raising it is a deliberate act rather than a drift. Note
@@ -27,9 +27,9 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-arrow = "58.2.0"
-bytes = "1"
-parquet = { version = "58.2.0", default-features = false, features = [
+arrow = { version = "58.2.0", optional = true }
+bytes = { version = "1", optional = true }
+parquet = { version = "58.2.0", default-features = false, optional = true, features = [
     "arrow",
     "simdutf8",
     "zstd",
@@ -39,17 +39,29 @@ parquet = { version = "58.2.0", default-features = false, features = [
 ] }
 # `bundled` compiles SQLite from source: slower builds, no runtime system
 # dependency, and it is what lets the crate build for wasm32.
-rusqlite = { version = "0.40", features = ["bundled", "blob", "serialize"] }
-serde_json = "1.0"
-tracing = "0.1"
+rusqlite = { version = "0.40", optional = true, features = ["bundled", "blob", "serialize"] }
+serde_json = { version = "1.0", optional = true }
+tracing = { version = "0.1", optional = true }
 
 [features]
 default = ["write"]
+# The archive: the SQLite container, its catalog, segments, reads, rewrites
+# and the archive publisher. Off, the crate is the replication wire alone
+# (`replicate::{Frame, wire}`, the row types and `keys`), with no SQLite,
+# arrow or parquet, for a producer that serves frames and stores nothing.
+archive = [
+    "dep:arrow",
+    "dep:bytes",
+    "dep:parquet",
+    "dep:rusqlite",
+    "dep:serde_json",
+    "dep:tracing",
+]
 # The append side: the streaming writer, its checkpoint thread, and retention.
-# With it off the crate is a READER — container, catalog, WAL-tail
-# materialization — which is the configuration that compiles for
+# With it off (and `archive` on) the crate is a READER — container, catalog,
+# WAL-tail materialization — which is the configuration that compiles for
 # `wasm32-unknown-unknown`.
-write = []
+write = ["archive"]
 # Test-only accessors (commit counters, fixture builders) that downstream
 # crates' tests need. Not `#[cfg(test)]`: a `#[cfg(test)]` item here is
 # invisible to a crate that depends on dendro.

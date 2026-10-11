@@ -33,6 +33,19 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** a feature `archive`, on by default, gates the container and
+  everything that reads or writes it: `archive`'s SQLite part, `read`,
+  `rewrite`, `segment`, `replicate::ArchivePublisher`, the `Error::Sqlite`
+  variant, `Error::sqlite` and `Error::sqlite_code`, and the arrow, bytes,
+  parquet, rusqlite, serde_json and tracing dependencies. `write` implies it.
+  With no features the crate is the replication wire (`replicate::{Frame,
+  wire}`, `keys`, `archive::{WalRow, SegmentMeta}`, `seal`) and has no
+  dependencies. A user that sets `default-features = false` and reads archives
+  adds `features = ["archive"]`. `Error::is_retryable` and
+  `Error::is_constraint` are false without it.
+
 ## [0.3.4] - 2026-10-02
 
 ### Added

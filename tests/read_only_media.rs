@@ -4,6 +4,9 @@
 //! refuses to. Every document names `open_read_only` as the open for that
 //! case, so this is where the claim is checked: a directory nothing can write
 //! to, with and without the sidecars a killed writer leaves behind.
+
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
 #![cfg(all(unix, feature = "write", feature = "test-support"))]
 
 use std::collections::BTreeMap;

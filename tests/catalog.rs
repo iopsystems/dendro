@@ -1,6 +1,9 @@
 //! The lazy read: what the catalog answers without a BLOB, one segment for
 //! a schema probe, a time-bounded read, and bytes fetched on demand.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 

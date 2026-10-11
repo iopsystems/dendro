@@ -4,6 +4,9 @@
 //! recognized without opening it and refused before any pragma writes to it;
 //! the source uuid is what lets two archives agree they hold the same source.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 
 use dendro::archive::{sniff, sniff_bytes, Archive, ArchiveMut, Sniff, SourceMeta, WalRow};

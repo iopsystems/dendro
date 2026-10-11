@@ -5,6 +5,9 @@
 //! seal could disagree about a live tail — the symmetry the crate depends on,
 //! broken silently.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 
 use dendro::archive::{ArchiveMut, SourceMeta, WalRow};

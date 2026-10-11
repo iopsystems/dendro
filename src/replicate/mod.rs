@@ -109,7 +109,9 @@ pub mod wire;
 
 pub use frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
 
+#[cfg(feature = "archive")]
 mod publisher;
+#[cfg(feature = "archive")]
 pub use publisher::ArchivePublisher;
 
 #[cfg(feature = "write")]

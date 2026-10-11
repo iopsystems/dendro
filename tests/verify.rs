@@ -2,6 +2,9 @@
 //! able to answer without reading all of it and seeing whether anything
 //! throws.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, ArchiveMut, Depth, Problem, SegmentMeta, SourceMeta, WalRow};

@@ -278,23 +278,30 @@ pub mod keys {
 }
 
 /// The container: schema, catalog, and every statement that touches SQL.
+///
+/// The row types the wire shares ([`archive::WalRow`],
+/// [`archive::SegmentMeta`]) are always present; the container needs the
+/// `archive` feature.
 pub mod archive;
 /// What can go wrong.
 pub mod error;
 /// Resolving an archive to segment bytes, live tail included.
+#[cfg(feature = "archive")]
 pub mod read;
 /// An archive's contents as a stream of frames, and the applier that turns
 /// them back into an archive.
 ///
-/// Not behind a feature. It adds no dependency and compiles wherever the crate
-/// does, so gating it would buy nothing and cost discoverability. The
-/// subscriber alone needs `write`, because it needs the writer's thread.
+/// The frames and the wire need no feature. The publisher reads an archive,
+/// so it needs `archive`; the subscriber needs `write`, because it needs the
+/// writer's thread.
 pub mod replicate;
 /// Combining, trimming and time-bounding archives without decoding a segment.
+#[cfg(feature = "archive")]
 pub mod rewrite;
 /// When to seal.
 pub mod seal;
 /// Segments, and the encoder boundary.
+#[cfg(feature = "archive")]
 pub mod segment;
 
 /// The error type and its `Result`, at the crate root.

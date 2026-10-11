@@ -9,6 +9,9 @@
 //! These tests stage that interleaving deterministically by committing from a
 //! second connection while the reader is mid-answer.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
