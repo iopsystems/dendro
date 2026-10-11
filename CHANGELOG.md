@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-11
+
 ### Changed
 
 - **Breaking:** a feature `archive`, on by default, gates the container and
