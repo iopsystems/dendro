@@ -101,9 +101,14 @@ if ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknow
     rustup target add wasm32-unknown-unknown
 fi
 
-# The reader build, which is what has to reach wasm32. Replication is part of
-# it rather than a feature: publishing is a read, so `ArchivePublisher` and the
-# codec build here, and only `Subscriber` is gated on `write` for the thread.
+# The reader build, which is what has to reach wasm32. Publishing is a read,
+# so `ArchivePublisher` and the codec build here, and only `Subscriber` is
+# gated on `write` for the thread.
+set -- cargo check --no-default-features --features archive --target wasm32-unknown-unknown
+echo "+ $*"
+"$@"
+
+# The wire alone, which a producer serving frames compiles.
 set -- cargo check --no-default-features --target wasm32-unknown-unknown
 echo "+ $*"
 "$@"

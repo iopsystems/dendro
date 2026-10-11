@@ -7,6 +7,9 @@
 //! caller's floor, and never
 //! make a stream exist.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

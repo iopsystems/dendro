@@ -119,7 +119,9 @@ pub enum Error {
     /// keeps SQLite's own error, and with it the result code — which is what
     /// lets a caller (the writer thread, mostly) tell a lock that will clear
     /// from a constraint that will not from a corrupt file that is fatal. See
-    /// [`Error::is_retryable`] and [`Error::is_constraint`].
+    /// [`Error::is_retryable`] and [`Error::is_constraint`]. Present with the
+    /// `archive` feature.
+    #[cfg(feature = "archive")]
     Sqlite {
         /// What was being done, for the message. Empty for a bare conversion.
         context: String,
@@ -205,7 +207,9 @@ impl fmt::Display for Error {
                 f,
                 "the archive writer thread exited before the source finished"
             ),
+            #[cfg(feature = "archive")]
             Error::Sqlite { context, source } if context.is_empty() => write!(f, "{source}"),
+            #[cfg(feature = "archive")]
             Error::Sqlite { context, source } => write!(f, "{context}: {source}"),
             Error::Message(m) => write!(f, "{m}"),
         }
@@ -217,6 +221,7 @@ impl std::error::Error for Error {
         match self {
             Error::Encoder { source, .. } => Some(&**source),
             Error::Writer(e) => Some(&**e),
+            #[cfg(feature = "archive")]
             Error::Sqlite { source, .. } => Some(source),
             _ => None,
         }
@@ -237,6 +242,7 @@ impl From<&str> for Error {
     }
 }
 
+#[cfg(feature = "archive")]
 impl From<rusqlite::Error> for Error {
     fn from(source: rusqlite::Error) -> Self {
         Error::Sqlite {
@@ -249,6 +255,7 @@ impl From<rusqlite::Error> for Error {
 impl Error {
     /// `map_err` adapter for a SQLite call: `context` names what was being
     /// done, and the result code travels with it.
+    #[cfg(feature = "archive")]
     pub fn sqlite(context: impl Into<String>) -> impl FnOnce(rusqlite::Error) -> Error {
         let context = context.into();
         move |source| Error::Sqlite { context, source }
@@ -257,6 +264,7 @@ impl Error {
     /// SQLite's primary result code, when this error (or the writer failure
     /// it wraps) is SQLite's. `None` for everything else, including a SQLite
     /// error that rusqlite raised without a code.
+    #[cfg(feature = "archive")]
     pub fn sqlite_code(&self) -> Option<rusqlite::ErrorCode> {
         match self.root() {
             Error::Sqlite {
@@ -271,8 +279,15 @@ impl Error {
     /// full disk, an interrupted call, memory pressure, a schema change under
     /// a prepared statement — so a retry before giving up on the work can
     /// succeed.
+    ///
+    /// Always false without the `archive` feature, which is the only source of
+    /// such errors.
     pub fn is_retryable(&self) -> bool {
+        #[cfg(not(feature = "archive"))]
+        return false;
+        #[cfg(feature = "archive")]
         use rusqlite::ErrorCode::*;
+        #[cfg(feature = "archive")]
         matches!(
             self.sqlite_code(),
             Some(
@@ -290,7 +305,12 @@ impl Error {
     /// A uniqueness or other constraint violation: the row is wrong, the
     /// database is fine. For a tick batched across sources, that means one
     /// source's rows are bad and the others' are not.
+    ///
+    /// Always false without the `archive` feature.
     pub fn is_constraint(&self) -> bool {
+        #[cfg(not(feature = "archive"))]
+        return false;
+        #[cfg(feature = "archive")]
         matches!(
             self.sqlite_code(),
             Some(rusqlite::ErrorCode::ConstraintViolation)
@@ -318,7 +338,7 @@ impl From<Error> for String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "archive"))]
 mod tests {
     use super::*;
     use std::error::Error as _;

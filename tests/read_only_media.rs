@@ -4,6 +4,7 @@
 //! refuses to. Every document names `open_read_only` as the open for that
 //! case, so this is where the claim is checked: a directory nothing can write
 //! to, with and without the sidecars a killed writer leaves behind.
+
 #![cfg(all(unix, feature = "write", feature = "test-support"))]
 
 use std::collections::BTreeMap;

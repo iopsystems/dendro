@@ -1,7 +1,7 @@
 // Feature annotations in the rendered docs. `docsrs` is set only by the
 // docs.rs build (see `[package.metadata.docs.rs]`), which runs nightly, so
 // this is inert for every ordinary build including the stable one.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Every public item carries its own docs, and CI runs rustdoc with
 // `-D warnings`, so this is a build failure rather than advice. It exists
 // because a moved function leaves its doc block behind: seven of them had
@@ -278,23 +278,30 @@ pub mod keys {
 }
 
 /// The container: schema, catalog, and every statement that touches SQL.
+///
+/// The row types the wire shares ([`archive::WalRow`],
+/// [`archive::SegmentMeta`]) are always present; the container needs the
+/// `archive` feature.
 pub mod archive;
 /// What can go wrong.
 pub mod error;
 /// Resolving an archive to segment bytes, live tail included.
+#[cfg(feature = "archive")]
 pub mod read;
 /// An archive's contents as a stream of frames, and the applier that turns
 /// them back into an archive.
 ///
-/// Not behind a feature. It adds no dependency and compiles wherever the crate
-/// does, so gating it would buy nothing and cost discoverability. The
-/// subscriber alone needs `write`, because it needs the writer's thread.
+/// The frames and the wire need no feature. The publisher reads an archive,
+/// so it needs `archive`; the subscriber needs `write`, because it needs the
+/// writer's thread.
 pub mod replicate;
 /// Combining, trimming and time-bounding archives without decoding a segment.
+#[cfg(feature = "archive")]
 pub mod rewrite;
 /// When to seal.
 pub mod seal;
 /// Segments, and the encoder boundary.
+#[cfg(feature = "archive")]
 pub mod segment;
 
 /// The error type and its `Result`, at the crate root.
@@ -315,8 +322,8 @@ pub use error::{Error, ReadOnly, Result};
 ///
 /// Behind the `write` feature, which is the one gate in this crate with a
 /// hard technical reason: the writer runs on a thread, and
-/// `wasm32-unknown-unknown` has none. With the feature off the crate is a
-/// reader, which is the configuration that works in a browser.
+/// `wasm32-unknown-unknown` has none. With it off and `archive` on, the crate
+/// is a reader, which is the configuration that works in a browser.
 ///
 /// The failure is clean rather than a trap. This crate uses
 /// `std::thread::Builder::spawn`, which returns `io::Result`, and reports the
@@ -327,7 +334,8 @@ pub use error::{Error, ReadOnly, Result};
 /// **A compile check cannot verify this.** `cargo check --target
 /// wasm32-unknown-unknown` passes on code that creates threads, because the
 /// call compiles and only fails when reached. That is why
-/// `scripts/check-wasm.sh` checks the reader configuration and never this one:
-/// an instrument that cannot fail on the hazard proves nothing by passing.
+/// `scripts/check-wasm.sh` checks the reader and wire configurations and never
+/// this one: an instrument that cannot fail on the hazard proves nothing by
+/// passing.
 #[cfg(feature = "write")]
 pub mod writer;

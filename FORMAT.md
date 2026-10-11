@@ -11,7 +11,7 @@ and this document has a bug.
 
 `DESIGN.md` says why the format is shaped this way. This says what it is.
 
-Schema version: **4** (`src/archive.rs`, `SCHEMA_VERSION`). See
+Schema version: **4** (`src/archive/sqlite.rs`, `SCHEMA_VERSION`). See
 [Compatibility](#8-compatibility) for what changes it.
 
 ## 1. The model
@@ -88,7 +88,7 @@ stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Five tables (`src/archive.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
+Five tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -218,7 +218,7 @@ source_id = ?1 AND stream = ?2
         OR NOT EXISTS (SELECT 1 FROM segments WHERE source_id = ?1 AND stream = ?2) )
 ```
 
-(`src/archive.rs`, `LIVE_WAL_PREDICATE`.) This is the recovery rule and the
+(`src/archive/sqlite.rs`, `LIVE_WAL_PREDICATE`.) This is the recovery rule and the
 reason the prune that follows a seal can run outside the seal transaction: a
 row a segment already covers is shadowed whether or not it has been deleted.
 A reader materializes a stream's live rows through the encoder into one

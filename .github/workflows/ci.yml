@@ -50,8 +50,21 @@ jobs:
       # `--all-targets`: a plain `check` compiles the lib only, so a test that
       # names a `write`-gated item builds green here and breaks for anyone
       # actually using the reader build.
+      - run: cargo clippy --all-targets --no-default-features --features archive -- -D warnings
+      - run: cargo test --no-default-features --features archive
+
+  # No features: the replication wire alone, with no SQLite, arrow or
+  # parquet. What a producer that serves frames compiles.
+  wire-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo test --no-default-features
+      # The dependency list is the point of this build.
+      - run: test "$(cargo tree --no-default-features -e normal --prefix none | sort -u | wc -l)" -eq 1
 
   # The documentation is a deliverable: it is what a reader sees on docs.rs,
   # and a broken intra-doc link ships silently without this. `-D warnings`
@@ -78,6 +91,7 @@ jobs:
       # `--all-targets` so tests and the test-support binaries are covered,
       # not just the library.
       - run: cargo check --all-targets --all-features
+      - run: cargo check --all-targets --no-default-features --features archive
       - run: cargo check --all-targets --no-default-features
 
   # What `cargo publish` will actually do, minus the upload: packaging, then

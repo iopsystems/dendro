@@ -1,6 +1,9 @@
 //! Per-stream retention bounds the clock-offset series the way whole-source
 //! retention does: at the oldest row the source still holds anywhere.
 
+// The archive, which the wire-only build (`--no-default-features`) leaves out.
+#![cfg(feature = "archive")]
+
 use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, ArchiveMut, SegmentMeta, SourceMeta, WalRow};
