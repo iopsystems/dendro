@@ -116,7 +116,10 @@ pub struct Compacted {
 /// **What it does not touch.** The live WAL tail, which has no segment yet.
 /// Segments whose schemas differ: a run stops at a schema change, because
 /// dendro concatenates parquet rather than reconciling it, and a stream's
-/// schema may drift. And any run of one.
+/// schema may drift. Segments whose file key-value metadata differs, for the
+/// same reason: the merged segment carries its inputs' metadata, which is
+/// possible only when they agree on all of it, so a run also stops where any
+/// key's value, or the set of keys, changes. And any run of one.
 /// The caller's time-keyed store ([`CallerRow`](crate::archive::CallerRow))
 /// is keyed by time, not by segment, so a merge leaves it exactly as it was;
 /// that is the property it exists for.
@@ -240,10 +243,11 @@ pub fn compact(db: &mut ArchiveMut, spec: &CompactSpec) -> Result<Compacted> {
     Ok(total)
 }
 
-/// Concatenate the leading run of `blobs` that share a schema into one
-/// parquet file. Returns the bytes, the rows in them, and how many blobs
-/// were consumed — fewer than all of them when the schema changes partway,
-/// which a stream's schema is allowed to do.
+/// Concatenate the leading run of `blobs` that share a schema and file
+/// key-value metadata into one parquet file, which carries that metadata.
+/// Returns the bytes, the rows in them, and how many blobs were consumed —
+/// fewer than all of them when the schema or the metadata changes partway,
+/// which a stream is allowed to do.
 ///
 /// This is dendro looking inside a segment, which it otherwise does only for
 /// a column projection. The compaction entry weighed the alternative — a
@@ -268,6 +272,34 @@ fn concat_parquet(
         ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(b.clone()))
             .map_err(|e| Error::Message(format!("failed to open a {stream} segment to merge: {e}")))
     };
+
+    // The run ends where the file key-value metadata changes. That metadata
+    // is the caller's description of the segment (a layout marker, a list of
+    // what its rows refer to), so the merged segment carries it, and dendro
+    // can carry it only when every input says the same thing: two different
+    // values cannot be combined without knowing what they mean. Arrow's
+    // schema entry is left out of the comparison; the writer writes the
+    // merged schema's own.
+    let carried = file_kv(&blobs[0], stream)?;
+    let mut agree = 1usize;
+    while agree < blobs.len() && file_kv(&blobs[agree], stream)? == carried {
+        agree += 1;
+    }
+    let blobs = &blobs[..agree];
+    let props = if carried.is_empty() {
+        props
+    } else {
+        // An input's value replaces the writer's for the same key: the
+        // inputs describe the rows being written, the properties only how.
+        let mut kv = props.key_value_metadata().cloned().unwrap_or_default();
+        kv.retain(|e| !carried.iter().any(|c| c.key == e.key));
+        kv.extend(carried);
+        props
+            .into_builder()
+            .set_key_value_metadata(Some(kv))
+            .build()
+    };
+
     let first = open(&blobs[0])?;
 
     // How far the run reaches, and what schema the merged segment gets.
@@ -381,6 +413,27 @@ fn concat_parquet(
         })?;
     }
     Ok((buf, rows, consumed))
+}
+
+/// A segment's file key-value metadata, without Arrow's schema entry, in
+/// file order. Compared as written, so the same entries in another order
+/// count as a change and stop a run.
+fn file_kv(blob: &[u8], stream: &str) -> Result<Vec<parquet::file::metadata::KeyValue>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(blob))
+        .map_err(|e| Error::Message(format!("failed to open a {stream} segment to merge: {e}")))?;
+    Ok(reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .map(|kv| {
+            kv.iter()
+                .filter(|e| e.key != "ARROW:schema")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Which columns of a segment survive a [`project_segment_columns`] pass.

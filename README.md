@@ -230,7 +230,8 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   small segments in place and reclaims the space. A run stops where a
   stream's schema changes; `CompactSpec::unioning_fields` opts into merging
   across a column *set* that grew or shrank, null-filling the rows that
-  predate a column.
+  predate a column. A merged segment carries its inputs' parquet file
+  key-value metadata, so a run also stops where that metadata changes.
 - **Replication, as frames you move yourself.** `ArchivePublisher` turns an
   archive's changes into frames and `Subscriber` applies them to another
   archive; `WIRE.md` specifies the bytes. There is one frame kind per table

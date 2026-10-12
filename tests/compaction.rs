@@ -502,3 +502,128 @@ fn unioning_still_stops_at_a_column_that_changed() {
         );
     }
 }
+
+/// An encoder that describes each segment in the file key-value metadata, as
+/// a caller marking a layout and listing what the segment's rows refer to
+/// does: a `layout` every segment carries, and a `refers` taken from the
+/// row's first byte, so a caller can change it between segments.
+struct Described;
+
+impl SegmentEncoder for Described {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let ts: Vec<i64> = rows.iter().map(|r| r.ts).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ts.clone())) as ArrayRef],
+        )
+        .map_err(|e| format!("{e}"))?;
+        let props = dendro::segment::writer_props()
+            .into_builder()
+            .set_key_value_metadata(Some(vec![
+                KeyValue::new("layout".to_string(), "long".to_string()),
+                KeyValue::new("refers".to_string(), rows[0].row[0].to_string()),
+            ]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut w =
+            ArrowWriter::try_new(&mut bytes, schema, Some(props)).map_err(|e| format!("{e}"))?;
+        w.write(&batch).map_err(|e| format!("{e}"))?;
+        w.close().map_err(|e| format!("{e}"))?;
+        Ok(Some(Segment {
+            bytes,
+            rows: rows.len() as u64,
+            first_ts: ts[0],
+            last_ts: ts[ts.len() - 1],
+            index: None,
+        }))
+    }
+}
+
+/// Each segment of stream `s` as `(rows, key-value metadata without Arrow's
+/// schema entry)`.
+fn described(path: &std::path::Path) -> Vec<(u64, Vec<(String, String)>)> {
+    let db = Archive::open(path).unwrap();
+    let metas = db.read_segment_meta(1, "s").unwrap();
+    metas
+        .into_iter()
+        .map(|(seq, meta)| {
+            let bytes = db.read_segment_bytes(1, "s", seq).unwrap().unwrap();
+            let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                bytes::Bytes::from(bytes),
+            )
+            .unwrap();
+            let kv = builder
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .map(|kv| {
+                    kv.iter()
+                        .filter(|e| e.key != "ARROW:schema")
+                        .map(|e| (e.key.clone(), e.value.clone().unwrap_or_default()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (meta.rows, kv)
+        })
+        .collect()
+}
+
+/// Four single-row segments of stream `s`, the first two referring to 7 and
+/// the last two to 9.
+fn described_archive(path: &std::path::Path) {
+    let (a, mut w) = Writer::single(path, Box::new(Described), meta()).unwrap();
+    for (ts, refers) in [(1, 7), (2, 7), (3, 9), (4, 9)] {
+        w.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![refers],
+        }])
+        .unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (4, 0)).unwrap();
+}
+
+/// A merged segment carries its inputs' file key-value metadata, and a run
+/// stops where that metadata changes, under either schema policy. The
+/// metadata is the caller's description of the segment; losing it makes the
+/// merged segment read as a different kind of segment, and two different
+/// descriptions cannot be combined without knowing what they mean.
+#[test]
+fn a_merge_keeps_the_file_metadata_and_stops_where_it_changes() {
+    let kv = |refers: &str| {
+        vec![
+            ("layout".to_string(), "long".to_string()),
+            ("refers".to_string(), refers.to_string()),
+        ]
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for (name, spec) in [
+        ("stop", CompactSpec::to_rows(100)),
+        ("union", CompactSpec::to_rows(100).unioning_fields()),
+    ] {
+        let path = dir.path().join(format!("{name}.dendro"));
+        described_archive(&path);
+        let mut db = ArchiveMut::open(&path).unwrap();
+        let done = compact(&mut db, &spec).unwrap();
+        assert_eq!(
+            (done.before, done.after),
+            (4, 2),
+            "{name}: the two 7s merge, the two 9s merge, and the pair does not"
+        );
+        drop(db);
+        assert_eq!(described(&path), vec![(2, kv("7")), (2, kv("9"))], "{name}");
+    }
+}

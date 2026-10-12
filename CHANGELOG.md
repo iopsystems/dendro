@@ -33,6 +33,19 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Fixed
+
+- Compaction (`rewrite::compact`, `rewrite::compact_stream`) dropped the
+  parquet file key-value metadata of the segments it merged, so a caller
+  that describes a segment there (a layout marker, a per-column list of what
+  the rows refer to) got a merged segment that read as a different kind of
+  segment. The merged segment now carries its inputs' metadata, Arrow's
+  schema entry aside, with an input's value replacing the writer
+  properties' for the same key. A run stops where any input's metadata
+  differs from the first's, under either `SchemaPolicy`; before, only
+  `StopAtChange` stopped there, because it compares whole Arrow schemas,
+  and `UnionFields` merged across the change.
+
 ## [0.4.0] - 2026-10-11
 
 ### Changed
