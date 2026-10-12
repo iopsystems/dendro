@@ -36,15 +36,20 @@ cannot reach a failed release any other way.
 ### Added
 
 - `rewrite::compact_with` and `rewrite::compact_stream_with`: compaction
-  with a caller-supplied function that decides the merged segment's file
-  key-value metadata. It is given the run's segments in order (each one's
-  metadata, columns and row count, as `rewrite::MergeInput`) and returns the
-  merged metadata, or `None` to end the run before the segment it was just
-  given. `compact` and `compact_stream` use `rewrite::identical_metadata`,
-  which merges only segments whose metadata is the same. A caller whose
-  metadata changes at every segment, such as a list of the rows' occupants
-  that a population that comes and goes changes constantly, can merge across
-  those changes by combining the lists.
+  with a caller-supplied `rewrite::MetadataMerge` that decides the merged
+  segment's file key-value metadata. It is a fold over the run's segments in
+  order, each given once as a `rewrite::MergeInput` (its metadata, columns
+  and row count): `start` with the first, `extend` with each next one, which
+  may refuse it and so end the run before it, and `finish` for the segments
+  merged. A segment the `SchemaPolicy` refuses ends the run before the merge
+  is given it. A merge that keeps what it has decoded in its `Run` costs time
+  linear in the run. `compact` and `compact_stream` use
+  `rewrite::IdenticalMetadata`, which merges only segments whose metadata has
+  the same entries. A caller whose metadata changes at every segment, such as
+  a list of the rows' occupants that a population that comes and goes changes
+  constantly, can merge across those changes by combining the lists.
+- `rewrite::compaction_opens` (`test-support`): how many segments compaction
+  has opened on the calling thread.
 
 ### Fixed
 
@@ -55,9 +60,13 @@ cannot reach a failed release any other way.
   segment. The merged segment now carries its inputs' metadata, Arrow's
   schema entry aside, with an input's value replacing the writer
   properties' for the same key. A run stops where any input's metadata
-  differs from the first's, under either `SchemaPolicy`; before, only
-  `StopAtChange` stopped there, because it compares whole Arrow schemas,
-  and `UnionFields` merged across the change.
+  has different entries from the first's, compared without regard to their
+  order, under either `SchemaPolicy`; before, only `StopAtChange` stopped
+  there, because it compares whole Arrow schemas, and `UnionFields` merged
+  across the change.
+- `rewrite::project_segment_columns` wrote a key twice when the writer
+  properties and the segment both carried it. The segment's value now
+  replaces the properties', as in compaction.
 
 ## [0.4.0] - 2026-10-11
 

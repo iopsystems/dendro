@@ -232,9 +232,10 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   across a column *set* that grew or shrank, null-filling the rows that
   predate a column. A merged segment carries its inputs' parquet file
   key-value metadata, so a run also stops where that metadata changes;
-  `rewrite::compact_with` takes a function that combines the segments'
-  metadata instead, for a caller whose metadata can be combined (a list of
-  what the rows refer to, say, which merges as a union).
+  `rewrite::compact_with` takes a `rewrite::MetadataMerge`, a fold that
+  combines the segments' metadata instead, for a caller whose metadata can
+  be combined (a list of what the rows refer to, say, which merges as a
+  union).
 - **Replication, as frames you move yourself.** `ArchivePublisher` turns an
   archive's changes into frames and `Subscriber` applies them to another
   archive; `WIRE.md` specifies the bytes. There is one frame kind per table

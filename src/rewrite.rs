@@ -90,8 +90,7 @@ impl CompactSpec {
     }
 }
 
-/// One segment of a compaction run, as a metadata merge
-/// ([`compact_stream_with`]) sees it.
+/// One segment of a compaction run, as a [`MetadataMerge`] sees it.
 #[derive(Debug, Clone, Copy)]
 /// Fields are added without a major version; dendro constructs these, and a
 /// caller reads them.
@@ -108,17 +107,71 @@ pub struct MergeInput<'a> {
     pub rows: u64,
 }
 
-/// The metadata merge [`compact`] and [`compact_stream`] use: the run's
+/// How a compaction run's file key-value metadata combines: a fold over the
+/// run's segments in order, [`start`](Self::start) with the first,
+/// [`extend`](Self::extend) with each one after it, and
+/// [`finish`](Self::finish) once, for the segments merged.
+///
+/// Each segment is given to the merge once, so a merge that keeps what it
+/// has decoded in [`Run`](Self::Run) costs time linear in the run. dendro
+/// gives the merge a segment only after the [`SchemaPolicy`] has admitted
+/// it, so the run `finish` describes is the run that is written.
+///
+/// [`IdenticalMetadata`] is the merge [`compact`] and [`compact_stream`] use.
+pub trait MetadataMerge {
+    /// What the merge keeps about the run so far.
+    type Run;
+
+    /// Begin a run at `first`, or `None` when no run can begin there; the
+    /// segment is then left as it is.
+    fn start(&self, first: &MergeInput<'_>) -> Option<Self::Run>;
+
+    /// Add `next` to the run and return `true`, or return `false` to end the
+    /// run before `next`. After `false`, `run` must still describe the run
+    /// without `next`, because that run is merged and finished: decide
+    /// before changing it.
+    fn extend(&self, run: &mut Self::Run, next: &MergeInput<'_>) -> bool;
+
+    /// The merged segment's file key-value metadata. An `ARROW:schema`
+    /// entry in it is ignored; the writer writes the merged schema's own.
+    fn finish(&self, run: Self::Run) -> Vec<KeyValue>;
+}
+
+/// The [`MetadataMerge`] [`compact`] and [`compact_stream`] use: the run's
 /// segments merge only while every one has the first's key-value metadata,
-/// the same entries in the same order, and the merged segment carries it.
+/// the same entries in any order, and the merged segment carries the first's,
+/// in its order.
 ///
 /// It is the only rule that is safe without knowing what the metadata means.
-pub fn identical_metadata(inputs: &[MergeInput<'_>]) -> Option<Vec<KeyValue>> {
-    let first = inputs.first()?;
-    inputs
-        .iter()
-        .all(|i| i.key_value == first.key_value)
-        .then(|| first.key_value.to_vec())
+/// Order is not part of it because parquet gives it no meaning, and a writer
+/// that lists the same entries in another order is describing the same
+/// segment.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdenticalMetadata;
+
+impl MetadataMerge for IdenticalMetadata {
+    /// The first segment's entries in file order, and sorted for comparing.
+    type Run = (Vec<KeyValue>, Vec<KeyValue>);
+
+    fn start(&self, first: &MergeInput<'_>) -> Option<Self::Run> {
+        Some((first.key_value.to_vec(), sorted(first.key_value)))
+    }
+
+    fn extend(&self, run: &mut Self::Run, next: &MergeInput<'_>) -> bool {
+        next.key_value.len() == run.1.len() && sorted(next.key_value) == run.1
+    }
+
+    fn finish(&self, run: Self::Run) -> Vec<KeyValue> {
+        run.0
+    }
+}
+
+/// `kv` sorted by key, then value, so two lists of the same entries compare
+/// equal whatever their order.
+fn sorted(kv: &[KeyValue]) -> Vec<KeyValue> {
+    let mut kv = kv.to_vec();
+    kv.sort_by(|a, b| (&a.key, &a.value).cmp(&(&b.key, &b.value)));
+    kv
 }
 
 /// What one compaction pass did.
@@ -152,7 +205,7 @@ pub struct Compacted {
 /// schema may drift. Segments whose file key-value metadata differs, for the
 /// same reason: the merged segment carries its inputs' metadata, which is
 /// possible only when they agree on all of it, so a run also stops where any
-/// key's value, or the set of keys, changes ([`identical_metadata`]; a caller
+/// key's value, or the set of keys, changes ([`IdenticalMetadata`]; a caller
 /// that can combine its metadata says how with [`compact_stream_with`]). And
 /// any run of one.
 /// The caller's time-keyed store ([`CallerRow`](crate::archive::CallerRow))
@@ -180,33 +233,29 @@ pub fn compact_stream(
     stream: &str,
     spec: &CompactSpec,
 ) -> Result<Compacted> {
-    compact_stream_with(db, source_id, stream, spec, &identical_metadata)
+    compact_stream_with(db, source_id, stream, spec, &IdenticalMetadata)
 }
 
 /// [`compact_stream`], with the caller deciding what the merged segment's
 /// file key-value metadata is, and so where a run must stop.
 ///
-/// `merge` is given the run's segments in order and answers with the merged
-/// segment's metadata, or `None` when they cannot be merged. It is asked
-/// about a growing run: the first segment, then the first two, and so on,
-/// and the run ends before the segment whose addition made it answer `None`.
-/// The answer for the segments actually merged is what the merged segment
-/// carries. [`identical_metadata`] is the rule [`compact_stream`] uses.
+/// `merge` is given the run's segments in order, each once, as a fold
+/// ([`MetadataMerge`]). The run ends before the segment the merge refuses,
+/// or before the first segment the [`SchemaPolicy`] refuses, whichever comes
+/// first, and the merged segment carries what [`MetadataMerge::finish`]
+/// returns for the segments merged. [`IdenticalMetadata`] is the merge
+/// [`compact_stream`] uses.
 ///
 /// For a caller whose metadata describes the rows in a way it can combine,
 /// such as a list of what the rows refer to that two segments' lists union
-/// into: under [`identical_metadata`] a run stops wherever that list changes,
+/// into: under [`IdenticalMetadata`] a run stops wherever that list changes,
 /// which for a population that comes and goes is nearly everywhere.
-///
-/// A run is asked about once per length, each time with every segment so
-/// far, so the cost is quadratic in the length of a run; a run is bounded by
-/// [`CompactSpec::target_rows`].
-pub fn compact_stream_with(
+pub fn compact_stream_with<M: MetadataMerge + ?Sized>(
     db: &mut ArchiveMut,
     source_id: i64,
     stream: &str,
     spec: &CompactSpec,
-    merge: &dyn Fn(&[MergeInput<'_>]) -> Option<Vec<KeyValue>>,
+    merge: &M,
 ) -> Result<Compacted> {
     let metas = db.read_segment_meta(source_id, stream)?;
     let mut done = Compacted {
@@ -233,17 +282,10 @@ pub fn compact_stream_with(
         // Read and re-encode BEFORE the transaction opens, as `seal_batch`
         // does: both are proportional to segment size and would otherwise
         // hold the write lock for their whole duration.
-        let mut blobs = Vec::with_capacity(end - at);
-        for (seq, _) in &metas[at..end] {
-            match db.read_segment_bytes(source_id, stream, *seq)? {
-                Some(b) => blobs.push(b),
-                // Vanished under us, which the single-writer rule says
-                // cannot happen; leave the run alone rather than guess.
-                None => break,
-            }
-        }
+        let seqs: Vec<u64> = metas[at..end].iter().map(|(seq, _)| *seq).collect();
+        let fetch = |seq: u64| db.read_segment_bytes(source_id, stream, seq);
         let (merged, merged_rows, consumed) =
-            concat_parquet(&blobs, spec.props(), spec.schema, merge, stream)?;
+            concat_parquet(&seqs, &fetch, spec.props(), spec.schema, merge, stream)?;
         if consumed < 2 {
             // A schema or metadata change at the very front of the run.
             at += 1;
@@ -290,16 +332,16 @@ pub fn compact_stream_with(
 /// the append path. There is no append path here: compaction already
 /// requires that nothing else is writing.
 pub fn compact(db: &mut ArchiveMut, spec: &CompactSpec) -> Result<Compacted> {
-    compact_with(db, spec, &identical_metadata)
+    compact_with(db, spec, &IdenticalMetadata)
 }
 
 /// [`compact`], with `merge` deciding the merged segments' file key-value
 /// metadata; see [`compact_stream_with`]. It is used for every stream of
 /// every source.
-pub fn compact_with(
+pub fn compact_with<M: MetadataMerge + ?Sized>(
     db: &mut ArchiveMut,
     spec: &CompactSpec,
-    merge: &dyn Fn(&[MergeInput<'_>]) -> Option<Vec<KeyValue>>,
+    merge: &M,
 ) -> Result<Compacted> {
     let mut total = Compacted::default();
     let sources = db.read_sources()?;
@@ -317,12 +359,13 @@ pub fn compact_with(
     Ok(total)
 }
 
-/// Concatenate the leading run of `blobs` that share a schema, and whose file
-/// key-value metadata `merge` accepts, into one parquet file, which carries
-/// the metadata `merge` returned for it. Returns the bytes, the rows in them,
-/// and how many blobs were consumed — fewer than all of them when the schema
-/// or the metadata changes partway, which a stream is allowed to do. A
-/// consumed count under two means nothing was written.
+/// Concatenate the leading run of the segments `seqs` names that the schema
+/// policy and `merge` both admit into one parquet file, which carries the
+/// metadata `merge` finishes for that run. `fetch` reads a segment's bytes,
+/// `None` if it is gone. Returns the bytes, the rows in them, and how many
+/// segments were consumed — fewer than all of them when the schema or the
+/// metadata changes partway, which a stream is allowed to do. A consumed
+/// count under two means nothing was written.
 ///
 /// This is dendro looking inside a segment, which it otherwise does only for
 /// a column projection. The compaction entry weighed the alternative — a
@@ -330,171 +373,158 @@ pub fn compact_with(
 /// chose this: concatenation is a property of the container, not of what a
 /// row means. The cost is that compaction, like projection, requires
 /// segments to actually be parquet.
-fn concat_parquet(
-    blobs: &[Vec<u8>],
+fn concat_parquet<M: MetadataMerge + ?Sized>(
+    seqs: &[u64],
+    fetch: &dyn Fn(u64) -> Result<Option<Vec<u8>>>,
     props: parquet::file::properties::WriterProperties,
     policy: SchemaPolicy,
-    merge: &dyn Fn(&[MergeInput<'_>]) -> Option<Vec<KeyValue>>,
+    merge: &M,
     stream: &str,
 ) -> Result<(Vec<u8>, u64, usize)> {
     use arrow::array::new_null_array;
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
 
-    let open = |b: &Vec<u8>| {
-        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(b.clone()))
-            .map_err(|e| Error::Message(format!("failed to open a {stream} segment to merge: {e}")))
-    };
-
+    // How far the run reaches, decided one segment at a time: first the
+    // schema policy, then `merge`, so `merge` is only ever given segments
+    // that will be written and its run is exactly the merged one.
+    //
+    // Under either policy a field that appears twice must be IDENTICAL —
+    // same type, same nullability, same metadata. The policies differ only
+    // on a field that appears in one segment and not another: stop there, or
+    // carry it and null-fill.
+    //
     // The file key-value metadata is the caller's description of the
     // segment (a layout marker, a list of what its rows refer to), so the
     // merged segment carries it, and only `merge` knows whether two
-    // segments' descriptions combine and into what. It is asked about a
-    // growing run, and the run ends before the segment that made it refuse.
-    // Arrow's schema entry is not the caller's and is left out; the writer
-    // writes the merged schema's own.
+    // segments' descriptions combine and into what. Arrow's schema entry is
+    // not the caller's and is left out; the writer writes the merged
+    // schema's own.
     //
     // The schema Arrow reads carries the file metadata as well, merged into
     // what the writer embedded under `ARROW:schema`. Those entries are
     // `merge`'s to judge, so they come out of the schema here, and what is
     // left is only what was embedded.
     //
-    // A segment is opened only when `merge` is about to be asked about it,
-    // so a run refused at its second segment reads two footers, not the
-    // whole run's.
-    let mut segments = Vec::with_capacity(blobs.len());
-    let mut merged: Vec<Vec<KeyValue>> = Vec::with_capacity(blobs.len());
-    while merged.len() < blobs.len() {
-        let builder = open(&blobs[merged.len()])?;
+    // A segment is read and opened only when it is about to be judged, so a
+    // run refused at its second segment reads two segments, not the whole
+    // planned run, and each one is opened once: the reader that judged it
+    // is the reader that copies its rows.
+    let mut opened: Vec<ParquetRecordBatchReaderBuilder<bytes::Bytes>> = Vec::new();
+    let mut run: Option<M::Run> = None;
+    // `StopAtChange`: the run's schema, the first segment's.
+    let mut first: Option<SchemaRef> = None;
+    // `UnionFields`: the fields in the order they first appear, where each
+    // is in that order, and how many segments carry it.
+    let mut order: Vec<Field> = Vec::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut carried_by: Vec<usize> = Vec::new();
+    for seq in seqs {
+        // Gone, which the single-writer rule says cannot happen; end the run
+        // here rather than guess.
+        let Some(blob) = fetch(*seq)? else {
+            break;
+        };
+        #[cfg(feature = "test-support")]
+        OPENS.with(|n| n.set(n.get() + 1));
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(blob)).map_err(|e| {
+                Error::Message(format!("failed to open a {stream} segment to merge: {e}"))
+            })?;
         let kv = file_kv(builder.metadata());
         let rows = builder.metadata().file_metadata().num_rows().max(0) as u64;
         let read = builder.schema();
         let mut embedded = read.metadata().clone();
         embedded.retain(|k, _| !kv.iter().any(|e| &e.key == k));
         let schema = Arc::new(Schema::new_with_metadata(read.fields().clone(), embedded));
-        segments.push((kv, schema, rows));
-        let inputs: Vec<MergeInput<'_>> = segments
-            .iter()
-            .map(|(kv, schema, rows)| MergeInput {
-                key_value: kv,
-                fields: schema.fields(),
-                rows: *rows,
-            })
-            .collect();
-        match merge(&inputs) {
-            Some(kv) => merged.push(kv),
-            None => break,
-        }
-    }
-    if merged.len() < 2 {
-        return Ok((Vec::new(), 0, 1));
-    }
-    let blobs = &blobs[..merged.len()];
-    let segments = &segments[..merged.len()];
 
-    // How far the run reaches, and what schema the merged segment gets.
-    //
-    // Under either policy a field that appears twice must be IDENTICAL —
-    // same type, same nullability, same metadata. The policies differ only
-    // on a field that appears in one segment and not another: stop there, or
-    // carry it and null-fill.
-    let (consumed, schema) = match policy {
-        SchemaPolicy::StopAtChange => {
-            let schema = segments[0].1.clone();
-            let mut consumed = 1usize;
-            while consumed < segments.len() && segments[consumed].1 == schema {
-                consumed += 1;
-            }
-            (consumed, schema)
+        let admitted = match policy {
+            SchemaPolicy::StopAtChange => first.as_ref().is_none_or(|f| *f == schema),
+            // Check the whole segment before taking any of it, so a
+            // conflict late in its field list does not leave the union
+            // half-extended.
+            SchemaPolicy::UnionFields => schema
+                .fields()
+                .iter()
+                .all(|f| seen.get(f.name()).is_none_or(|i| &order[*i] == f.as_ref())),
+        };
+        if !admitted {
+            break;
         }
-        SchemaPolicy::UnionFields => {
-            let mut order: Vec<Field> = Vec::new();
-            let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-            let mut consumed = 0usize;
-            'segments: while consumed < segments.len() {
-                let s = segments[consumed].1.clone();
-                // Check the whole segment before taking any of it, so a
-                // conflict late in its field list does not leave the union
-                // half-extended.
-                for f in s.fields() {
-                    if let Some(i) = seen.get(f.name()) {
-                        if &order[*i] != f.as_ref() {
-                            break 'segments;
+        let input = MergeInput {
+            key_value: &kv,
+            fields: schema.fields(),
+            rows,
+        };
+        match run.as_mut() {
+            None => match merge.start(&input) {
+                Some(r) => run = Some(r),
+                None => break,
+            },
+            Some(r) => {
+                if !merge.extend(r, &input) {
+                    break;
+                }
+            }
+        }
+
+        match policy {
+            SchemaPolicy::StopAtChange => {
+                first.get_or_insert(schema);
+            }
+            SchemaPolicy::UnionFields => {
+                for f in schema.fields() {
+                    match seen.get(f.name()) {
+                        Some(i) => carried_by[*i] += 1,
+                        None => {
+                            seen.insert(f.name().clone(), order.len());
+                            order.push(f.as_ref().clone());
+                            carried_by.push(1);
                         }
                     }
                 }
-                for f in s.fields() {
-                    if !seen.contains_key(f.name()) {
-                        seen.insert(f.name().clone(), order.len());
-                        order.push(f.as_ref().clone());
-                    }
-                }
-                consumed += 1;
-            }
-            if consumed == 0 {
-                // The first segment conflicts with nothing, so this is
-                // unreachable; fall back rather than assume it.
-                (1, segments[0].1.clone())
-            } else {
-                // A field the whole run carries keeps its nullability; one
-                // only some segments have must become nullable, because the
-                // rest contribute nulls for it.
-                let mut in_every: BTreeMap<String, usize> = BTreeMap::new();
-                for (_, s, _) in &segments[..consumed] {
-                    for f in s.fields() {
-                        *in_every.entry(f.name().clone()).or_insert(0) += 1;
-                    }
-                }
-                let fields: Vec<Field> = order
-                    .into_iter()
-                    .map(|f| {
-                        if in_every.get(f.name()) == Some(&consumed) {
-                            f
-                        } else {
-                            let md = f.metadata().clone();
-                            Field::new(f.name(), f.data_type().clone(), true).with_metadata(md)
-                        }
-                    })
-                    .collect();
-                (consumed, Arc::new(Schema::new(fields)))
             }
         }
+        opened.push(builder);
+    }
+    let consumed = opened.len();
+    let Some(run) = run.filter(|_| consumed >= 2) else {
+        return Ok((Vec::new(), 0, 1));
     };
 
-    if consumed < 2 {
-        return Ok((Vec::new(), 0, 1));
-    }
-    // What `merge` said about exactly the segments being merged: the schema
-    // policy can end the run before `merge` would have.
-    let carried: Vec<KeyValue> = merged
-        .swap_remove(consumed - 1)
-        .into_iter()
-        .filter(|e| e.key != "ARROW:schema")
-        .collect();
-    let props = if carried.is_empty() {
-        props
-    } else {
-        // An input's value replaces the writer's for the same key: the
-        // inputs describe the rows being written, the properties only how.
-        let mut kv = props.key_value_metadata().cloned().unwrap_or_default();
-        kv.retain(|e| !carried.iter().any(|c| c.key == e.key));
-        kv.extend(carried);
-        props
-            .into_builder()
-            .set_key_value_metadata(Some(kv))
-            .build()
+    let schema = match first {
+        Some(schema) => schema,
+        None => {
+            // A field the whole run carries keeps its nullability; one only
+            // some segments have must become nullable, because the rest
+            // contribute nulls for it.
+            let fields: Vec<Field> = order
+                .into_iter()
+                .zip(carried_by)
+                .map(|(f, n)| {
+                    if n == consumed {
+                        f
+                    } else {
+                        let md = f.metadata().clone();
+                        Field::new(f.name(), f.data_type().clone(), true).with_metadata(md)
+                    }
+                })
+                .collect();
+            Arc::new(Schema::new(fields))
+        }
     };
+    let props = with_file_metadata(props, merge.finish(run));
 
     let mut buf: Vec<u8> = Vec::new();
     let mut rows = 0u64;
     {
         let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
             .map_err(|e| Error::Message(format!("failed to open a merged {stream} writer: {e}")))?;
-        for b in &blobs[..consumed] {
-            for batch in open(b)?.build().map_err(|e| {
+        for builder in opened {
+            for batch in builder.build().map_err(|e| {
                 Error::Message(format!("failed to read a {stream} segment to merge: {e}"))
             })? {
                 let batch = batch.map_err(|e| {
@@ -530,6 +560,44 @@ fn concat_parquet(
         })?;
     }
     Ok((buf, rows, consumed))
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many segments compaction has opened on this thread, for a test that
+/// bounds how much of a stream a compaction reads. Per thread, so tests
+/// running in parallel do not count each other's opens.
+#[cfg(feature = "test-support")]
+pub fn compaction_opens() -> usize {
+    OPENS.with(|n| n.get())
+}
+
+/// `props` with `carried` as file key-value metadata. A carried entry
+/// replaces the properties' entry for the same key: `carried` describes the
+/// rows being written, the properties only how they are written. Arrow's
+/// schema entry is dropped from `carried`; the writer writes the new
+/// schema's own.
+fn with_file_metadata(
+    props: parquet::file::properties::WriterProperties,
+    carried: Vec<KeyValue>,
+) -> parquet::file::properties::WriterProperties {
+    let carried: Vec<KeyValue> = carried
+        .into_iter()
+        .filter(|e| e.key != "ARROW:schema")
+        .collect();
+    if carried.is_empty() {
+        return props;
+    }
+    let mut kv = props.key_value_metadata().cloned().unwrap_or_default();
+    kv.retain(|e| !carried.iter().any(|c| c.key == e.key));
+    kv.extend(carried);
+    props
+        .into_builder()
+        .set_key_value_metadata(Some(kv))
+        .build()
 }
 
 /// A segment's file key-value metadata, without Arrow's schema entry, in
@@ -878,16 +946,7 @@ pub fn project_segment_columns(
                 .collect()
         })
         .unwrap_or_default();
-    let props = if carried.is_empty() {
-        props
-    } else {
-        let mut kv = props.key_value_metadata().cloned().unwrap_or_default();
-        kv.extend(carried);
-        props
-            .into_builder()
-            .set_key_value_metadata(Some(kv))
-            .build()
-    };
+    let props = with_file_metadata(props, carried);
 
     let mut indices: Vec<usize> = Vec::new();
     let mut has_value = false;

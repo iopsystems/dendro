@@ -17,7 +17,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
-use dendro::rewrite::{compact, compact_stream, compact_with, CompactSpec, MergeInput};
+use dendro::rewrite::{
+    compact, compact_stream, compact_with, CompactSpec, MergeInput, MetadataMerge,
+};
 use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 use parquet::file::metadata::KeyValue;
@@ -507,7 +509,8 @@ fn unioning_still_stops_at_a_column_that_changed() {
 /// An encoder that describes each segment in the file key-value metadata, as
 /// a caller marking a layout and listing what the segment's rows refer to
 /// does: a `layout` every segment carries, and a `refers` taken from the
-/// row's first byte, so a caller can change it between segments.
+/// row's first byte, so a caller can change it between segments. A second
+/// byte of 1 lists the two entries in reverse.
 struct Described;
 
 impl SegmentEncoder for Described {
@@ -529,12 +532,16 @@ impl SegmentEncoder for Described {
             vec![Arc::new(Int64Array::from(ts.clone())) as ArrayRef],
         )
         .map_err(|e| format!("{e}"))?;
+        let mut kv = vec![
+            KeyValue::new("layout".to_string(), "long".to_string()),
+            KeyValue::new("refers".to_string(), rows[0].row[0].to_string()),
+        ];
+        if rows[0].row.get(1) == Some(&1) {
+            kv.reverse();
+        }
         let props = dendro::segment::writer_props()
             .into_builder()
-            .set_key_value_metadata(Some(vec![
-                KeyValue::new("layout".to_string(), "long".to_string()),
-                KeyValue::new("refers".to_string(), rows[0].row[0].to_string()),
-            ]))
+            .set_key_value_metadata(Some(kv))
             .build();
         let mut bytes = Vec::new();
         let mut w =
@@ -631,30 +638,51 @@ fn a_merge_keeps_the_file_metadata_and_stops_where_it_changes() {
 
 /// A caller merge that unions `refers` as a comma-separated set, and refuses
 /// a run whose segments disagree on anything else.
-fn union_refers(inputs: &[MergeInput<'_>]) -> Option<Vec<KeyValue>> {
+struct UnionRefers;
+
+/// The run so far: the entries other than `refers`, which must agree, and
+/// the union of the `refers` lists.
+type Refers = (Vec<KeyValue>, std::collections::BTreeSet<u64>);
+
+/// One segment's entries other than `refers`, and its `refers` list, or
+/// `None` for a list that does not parse.
+fn split_refers(input: &MergeInput<'_>) -> Option<Refers> {
     let mut refers = std::collections::BTreeSet::new();
-    let mut rest: Option<Vec<KeyValue>> = None;
-    for input in inputs {
-        let mut others = Vec::new();
-        for e in input.key_value {
-            if e.key == "refers" {
-                for r in e.value.as_deref()?.split(',') {
-                    refers.insert(r.parse::<u64>().ok()?);
-                }
-            } else {
-                others.push(e.clone());
+    let mut others = Vec::new();
+    for e in input.key_value {
+        if e.key == "refers" {
+            for r in e.value.as_deref()?.split(',') {
+                refers.insert(r.parse::<u64>().ok()?);
             }
-        }
-        match &rest {
-            None => rest = Some(others),
-            Some(r) if *r == others => {}
-            Some(_) => return None,
+        } else {
+            others.push(e.clone());
         }
     }
-    let mut out = rest?;
-    let list: Vec<String> = refers.iter().map(u64::to_string).collect();
-    out.push(KeyValue::new("refers".to_string(), list.join(",")));
-    Some(out)
+    Some((others, refers))
+}
+
+impl MetadataMerge for UnionRefers {
+    type Run = Refers;
+
+    fn start(&self, first: &MergeInput<'_>) -> Option<Refers> {
+        split_refers(first)
+    }
+
+    fn extend(&self, run: &mut Refers, next: &MergeInput<'_>) -> bool {
+        match split_refers(next) {
+            Some((others, refers)) if others == run.0 => {
+                run.1.extend(refers);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn finish(&self, (mut out, refers): Refers) -> Vec<KeyValue> {
+        let list: Vec<String> = refers.iter().map(u64::to_string).collect();
+        out.push(KeyValue::new("refers".to_string(), list.join(",")));
+        out
+    }
 }
 
 /// With a merge that knows how to combine it, a run merges across a change
@@ -675,34 +703,67 @@ fn a_caller_merge_combines_metadata_across_a_change() {
         let path = dir.path().join(format!("{name}.dendro"));
         described_archive(&path);
         let mut db = ArchiveMut::open(&path).unwrap();
-        let done = compact_with(&mut db, &spec, &union_refers).unwrap();
+        let done = compact_with(&mut db, &spec, &UnionRefers).unwrap();
         assert_eq!((done.before, done.after), (4, 1), "{name}");
         drop(db);
         assert_eq!(described(&path), vec![(4, kv("7,9"))], "{name}");
     }
 }
 
-/// The merge is asked about a growing run, and the run ends before the
-/// segment whose addition made it refuse.
+/// [`UnionRefers`], refusing a fourth segment, and recording the run length
+/// at every call and the length `finish` was given.
+struct UpToThree {
+    calls: std::cell::RefCell<Vec<(&'static str, usize)>>,
+}
+
+impl MetadataMerge for UpToThree {
+    type Run = (usize, Refers);
+
+    fn start(&self, first: &MergeInput<'_>) -> Option<Self::Run> {
+        self.calls.borrow_mut().push(("start", 1));
+        Some((1, UnionRefers.start(first)?))
+    }
+
+    fn extend(&self, run: &mut Self::Run, next: &MergeInput<'_>) -> bool {
+        self.calls.borrow_mut().push(("extend", run.0 + 1));
+        if run.0 == 3 || !UnionRefers.extend(&mut run.1, next) {
+            return false;
+        }
+        run.0 += 1;
+        true
+    }
+
+    fn finish(&self, run: Self::Run) -> Vec<KeyValue> {
+        self.calls.borrow_mut().push(("finish", run.0));
+        UnionRefers.finish(run.1)
+    }
+}
+
+/// The merge is given each segment once, in order, and the run ends before
+/// the segment it refused; the refused segment begins no run of its own,
+/// since a run of one is not merged.
 #[test]
 fn a_caller_merge_that_refuses_ends_the_run_there() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     described_archive(&path);
-    let asked = std::cell::RefCell::new(Vec::new());
-    let three = |inputs: &[MergeInput<'_>]| {
-        asked.borrow_mut().push(inputs.len());
-        if inputs.len() > 3 {
-            None
-        } else {
-            union_refers(inputs)
-        }
+    let merge = UpToThree {
+        calls: Default::default(),
     };
     let mut db = ArchiveMut::open(&path).unwrap();
-    let done = compact_with(&mut db, &CompactSpec::to_rows(100), &three).unwrap();
+    let done = compact_with(&mut db, &CompactSpec::to_rows(100), &merge).unwrap();
     assert_eq!((done.before, done.after), (4, 2));
     drop(db);
-    assert_eq!(*asked.borrow(), vec![1, 2, 3, 4]);
+    assert_eq!(
+        *merge.calls.borrow(),
+        vec![
+            ("start", 1),
+            ("extend", 2),
+            ("extend", 3),
+            ("extend", 4),
+            ("finish", 3)
+        ]
+    );
     let refers: Vec<(u64, String)> = described(&path)
         .into_iter()
         .map(|(rows, kv)| {
@@ -717,9 +778,96 @@ fn a_caller_merge_that_refuses_ends_the_run_there() {
     );
 }
 
+/// [`UnionRefers`], refusing any segment that refers to 9.
+struct NotNine;
+
+impl MetadataMerge for NotNine {
+    type Run = Refers;
+
+    fn start(&self, first: &MergeInput<'_>) -> Option<Refers> {
+        UnionRefers.start(first).filter(|r| !r.1.contains(&9))
+    }
+
+    fn extend(&self, run: &mut Refers, next: &MergeInput<'_>) -> bool {
+        UnionRefers.start(next).is_some_and(|r| !r.1.contains(&9)) && UnionRefers.extend(run, next)
+    }
+
+    fn finish(&self, run: Refers) -> Vec<KeyValue> {
+        UnionRefers.finish(run)
+    }
+}
+
+/// A refused segment in the middle of a stream ends the run there: the
+/// segments after it are not merged across it, and every row is kept.
+#[test]
+fn a_run_never_skips_a_refused_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n.dendro");
+    let (a, mut w) = Writer::single(&path, Box::new(Described), meta()).unwrap();
+    for (ts, refers) in [(1, 7), (2, 7), (3, 9), (4, 7), (5, 7)] {
+        w.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![refers],
+        }])
+        .unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (5, 0)).unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let done = compact_with(&mut db, &CompactSpec::to_rows(100), &NotNine).unwrap();
+    assert_eq!((done.before, done.after), (5, 3));
+    drop(db);
+    let refers: Vec<(u64, String)> = described(&path)
+        .into_iter()
+        .map(|(rows, kv)| {
+            let r = kv.into_iter().find(|(k, _)| k == "refers").unwrap().1;
+            (rows, r)
+        })
+        .collect();
+    assert_eq!(
+        refers,
+        vec![
+            (2, "7".to_string()),
+            (1, "9".to_string()),
+            (2, "7".to_string())
+        ]
+    );
+    assert_eq!(timestamps(&path), vec![1, 2, 3, 4, 5]);
+}
+
+/// A merge that writes how many segments it was given, and records each
+/// one's column count and rows.
+struct Count {
+    seen: std::cell::RefCell<Vec<(usize, u64)>>,
+}
+
+impl MetadataMerge for Count {
+    type Run = usize;
+
+    fn start(&self, first: &MergeInput<'_>) -> Option<usize> {
+        self.seen
+            .borrow_mut()
+            .push((first.fields.len(), first.rows));
+        Some(1)
+    }
+
+    fn extend(&self, run: &mut usize, next: &MergeInput<'_>) -> bool {
+        self.seen.borrow_mut().push((next.fields.len(), next.rows));
+        *run += 1;
+        true
+    }
+
+    fn finish(&self, run: usize) -> Vec<KeyValue> {
+        vec![KeyValue::new("count".to_string(), run.to_string())]
+    }
+}
+
 /// When the schema ends a run that the merge would have taken further, the
-/// merged segment carries the merge's answer for the segments merged, not
-/// for the longer run it was asked about.
+/// merge is not given the segment the schema refused, and the merged segment
+/// carries the merge's answer for the segments merged.
 #[test]
 fn the_merged_metadata_describes_only_the_segments_merged() {
     let dir = tempfile::tempdir().unwrap();
@@ -731,27 +879,18 @@ fn the_merged_metadata_describes_only_the_segments_merged() {
     }
     a.finalize_single(w, (3, 0)).unwrap();
 
-    let widths = std::cell::RefCell::new(Vec::new());
-    let count = |inputs: &[MergeInput<'_>]| {
-        widths.borrow_mut().push(
-            inputs
-                .iter()
-                .map(|i| (i.fields.len(), i.rows))
-                .collect::<Vec<_>>(),
-        );
-        Some(vec![KeyValue::new(
-            "count".to_string(),
-            inputs.len().to_string(),
-        )])
+    let merge = Count {
+        seen: Default::default(),
     };
     let mut db = ArchiveMut::open(&path).unwrap();
-    let done = compact_with(&mut db, &CompactSpec::to_rows(100), &count).unwrap();
+    let done = compact_with(&mut db, &CompactSpec::to_rows(100), &merge).unwrap();
     assert_eq!((done.before, done.after), (3, 2));
     drop(db);
     assert_eq!(
-        widths.borrow().last().unwrap(),
-        &vec![(3, 1), (3, 1), (6, 1)],
-        "the merge sees each segment's columns and rows"
+        *merge.seen.borrow(),
+        vec![(3, 1), (3, 1)],
+        "the merge sees each merged segment's columns and rows, and not the \
+         segment whose schema ended the run"
     );
     let counts: Vec<(u64, Vec<(String, String)>)> = described(&path);
     assert_eq!(
@@ -761,5 +900,140 @@ fn the_merged_metadata_describes_only_the_segments_merged() {
             (1, vec![])
         ],
         "the schema stopped the run at two"
+    );
+}
+
+/// The default merge compares entries, not their order: segments that list
+/// the same entries in a different order merge, and the merged segment
+/// carries the first's order.
+#[test]
+fn the_default_merge_ignores_the_order_of_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let (a, mut w) = Writer::single(&path, Box::new(Described), meta()).unwrap();
+    for ts in 1..=4 {
+        w.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            // `refers` 7 throughout; every other segment lists its entries
+            // in reverse.
+            row: vec![7, (ts % 2) as u8],
+        }])
+        .unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (4, 0)).unwrap();
+    let orders: Vec<Vec<String>> = described(&path)
+        .into_iter()
+        .map(|(_, kv)| kv.into_iter().map(|(k, _)| k).collect())
+        .collect();
+    assert_ne!(orders[0], orders[1], "the fixture alternates the order");
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let done = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
+    assert_eq!((done.before, done.after), (4, 1));
+    drop(db);
+    let merged = described(&path);
+    let keys: Vec<&str> = merged[0].1.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, orders[0], "the first segment's order");
+}
+
+/// An entry the segments carry replaces the writer properties' entry for
+/// the same key, in a compaction and in a column projection: the merged or
+/// projected segment has the key once, with the segment's value.
+#[test]
+fn a_segment_entry_replaces_the_writer_properties_entry() {
+    let props = || {
+        dendro::segment::writer_props()
+            .into_builder()
+            .set_key_value_metadata(Some(vec![
+                KeyValue::new("layout".to_string(), "wide".to_string()),
+                KeyValue::new("writer".to_string(), "x".to_string()),
+            ]))
+            .build()
+    };
+    let want = |refers: &str| {
+        vec![
+            ("layout".to_string(), "long".to_string()),
+            ("writer".to_string(), "x".to_string()),
+            ("refers".to_string(), refers.to_string()),
+        ]
+    };
+    let sorted = |mut kv: Vec<(String, String)>| {
+        kv.sort();
+        kv
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.dendro");
+    described_archive(&path);
+    let mut spec = CompactSpec::to_rows(100);
+    spec.writer_props = Some(props());
+    let mut db = ArchiveMut::open(&path).unwrap();
+    compact(&mut db, &spec).unwrap();
+    drop(db);
+    let merged = described(&path);
+    assert_eq!(merged.len(), 2);
+    for ((_, kv), refers) in merged.into_iter().zip(["7", "9"]) {
+        assert_eq!(sorted(kv), sorted(want(refers)), "compaction");
+    }
+
+    struct All;
+    impl dendro::rewrite::ColumnFilter for All {
+        fn keep(&self, _: &Field) -> bool {
+            true
+        }
+        fn is_data(&self, _: &Field) -> bool {
+            true
+        }
+    }
+    let db = Archive::open(&path).unwrap();
+    let seq = db.read_segment_meta(1, "s").unwrap()[0].0;
+    let bytes = db.read_segment_bytes(1, "s", seq).unwrap().unwrap();
+    let projected = dendro::rewrite::project_segment_columns(&bytes, &All, props())
+        .unwrap()
+        .unwrap();
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(projected),
+    )
+    .unwrap();
+    let kv: Vec<(String, String)> = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .iter()
+        .filter(|e| e.key != "ARROW:schema")
+        .map(|e| (e.key.clone(), e.value.clone().unwrap_or_default()))
+        .collect();
+    assert_eq!(sorted(kv), sorted(want("7")), "projection");
+}
+
+/// Compaction reads a segment only when it judges it. A stream whose schema
+/// changes at every segment plans one long run per position and has every
+/// run refused at its second segment; reading the whole planned run each
+/// time opens a number of segments quadratic in the stream's length, where
+/// judging as it goes opens two per position.
+#[test]
+fn compaction_opens_only_the_segments_it_judges() {
+    const SEGMENTS: usize = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.dendro");
+    let (a, mut w) = Writer::single(&path, Box::new(Widening), meta()).unwrap();
+    for ts in 1..=SEGMENTS as i64 {
+        w.wal(vec![row(ts, 1 + (ts % 2) as usize)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (SEGMENTS as i64, 0)).unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let before = dendro::rewrite::compaction_opens();
+    let done = compact(&mut db, &CompactSpec::to_rows(1000)).unwrap();
+    let opens = dendro::rewrite::compaction_opens() - before;
+    assert_eq!((done.before, done.after), (SEGMENTS, SEGMENTS));
+    assert!(
+        opens <= 2 * SEGMENTS,
+        "{opens} opens for {SEGMENTS} segments"
     );
 }
