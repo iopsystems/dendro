@@ -1037,3 +1037,147 @@ fn compaction_opens_only_the_segments_it_judges() {
         "{opens} opens for {SEGMENTS} segments"
     );
 }
+
+/// An encoder that writes two parquet rows per WAL row, as a long layout
+/// writes one row per occupant. The segment's `rows` is the WAL rows it
+/// covers, as the seal path requires.
+struct Doubling;
+
+impl SegmentEncoder for Doubling {
+    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let ts: Vec<i64> = rows.iter().flat_map(|r| [r.ts, r.ts]).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ts.clone())) as ArrayRef],
+        )
+        .map_err(|e| format!("{e}"))?;
+        Ok(Some(Segment {
+            bytes: encode_batch(schema, &batch)?,
+            rows: rows.len() as u64,
+            first_ts: ts[0],
+            last_ts: ts[ts.len() - 1],
+            index: None,
+        }))
+    }
+}
+
+/// The merged segment's catalog rows are the WAL rows its inputs covered,
+/// not its parquet row count, which an encoder writing several parquet rows
+/// per WAL row makes larger.
+#[test]
+fn a_merged_segment_catalogs_wal_rows_not_parquet_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d.dendro");
+    let (a, mut w) = Writer::single(&path, Box::new(Doubling), meta()).unwrap();
+    for ts in 1..=4 {
+        w.wal(vec![row(ts, 0)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (4, 0)).unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let done = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
+    assert_eq!((done.before, done.after), (4, 1));
+    drop(db);
+    let db = Archive::open(&path).unwrap();
+    let metas = db.read_segment_meta(1, "s").unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].1.rows, 4, "four WAL rows, eight parquet rows");
+    assert_eq!((metas[0].1.first_ts, metas[0].1.last_ts), (1, 4));
+    let bytes = db.read_segment_bytes(1, "s", metas[0].0).unwrap().unwrap();
+    let parquet_rows = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(bytes),
+    )
+    .unwrap()
+    .metadata()
+    .file_metadata()
+    .num_rows();
+    assert_eq!(parquet_rows, 8);
+}
+
+/// A merge that refuses the third segment of a run.
+struct TwoAtMost;
+
+impl MetadataMerge for TwoAtMost {
+    type Run = usize;
+
+    fn start(&self, _: &MergeInput<'_>) -> Option<usize> {
+        Some(1)
+    }
+
+    fn extend(&self, run: &mut usize, _: &MergeInput<'_>) -> bool {
+        *run += 1;
+        *run <= 2
+    }
+
+    fn finish(&self, _: usize) -> Vec<KeyValue> {
+        Vec::new()
+    }
+}
+
+/// Under `UnionFields`, a column only the refused segment has is not in the
+/// merged segment: the union covers the segments merged.
+#[test]
+fn a_column_only_the_refused_segment_has_is_not_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("u.dendro");
+    let (a, mut w) = Writer::single(&path, Box::new(Widening), meta()).unwrap();
+    for (ts, columns) in [(1, 1), (2, 1), (3, 2)] {
+        w.wal(vec![row(ts, columns)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    a.finalize_single(w, (3, 0)).unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let spec = CompactSpec::to_rows(100).unioning_fields();
+    let done = compact_with(&mut db, &spec, &TwoAtMost).unwrap();
+    assert_eq!((done.before, done.after), (3, 2));
+    drop(db);
+    let db = Archive::open(&path).unwrap();
+    let seq = db.read_segment_meta(1, "s").unwrap()[0].0;
+    let bytes = db.read_segment_bytes(1, "s", seq).unwrap().unwrap();
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(bytes),
+    )
+    .unwrap();
+    let names: Vec<&str> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(names, vec!["timestamp", "v0"]);
+}
+
+/// A caller can drive a merge without an archive, through
+/// `MergeInput::new`: the default merge takes the same entries in another
+/// order, refuses a changed value, and finishes with the first's order.
+#[test]
+fn a_merge_runs_on_inputs_built_by_hand() {
+    use dendro::rewrite::IdenticalMetadata;
+
+    let kv = |pairs: &[(&str, &str)]| -> Vec<KeyValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+            .collect()
+    };
+    let fields = arrow::datatypes::Fields::empty();
+    let one = kv(&[("a", "1"), ("b", "2")]);
+    let reordered = kv(&[("b", "2"), ("a", "1")]);
+    let changed = kv(&[("a", "1"), ("b", "3")]);
+    let mut run = IdenticalMetadata
+        .start(&MergeInput::new(&one, &fields, 1))
+        .unwrap();
+    assert!(IdenticalMetadata.extend(&mut run, &MergeInput::new(&reordered, &fields, 1)));
+    assert!(!IdenticalMetadata.extend(&mut run, &MergeInput::new(&changed, &fields, 1)));
+    assert_eq!(IdenticalMetadata.finish(run), one);
+}

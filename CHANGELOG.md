@@ -46,18 +46,34 @@ cannot reach a failed release any other way.
   linear in the run. `compact` and `compact_stream` use
   `rewrite::IdenticalMetadata`, which merges only segments whose metadata has
   the same entries. A caller whose metadata changes at every segment, such as
-  a list of the rows' occupants that a population that comes and goes changes
-  constantly, can merge across those changes by combining the lists.
+  a list of the occupants the rows refer to, which changes whenever the
+  population does, can merge across those changes by combining the lists.
+  `MergeInput::new` builds an input by hand, for testing a merge without an
+  archive; `MergeInput::rows` is the segment's parquet row count, which for a
+  stream that writes several parquet rows per WAL row is larger than the
+  catalog's `SegmentMeta::rows`.
 - `rewrite::compaction_opens` (`test-support`): how many segments compaction
   has opened on the calling thread.
 
 ### Fixed
 
-- Compaction (`rewrite::compact`, `rewrite::compact_stream`) dropped the
-  parquet file key-value metadata of the segments it merged, so a caller
-  that describes a segment there (a layout marker, a per-column list of what
-  the rows refer to) got a merged segment that read as a different kind of
-  segment. The merged segment now carries its inputs' metadata, Arrow's
+- Compaction (`rewrite::compact`, `rewrite::compact_stream`) catalogued a
+  merged segment's `rows` as its parquet row count. Everywhere else the
+  catalog's `rows` counts the WAL rows a segment covers (the seal path
+  writes it, and `segment::materialize` refuses a segment whose count
+  differs), and the two differ for an encoder that writes several parquet
+  rows per WAL row: compacting a long stream, one parquet row per occupant
+  per WAL row, took a stream's catalog rows from 34,678 to 76,182,021. A
+  merged segment now catalogs the sum of its inputs' `rows`. Segments
+  already compacted keep the inflated count.
+- Compaction (`rewrite::compact`, `rewrite::compact_stream`) did not carry
+  the parquet file key-value metadata of the segments it merged into the
+  merged segment's file metadata. Under `StopAtChange` it moved the entries
+  into the merged file's embedded `ARROW:schema`, and under `UnionFields` it
+  dropped them entirely, so a caller that describes a segment there (a
+  layout marker, a per-column list of what the rows refer to) got a merged
+  segment that read as a different kind of segment. Segments already
+  compacted are not repaired. The merged segment now carries its inputs' metadata, Arrow's
   schema entry aside, with an input's value replacing the writer
   properties' for the same key. A run stops where any input's metadata
   has different entries from the first's, compared without regard to their

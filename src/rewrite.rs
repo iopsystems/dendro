@@ -103,8 +103,23 @@ pub struct MergeInput<'a> {
     /// names columns needs these to tell a column the segment lacks from one
     /// its metadata says nothing about.
     pub fields: &'a arrow::datatypes::Fields,
-    /// The rows in the segment.
+    /// The segment's parquet row count, from its footer. For a stream whose
+    /// encoder writes several parquet rows per WAL row (a long layout, one
+    /// per occupant) this is larger than the catalog's
+    /// [`SegmentMeta::rows`], which counts WAL rows.
     pub rows: u64,
+}
+
+impl<'a> MergeInput<'a> {
+    /// A segment as a merge sees it, for testing a [`MetadataMerge`]
+    /// without an archive. dendro builds these itself during compaction.
+    pub fn new(key_value: &'a [KeyValue], fields: &'a arrow::datatypes::Fields, rows: u64) -> Self {
+        MergeInput {
+            key_value,
+            fields,
+            rows,
+        }
+    }
 }
 
 /// How a compaction run's file key-value metadata combines: a fold over the
@@ -149,20 +164,31 @@ pub trait MetadataMerge {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IdenticalMetadata;
 
+/// An [`IdenticalMetadata`] run: the first segment's entries.
+#[derive(Debug, Clone)]
+pub struct IdenticalMetadataRun {
+    /// In file order, which the merged segment is written with.
+    first: Vec<KeyValue>,
+    /// Sorted, for comparing.
+    sorted: Vec<KeyValue>,
+}
+
 impl MetadataMerge for IdenticalMetadata {
-    /// The first segment's entries in file order, and sorted for comparing.
-    type Run = (Vec<KeyValue>, Vec<KeyValue>);
+    type Run = IdenticalMetadataRun;
 
     fn start(&self, first: &MergeInput<'_>) -> Option<Self::Run> {
-        Some((first.key_value.to_vec(), sorted(first.key_value)))
+        Some(IdenticalMetadataRun {
+            first: first.key_value.to_vec(),
+            sorted: sorted(first.key_value),
+        })
     }
 
     fn extend(&self, run: &mut Self::Run, next: &MergeInput<'_>) -> bool {
-        next.key_value.len() == run.1.len() && sorted(next.key_value) == run.1
+        next.key_value.len() == run.sorted.len() && sorted(next.key_value) == run.sorted
     }
 
     fn finish(&self, run: Self::Run) -> Vec<KeyValue> {
-        run.0
+        run.first
     }
 }
 
@@ -246,10 +272,9 @@ pub fn compact_stream(
 /// returns for the segments merged. [`IdenticalMetadata`] is the merge
 /// [`compact_stream`] uses.
 ///
-/// For a caller whose metadata describes the rows in a way it can combine,
-/// such as a list of what the rows refer to that two segments' lists union
-/// into: under [`IdenticalMetadata`] a run stops wherever that list changes,
-/// which for a population that comes and goes is nearly everywhere.
+/// Use it when the metadata can be combined, such as a list of what the
+/// rows refer to, which unions across segments. Under [`IdenticalMetadata`]
+/// a run stops wherever such a list changes.
 pub fn compact_stream_with<M: MetadataMerge + ?Sized>(
     db: &mut ArchiveMut,
     source_id: i64,
@@ -284,7 +309,7 @@ pub fn compact_stream_with<M: MetadataMerge + ?Sized>(
         // hold the write lock for their whole duration.
         let seqs: Vec<u64> = metas[at..end].iter().map(|(seq, _)| *seq).collect();
         let fetch = |seq: u64| db.read_segment_bytes(source_id, stream, seq);
-        let (merged, merged_rows, consumed) =
+        let (merged, consumed) =
             concat_parquet(&seqs, &fetch, spec.props(), spec.schema, merge, stream)?;
         if consumed < 2 {
             // A schema or metadata change at the very front of the run.
@@ -292,8 +317,11 @@ pub fn compact_stream_with<M: MetadataMerge + ?Sized>(
             continue;
         }
         let run = &metas[at..at + consumed];
+        // The catalog counts the WAL rows a segment covers, which is not
+        // always its parquet row count: a caller's encoder may write several
+        // parquet rows per WAL row (a long layout writes one per occupant).
         let meta = SegmentMeta {
-            rows: merged_rows,
+            rows: run.iter().map(|(_, m)| m.rows).sum(),
             first_ts: run[0].1.first_ts,
             last_ts: run[consumed - 1].1.last_ts,
         };
@@ -362,8 +390,8 @@ pub fn compact_with<M: MetadataMerge + ?Sized>(
 /// Concatenate the leading run of the segments `seqs` names that the schema
 /// policy and `merge` both admit into one parquet file, which carries the
 /// metadata `merge` finishes for that run. `fetch` reads a segment's bytes,
-/// `None` if it is gone. Returns the bytes, the rows in them, and how many
-/// segments were consumed — fewer than all of them when the schema or the
+/// `None` if it is gone. Returns the bytes and how many segments were
+/// consumed — fewer than all of them when the schema or the
 /// metadata changes partway, which a stream is allowed to do. A consumed
 /// count under two means nothing was written.
 ///
@@ -380,7 +408,7 @@ fn concat_parquet<M: MetadataMerge + ?Sized>(
     policy: SchemaPolicy,
     merge: &M,
     stream: &str,
-) -> Result<(Vec<u8>, u64, usize)> {
+) -> Result<(Vec<u8>, usize)> {
     use arrow::array::new_null_array;
     use arrow::datatypes::{Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
@@ -405,9 +433,11 @@ fn concat_parquet<M: MetadataMerge + ?Sized>(
     // schema's own.
     //
     // The schema Arrow reads carries the file metadata as well, merged into
-    // what the writer embedded under `ARROW:schema`. Those entries are
-    // `merge`'s to judge, so they come out of the schema here, and what is
-    // left is only what was embedded.
+    // what the writer embedded under `ARROW:schema`, with a file entry
+    // winning for a key both carry (parquet's
+    // `parquet_to_arrow_schema_and_fields`). Those entries are `merge`'s to
+    // judge, so they come out of the schema here; what is left is the
+    // embedded entries whose keys the file metadata does not also carry.
     //
     // A segment is read and opened only when it is about to be judged, so a
     // run refused at its second segment reads two segments, not the whole
@@ -492,7 +522,7 @@ fn concat_parquet<M: MetadataMerge + ?Sized>(
     }
     let consumed = opened.len();
     let Some(run) = run.filter(|_| consumed >= 2) else {
-        return Ok((Vec::new(), 0, 1));
+        return Ok((Vec::new(), 1));
     };
 
     let schema = match first {
@@ -519,7 +549,6 @@ fn concat_parquet<M: MetadataMerge + ?Sized>(
     let props = with_file_metadata(props, merge.finish(run));
 
     let mut buf: Vec<u8> = Vec::new();
-    let mut rows = 0u64;
     {
         let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
             .map_err(|e| Error::Message(format!("failed to open a merged {stream} writer: {e}")))?;
@@ -530,7 +559,6 @@ fn concat_parquet<M: MetadataMerge + ?Sized>(
                 let batch = batch.map_err(|e| {
                     Error::Message(format!("failed to read a {stream} batch to merge: {e}"))
                 })?;
-                rows += batch.num_rows() as u64;
                 // Under `StopAtChange` every batch already has the merged
                 // schema and this is a move; under `UnionFields` a segment
                 // that lacked a column contributes nulls for it.
@@ -559,7 +587,7 @@ fn concat_parquet<M: MetadataMerge + ?Sized>(
             Error::Message(format!("failed to finish a merged {stream} segment: {e}"))
         })?;
     }
-    Ok((buf, rows, consumed))
+    Ok((buf, consumed))
 }
 
 #[cfg(feature = "test-support")]
