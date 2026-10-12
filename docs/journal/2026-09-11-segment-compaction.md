@@ -1,7 +1,7 @@
 ---
 status: implemented
 opened: 2026-09-11
-updated: 2026-09-11
+updated: 2026-10-12
 ---
 
 # Segment compaction
@@ -216,6 +216,52 @@ not](2026-09-12-what-a-tsdb-has-that-we-do-not.md), which honored this
 entry's gate rather than pre-empting it — and the measurement then paid for
 itself twice: once by justifying the work, and once by catching that the
 first working version returned no space at all.
+
+### 2026-10-12: file metadata, a caller's merge, and the catalog's rows
+
+Three changes since the entry closed, each found by measuring an archive
+someone runs: a 5874-segment recording with no file key-value metadata, and a
+295-segment recording whose `cpu_usage/cpu_usage_task` stream is long (one
+parquet row per occupant per WAL row, occupant lists in the file metadata).
+Every timing below is 3 runs on APFS clones of those files, on one machine,
+with the runs of the versions compared alternating.
+
+**A merged segment carries its inputs' file key-value metadata** (1cdaa24).
+0.4.0 did not write it to the merged file's metadata: `StopAtChange` moved it
+into the embedded `ARROW:schema`, `UnionFields` dropped it. A run now stops
+where the entries differ (`IdenticalMetadata`, order ignored), or the caller
+says how to combine them with `compact_with` and a `MetadataMerge`.
+
+**The merge is a fold** (4e0df28). The first version called the caller's
+function with the growing run, so a merge that decodes occupant lists
+re-decoded each segment at every run length; it also opened every segment of
+a planned run before the schema check cut it. Now one loop reads, opens and
+judges a segment at a time (schema policy, then merge) and stops at the first
+refusal.
+
+| Archive, `to_rows` | Rule | Before | After | Segments |
+| --- | --- | --- | --- | --- |
+| 5874 segments, 1M | default | 25.2–25.7 s (0.4.0) | 11.7–12.1 s | 5874 → 619 |
+| long, 10k | default | 2.38–2.40 s (4687dec) | 0.29–0.31 s | 295 → 292 |
+| long, 1M | default | 4.19–4.21 s (4687dec) | 0.29–0.30 s | 295 → 292 |
+| long, 10k | union | 7.38–7.58 s (4687dec) | 4.85 s | 295 → 5 |
+| long, 1M | union | 14.30–14.44 s (4687dec) | 4.88–4.92 s | 295 → 2 |
+
+"Union" is metriken-storage's occupant-list merge. The 5874-segment result
+lists byte-identically to 0.4.0's, metadata included; the long results list
+byte-identically to 4687dec's. One run of 0.4.0 on the long archive at
+`to_rows(10_000)` took 5.97 s. With the row fix below, the long archive
+measures 0.30–0.31 s default and 4.98–5.18 s union at 10k, 0.30 s and
+5.08–5.17 s at 1M, with the same segment counts.
+
+**The catalog counts WAL rows** (d0114af). Compaction wrote the merged
+parquet file's row count into `SegmentMeta::rows`, which everywhere else
+counts WAL rows. On the long archive the union merge at `to_rows(1_000_000)`
+took `cpu_usage_task` from 34,678 catalog rows to 76,182,021 and metriken's
+`ArchiveReader::interval()` from 1 s to 0.001 s; the default rule took
+`cpu_usage_task/occupants` from 3,383 to 264,286. After the fix both streams
+keep 34,678 and 3,383 and `interval()` stays 1 s. The bug is in 0.4.0, and
+segments it compacted keep the inflated count.
 
 ## Deferred or Reopen Items
 
