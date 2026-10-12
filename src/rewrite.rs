@@ -361,9 +361,14 @@ fn concat_parquet(
     // what the writer embedded under `ARROW:schema`. Those entries are
     // `merge`'s to judge, so they come out of the schema here, and what is
     // left is only what was embedded.
+    //
+    // A segment is opened only when `merge` is about to be asked about it,
+    // so a run refused at its second segment reads two footers, not the
+    // whole run's.
     let mut segments = Vec::with_capacity(blobs.len());
-    for b in blobs {
-        let builder = open(b)?;
+    let mut merged: Vec<Vec<KeyValue>> = Vec::with_capacity(blobs.len());
+    while merged.len() < blobs.len() {
+        let builder = open(&blobs[merged.len()])?;
         let kv = file_kv(builder.metadata());
         let rows = builder.metadata().file_metadata().num_rows().max(0) as u64;
         let read = builder.schema();
@@ -371,10 +376,7 @@ fn concat_parquet(
         embedded.retain(|k, _| !kv.iter().any(|e| &e.key == k));
         let schema = Arc::new(Schema::new_with_metadata(read.fields().clone(), embedded));
         segments.push((kv, schema, rows));
-    }
-    let mut merged: Vec<Vec<KeyValue>> = Vec::with_capacity(blobs.len());
-    while merged.len() < segments.len() {
-        let inputs: Vec<MergeInput<'_>> = segments[..=merged.len()]
+        let inputs: Vec<MergeInput<'_>> = segments
             .iter()
             .map(|(kv, schema, rows)| MergeInput {
                 key_value: kv,
