@@ -33,6 +33,19 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `rewrite::compact_with` and `rewrite::compact_stream_with`: compaction
+  with a caller-supplied function that decides the merged segment's file
+  key-value metadata. It is given the run's segments in order (each one's
+  metadata, columns and row count, as `rewrite::MergeInput`) and returns the
+  merged metadata, or `None` to end the run before the segment it was just
+  given. `compact` and `compact_stream` use `rewrite::identical_metadata`,
+  which merges only segments whose metadata is the same. A caller whose
+  metadata changes at every segment, such as a list of the rows' occupants
+  that a population that comes and goes changes constantly, can merge across
+  those changes by combining the lists.
+
 ### Fixed
 
 - Compaction (`rewrite::compact`, `rewrite::compact_stream`) dropped the
