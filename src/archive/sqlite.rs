@@ -439,6 +439,14 @@ pub struct Evicted {
     pub live_rows: usize,
     /// Rows of the caller's time-keyed store deleted; see [`CallerRow`].
     pub caller_rows: usize,
+    /// Streams the pass left alone because a seal of theirs was deferred
+    /// and still could not commit when the pass ran. Only the writer
+    /// ([`SourceWriter::evict_before`](crate::writer::SourceWriter::evict_before)
+    /// and its variants) holds a stream back; an `ArchiveMut` pass has no
+    /// seals to wait for and reports 0. A held stream keeps everything this
+    /// pass would have removed, and the next pass after its seal commits
+    /// removes it.
+    pub held_streams: usize,
 }
 
 /// How many rows a table holds and what time span they cover, answered from
@@ -2682,6 +2690,7 @@ impl ArchiveMut {
                 wal_rows,
                 live_rows: live_rows as usize,
                 caller_rows,
+                held_streams: 0,
             })
         })
     }
