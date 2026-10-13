@@ -440,7 +440,8 @@ pub struct Evicted {
     /// Rows of the caller's time-keyed store deleted; see [`CallerRow`].
     pub caller_rows: usize,
     /// Streams the pass left alone because a seal of theirs was deferred
-    /// and still could not commit when the pass ran. Only the writer
+    /// and still could not commit when the pass ran, counting only streams
+    /// the pass's own filter would have evicted. Only the writer
     /// ([`SourceWriter::evict_before`](crate::writer::SourceWriter::evict_before)
     /// and its variants) holds a stream back; an `ArchiveMut` pass has no
     /// seals to wait for and reports 0. A held stream keeps everything this

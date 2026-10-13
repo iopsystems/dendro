@@ -1760,7 +1760,8 @@ fn writer_loop(
                     Err(e) if e.is_retryable() => {
                         warn!(
                             "seal of {} stream(s) for source {source_id} deferred ({e}); their \
-                             rows stay in the WAL and seal with the next batch",
+                             rows stay in the WAL and seal with the next batch or \
+                             before the next retention pass",
                             batch.len()
                         );
                         let held = deferred.entry(source_id).or_default();
@@ -1798,8 +1799,8 @@ fn writer_loop(
                 // A stream whose seal was deferred is sealed now, before
                 // anything is cut. Its rows are in no segment, and deleting
                 // the oldest of them can leave the rest undecodable. The
-                // retry is one batch per cap, like the seals that deferred;
-                // a stream still unsealed after it is left out of the pass.
+                // retry is one batch per cap; a stream still unsealed after
+                // it is left out of the pass, its sealed segments included.
                 let held = retry_deferred_seals(
                     db,
                     source_id,
@@ -1807,11 +1808,17 @@ fn writer_loop(
                     &mut next_seq,
                     &mut watermarks,
                     encoder,
-                )?;
+                );
                 // Reported, not swallowed. `Evicted` exists so a caller can
                 // tell "the window moved" from "nothing was old enough yet",
                 // and the writer used to throw it away - which made it
                 // unreachable through the only supported path.
+                // Counted only where the caller's own filter would have
+                // evicted, so the count is what this pass held back.
+                let held: BTreeSet<String> = held
+                    .into_iter()
+                    .filter(|s| streams.as_ref().is_none_or(|evict| evict(s)))
+                    .collect();
                 let streams: Option<StreamFilter> = if held.is_empty() {
                     streams
                 } else {
@@ -2043,8 +2050,11 @@ fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
 
 /// Seal `source_id`'s deferred streams, retried like any seal, and return
 /// the ones that are still unsealed. Streams sharing a `max_rows` go in one
-/// batch, as the seals that deferred them did. A stream that seals is taken
-/// off `deferred`; a retryable failure leaves its batch listed and returned.
+/// batch, so streams deferred under different caps commit separately. A
+/// stream that seals is taken off `deferred`; a batch that fails stays
+/// listed and is returned. A failure that is not retryable, such as an
+/// encoder error, is logged rather than returned: retention failing must
+/// not stop the writer, and the next `Seal` of the stream reports it.
 fn retry_deferred_seals(
     db: &mut ArchiveMut,
     source_id: i64,
@@ -2052,9 +2062,9 @@ fn retry_deferred_seals(
     next_seq: &mut BTreeMap<(i64, String), u64>,
     watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
     encoder: &(dyn SegmentEncoder + Send),
-) -> Result<BTreeSet<String>> {
+) -> BTreeSet<String> {
     let Some(listed) = deferred.get(&source_id) else {
-        return Ok(BTreeSet::new());
+        return BTreeSet::new();
     };
     let mut by_cap: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     for (stream, cap) in listed {
@@ -2080,14 +2090,21 @@ fn retry_deferred_seals(
                     }
                 }
             }
-            Err(e) if e.is_retryable() => held.extend(batch),
-            Err(e) => return Err(e),
+            Err(e) => {
+                if !e.is_retryable() {
+                    warn!(
+                        "sealing deferred stream(s) {batch:?} of source {source_id} before \
+                         retention failed ({e}); they are left out of the pass"
+                    );
+                }
+                held.extend(batch);
+            }
         }
     }
     if deferred.get(&source_id).is_some_and(BTreeMap::is_empty) {
         deferred.remove(&source_id);
     }
-    Ok(held)
+    held
 }
 
 /// Encode one batch's segments, insert them — with the batch's clock

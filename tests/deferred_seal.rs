@@ -14,9 +14,9 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use dendro::archive::{Archive, SourceMeta, WalRow};
+use dendro::archive::{Archive, Evicted, SourceMeta, WalRow};
 use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
-use dendro::writer::Writer;
+use dendro::writer::{SourceWriter, Writer};
 
 fn source() -> SourceMeta {
     SourceMeta {
@@ -172,6 +172,38 @@ fn eviction_seals_a_deferred_stream_first() {
 /// eighth call lands in the middle of the pass's wait.
 #[test]
 fn eviction_leaves_out_a_stream_whose_seal_still_cannot_commit() {
+    held(|w, cutoff| w.evict_before(cutoff).unwrap(), 1);
+}
+
+/// The same with a caller's filter that names the stream: the hold-back
+/// applies on top of it.
+#[test]
+fn a_filtered_eviction_leaves_out_a_held_stream() {
+    held(
+        |w, cutoff| {
+            w.evict_streams_before(cutoff, Box::new(|s: &str| s == "s"))
+                .unwrap()
+        },
+        1,
+    );
+}
+
+/// A caller's filter that does not name the stream: nothing was held back
+/// that the caller asked to evict, so `held_streams` is 0.
+#[test]
+fn a_held_stream_the_filter_skips_is_not_counted() {
+    held(
+        |w, cutoff| {
+            w.evict_streams_before(cutoff, Box::new(|s: &str| s != "s"))
+                .unwrap()
+        },
+        0,
+    );
+}
+
+/// A seal deferred, its retry at the start of `evict` failing too, and the
+/// pass that follows; `held_streams` is expected to be `count`.
+fn held(evict: fn(&mut SourceWriter, i64) -> Evicted, count: usize) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("held.dendro");
     let (calls_tx, calls_rx): (Sender<usize>, Receiver<usize>) = channel();
@@ -194,9 +226,9 @@ fn eviction_leaves_out_a_stream_whose_seal_still_cannot_commit() {
         std::thread::sleep(Duration::from_millis(600));
     });
     w.seal(vec!["s".to_string()]).unwrap();
-    let evicted = w.evict_before(2_500).unwrap();
+    let evicted = evict(&mut w, 2_500);
     holder.join().unwrap();
-    assert_eq!(evicted.held_streams, 1, "{evicted:?}");
+    assert_eq!(evicted.held_streams, count, "{evicted:?}");
     assert_eq!(evicted.wal_rows, 0, "{evicted:?}");
     assert_eq!(evicted.live_rows, 0, "{evicted:?}");
     assert_eq!(wal_rows(&path), 3, "the held stream kept its rows");

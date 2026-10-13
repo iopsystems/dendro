@@ -71,8 +71,13 @@ cannot reach a failed release any other way.
   The writer now remembers which streams' seals deferred, seals them at the
   start of the next pass (retried like any seal), and leaves out of the
   pass any stream it still cannot seal; that stream is evicted by the
-  first pass after its seal commits. A pass after a deferral can take as
-  long as the retried seal.
+  first pass after its seal commits. The stream is left out whole, its
+  sealed segments and caller rows included. While a stream is held, a
+  whole-source pass runs stream by stream, so a `CallerRowFloor` is asked
+  for every stream name rather than only the names with caller rows. A
+  pass after a deferral takes as long as the retried seals: one retry
+  schedule (up to four busy timeouts and 310 ms) per distinct `max_rows`
+  among the deferred streams, on the writer thread.
 
 - A seal put every live row of a stream into one segment, so a caller that
   checked `SegmentAccount::is_due` once after several rows had arrived
