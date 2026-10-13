@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -28,8 +28,12 @@ fn source() -> SourceMeta {
 
 /// A row of stream `s`; `anchor` marks the row the rows after it need.
 fn row(ts: i64, anchor: bool) -> WalRow {
+    row_of("s", ts, anchor)
+}
+
+fn row_of(stream: &str, ts: i64, anchor: bool) -> WalRow {
     WalRow {
-        stream: "s".to_string(),
+        stream: stream.to_string(),
         ts,
         wall_offset: ts * 10,
         row: vec![if anchor { b'A' } else { b'R' }],
@@ -39,30 +43,33 @@ fn row(ts: i64, anchor: bool) -> WalRow {
 /// Decodes a row only after an anchor row and drops the rows before the
 /// first anchor, as an encoder whose schema is stated once per segment does.
 /// Sends the running count of `encode` calls on `calls`, when set, and
-/// fails the call numbered `fail_on`.
+/// fails every call from `fail_from.0` on that encodes stream `fail_from.1`.
 struct Anchored {
-    count: AtomicUsize,
+    count: Arc<AtomicUsize>,
     calls: Option<Mutex<Sender<usize>>>,
-    fail_on: Option<usize>,
+    fail_from: Option<(usize, &'static str)>,
 }
 
 impl Anchored {
     fn new(calls: Option<Sender<usize>>) -> Self {
         Self {
-            count: AtomicUsize::new(0),
+            count: Arc::new(AtomicUsize::new(0)),
             calls: calls.map(Mutex::new),
-            fail_on: None,
+            fail_from: None,
         }
     }
 }
 
 impl SegmentEncoder for Anchored {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(calls) = &self.calls {
             let _ = calls.lock().unwrap().send(n);
         }
-        if self.fail_on == Some(n) {
+        if self
+            .fail_from
+            .is_some_and(|(from, name)| n >= from && stream == name)
+        {
             return Err("encoder refused the rows".into());
         }
         let mut anchored = false;
@@ -105,7 +112,14 @@ fn hold_lock(path: &Path, release: impl FnOnce() + Send + 'static) -> JoinHandle
 
 /// Each segment of `s` as `(first_ts, last_ts)`, and its bytes.
 fn segments(path: &Path, id: i64) -> (Vec<(i64, i64)>, Vec<String>) {
-    let segs = Archive::open(path).unwrap().read_segments(id, "s").unwrap();
+    segments_of(path, id, "s")
+}
+
+fn segments_of(path: &Path, id: i64, stream: &str) -> (Vec<(i64, i64)>, Vec<String>) {
+    let segs = Archive::open(path)
+        .unwrap()
+        .read_segments(id, stream)
+        .unwrap();
     (
         segs.iter()
             .map(|s| (s.meta.first_ts, s.meta.last_ts))
@@ -117,11 +131,17 @@ fn segments(path: &Path, id: i64) -> (Vec<(i64, i64)>, Vec<String>) {
 }
 
 fn wal_rows(path: &Path) -> i64 {
+    wal_rows_of(path, "s")
+}
+
+fn wal_rows_of(path: &Path, stream: &str) -> i64 {
     rusqlite::Connection::open(path)
         .unwrap()
-        .query_row("SELECT COUNT(*) FROM wal WHERE stream = 's'", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM wal WHERE stream = ?1",
+            [stream],
+            |r| r.get(0),
+        )
         .unwrap()
 }
 
@@ -174,8 +194,11 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encoder.dendro");
     let mut encoder = Anchored::new(None);
-    // Calls 1 to 4 are the deferred seal's attempts; 5 is the retry.
-    encoder.fail_on = Some(5);
+    // Calls 1 to 4 are the deferred seal's attempts; 5 is the retry, and
+    // every call after it fails too, so a stream left on the list would be
+    // retried and fail again rather than seal.
+    encoder.fail_from = Some((5, "s"));
+    let calls = Arc::clone(&encoder.count);
     let mut archive = Writer::create_with_busy_timeout(
         &path,
         Box::new(encoder),
@@ -199,13 +222,68 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
     assert_eq!(evicted.live_rows, 2, "{evicted:?}");
     assert_eq!(wal_rows(&path), 1);
 
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     let evicted = w.evict_before(2_500).unwrap();
-    assert_eq!(evicted.held_streams, 0, "taken off the list: {evicted:?}");
+    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "taken off the list: the second pass did not retry it"
+    );
     w.wal(vec![row(4_000, true)]).unwrap();
     w.sync().unwrap();
     drop(w);
     archive.join().unwrap();
     assert_eq!(wal_rows(&path), 2, "the writer still commits");
+}
+
+/// Two streams deferred in one seal, and the retry fails in the encoder for
+/// `t` only: `s` seals, `t` is evicted as unsealed rows, and neither is
+/// held. Calls 1 to 8 are the deferred seal's four attempts at both
+/// streams; 9 is the retry of `s` and 10 the retry of `t`.
+#[test]
+fn an_encoder_failure_in_one_stream_does_not_hold_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two.dendro");
+    let mut encoder = Anchored::new(None);
+    encoder.fail_from = Some((9, "t"));
+    let mut archive = Writer::create_with_busy_timeout(
+        &path,
+        Box::new(encoder),
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    let mut w = archive.add_source(source()).unwrap();
+    let id = w.source_id();
+    for ts in 1..=3 {
+        w.wal(vec![
+            row_of("s", ts * 1_000, ts == 1),
+            row_of("t", ts * 1_000, ts == 1),
+        ])
+        .unwrap();
+    }
+    w.sync().unwrap();
+
+    let holder = hold_lock(&path, || std::thread::sleep(Duration::from_millis(1_500)));
+    w.seal(vec!["s".to_string(), "t".to_string()]).unwrap();
+    w.sync().unwrap();
+    holder.join().unwrap();
+
+    let evicted = w.evict_before(2_500).unwrap();
+    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
+    assert_eq!(
+        evicted.live_rows, 2,
+        "t's rows at 1000 and 2000: {evicted:?}"
+    );
+    assert_eq!(
+        segments_of(&path, id, "s"),
+        (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
+    );
+    assert_eq!(segments_of(&path, id, "t").0, []);
+    assert_eq!(wal_rows_of(&path, "t"), 1);
+    drop(w);
+    archive.join().unwrap();
 }
 
 /// The retry before the pass also fails, and the lock clears only after
@@ -290,4 +368,49 @@ fn held(evict: fn(&mut SourceWriter, i64) -> Evicted, count: usize) {
         segments(&path, id),
         (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
     );
+}
+
+/// Two streams deferred, and the retry of the first fails on the lock:
+/// the second is held without being tried, so a pass costs one retry
+/// schedule however many streams are deferred. Calls 1 to 8 are the
+/// deferred seal's four attempts at both streams and 9 to 12 the retry of
+/// `s`; the lock is released 600 ms after call 12, inside the pass's wait,
+/// as in [`held`].
+#[test]
+fn after_one_retry_fails_the_rest_are_held_untried() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("untried.dendro");
+    let (calls_tx, calls_rx): (Sender<usize>, Receiver<usize>) = channel();
+    let encoder = Anchored::new(Some(calls_tx));
+    let calls = Arc::clone(&encoder.count);
+    let mut archive = Writer::create_with_busy_timeout(
+        &path,
+        Box::new(encoder),
+        Duration::from_secs(10),
+        Duration::from_millis(400),
+    )
+    .unwrap();
+    let mut w = archive.add_source(source()).unwrap();
+    for ts in 1..=3 {
+        w.wal(vec![
+            row_of("s", ts * 1_000, ts == 1),
+            row_of("t", ts * 1_000, ts == 1),
+        ])
+        .unwrap();
+    }
+    w.sync().unwrap();
+
+    let holder = hold_lock(&path, move || {
+        while calls_rx.recv().unwrap() < 12 {}
+        std::thread::sleep(Duration::from_millis(600));
+    });
+    w.seal(vec!["s".to_string(), "t".to_string()]).unwrap();
+    let evicted = w.evict_before(2_500).unwrap();
+    holder.join().unwrap();
+    assert_eq!(evicted.held_streams, 2, "{evicted:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 12, "t was not tried");
+    assert_eq!(wal_rows_of(&path, "s"), 3);
+    assert_eq!(wal_rows_of(&path, "t"), 3);
+    drop(w);
+    archive.join().unwrap();
 }

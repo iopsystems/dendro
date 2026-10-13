@@ -2050,9 +2050,15 @@ fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
 
 /// Seal `source_id`'s deferred streams, each in its own transaction and
 /// retried like any seal, and return the ones still unsealed after a
-/// retryable failure. One stream per transaction, so one stream's failure
-/// does not hold back another; nothing relies on deferred streams sealing
-/// together.
+/// retryable failure. One stream per transaction, so one stream's encoder
+/// failure does not hold back another; nothing relies on deferred streams
+/// sealing together.
+///
+/// After the first retryable failure the remaining streams are held without
+/// being tried. A lock or I/O error that outlasted one retry schedule will
+/// almost always outlast the next, and a schedule per stream would block
+/// the writer thread for one schedule (about 20 s at the default busy
+/// timeout) per deferred stream.
 ///
 /// A stream that seals, or whose seal fails with an error that is not
 /// retryable, is taken off `deferred`. The second is logged rather than
@@ -2075,6 +2081,10 @@ fn retry_deferred_seals(
     };
     let mut held = BTreeMap::new();
     for (stream, cap) in listed {
+        if !held.is_empty() {
+            held.insert(stream, cap);
+            continue;
+        }
         match with_retries("sealing a deferred stream before retention", || {
             seal_batch(
                 db,
