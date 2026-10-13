@@ -82,8 +82,14 @@ enum Msg {
     /// trade ("12 implicit commits would be 12 fsyncs at `synchronous=FULL`
     /// against a ~46 ms tick"); this carries the argument across sources.
     Wal { ticks: Vec<(i64, Vec<WalRow>)> },
-    /// One seal batch for one source = one transaction.
-    Seal { source_id: i64, batch: Vec<String> },
+    /// One seal batch for one source = one transaction. `max_rows` is the
+    /// most WAL rows one segment may hold; `usize::MAX` for an uncapped
+    /// `seal`.
+    Seal {
+        source_id: i64,
+        batch: Vec<String>,
+        max_rows: usize,
+    },
     /// One segment built elsewhere, to be inserted at the stream's next
     /// `seq`. The seal path's other entrance: `Seal` says "encode what is in
     /// the WAL", this says "here are the bytes". Replies, unlike `Seal`,
@@ -786,13 +792,57 @@ impl SourceWriter {
     /// Hand one seal batch (= one transaction) to the writer, as the streams
     /// to seal. Blocks while the channel is full: that is the intended
     /// backpressure signal.
+    ///
+    /// Each stream's live rows become one segment, however many there are.
+    /// A caller that asks for a seal when [`SegmentAccount::is_due`]
+    /// says so can still get a segment past its policy's `max_rows`: rows
+    /// that arrive between two seal checks all go into the next segment.
+    /// [`seal_capped`](Self::seal_capped) bounds that.
+    ///
+    /// [`SegmentAccount::is_due`]: crate::seal::SegmentAccount::is_due
     pub fn seal(&mut self, batch: Vec<String>) -> Result<()> {
+        self.seal_capped(batch, usize::MAX)
+    }
+
+    /// [`seal`](Self::seal), with no segment holding more than `max_rows`
+    /// WAL rows. A stream with more live rows than that is sealed as
+    /// consecutive segments of `max_rows` rows each, oldest first, and a
+    /// last one with the remainder: 7 live rows at `max_rows = 2` become
+    /// segments of 2, 2, 2 and 1 rows. All of them, for every stream in the
+    /// batch, commit in the batch's one transaction. A `max_rows` of 0 is
+    /// taken as 1.
+    ///
+    /// Pass the policy's `max_rows` ([`SealPolicy::max_rows`]). The cap is
+    /// on WAL rows, which is what the catalog's `rows` counts, not on the
+    /// parquet rows an encoder writes for them.
+    ///
+    /// Only the row cap is applied here. The byte cap and the age bound
+    /// stay triggers: they decide when the caller asks for a seal, and a
+    /// split does not look at them. The writer does not have the byte
+    /// estimate the caller's account charged for each row, and splitting
+    /// by a different measure would put the edges where the account did
+    /// not.
+    ///
+    /// Every part after the first is encoded with
+    /// [`SegmentEncoder::encode_after`], which an encoder whose rows depend
+    /// on earlier rows must implement. If a part's segment does not hold
+    /// every row it was given at the edges it shares with its neighbours
+    /// (it dropped a row there, or returned no segment), the split is
+    /// abandoned for that stream and its live rows are sealed as one
+    /// segment, as `seal` would: a dropped row inside the run would
+    /// otherwise sit below a later part's watermark, out of every segment
+    /// and every read.
+    ///
+    /// [`SealPolicy::max_rows`]: crate::seal::SealPolicy::max_rows
+    /// [`SegmentEncoder::encode_after`]: crate::segment::SegmentEncoder::encode_after
+    pub fn seal_capped(&mut self, batch: Vec<String>, max_rows: usize) -> Result<()> {
         if batch.is_empty() {
             return self.check_alive();
         }
         self.send(Msg::Seal {
             source_id: self.source_id,
             batch,
+            max_rows: max_rows.max(1),
         })
     }
 
@@ -1662,7 +1712,11 @@ fn writer_loop(
             Ok(Msg::Commits(reply)) => {
                 let _ = reply.send(db.commits());
             }
-            Ok(Msg::Seal { source_id, batch }) => {
+            Ok(Msg::Seal {
+                source_id,
+                batch,
+                max_rows,
+            }) => {
                 // A seal that cannot commit is DEFERRED, not lost: its rows
                 // are still live in the WAL, `seal_batch` re-reads them on
                 // every attempt, and if the schedule runs out they stay live
@@ -1676,6 +1730,7 @@ fn writer_loop(
                         &mut next_seq,
                         &mut watermarks,
                         batch.clone(),
+                        max_rows,
                         encoder,
                     )
                 }) {
@@ -2034,6 +2089,7 @@ fn seal_batch(
     next_seq: &mut BTreeMap<(i64, String), u64>,
     watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
     batch: Vec<String>,
+    max_rows: usize,
     encoder: &(dyn SegmentEncoder + Send),
 ) -> Result<()> {
     // Read and encode BEFORE the transaction opens. Both are proportional to
@@ -2072,7 +2128,10 @@ fn seal_batch(
         }
         // One contract for the three encode sites — see `segment::materialize`
         // for what it checks and why counting is the only check that works.
-        let Some(tail) = crate::segment::materialize(encoder, &stream, &rows)? else {
+        // Split into parts of at most `max_rows`, each its own segment; see
+        // `split_seal`.
+        let parts = split_seal(encoder, &stream, &rows, max_rows)?;
+        let Some(tail) = parts.last() else {
             continue;
         };
         // The batch's clock observation: ONE row's `(ts, wall_offset)`, never
@@ -2100,32 +2159,13 @@ fn seal_batch(
         // source as well as stream: `segments.seq` is scoped to
         // `(source_id, stream)`, so two sources of the same host must not
         // share a counter.
-        let seq = next_seq
+        let first_seq = next_seq
             .get(&(source_id, stream.clone()))
             .copied()
             .unwrap_or(0);
-        encoded.push(Encoded {
-            stream,
-            seq,
-            meta: SegmentMeta {
-                // ALL THREE from `tail`, never from the input rows. An encoder
-                // may drop rows it cannot decode on their own, and those are
-                // real WAL rows that never reach the segment; cataloging the
-                // input's span would claim coverage the bytes do not have.
-                //
-                // `last_ts` is the one that used to come from the input, and it
-                // was the expensive one: it is what the WAL prune below and the
-                // read watermark are both computed from, so a dropped trailing
-                // row was deleted from the WAL, absent from the segment, and
-                // hidden by a watermark claiming to cover it. Taken from the
-                // segment, that row stays live and seals next time.
-                rows: tail.rows,
-                first_ts: tail.first_ts,
-                last_ts: tail.last_ts,
-            },
-            bytes: tail.bytes,
-            caller_index: tail.index,
-        });
+        for (seq, part) in (first_seq..).zip(parts) {
+            encoded.push(encoded_part(stream.clone(), seq, part));
+        }
     }
 
     // ONE transaction for the whole batch. A real workload seals a dozen
@@ -2173,11 +2213,97 @@ fn seal_batch(
     // background optimization. `Transaction` does not expose `prune_wal`, so this
     // ordering is enforced by the type, not by this comment.
     //
-    // Each stream is pruned only up to its OWN segment's `last_ts`: rows a
-    // stream ingested after the sealed span, and every other stream's rows,
-    // stay live.
-    for e in &encoded {
-        db.prune_wal(source_id, &e.stream, e.meta.last_ts)?;
+    // Each stream is pruned only up to its OWN newest segment's `last_ts`:
+    // rows a stream ingested after the sealed span, and every other stream's
+    // rows, stay live. A split stream's parts are consecutive in `encoded`,
+    // oldest first, so its last part carries the newest `last_ts`.
+    for (i, e) in encoded.iter().enumerate() {
+        if encoded
+            .get(i + 1)
+            .is_none_or(|next| next.stream != e.stream)
+        {
+            db.prune_wal(source_id, &e.stream, e.meta.last_ts)?;
+        }
     }
     Ok(())
+}
+
+/// One part of a stream's seal, numbered and cataloged.
+fn encoded_part(stream: String, seq: u64, segment: crate::segment::Segment) -> Encoded {
+    Encoded {
+        stream,
+        seq,
+        meta: SegmentMeta {
+            // ALL THREE from the segment, never from the input rows. An
+            // encoder may drop rows it cannot decode on their own, and those
+            // are real WAL rows that never reach the segment; cataloging the
+            // input's span would claim coverage the bytes do not have.
+            //
+            // `last_ts` is the one that used to come from the input, and it
+            // was the expensive one: it is what the WAL prune and the read
+            // watermark are both computed from, so a dropped trailing row was
+            // deleted from the WAL, absent from the segment, and hidden by a
+            // watermark claiming to cover it. Taken from the segment, that
+            // row stays live and seals next time.
+            rows: segment.rows,
+            first_ts: segment.first_ts,
+            last_ts: segment.last_ts,
+        },
+        bytes: segment.bytes,
+        caller_index: segment.index,
+    }
+}
+
+/// A stream's live rows as segments of at most `max_rows` WAL rows each,
+/// oldest first; empty when the encoder produces no segment.
+///
+/// At or under the cap this is one `materialize`, exactly the unsplit seal.
+/// Over it, part `k` is `rows[k * max_rows..]` up to `max_rows` rows,
+/// encoded after the rows before it (`SegmentEncoder::encode_after`).
+///
+/// The parts must tile the run with no gap between them. A row an encoder
+/// drops at the end of one part, or the start of the next, would be below
+/// the next part's `last_ts`: the prune deletes it and the read watermark
+/// hides it, so it is in no segment and no WAL. The first part may still
+/// drop a leading run and the last a trailing one, as an unsplit segment
+/// may. A part that drops at an inner edge, or yields no segment, abandons
+/// the split: the whole run is encoded as one segment instead, which is no
+/// worse than an uncapped seal and loses nothing.
+fn split_seal(
+    encoder: &(dyn SegmentEncoder + Send),
+    stream: &str,
+    rows: &[WalRow],
+    max_rows: usize,
+) -> Result<Vec<crate::segment::Segment>> {
+    let max_rows = max_rows.max(1);
+    if rows.len() <= max_rows {
+        return Ok(crate::segment::materialize(encoder, stream, rows)?
+            .into_iter()
+            .collect());
+    }
+    let mut parts = Vec::with_capacity(rows.len().div_ceil(max_rows));
+    let mut start = 0;
+    while start < rows.len() {
+        let end = rows.len().min(start + max_rows);
+        let part = &rows[start..end];
+        let segment = crate::segment::materialize_after(encoder, stream, &rows[..start], part)?;
+        let tiles = segment.as_ref().is_some_and(|s| {
+            (start == 0 || s.first_ts == part[0].ts)
+                && (end == rows.len() || s.last_ts == part[part.len() - 1].ts)
+        });
+        let Some(segment) = segment.filter(|_| tiles) else {
+            warn!(
+                "the encoder did not cover rows {start}..{end} of `{stream}`'s {} live rows \
+                 at an edge shared with another part; sealing them as one segment, past the \
+                 row cap of {max_rows}",
+                rows.len()
+            );
+            return Ok(crate::segment::materialize(encoder, stream, rows)?
+                .into_iter()
+                .collect());
+        };
+        parts.push(segment);
+        start = end;
+    }
+    Ok(parts)
 }

@@ -141,6 +141,30 @@ pub trait SegmentEncoder {
     fn version(&self) -> Option<&str> {
         None
     }
+
+    /// Encode `rows` as one segment, where `before` are the stream's live
+    /// rows that precede them in the same seal. `Ok(None)` for no segment,
+    /// and the same rules as [`encode`](Self::encode) for what a segment may
+    /// claim.
+    ///
+    /// A capped seal (`SourceWriter::seal_capped`, feature `write`) splits a stream's live
+    /// rows into consecutive parts of at most its row cap. The first part is
+    /// encoded with [`encode`](Self::encode); each later part with this, so
+    /// that an encoder whose rows depend on earlier rows can read what it
+    /// needs from `before`. A row that carries a schema only when it is the
+    /// first since the last seal is the usual case: in a split, the part that
+    /// starts after it has rows that refer to that schema and none that
+    /// carry it.
+    ///
+    /// The default ignores `before` and calls `encode(stream, rows)`, which
+    /// is correct when every row can be decoded on its own. An encoder whose
+    /// rows cannot must override this before its caller uses
+    /// `seal_capped`; plain `SourceWriter::seal` never splits and never
+    /// calls it.
+    fn encode_after(&self, stream: &str, before: &[WalRow], rows: &[WalRow]) -> EncodeResult {
+        let _ = before;
+        self.encode(stream, rows)
+    }
 }
 
 /// Run an encoder over a run of WAL rows and validate the result.
@@ -169,11 +193,28 @@ pub fn materialize(
     stream: &str,
     rows: &[WalRow],
 ) -> Result<Option<Segment>> {
+    materialize_after(encoder, stream, &[], rows)
+}
+
+/// [`materialize`] for a part of a split seal: `rows` encoded after
+/// `before` with [`SegmentEncoder::encode_after`], and validated against
+/// `rows` alone. An empty `before` calls [`SegmentEncoder::encode`], so
+/// the first part of a split is encoded exactly as an unsplit seal is.
+pub(crate) fn materialize_after(
+    encoder: &dyn SegmentEncoder,
+    stream: &str,
+    before: &[WalRow],
+    rows: &[WalRow],
+) -> Result<Option<Segment>> {
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
         return Ok(None);
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        encoder.encode(stream, rows)
+        if before.is_empty() {
+            encoder.encode(stream, rows)
+        } else {
+            encoder.encode_after(stream, before, rows)
+        }
     }));
     let segment = match outcome {
         Ok(Ok(Some(segment))) => segment,
@@ -239,6 +280,9 @@ impl<T: SegmentEncoder + ?Sized> SegmentEncoder for &T {
     }
     fn version(&self) -> Option<&str> {
         (**self).version()
+    }
+    fn encode_after(&self, stream: &str, before: &[WalRow], rows: &[WalRow]) -> EncodeResult {
+        (**self).encode_after(stream, before, rows)
     }
 }
 
