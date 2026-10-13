@@ -55,7 +55,9 @@ cannot reach a failed release any other way.
   implement it before its caller uses `seal_capped`. A part whose segment
   drops a row at an edge it shares with another part, or that yields no
   segment, abandons the split for that stream, which is then sealed as one
-  segment as `seal` would, so a split never loses a row.
+  segment as `seal` would, so a split never loses a row. That holds only
+  for an encoder whose segment reports the rows it wrote: one that claims
+  rows it skipped hides the gap from this check.
 
 ### Fixed
 
