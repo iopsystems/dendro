@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-12
+
 ### Added
 
 - `rewrite::compact_with` and `rewrite::compact_stream_with`: compaction
