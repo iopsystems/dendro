@@ -981,7 +981,12 @@ impl SourceWriter {
     /// the oldest of them may be one the rest need to decode. A stream still
     /// unsealed after that is left out of the pass and counted in
     /// [`Evicted::held_streams`]; the first pass after its seal commits
-    /// evicts it. This applies to every eviction spelling.
+    /// evicts it. After the first deferred stream whose retry fails with a
+    /// retryable error, the remaining ones are held without being tried, so
+    /// a pass waits for at most one retry schedule. A stream whose retried
+    /// seal fails with an error that is not retryable, such as an encoder
+    /// error, is not held: it is logged and its live rows are evicted. This
+    /// applies to every eviction spelling.
     pub fn evict_before(&mut self, cutoff_ts: i64) -> Result<Evicted> {
         self.evict(cutoff_ts, None, None)
     }

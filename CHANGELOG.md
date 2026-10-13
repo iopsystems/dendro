@@ -79,7 +79,8 @@ cannot reach a failed release any other way.
   its own transaction, on the writer thread; after the first one that
   still cannot commit (one retry schedule: up to four busy timeouts and
   310 ms) the rest are held without being tried. A retried seal that
-  fails in the encoder is not held: it is logged, the pass evicts the
+  fails with an error that is not retryable, such as an encoder error, is
+  not held: it is logged, the pass evicts the
   stream's live rows as it did before, and a `Seal` of the stream that
   fails the same way stops the writer, as it always has.
 - A seal put every live row of a stream into one segment, so a caller that

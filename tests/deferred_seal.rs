@@ -238,15 +238,16 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
 }
 
 /// Two streams deferred in one seal, and the retry fails in the encoder for
-/// `t` only: `s` seals, `t` is evicted as unsealed rows, and neither is
-/// held. Calls 1 to 8 are the deferred seal's four attempts at both
-/// streams; 9 is the retry of `s` and 10 the retry of `t`.
+/// `s` only, which is retried first: `t` is still tried and seals, `s` is
+/// evicted as unsealed rows, and neither is held. Calls 1 to 8 are the
+/// deferred seal's four attempts at both streams; 9 is the retry of `s`
+/// and 10 the retry of `t`.
 #[test]
 fn an_encoder_failure_in_one_stream_does_not_hold_another() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two.dendro");
     let mut encoder = Anchored::new(None);
-    encoder.fail_from = Some((9, "t"));
+    encoder.fail_from = Some((9, "s"));
     let mut archive = Writer::create_with_busy_timeout(
         &path,
         Box::new(encoder),
@@ -274,14 +275,14 @@ fn an_encoder_failure_in_one_stream_does_not_hold_another() {
     assert_eq!(evicted.held_streams, 0, "{evicted:?}");
     assert_eq!(
         evicted.live_rows, 2,
-        "t's rows at 1000 and 2000: {evicted:?}"
+        "s's rows at 1000 and 2000: {evicted:?}"
     );
     assert_eq!(
-        segments_of(&path, id, "s"),
+        segments_of(&path, id, "t"),
         (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
     );
-    assert_eq!(segments_of(&path, id, "t").0, []);
-    assert_eq!(wal_rows_of(&path, "t"), 1);
+    assert_eq!(segments_of(&path, id, "s").0, []);
+    assert_eq!(wal_rows_of(&path, "s"), 1);
     drop(w);
     archive.join().unwrap();
 }
