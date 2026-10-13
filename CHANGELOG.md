@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-13
+
 ### Added
 
 - `SourceWriter::seal_capped(batch, max_rows)`: a seal that writes no
