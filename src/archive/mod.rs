@@ -18,7 +18,8 @@
 /// SQLite is asked to know about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
-    /// How many rows the segment holds.
+    /// How many WAL rows the segment covers. An encoder that writes several
+    /// parquet rows per WAL row writes more parquet rows than this.
     pub rows: u64,
     /// The timestamp of its first row.
     pub first_ts: i64,

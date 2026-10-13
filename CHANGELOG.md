@@ -33,6 +33,64 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `rewrite::compact_with` and `rewrite::compact_stream_with`: compaction
+  with a caller-supplied `rewrite::MetadataMerge` that decides the merged
+  segment's file key-value metadata. It is a fold over the run's segments in
+  order, each given once as a `rewrite::MergeInput` (its metadata, columns
+  and row count): `start` with the first, `extend` with each next one, which
+  may refuse it and so end the run before it, and `finish` for the segments
+  merged. A segment the `SchemaPolicy` refuses ends the run before the merge
+  is given it. A merge that keeps what it has decoded in its `Run` costs time
+  linear in the run. `compact` and `compact_stream` use
+  `rewrite::IdenticalMetadata`, which merges only segments whose metadata has
+  the same entries; its `Run` is `rewrite::IdenticalMetadataRun`. A caller
+  whose metadata changes at every segment, such as a list of the occupants
+  the rows refer to, which changes whenever the population does, can merge
+  across those changes by combining the lists.
+  `MergeInput::new` builds an input by hand, for testing a merge without an
+  archive; `MergeInput::rows` is the segment's parquet row count, which for a
+  stream that writes several parquet rows per WAL row is larger than the
+  catalog's `SegmentMeta::rows`.
+- `rewrite::compaction_opens` (`test-support`): how many segments compaction
+  has opened on the calling thread.
+
+### Fixed
+
+- Compaction (`rewrite::compact`, `rewrite::compact_stream`) cataloged a
+  merged segment's `rows` as its parquet row count. Everywhere else the
+  catalog's `rows` counts the WAL rows a segment covers (the seal path
+  writes it, and `segment::materialize` refuses a segment whose count
+  differs), and the two differ for an encoder that writes several parquet
+  rows per WAL row, such as a long layout with one parquet row per occupant
+  per WAL row. On one long recording, 0.4.0's `compact` took a
+  `cpu_usage_task/occupants` stream from 3,383 catalog rows to 264,286, and
+  with `CompactSpec::unioning_fields` it also took `cpu_usage_task` from
+  34,678 to 76,182,021 and metriken's `ArchiveReader::interval()` from 1 s to
+  0.001 s; this release's caller merge would have done the same to
+  `cpu_usage_task` without the fix. A merged segment now catalogs the sum of
+  its inputs' `rows`. Segments already compacted keep the inflated count, and
+  the compaction planner, which sizes runs by that count, treats each as over
+  any target below it, so they are not merged again.
+- Compaction (`rewrite::compact`, `rewrite::compact_stream`) did not carry
+  the parquet file key-value metadata of the segments it merged into the
+  merged segment's file metadata. Under `StopAtChange` it moved the entries
+  into the merged file's embedded `ARROW:schema`, and under `UnionFields` it
+  dropped them entirely, so a caller that describes a segment there (a
+  layout marker, a per-column list of what the rows refer to) got a merged
+  segment that read as a different kind of segment. The merged segment now
+  carries its inputs' metadata, Arrow's schema entry aside, with an input's
+  value replacing the writer properties' for the same key. A run stops
+  where any input's metadata has different entries from the first's,
+  compared without regard to their order, under either `SchemaPolicy`;
+  before, only `StopAtChange` stopped there, because it compares whole
+  Arrow schemas, and `UnionFields` merged across the change. Segments
+  already compacted are not repaired.
+- `rewrite::project_segment_columns` wrote a key twice when the writer
+  properties and the segment both carried it. The segment's value now
+  replaces the properties', as in compaction.
+
 ## [0.4.0] - 2026-10-11
 
 ### Changed
