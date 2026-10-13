@@ -44,6 +44,12 @@ pub struct SealPolicy {
     pub max_bytes: usize,
     /// Seal once the open segment holds this many rows. The cap that splits
     /// the THIN streams, which take a long time to reach any byte threshold.
+    ///
+    /// As a trigger it is checked when the caller asks, so rows that arrive
+    /// between two checks overshoot it: `SourceWriter::seal` puts all of a
+    /// stream's live rows in one segment. Pass it to
+    /// `SourceWriter::seal_capped` as well to make it a bound, which splits
+    /// such a backlog into segments of at most this many rows.
     pub max_rows: usize,
     /// Seal once the open segment is this old, whatever its size. Bounds how
     /// much an unclean kill loses, not seal cost.

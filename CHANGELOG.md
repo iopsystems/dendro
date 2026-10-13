@@ -33,6 +33,41 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `SourceWriter::seal_capped(batch, max_rows)`: a seal that writes no
+  segment with more than `max_rows` WAL rows. A stream with more live rows
+  than that is sealed as consecutive segments of `max_rows` rows, oldest
+  first, and a last one with the remainder (7 live rows at a cap of 2 are
+  segments of 2, 2, 2 and 1), each with its own catalog entry and `seq`,
+  all in the batch's one transaction. The cap counts WAL rows, as the
+  catalog's `rows` does, not the parquet rows an encoder writes for them.
+  Only the row cap is applied: the byte cap and the age bound remain
+  triggers for when the caller seals, because the writer does not have the
+  byte estimate the caller's `SegmentAccount` charged per row. A seal that
+  is deferred (its transaction could not commit) leaves its rows live, and
+  the next capped seal of the stream splits them with the rest.
+- `SegmentEncoder::encode_after(stream, before, rows)`: how a capped seal
+  encodes each part after the first, with the stream's earlier live rows
+  as `before`. The default ignores `before` and calls `encode`, which is
+  right when every row decodes on its own. An encoder whose rows depend on
+  earlier ones (a schema carried only by the first row after a seal) must
+  implement it before its caller uses `seal_capped`. A part whose segment
+  drops a row at an edge it shares with another part, or that yields no
+  segment, abandons the split for that stream, which is then sealed as one
+  segment as `seal` would, so a split never loses a row. That holds only
+  for an encoder whose segment reports the rows it wrote: one that claims
+  rows it skipped hides the gap from this check.
+
+### Fixed
+
+- A seal put every live row of a stream into one segment, so a caller that
+  checked `SegmentAccount::is_due` once after several rows had arrived
+  (frames that queued while a slow seal ran) got segments past its
+  policy's `max_rows`: 3- and 4-row segments against a cap of 2 at 10 Hz
+  with ~350 ms seals. `seal_capped` with the policy's `max_rows` bounds
+  them. `seal` is unchanged.
+
 ## [0.4.1] - 2026-10-12
 
 ### Added
