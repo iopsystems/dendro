@@ -58,9 +58,31 @@ cannot reach a failed release any other way.
   segment as `seal` would, so a split never loses a row. That holds only
   for an encoder whose segment reports the rows it wrote: one that claims
   rows it skipped hides the gap from this check.
+- `Evicted::held_streams`: how many streams a writer retention pass left
+  out because their seal was deferred and still could not commit.
 
 ### Fixed
 
+- A writer retention pass (`SourceWriter::evict_before` and its variants)
+  deleted the live rows of a stream whose seal had been deferred, the same
+  as any other live row past the cutoff. For an encoder whose rows depend
+  on an earlier one (a schema stated once at a segment's start), that cut
+  the row the survivors needed, and the next seal decoded none of them.
+  The writer now remembers which streams' seals deferred, seals them at the
+  start of the next pass (retried like any seal), and leaves out of the
+  pass any stream it still cannot seal; that stream is evicted by the
+  first pass after its seal commits. The stream is left out whole, its
+  sealed segments and caller rows included. While a stream is held, a
+  whole-source pass runs stream by stream, so a `CallerRowFloor` is asked
+  for every stream name rather than only the names with caller rows. A
+  pass after a deferral first retries the deferred streams' seals, each in
+  its own transaction, on the writer thread; after the first one that
+  still cannot commit (one retry schedule: up to four busy timeouts and
+  310 ms) the rest are held without being tried. A retried seal that
+  fails with an error that is not retryable, such as an encoder error, is
+  not held: it is logged, the pass evicts the
+  stream's live rows as it did before, and a `Seal` of the stream that
+  fails the same way stops the writer, as it always has.
 - A seal put every live row of a stream into one segment, so a caller that
   checked `SegmentAccount::is_due` once after several rows had arrived
   (frames that queued while a slow seal ran) got segments past its
