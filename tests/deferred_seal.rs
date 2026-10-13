@@ -38,10 +38,12 @@ fn row(ts: i64, anchor: bool) -> WalRow {
 
 /// Decodes a row only after an anchor row and drops the rows before the
 /// first anchor, as an encoder whose schema is stated once per segment does.
-/// Sends the running count of `encode` calls on `calls`, when set.
+/// Sends the running count of `encode` calls on `calls`, when set, and
+/// fails the call numbered `fail_on`.
 struct Anchored {
     count: AtomicUsize,
     calls: Option<Mutex<Sender<usize>>>,
+    fail_on: Option<usize>,
 }
 
 impl Anchored {
@@ -49,6 +51,7 @@ impl Anchored {
         Self {
             count: AtomicUsize::new(0),
             calls: calls.map(Mutex::new),
+            fail_on: None,
         }
     }
 }
@@ -58,6 +61,9 @@ impl SegmentEncoder for Anchored {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(calls) = &self.calls {
             let _ = calls.lock().unwrap().send(n);
+        }
+        if self.fail_on == Some(n) {
+            return Err("encoder refused the rows".into());
         }
         let mut anchored = false;
         let mut decoded = Vec::new();
@@ -158,6 +164,48 @@ fn eviction_seals_a_deferred_stream_first() {
 
     drop(w);
     archive.join().unwrap();
+}
+
+/// The retry before the pass fails in the encoder, which no retry fixes:
+/// the stream is not held, the pass evicts its live rows as it would have
+/// without the deferral, and the writer stays up.
+#[test]
+fn an_encoder_failure_in_the_retry_is_not_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encoder.dendro");
+    let mut encoder = Anchored::new(None);
+    // Calls 1 to 4 are the deferred seal's attempts; 5 is the retry.
+    encoder.fail_on = Some(5);
+    let mut archive = Writer::create_with_busy_timeout(
+        &path,
+        Box::new(encoder),
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    let mut w = archive.add_source(source()).unwrap();
+    for ts in 1..=3 {
+        w.wal(vec![row(ts * 1_000, ts == 1)]).unwrap();
+    }
+    w.sync().unwrap();
+
+    let holder = hold_lock(&path, || std::thread::sleep(Duration::from_millis(1_500)));
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.sync().unwrap();
+    holder.join().unwrap();
+
+    let evicted = w.evict_before(2_500).unwrap();
+    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
+    assert_eq!(evicted.live_rows, 2, "{evicted:?}");
+    assert_eq!(wal_rows(&path), 1);
+
+    let evicted = w.evict_before(2_500).unwrap();
+    assert_eq!(evicted.held_streams, 0, "taken off the list: {evicted:?}");
+    w.wal(vec![row(4_000, true)]).unwrap();
+    w.sync().unwrap();
+    drop(w);
+    archive.join().unwrap();
+    assert_eq!(wal_rows(&path), 2, "the writer still commits");
 }
 
 /// The retry before the pass also fails, and the lock clears only after

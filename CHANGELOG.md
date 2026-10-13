@@ -75,10 +75,12 @@ cannot reach a failed release any other way.
   sealed segments and caller rows included. While a stream is held, a
   whole-source pass runs stream by stream, so a `CallerRowFloor` is asked
   for every stream name rather than only the names with caller rows. A
-  pass after a deferral takes as long as the retried seals: one retry
-  schedule (up to four busy timeouts and 310 ms) per distinct `max_rows`
-  among the deferred streams, on the writer thread.
-
+  pass after a deferral takes as long as the retried seals, each deferred
+  stream in its own transaction with its own retry schedule (up to four
+  busy timeouts and 310 ms), on the writer thread. A retried seal that
+  fails in the encoder is not held: it is logged, the pass evicts the
+  stream's live rows as it did before, and a `Seal` of the stream that
+  fails the same way stops the writer, as it always has.
 - A seal put every live row of a stream into one segment, so a caller that
   checked `SegmentAccount::is_due` once after several rows had arrived
   (frames that queued while a slow seal ran) got segments past its
