@@ -53,6 +53,13 @@ pub enum SchemaPolicy {
 pub struct CompactSpec {
     /// Merge adjacent segments until the next one would push the total past
     /// this. A run of one is left alone.
+    ///
+    /// It counts catalog rows ([`SegmentMeta::rows`]), which are WAL rows. A
+    /// stream whose encoder writes several parquet rows per WAL row gets a
+    /// merged segment larger than this by that factor: a long layout writes
+    /// one per occupant, and `to_rows(1_000_000)` over one measured long
+    /// stream of 34,678 WAL rows built a single segment of 76,182,021
+    /// parquet rows, in memory, with a peak resident set of about 2.1 GB.
     pub target_rows: u64,
     /// Properties for the merged segment. `None` uses the archive's own
     /// ([`segment::writer_props`](crate::segment::writer_props)); a caller
@@ -92,8 +99,8 @@ impl CompactSpec {
 
 /// One segment of a compaction run, as a [`MetadataMerge`] sees it.
 #[derive(Debug, Clone, Copy)]
-/// Fields are added without a major version; dendro constructs these, and a
-/// caller reads them.
+/// Fields are added without a major version; dendro constructs these during
+/// compaction, and a caller can construct one with [`MergeInput::new`].
 #[non_exhaustive]
 pub struct MergeInput<'a> {
     /// The segment's parquet file key-value metadata, in file order, without

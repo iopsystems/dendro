@@ -1114,8 +1114,11 @@ impl MetadataMerge for TwoAtMost {
     }
 
     fn extend(&self, run: &mut usize, _: &MergeInput<'_>) -> bool {
+        if *run == 2 {
+            return false;
+        }
         *run += 1;
-        *run <= 2
+        true
     }
 
     fn finish(&self, _: usize) -> Vec<KeyValue> {

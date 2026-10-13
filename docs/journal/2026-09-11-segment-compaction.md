@@ -223,8 +223,20 @@ Three changes since the entry closed, each found by measuring an archive
 someone runs: a 5874-segment recording with no file key-value metadata, and a
 295-segment recording whose `cpu_usage/cpu_usage_task` stream is long (one
 parquet row per occupant per WAL row, occupant lists in the file metadata).
-Every timing below is 3 runs on APFS clones of those files, on one machine,
-with the runs of the versions compared alternating.
+How each figure was taken: the archive is copied with `cp -c` (an APFS
+clone, so the original is never opened for writing) for every run, and the
+clone deleted after. One process opens it with `ArchiveMut::open`, and times
+a single `compact(&mut db, &CompactSpec::to_rows(N))` call for the default
+rule, or `compact_with(.., &spec, &merge)` with metriken-storage's
+`SegmentMetadataMerge` (`merge_segment_metadata` before the fold) for the
+union rule, with `N` the target in the table. Each cell is 3 runs on one
+machine, the versions compared alternating run by run. Segment counts are
+`Compacted::before` and `after`. "Byte-identical" means a listing of every
+segment's stream, sequence number, catalog rows, first and last timestamp
+and sorted key-value metadata compared equal after compacting with each
+version. Catalog rows are summed from `read_segment_meta`, and
+`interval()` is metriken-storage's `ArchiveReader` opened on the compacted
+clone. Peak memory is `/usr/bin/time -l`'s maximum resident set size.
 
 **A merged segment carries its inputs' file key-value metadata** (1cdaa24).
 0.4.0 did not write it to the merged file's metadata: `StopAtChange` moved it
@@ -260,8 +272,18 @@ counts WAL rows. On the long archive the union merge at `to_rows(1_000_000)`
 took `cpu_usage_task` from 34,678 catalog rows to 76,182,021 and metriken's
 `ArchiveReader::interval()` from 1 s to 0.001 s; the default rule took
 `cpu_usage_task/occupants` from 3,383 to 264,286. After the fix both streams
-keep 34,678 and 3,383 and `interval()` stays 1 s. The bug is in 0.4.0, and
-segments it compacted keep the inflated count.
+keep 34,678 and 3,383 and `interval()` stays 1 s. The bug is in 0.4.0: its
+default `compact` inflated `cpu_usage_task/occupants` the same way, and with
+`unioning_fields` it inflated `cpu_usage_task` to 76,182,021 as well (one
+run each). Segments it compacted keep the inflated count, which the planner
+reads as over any smaller target, so they are not merged again.
+
+`target_rows` counts these WAL rows, so a long stream's merged segment is
+larger by the occupant count: the union merge at `to_rows(1_000_000)` built
+one `cpu_usage_task` segment of 76,182,021 parquet rows in memory. Peak
+resident set for that whole compaction was 2.13-2.20 GB with the fix and
+2.12-2.13 GB without it (3 runs each), so the fix does not change it; a
+target sized in WAL rows is what decides it.
 
 ## Deferred or Reopen Items
 
