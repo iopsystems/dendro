@@ -418,9 +418,7 @@ pub fn staggers_identically(a: &str, b: &str) -> bool {
             _ => return false,
         }
     }
-    // `%` rather than `is_multiple_of`, which needs Rust 1.87; the crate
-    // supports 1.85, the floor its dependencies set.
-    bit5_flips % 2 == 0
+    bit5_flips.is_multiple_of(2)
 }
 
 /// A source's stagger identity: its label set, canonically rendered.
