@@ -352,11 +352,8 @@ impl SegmentEncoder for Relabeling {
         let tag = rows[0].row[0].to_string();
         let fields = vec![
             Field::new("timestamp", DataType::Int64, false),
-            Field::new("v0", DataType::Int64, false).with_metadata(
-                BTreeMap::from([("id".to_string(), tag)])
-                    .into_iter()
-                    .collect(),
-            ),
+            Field::new("v0", DataType::Int64, false)
+                .with_metadata(BTreeMap::from([("id".to_string(), tag)])),
         ];
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(ts.clone())),

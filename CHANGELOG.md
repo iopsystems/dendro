@@ -33,6 +33,22 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** arrow and parquet are 60 (were 58). Parquet 59 and later no
+  longer depend on `thrift`, which clears GHSA-2f9f-gq7v-9h6m (thrift 0.17).
+  Arrow and parquet types appear in the public API, so a caller must use the
+  same major version: `segment::encode_batch` takes an arrow `Schema` and
+  `RecordBatch`, `segment::writer_props` returns a parquet
+  `WriterProperties`, `CompactSpec::writer_props` and
+  `CopySpec::writer_props` hold one, `MergeInput` carries parquet
+  `KeyValue`s and arrow `Fields`, `MetadataMerge::finish` returns
+  `KeyValue`s, and `ColumnFilter`'s methods take an arrow `Field`.
+- **Breaking:** the minimum supported Rust version is 1.88 (was 1.85), the
+  floor arrow and parquet 60 set. Parquet 59 would clear the advisory at
+  1.85; 60 matches the metriken crates, which take arrow and parquet types
+  across this API and move to 60 with it.
+
 ## [0.4.2] - 2026-10-13
 
 ### Added
