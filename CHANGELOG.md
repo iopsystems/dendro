@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-14
+
 ### Changed
 
 - **Breaking:** arrow and parquet are 60 (were 58). Parquet 59 and later no
