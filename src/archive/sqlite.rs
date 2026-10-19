@@ -2762,7 +2762,8 @@ impl ArchiveMut {
     /// In place, as [`update_source_metadata`](Self::update_source_metadata)
     /// is: an assembly that copied sources from several archives tags each
     /// copy (`arm=baseline`) without rewriting its segments. The source keeps
-    /// its `uuid`: labels describe a source, the uuid identifies it.
+    /// its `uuid`, so `rewrite::shared_sources` still reports the relabelled
+    /// copy as the same source as its original.
     pub fn update_source_labels(
         &mut self,
         source_id: i64,
@@ -3547,12 +3548,11 @@ mod tests {
         .collect();
         db.update_source_labels(a, &labels).unwrap();
         let got = db.read_sources().unwrap();
-        assert_eq!(got[0].id, a);
-        assert_eq!(got[0].meta.labels, labels);
-        assert_eq!(got[0].meta.metadata, before[0].meta.metadata);
-        assert_eq!(got[0].uuid, before[0].uuid);
+        let mut want = before[0].clone();
+        want.meta.labels = labels.clone();
+        assert_eq!(got[0], want);
+        assert_eq!(got[1], before[1]);
         assert_eq!(got[1].id, b);
-        assert_eq!(got[1].meta.labels, before[1].meta.labels);
         assert!(db.update_source_labels(b + 1, &labels).is_err());
     }
 
