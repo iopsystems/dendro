@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-19
+
 ### Added
 
 - `ArchiveMut::update_source_labels`, which replaces one source's labels in
