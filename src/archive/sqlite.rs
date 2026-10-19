@@ -2757,6 +2757,33 @@ impl ArchiveMut {
         Ok(())
     }
 
+    /// Replace one source's labels.
+    ///
+    /// In place, as [`update_source_metadata`](Self::update_source_metadata)
+    /// is: an assembly that copied sources from several archives tags each
+    /// copy (`arm=baseline`) without rewriting its segments. The source keeps
+    /// its `uuid`: labels describe a source, the uuid identifies it.
+    pub fn update_source_labels(
+        &mut self,
+        source_id: i64,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(labels)
+            .map_err(|e| Error::Message(format!("failed to encode source labels: {e}")))?;
+        let changed = self
+            .db
+            .conn
+            .execute(
+                "UPDATE sources SET labels = ?1 WHERE id = ?2",
+                rusqlite::params![encoded, source_id],
+            )
+            .map_err(Error::sqlite("failed to update source labels"))?;
+        if changed == 0 {
+            return Err(Error::Message(format!("no source with id {source_id}")));
+        }
+        Ok(())
+    }
+
     /// Copy what the `-wal` sidecar holds into the archive itself, best-effort.
     ///
     /// **Passive by design.** A passive checkpoint moves whatever frames it
@@ -3492,6 +3519,41 @@ mod tests {
         assert_eq!(got[0].meta.metadata["source"], "weather");
         assert_eq!(got[0].meta.clock_anchor_wall_ns, 1_700_000_000_000_000_000);
         assert!(!got[0].complete, "a fresh source is not complete");
+    }
+
+    /// A source's labels are replaced in place, its other fields and the
+    /// other sources untouched; an unknown id is an error.
+    #[test]
+    fn a_sources_labels_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
+        let meta = |host: &str| SourceMeta {
+            labels: [("host".to_string(), host.to_string())]
+                .into_iter()
+                .collect(),
+            metadata: [("source".to_string(), "weather".to_string())]
+                .into_iter()
+                .collect(),
+            clock_anchor_wall_ns: 1,
+        };
+        let a = db.insert_source(&meta("h1")).unwrap();
+        let b = db.insert_source(&meta("h2")).unwrap();
+        let before = db.read_sources().unwrap();
+        let labels: BTreeMap<String, String> = [
+            ("host".to_string(), "h1".to_string()),
+            ("arm".to_string(), "baseline".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        db.update_source_labels(a, &labels).unwrap();
+        let got = db.read_sources().unwrap();
+        assert_eq!(got[0].id, a);
+        assert_eq!(got[0].meta.labels, labels);
+        assert_eq!(got[0].meta.metadata, before[0].meta.metadata);
+        assert_eq!(got[0].uuid, before[0].uuid);
+        assert_eq!(got[1].id, b);
+        assert_eq!(got[1].meta.labels, before[1].meta.labels);
+        assert!(db.update_source_labels(b + 1, &labels).is_err());
     }
 
     #[test]
