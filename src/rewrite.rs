@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::archive::{Archive, ArchiveMut, SegmentMeta, Transaction};
+use crate::archive::{Archive, ArchiveMut, CopiedDocuments, SegmentMeta, Transaction};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -780,6 +780,9 @@ pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
 /// archive rather than to a source or a time, so no part of the spec
 /// selects it. See [`copy_documents_into`], which this calls in the same
 /// snapshot, for how revisions already in the destination are handled.
+/// Its report is not returned here; a caller that needs it (a combine
+/// checking which inputs' documents collide) calls
+/// [`copy_documents_into`] first, and the copy here then adds nothing.
 pub fn copy_sources_into(
     src: &Archive,
     tx: &Transaction<'_>,
@@ -949,21 +952,30 @@ fn copy_sources_snapshotted(
 }
 
 /// Copy every document revision in `src` into the open destination
-/// transaction, returning how many were inserted. FORMAT.md §3.6.
+/// transaction, and say what changed. FORMAT.md §3.6.
 ///
 /// [`copy_sources_into`] calls this, so a caller copying sources need not.
-/// It is public for an assembly that builds its sources some other way and
-/// still wants the documents.
+/// It is public for an assembly that builds its sources some other way, and
+/// for a caller that wants the report: call it before
+/// [`copy_sources_into`], whose own copy then adds nothing.
 ///
 /// A revision is identified by its uuid, and one the destination already
 /// holds is skipped, so copying the same archive twice, or a copy beside its
-/// original, adds each revision once. `supersedes` is renumbered to the
-/// destination's ids. Inserted revisions take ids after everything the
-/// destination holds, in `src`'s order, so where two inputs both hold
-/// revisions of one document, the input copied last supplies the current
-/// one and the other's stay in its history.
-pub fn copy_documents_into(src: &Archive, tx: &Transaction<'_>) -> Result<usize> {
-    src.read_snapshot(|src| tx.copy_documents_from(src))
+/// original, adds each revision once. A held revision must match the
+/// incoming one in kind, name, schema and body; a mismatch is an error,
+/// because a revision never changes and the copy cannot tell which file is
+/// wrong. `supersedes` is renumbered to the destination's ids. Inserted
+/// revisions take ids after everything the destination holds, in `src`'s
+/// order, so where two inputs both hold revisions of one document, the
+/// input copied last supplies the current one and the other's stay in its
+/// history; [`CopiedDocuments::forked`] names those documents.
+///
+/// `src` is read with one statement, which is one snapshot of it, and one
+/// body at a time. `src` may be a v4 archive, which holds none. A v4
+/// destination is refused as [`Error::SchemaTooOld`] when `src` holds any
+/// revision, since a v4 archive is never given documents (FORMAT.md §8).
+pub fn copy_documents_into(src: &Archive, tx: &Transaction<'_>) -> Result<CopiedDocuments> {
+    tx.copy_documents_from(src)
 }
 
 /// Re-encode one segment with only the columns `keep` accepts, or `None` when

@@ -61,7 +61,7 @@
 //! | **index** | The caller's, not dendro's: an opaque blob stored beside a segment ([`Segment::index`]) that the archive never reads. The catalog knows a segment's stream and span; anything finer lives here. |
 //! | **caller store** | Also the caller's: opaque rows kept against `(stream, ts)` ([`archive::CallerRow`]), read by range, evicted with the segments, and untouched by compaction. For what must survive a merge, which a per-segment index cannot. |
 //! | **encoder** | The caller's [`SegmentEncoder`]. The only thing that knows what a row means. |
-//! | **document** | Named JSON belonging to the archive rather than to a source ([`archive::Document`]): a saved view, a report's selection. Revisions are appended, never overwritten, and every copy carries them. |
+//! | **document** | Named JSON belonging to the archive rather than to a source ([`archive::Document`]): a saved view, a report's selection. Revisions are appended, never overwritten. The copies this crate makes carry them; replication does not (FORMAT.md §3.6). |
 //!
 //! **A source is a namespace.** It makes a stream name unambiguous and gives
 //! its rows a shared wall-clock anchor: row timestamps are

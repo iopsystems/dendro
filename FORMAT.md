@@ -11,7 +11,8 @@ and this document has a bug.
 
 `DESIGN.md` says why the format is shaped this way. This says what it is.
 
-Schema version: **4** (`src/archive/sqlite.rs`, `SCHEMA_VERSION`). See
+Schema version: **5**, and this build also reads **4** (`src/archive/sqlite.rs`,
+`SCHEMA_VERSION`, `OLDEST_READ_SCHEMA_VERSION`). See
 [Compatibility](#8-compatibility) for what changes it.
 
 ## 1. The model
@@ -139,7 +140,7 @@ CREATE TABLE caller_rows(
   blob BLOB NOT NULL                   -- opaque, the caller's
 );
 CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
-CREATE TABLE documents(                -- absent in archives before it existed
+CREATE TABLE documents(                -- schema 5; a v4 archive has none
   id INTEGER PRIMARY KEY,
   uuid TEXT NOT NULL UNIQUE,
   kind TEXT NOT NULL,
@@ -316,11 +317,17 @@ spans every source. Each row is one **revision** of the document
   same `supersedes` are a **fork**: two writers each replaced the revision
   they had read, and both are kept. The newer is current by the rule above;
   a conditional write (`put_document_if_current`) refuses instead of forking
-  when the revision it read is no longer current.
+  when the revision it read is no longer current. It names that revision by
+  `uuid`, not `id`, because a copy renumbers ids.
 - **`uuid`** is the revision's identity, minted at insert in the form of
-  §3.1's and carried by every copy. A copy skips a revision whose `uuid` the
-  destination already holds, so copying an archive twice, or into an archive
-  that already holds a copy of it, adds each revision once.
+  §3.1's and carried by the copies this crate makes. A copy skips a
+  revision whose `uuid` the destination already holds, so copying an archive
+  twice, or into an archive that already holds a copy of it, adds each
+  revision once. A revision never changes, so a held revision must equal the
+  incoming one in `kind`, `name`, `schema` and `body`; a copy that finds the
+  same `uuid` with different contents fails, because one of the two files is
+  wrong and the copy cannot tell which. (`created_wall_ns` and `supersedes`
+  are not compared: the first is provenance, the second a file-local id.)
 - **`kind`** is a namespace the caller chooses, such as `myapp.view`, and
   **`name`** says which document of that kind. Both are non-empty. Kinds
   beginning `dendro.` are reserved for this crate, which writes none today.
@@ -331,23 +338,30 @@ spans every source. Each row is one **revision** of the document
   revision whose `schema` it does recognize, saying that it is showing an
   older revision. A writer that changes a body's shape writes a new
   `schema`, never a new shape under an old one.
-- **`body`** is JSON text. A writer checks that it parses and stores it as
-  given; nothing else reads it.
+- **`body`** is JSON text (RFC 8259). A writer checks that it parses and
+  stores it as given; nothing else reads it. The check sets no nesting limit
+  and accepts an escaped lone surrogate (`"\ud800"`), both of which the
+  grammar allows and JavaScript's `JSON.stringify` can produce.
 - **`created_wall_ns`** is the wall clock at insert, in nanoseconds since
   the Unix epoch at millisecond resolution, from SQLite's own clock.
   Provenance only: no rule orders by it.
-- **Copies.** `rewrite::copy_sources_into` carries every revision of every
-  document, whatever its time bound and stream filter select, and renumbers
-  `supersedes` to the destination's ids. Inserted revisions take ids after
-  everything the destination holds, in the source's order, so when several
-  archives are combined, the one copied last supplies the current revision
-  of a document they share. `vacuum_into` and `serialize` copy the file
-  whole. Compaction and retention do not touch the table. Replication does
-  not carry it (WIRE.md is per source).
-- **Archives without the table.** An archive created before the table
-  existed has no `documents` table, and a reader treats that as no
-  documents. The first document written to it creates the table, inside that
-  write's transaction (§8).
+- **Copies.** `rewrite::copy_sources_into` and `rewrite::copy_documents_into`
+  carry every revision of every document, whatever the copy's time bound
+  and stream filter select, and renumber `supersedes` to the destination's
+  ids. Inserted revisions take ids after everything the destination holds,
+  in the source's order, so when several archives are combined, the one
+  copied last supplies the current revision of a document they share.
+  `copy_documents_into` reports which documents' current revision came
+  from its input and which of those displaced a current document they do
+  not supersede (`CopiedDocuments::forked`), so a combine can choose or
+  rename. `vacuum_into` and `serialize` copy the file whole. Compaction and
+  retention do not touch the table. Replication does not carry it (WIRE.md
+  is per source).
+- **v4 archives.** A v4 archive has no `documents` table, and a reader
+  treats that as no documents. No document is ever written into one: a put,
+  or a copy that would insert a revision, is refused as
+  `Error::SchemaTooOld`, and the archive is copied forward into a new (v5)
+  archive instead (§8).
 
 ## 4. Reading
 
@@ -462,17 +476,13 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   to be correct, a change to the live-WAL rule, a change to what
   `first_ts`/`last_ts`/`rows` mean, a change to the time model. A reader
   refuses a version above its own.
+  Also a new table whose loss to an old copier loses data nobody can
+  regenerate: see version 5 below.
 - **What does not.** A nullable column an old reader can ignore (`uuid`,
   `caller_index`, `heartbeat` and `heartbeat_interval_ns` were added this
-  way); a new table an old reader never queries (`documents` was); a new
-  reserved metadata key
+  way); a new reserved metadata key
   (`producer_epoch`, `writer_sessions` were); a new event kind. Old copiers
   drop what they do not know, which degrades to "unknown", never to wrong.
-  For `documents` that was checked against the previous release's build
-  rather than argued: its open gate reads only the header, nothing in it
-  lists or refuses tables, its `verify` passes an archive holding documents,
-  and its writer resumes a source in one. Its `copy_sources_into` drops the
-  documents; its `vacuum_into` keeps them.
   One exception: a writer older than the heartbeat that resumes a source a
   newer writer left does not bump `heartbeat`, so a newer reader reads that
   source as stopped while it is being appended to.
@@ -497,10 +507,30 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   over time belongs in `caller_rows` (§3.5), keyed by the time it changed,
   never in field metadata: rows that span such a change fuse two series into
   one column, and the segment carries no evidence of it.
+- **Version 5 added `documents` (§3.6).** An old reader would not misread
+  a v5 archive: checked against the 0.5.1 build, its open gate reads only
+  the header, nothing in it lists or refuses tables, its `verify` passes an
+  archive holding documents, and its writer resumes a source in one. The
+  bump is for the copiers. 0.5.1's `copy_sources_into` copies a fixed list
+  of tables and drops `documents`, and a document is something a person
+  wrote (a saved view, a report's selection), not a fact an old copier can
+  degrade to "unknown". A copy that silently loses it is wrong, so a build
+  that would make one must refuse the file instead. Releases up to 0.5.1
+  refuse every v5 archive as `unsupported archive schema version 5`.
+- **Writing a v4 archive.** A v5 build reads v4. It also writes into one
+  what v4 holds, so that a recording made before the upgrade can be resumed
+  and annotated in place: a writer resumes its sources, metadata and labels
+  are edited, compaction and retention run, and the file stays v4. It never
+  adds a v5 structure to it. A document written into a v4 archive, directly
+  or by a copy, is refused as `Error::SchemaTooOld`, and the archive is
+  copied forward instead: `rewrite::copy_sources_into` into a new archive,
+  which is v5. The header is never restamped.
 - **Versions 1 to 3 are not dendro's.** They are rezolus's `.rez` formats,
   never read here; rezolus upgrades them by copying into a new archive.
 - **What a release promises.** A build reads its own schema version and the
-  one before it, and writes only its own. A schema bump therefore ships with
+  one before it, and writes only its own: it creates archives of its own
+  version, and adds nothing of its own version to an older one (above). A
+  schema bump therefore ships with
   a reader for the previous version and a copy-forward through `rewrite`,
   and an archive is never migrated in place. Reserved metadata keys are never
   removed and never change meaning; a key that stops being written keeps its

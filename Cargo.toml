@@ -39,6 +39,9 @@ parquet = { version = "60.0.0", default-features = false, optional = true, featu
 # `bundled` compiles SQLite from source: slower builds, no runtime system
 # dependency, and it is what lets the crate build for wasm32.
 rusqlite = { version = "0.40", optional = true, features = ["bundled", "blob", "serialize"] }
+# `serde::de::IgnoredAny`, which checks that a document body is JSON without
+# building it. Already in the graph through serde_json.
+serde = { version = "1", optional = true }
 serde_json = { version = "1.0", optional = true }
 tracing = { version = "0.1", optional = true }
 
@@ -53,6 +56,7 @@ archive = [
     "dep:bytes",
     "dep:parquet",
     "dep:rusqlite",
+    "dep:serde",
     "dep:serde_json",
     "dep:tracing",
 ]

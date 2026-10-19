@@ -9,7 +9,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 mod documents;
-pub use documents::{Deletion, Document, Revision, RESERVED_KIND_PREFIX};
+pub use documents::{CopiedDocuments, Deletion, Document, Revision, RESERVED_KIND_PREFIX};
 
 /// Fixed at file creation and not changeable afterwards without leaving WAL
 /// mode and running a full `VACUUM`, so treat it as permanent.
@@ -70,13 +70,23 @@ const _: () = assert!(
     "the writer's page cache must be smaller than the reader's"
 );
 
-/// The schema this build writes and reads. Stamped into the header at
-/// creation as `user_version`.
+/// The schema this build writes. Stamped into the header at creation as
+/// `user_version`.
 ///
 /// Numbering starts at 4 because 1 through 3 were rezolus's `.rez` formats,
 /// which this crate does not read: a `.rez` recording is upgraded to a dendro
 /// archive by rezolus, and dendro reads only what dendro stamped.
-const SCHEMA_VERSION: i64 = 4;
+///
+/// 5 added the `documents` table (FORMAT.md §3.6, §8).
+const SCHEMA_VERSION: i64 = 5;
+
+/// The oldest schema this build reads: the one before its own (FORMAT.md
+/// §8). A v4 archive has no `documents` table and reads as holding no
+/// documents.
+const OLDEST_READ_SCHEMA_VERSION: i64 = 4;
+
+/// The first schema with the `documents` table.
+pub(crate) const DOCUMENTS_SCHEMA_VERSION: i64 = 5;
 
 /// `PRAGMA application_id`, stamped into the SQLite file header at creation:
 /// the ASCII bytes `dend`, four because the field is a 32-bit integer and the
@@ -965,7 +975,8 @@ impl Archive {
     ///
     /// Decided from the header stamp, before any pragma that writes: the
     /// `application_id` must be [`APPLICATION_ID`], and the `user_version` it
-    /// vouches for must be [`SCHEMA_VERSION`]. Anything else is refused
+    /// vouches for must be one this build reads: [`SCHEMA_VERSION`] or the
+    /// one before it. Anything else is refused
     /// rather than guessed at, by name: not SQLite, an unstamped SQLite
     /// database (SQLite's default id, which is also what a `.rez` recording
     /// from before dendro carries), another application's database, or a
@@ -1009,11 +1020,11 @@ impl Archive {
             )));
         }
         match self.pragma_i64("user_version")? {
-            SCHEMA_VERSION => Ok(()),
+            OLDEST_READ_SCHEMA_VERSION..=SCHEMA_VERSION => Ok(()),
             other => Err(Error::UnsupportedSchema {
                 found: other,
                 writes: SCHEMA_VERSION,
-                reads: SCHEMA_VERSION,
+                reads: OLDEST_READ_SCHEMA_VERSION,
             }),
         }
     }
@@ -1101,6 +1112,15 @@ impl Archive {
         self.conn
             .pragma_update(None, name, value)
             .map_err(Error::sqlite(format!("failed to set pragma {name}")))
+    }
+
+    /// The archive's schema version, its header's `user_version`: 5 for an
+    /// archive this build created, 4 for one an earlier release created.
+    /// A v4 archive holds no documents and cannot be given any; copying it
+    /// into a new archive through [`crate::rewrite`] makes a v5 one
+    /// (FORMAT.md §8).
+    pub fn schema_version(&self) -> Result<i64> {
+        self.pragma_i64("user_version")
     }
 
     /// A fresh random (version 4) UUID, in the canonical 8-4-4-4-12 form.

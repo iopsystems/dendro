@@ -50,14 +50,35 @@ of the document `(kind, name)`: `uuid`, `schema`, `body` (JSON),
   so a fork (two revisions superseding one) is visible in
   `document_history`, and nothing is lost when one happens. A writer that
   must not fork uses `put_document_if_current`, which compares the current
-  id with the one the caller read and refuses with
+  revision's uuid with the one the caller read and refuses with
   `Error::DocumentConflict`. That is the concurrency answer for "a viewer
-  read the document, the user edited it, the viewer saves".
+  read the document, the user edited it, the viewer saves". The first build
+  compared ids; a review pointed out that a copy renumbers them, so an
+  editor that read from one file and saved into a combined copy got a false
+  conflict. The token is the uuid, and the conflict carries uuids.
 - **A `uuid` per revision.** Not in the original sketch. Without it a copy
   cannot tell a revision it already holds from a new one, so combining an
   archive with a copy of itself, or copying documents twice into one
   destination, would duplicate every revision and fork every document. With
   it a copy is idempotent, and `supersedes` is renumbered through it.
+- **The same uuid with different contents fails the copy.** A revision is
+  never changed, so a held revision that differs in kind, name, schema or
+  body from the incoming one means one of the two files is wrong. Skipping
+  it would keep whichever arrived first without saying so; a warning would
+  do the same in a log nobody reads. The copy cannot tell which file is
+  right, so it refuses. `created_wall_ns` and `supersedes` are not compared:
+  the first is provenance, the second a file-local id.
+- **A copy reports what it changed (`CopiedDocuments`).** rezolus combines
+  archives that each carry a `default` view, and needs to know when one
+  input's view displaced another's. `copy_documents_into` returns the
+  revisions inserted, the documents whose current revision came from this
+  input, and `forked`: those where the destination's previous current
+  document is not an ancestor (through `supersedes`) of the new one. A
+  newer copy of the same document is an update, not a fork; a document the
+  destination had deleted is not displaced. `copy_sources_into` still
+  returns the source count, so a caller that wants the report calls
+  `copy_documents_into` first, and the copy inside `copy_sources_into` then
+  inserts nothing.
 - **`schema` is the caller's and never read.** It is the body's type name
   and version (`rezolus.view/1`). dendro cannot interpret a body, so it
   cannot version one; what it can do is store the version beside it and
@@ -65,8 +86,24 @@ of the document `(kind, name)`: `uuid`, `schema`, `body` (JSON),
   `schema` you do not know, and you may walk the history back to the newest
   revision you do know. Cross-version compatibility of the body is then a
   consumer decision with the information it needs in the file.
-- **`body` must parse as JSON.** Checked at write with `serde_json`; nothing
-  else reads it. A reader can then rely on the column holding JSON.
+- **`body` must parse as JSON, checked without building it.** The first
+  build parsed into `serde_json::Value`, which a review measured at 528 MB
+  peak for one 56 MB body, and which refuses two kinds of valid JSON:
+  nesting past 128 and an escaped lone surrogate (`"\ud800"`, which
+  JavaScript's `JSON.stringify` produces). `serde::de::IgnoredAny` walks the
+  text and keeps nothing, has no nesting limit, and accepts the surrogate;
+  it still refuses trailing characters, control characters, bad escapes,
+  `NaN` and comments (probed on serde_json 1.0.151). SQLite's `json_valid`
+  was the other candidate: it accepts the surrogate and refuses nesting past
+  1000, so a deep but valid body would still be refused. `serde` was already
+  in the graph through serde_json; it is now a direct optional dependency
+  under `archive`.
+- **Hold one body at a time.** A put reads the previous revision's id and
+  whether it is a deletion, not its body. A copy reads the source with one
+  statement, row by row, binding each row's text straight into the insert,
+  and compares a held revision in SQL. That one statement is also the copy's
+  snapshot of the source, so `copy_documents_into` no longer opens a read
+  transaction of its own.
 - **`kind` is the caller's namespace; `dendro.` is reserved.** dendro writes
   no documents today. Reserving the prefix now, and refusing it from
   callers, means a later dendro can write archive-level documents of its own
@@ -77,49 +114,73 @@ of the document `(kind, name)`: `uuid`, `schema`, `body` (JSON),
   comes from its VFS, which works there, the same reason `mint_uuid` uses
   `randomblob`. Millisecond resolution. Provenance only; no rule orders by
   it.
-- **Principle 2 is a naming convention, not a mechanism.** A producer's
-  template and a user's layer over it are two documents (`name` "producer"
-  and "user", or two kinds); the consumer composes them. dendro guarantees
-  the part it can: no write replaces another revision, so the producer's
-  copy survives a user's edit even under the same name.
+- **dendro does not enforce principle 2.** A producer's template and a
+  user's layer are two documents (`name` "producer" and "user", or two
+  kinds) that the consumer composes. dendro guarantees the part it can: no
+  write replaces another revision, so the producer's copy survives a user's
+  edit even under the same name.
 
-### Compatibility
+### Compatibility: schema version 5
 
-FORMAT.md §8 says a change an old reader would not misread needs no schema
-bump. A new table qualifies only if no existing reader, copier or validator
-lists tables or refuses unknown ones, so that was checked in the code of
-origin/main (`da79f94`, the v0.5.1 code):
+The first build of this change kept schema version 4 and created the table
+lazily, on the argument in FORMAT.md §8 that an old reader would not misread
+a new table. That argument was checked in the code of origin/main
+(`da79f94`, the v0.5.1 code) and then run, with two scratch binaries, one on
+each build, exchanging files:
 
 - The open gate (`adopt_schema`) reads `application_id` and `user_version`
   from the header and nothing else.
 - `verify` runs `integrity_check`/`quick_check` and `foreign_key_check`
   over the whole file, both of which pass a well-formed extra table, then
   walks `sources` and their streams.
-- The only table listing is `user_table_names`, `#[cfg(test)]`, used by
-  `rewrite`'s schema-coverage test.
-- `copy_sources_into` copies a fixed set of tables, so the previous release
-  drops documents from a copy. That is the "old copiers drop what they do
-  not know" case.
+- The only table listing is `user_table_names`, `#[cfg(test)]`.
+- `copy_sources_into` copies a fixed set of tables.
 
-Then it was run. Two scratch binaries, one against origin/main's dendro and
-one against this branch, exchanged files (not committed; the transcript is
-summarized here):
+| Step (first build, v4 with a lazy table) | Result |
+| --- | --- |
+| old build reads an archive before and after this build added a document | identical output: sources, segment bytes, WAL rows, caller rows, `verify(Full)` sound |
+| old build: `ArchiveMut::open`, then `Writer::open` + `resume_source` + append + finalize | succeeds; the document is intact afterwards |
+| old build reads an archive this build wrote with revisions and a deletion | no refusal; everything intact; `verify(Full)` sound |
+| old build `copy_sources_into` of it | 1 source copied, **0 documents** |
+| old build `vacuum_into` of it | every revision |
+
+The reader half held. The owner decided (2026-10-19) to bump anyway,
+because of the copier: an old `copy_sources_into` drops the table, and a
+document is something a person wrote, not a fact that degrades to
+"unknown". FORMAT.md §8 now gives that reason. The bump is at create:
+
+- Every archive this build creates is stamped 5 and has the table.
+- The gate reads 4 and 5 (`OLDEST_READ_SCHEMA_VERSION`); 0.5.1 refuses 5.
+- A v4 archive reads as holding no documents.
+- A lazy upgrade on first write (the reviewer's suggestion) was not taken:
+  §8 says an archive is never migrated in place. A document written into a
+  v4 archive, by a put or by a copy that would insert a revision, is
+  refused as `Error::SchemaTooOld`, and the remedy is a copy-forward
+  through `rewrite` into a new archive, which is v5.
+- Everything else a v4 archive holds is still written in place, and the
+  file stays v4: a writer resumes its sources, metadata and labels are
+  edited, compaction and retention run. That is a reading of §8's "writes
+  only its own" as "adds nothing of its own version to an older archive",
+  rather than "refuses to write an older archive at all". The strict
+  reading would break `rezolus recording annotate`, which edits a `.dendro`
+  in place through `ArchiveMut::open`, on every recording made before the
+  upgrade, and would stop a recording from being resumed across a dendro
+  upgrade. rezolus's hindsight creates its buffer rather than reopening
+  one, so it is unaffected either way.
+
+Run again with the bump in place (0.5.1 against this build):
 
 | Step | Result |
 | --- | --- |
-| old build writes an archive; new build adds a document through `ArchiveMut::open` | table created on the write |
-| old build reads that archive before and after | identical output: sources, segment bytes, WAL rows, caller rows, `verify(Full)` sound |
-| old build: `ArchiveMut::open`, then `Writer::open` + `resume_source` + append + finalize | succeeds; new build then reads the document unchanged, and the old session's row |
-| new build writes an archive with two revisions and a deletion; old build reads it | no refusal; sources, segments, WAL, caller rows intact; `verify(Full)` sound |
-| old build `copy_sources_into` of it | 1 source copied, 0 documents |
-| old build `vacuum_into` of it | every revision, deletion included |
+| 0.5.1 writes an archive; this build reads it | read as v4; sources, segment bytes, WAL, caller rows intact; `verify(Full)` sound |
+| this build `put_document` into it | `SchemaTooOld { found: 4, needs: 5 }` |
+| this build copies it forward (`copy_sources_into` into a new archive) and puts a document there | new archive is v5, the source keeps its uuid, the document reads back, `verify(Full)` sound |
+| 0.5.1 resumes and appends to the original afterwards | succeeds: it is still v4 |
+| 0.5.1 opens an archive this build created | `UnsupportedSchema { found: 5, writes: 4, reads: 4 }` |
 
-So the schema version stays 4. Creating the table lazily is safe under both
-write handles: `ArchiveMut::open` holds the file exclusively, and the
-writer thread is the file's one writing connection; the DDL runs inside the
-write's own transaction, so a failed write leaves no table. The read
-handle's `query_only` never needs to create anything, because every read
-checks `sqlite_master` first and answers "no documents".
+(The copy-forward's live tail went through the probe's encoder, which
+encodes nothing, so its one WAL row is not in the copy. That is the copy's
+existing rule for the tail, not something this change touched.)
 
 ### Writing during a recording
 
@@ -137,7 +198,7 @@ another process holds; that is the same rule as every other write.
 | Path | Documents |
 | --- | --- |
 | `rewrite::copy_sources_into` | every revision, regardless of `CopySpec`'s time bound or stream filter |
-| `rewrite::copy_documents_into` | the same, for an assembly that builds its sources another way |
+| `rewrite::copy_documents_into` | the same, with a report; for an assembly that builds its sources another way, or a combine that must detect forks |
 | `Archive::vacuum_into`, `serialize` | the whole file |
 | `rewrite::compact` | untouched (tested) |
 | retention | untouched |
@@ -149,8 +210,10 @@ added: the struct is not `#[non_exhaustive]`, so a new field breaks any
 caller that builds it without `..CopySpec::everything()`, and no caller has
 asked to drop documents. A combine calls `copy_sources_into` once per input,
 so it carries each input's documents; where two inputs hold revisions of
-one document (two edited copies of one report) the history holds both edits
-and the input copied last is current.
+one document (two edited copies of one report) the history holds both edits,
+the input copied last is current, and its `CopiedDocuments::forked` names the
+document. A copy into a v4 destination is refused when the source holds any
+revision.
 
 ## Alternatives not taken
 
@@ -165,18 +228,52 @@ and the input copied last is current.
 
 ## Outcome
 
-Implemented on `feat/archive-documents`. Tests in `tests/documents.rs`
-(13) and `tests/compaction.rs` (`compaction_keeps_the_archives_documents`),
-each mutation-checked: 25 mutations of the implementation, each turning at
-least one test red. One mutation survived the first run: removing the
-`body IS NOT NULL` filter from `documents()`'s SQL changed nothing because
-the Rust loop also drops deletions. The SQL filter was removed; mutating the
-Rust filter turns `listing_shows_each_current_document_of_a_kind_once` red.
+Implemented on `feat/archive-documents` in two commits: the first build
+(`6511d10`), and the review fixes with the schema bump.
 
-The "previous release" archive in the committed tests is a new archive with
-`documents` dropped through a raw connection. That is exact for this change
-because the table and its index are the only schema difference; the real
-cross-build check is the table above.
+Tests: 20 in `tests/documents.rs` (18 of them also in the reader-only
+build), `compaction_keeps_the_archives_documents` in `tests/compaction.rs`,
+and `the_schema_before_this_one_opens_and_the_one_before_that_does_not` in
+`tests/identity.rs`.
+
+Mutation checks, one command each (mutate, run, restore, and a hash check
+that every touched file was restored):
+
+- First build: 25 mutations. 24 turned at least one test red. The 25th,
+  removing the `body IS NOT NULL` filter from `documents()`'s SQL, changed
+  nothing, because the Rust loop also drops deletions. The SQL filter was
+  removed; mutating the Rust filter turns
+  `listing_shows_each_current_document_of_a_kind_once` red.
+- The review then found five more mutations that the tests let through:
+  - a copy losing `schema`, and a copy restamping `created_wall_ns`, both
+    because the test helper compared only `(uuid, body)`;
+  - a seconds-resolution clock;
+  - a delete without the key check;
+  - `copy_documents_into` without its read snapshot.
+
+  The helper now compares `(uuid, schema, body, created_wall_ns)`, with a
+  sleep before the copy so a restamp differs. New tests cover the clock's
+  resolution and the delete refusals. The snapshot wrapper was removed
+  rather than tested: the copy now reads the source with one statement,
+  which is one SQLite read transaction, and no test could interleave a
+  write into one statement deterministically.
+- Second build: 40 mutations, the first set re-anchored plus the review's
+  survivors, the validator, the copy report, the content check and the v4
+  rules. Every one turned at least one test red, and every test is red
+  under at least one of them.
+
+Memory, peak RSS by `/usr/bin/time -l`, one run each, release build, same
+harness and bodies (an array of short strings):
+
+| Case | first build | now |
+| --- | --- | --- |
+| put a 56 MB body, previous revision 1 MB | 410 MB | 261 MB |
+| put a 56 MB body, previous revision 56 MB | 469 MB | 260 MB |
+| copy 10 documents of 56 MB | 735 MB | 207 MB |
+
+What remains in the put is the caller's own body, SQLite's bound copy of
+it, and the read cache `ArchiveMut::open` sets (256 MiB). The copy no
+longer grows with the number of documents.
 
 ## Reopen
 

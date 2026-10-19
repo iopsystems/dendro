@@ -206,7 +206,7 @@ struct DocumentPut {
     body: String,
     /// `None` writes unconditionally; `Some(e)` is
     /// [`ArchiveMut::put_document_if_current`] with `e`.
-    expected: Option<Option<i64>>,
+    expected: Option<Option<String>>,
 }
 
 /// Where the writer thread leaves its failure so a *handle* can report it.
@@ -552,8 +552,9 @@ impl Writer {
     /// there is one writing connection, so a document written during a
     /// recording goes through this thread like every other write. It is
     /// ordered after everything queued before it and committed on its own.
-    /// A refusal (a reserved kind, a body that is not JSON) is returned and
-    /// does not stop the writer.
+    /// A refusal (a reserved kind, a body that is not JSON, a v4 archive
+    /// reopened with [`Writer::open`], which takes no documents) is returned
+    /// and does not stop the writer.
     pub fn put_document(
         &mut self,
         kind: &str,
@@ -566,16 +567,16 @@ impl Writer {
 
     /// [`ArchiveMut::put_document_if_current`] through the writer thread:
     /// refused with [`Error::DocumentConflict`] unless the current
-    /// document's id is `expected`.
+    /// document's uuid is `expected`.
     pub fn put_document_if_current(
         &mut self,
         kind: &str,
         name: &str,
         schema: &str,
         body: &str,
-        expected: Option<i64>,
+        expected: Option<&str>,
     ) -> Result<i64> {
-        self.send_document(kind, name, schema, body, Some(expected))
+        self.send_document(kind, name, schema, body, Some(expected.map(str::to_string)))
     }
 
     /// [`ArchiveMut::delete_document`] through the writer thread.
@@ -606,7 +607,7 @@ impl Writer {
         name: &str,
         schema: &str,
         body: &str,
-        expected: Option<Option<i64>>,
+        expected: Option<Option<String>>,
     ) -> Result<i64> {
         let Some(tx) = self.tx.as_ref() else {
             return Err(Error::WriterGone);
@@ -2019,9 +2020,11 @@ fn writer_loop(
                     expected,
                 } = *put;
                 let written = with_retries("writing a document", || {
-                    db.transaction(|tx| match expected {
+                    db.transaction(|tx| match &expected {
                         None => tx.put_document(&kind, &name, &schema, &body),
-                        Some(e) => tx.put_document_if_current(&kind, &name, &schema, &body, e),
+                        Some(e) => {
+                            tx.put_document_if_current(&kind, &name, &schema, &body, e.as_deref())
+                        }
                     })
                 });
                 let _ = reply.send(written);

@@ -2,8 +2,8 @@
 #![cfg(feature = "archive")]
 
 //! Archive-level documents (FORMAT.md §3.6): append-only revisions keyed by
-//! `(kind, name)`, carried by every copy, readable from archives written
-//! before the table existed.
+//! `(kind, name)`, carried by this crate's copies, readable from archives
+//! written before the table existed.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,19 +31,26 @@ fn source() -> SourceMeta {
     }
 }
 
-/// The `(uuid, body)` of every revision of `(kind, name)`, oldest first;
-/// a deletion's body is `None`. What a copy has to carry, without the ids it
-/// renumbers.
-fn revisions(db: &Archive, kind: &str, name: &str) -> Vec<(String, Option<String>)> {
+/// One revision as a copy must carry it: `(uuid, schema, body,
+/// created_wall_ns)`, with `None` for a deletion's schema and body. The id
+/// is left out because a copy renumbers it.
+type Carried = (String, Option<String>, Option<String>, i64);
+
+/// Every revision of `(kind, name)`, oldest first, as [`Carried`].
+fn revisions(db: &Archive, kind: &str, name: &str) -> Vec<Carried> {
     db.document_history(kind, name)
         .unwrap()
         .into_iter()
         .map(|r| match r {
-            Revision::Put(d) => (d.uuid, Some(d.body)),
-            Revision::Delete(d) => (d.uuid, None),
+            Revision::Put(d) => (d.uuid, Some(d.schema), Some(d.body), d.created_wall_ns),
+            Revision::Delete(d) => (d.uuid, None, None, d.created_wall_ns),
             _ => unreachable!("a revision this test does not know"),
         })
         .collect()
+}
+
+fn key(kind: &str, name: &str) -> (String, String) {
+    (kind.to_string(), name.to_string())
 }
 
 /// Each revision's `supersedes`, as the uuid of the revision it names.
@@ -66,14 +73,16 @@ fn chain(db: &Archive, kind: &str, name: &str) -> Vec<Option<String>> {
         .collect()
 }
 
-/// An archive as the previous release left it: the schema minus the
-/// `documents` table, which is the only difference between the two.
-fn previous_release_archive(path: &Path) {
+/// A v4 archive, as releases up to 0.5.1 create it: this build's schema
+/// minus the `documents` table, stamped 4. The table and the stamp are the
+/// only differences between the two.
+fn v4_archive(path: &Path) {
     let mut db = ArchiveMut::create(path).unwrap();
     db.insert_source(&source()).unwrap();
     drop(db);
     let raw = rusqlite::Connection::open(path).unwrap();
-    raw.execute_batch("DROP TABLE documents").unwrap();
+    raw.execute_batch("DROP TABLE documents; PRAGMA user_version = 4;")
+        .unwrap();
     let left: i64 = raw
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'documents%'",
@@ -177,21 +186,21 @@ fn a_delete_is_a_revision_and_the_history_survives_it() {
 fn a_conditional_put_is_refused_when_another_revision_landed() {
     let mut db = ArchiveMut::create_in_memory().unwrap();
     // `None` means "there is no current document".
-    let v1 = db
-        .put_document_if_current(KIND, "main", SCHEMA, "1", None)
+    db.put_document_if_current(KIND, "main", SCHEMA, "1", None)
         .unwrap();
+    let v1 = db.document(KIND, "main").unwrap().unwrap().uuid;
     match db.put_document_if_current(KIND, "main", SCHEMA, "0", None) {
         Err(Error::DocumentConflict {
             expected, current, ..
-        }) => assert_eq!((expected, current), (None, Some(v1))),
+        }) => assert_eq!((expected, current), (None, Some(v1.clone()))),
         other => panic!("expected a conflict, got {other:?}"),
     }
 
     // Two editors read v1; the first saves, the second is refused.
-    let v2 = db
-        .put_document_if_current(KIND, "main", SCHEMA, "2", Some(v1))
+    db.put_document_if_current(KIND, "main", SCHEMA, "2", Some(&v1))
         .unwrap();
-    match db.put_document_if_current(KIND, "main", SCHEMA, "99", Some(v1)) {
+    let v2 = db.document(KIND, "main").unwrap().unwrap().uuid;
+    match db.put_document_if_current(KIND, "main", SCHEMA, "99", Some(&v1)) {
         Err(Error::DocumentConflict {
             kind,
             name,
@@ -228,6 +237,14 @@ fn malformed_and_reserved_documents_are_refused_and_nothing_is_written() {
         assert!(
             matches!(got, Err(Error::Message(_))),
             "{kind:?}/{name:?} schema {schema:?} body {body:?}: {got:?}"
+        );
+    }
+    // A delete checks the key the same way.
+    for (kind, name) in [("", "main"), (KIND, ""), ("dendro.view", "main")] {
+        let got = db.delete_document(kind, name);
+        assert!(
+            matches!(got, Err(Error::Message(_))),
+            "delete {kind:?}/{name:?}: {got:?}"
         );
     }
     assert!(db.document_kinds().unwrap().is_empty());
@@ -291,13 +308,16 @@ fn a_copy_carries_every_revision_with_its_identity() {
     let mut src = ArchiveMut::create(&src_path).unwrap();
     src.insert_source(&source()).unwrap();
     src.put_document(KIND, "main", SCHEMA, "1").unwrap();
-    src.put_document(KIND, "main", SCHEMA, "2").unwrap();
+    src.put_document(KIND, "main", "app.view/2", "2").unwrap();
     src.delete_document(KIND, "main").unwrap();
-    src.put_document(KIND, "main", SCHEMA, "4").unwrap();
+    src.put_document(KIND, "main", "app.view/3", "4").unwrap();
     src.put_document("app.event", "e", "app.event/1", "{}")
         .unwrap();
     drop(src);
     let src = Archive::open(&src_path).unwrap();
+    // The copy must keep the stamps, not take its own: let the clock move
+    // past every one of them first (millisecond resolution).
+    std::thread::sleep(std::time::Duration::from_millis(5));
 
     // The destination already holds a document, so its ids and the
     // source's do not line up: `supersedes` must be renumbered.
@@ -331,9 +351,10 @@ fn a_copy_carries_every_revision_with_its_identity() {
         "the copy renumbered, or the supersedes check above proves nothing"
     );
 
-    // Copying the same archive again adds nothing.
-    let added = dst.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
-    assert_eq!(added, 0);
+    // Copying the same archive again adds nothing, and makes nothing current.
+    let again = dst.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
+    assert_eq!(again.inserted, 0);
+    assert!(again.current.is_empty());
     assert_eq!(dst.document_history(KIND, "main").unwrap().len(), 4);
 }
 
@@ -357,15 +378,20 @@ fn two_edited_copies_combine_into_one_history_with_the_last_input_current() {
     let b = edit(r#""b""#);
 
     let mut combined = ArchiveMut::create_in_memory().unwrap();
-    combined
-        .transaction(|tx| {
-            copy_documents_into(&a, tx)?;
-            copy_documents_into(&b, tx)
-        })
+    let (from_a, from_b) = combined
+        .transaction(|tx| Ok((copy_documents_into(&a, tx)?, copy_documents_into(&b, tx)?)))
         .unwrap();
+    // The first input brings base and its edit; the second only its edit,
+    // which displaces the first input's without superseding it.
+    assert_eq!(from_a.inserted, 2);
+    assert_eq!(from_a.current, vec![key(KIND, "main")]);
+    assert!(from_a.forked.is_empty());
+    assert_eq!(from_b.inserted, 1);
+    assert_eq!(from_b.current, vec![key(KIND, "main")]);
+    assert_eq!(from_b.forked, vec![key(KIND, "main")]);
     // The shared base once, then each edit; the input copied last is current.
     let history = revisions(&combined, KIND, "main");
-    let bodies: Vec<Option<&str>> = history.iter().map(|(_, b)| b.as_deref()).collect();
+    let bodies: Vec<Option<&str>> = history.iter().map(|r| r.2.as_deref()).collect();
     assert_eq!(
         bodies,
         vec![Some(r#""base""#), Some(r#""a""#), Some(r#""b""#)]
@@ -381,32 +407,60 @@ fn two_edited_copies_combine_into_one_history_with_the_last_input_current() {
 }
 
 #[test]
-fn an_archive_from_before_the_table_reads_as_empty_and_gains_it_on_first_write() {
+fn a_new_archive_is_schema_5_with_the_table() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("old.dendro");
-    previous_release_archive(&path);
+    let path = dir.path().join("new.dendro");
+    drop(ArchiveMut::create(&path).unwrap());
+    assert_eq!(
+        dendro::archive::sniff(&path).unwrap(),
+        dendro::archive::Sniff::Stamped { version: 5 }
+    );
+    assert_eq!(Archive::open(&path).unwrap().schema_version().unwrap(), 5);
+    let in_memory = ArchiveMut::create_in_memory().unwrap();
+    assert_eq!(in_memory.schema_version().unwrap(), 5);
+    let reopened = Archive::open_bytes(in_memory.serialize().unwrap()).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 5);
+}
 
-    // The read handle cannot create the table, and does not need it.
+#[test]
+fn a_v4_archive_reads_as_holding_no_documents_and_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v4.dendro");
+    v4_archive(&path);
+
     let reader = Archive::open(&path).unwrap();
+    assert_eq!(reader.schema_version().unwrap(), 4);
     assert_eq!(reader.document(KIND, "main").unwrap(), None);
     assert!(reader.documents(KIND).unwrap().is_empty());
     assert!(reader.document_kinds().unwrap().is_empty());
     assert!(reader.document_history(KIND, "main").unwrap().is_empty());
+    assert_eq!(reader.read_sources().unwrap().len(), 1);
     drop(reader);
 
     let mut db = ArchiveMut::open(&path).unwrap();
-    // A delete on an archive with no table is a no-op, not a schema change.
+    // Nothing to delete, so nothing written.
     assert_eq!(db.delete_document(KIND, "main").unwrap(), None);
-    db.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    match db.put_document(KIND, "main", SCHEMA, "1") {
+        Err(Error::SchemaTooOld { found, needs }) => assert_eq!((found, needs), (4, 5)),
+        other => panic!("expected SchemaTooOld, got {other:?}"),
+    }
+    // What v4 holds can still be written, and the file stays v4.
+    let id = db.read_sources().unwrap()[0].id;
+    db.patch_source_metadata(id, &BTreeMap::from([("k".to_string(), "v".to_string())]))
+        .unwrap();
     drop(db);
 
     let reader = Archive::open(&path).unwrap();
-    assert_eq!(reader.document(KIND, "main").unwrap().unwrap().body, "1");
-    assert_eq!(
-        reader.read_sources().unwrap().len(),
-        1,
-        "the source is kept"
-    );
+    assert_eq!(reader.schema_version().unwrap(), 4);
+    let tables: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'documents%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "never migrated in place");
     assert!(reader
         .verify(dendro::archive::Depth::Full)
         .unwrap()
@@ -414,28 +468,190 @@ fn an_archive_from_before_the_table_reads_as_empty_and_gains_it_on_first_write()
 }
 
 #[test]
-fn copies_to_and_from_an_archive_without_the_table() {
+fn a_v4_archive_copied_forward_is_v5_and_takes_documents() {
     let dir = tempfile::tempdir().unwrap();
-    let old = dir.path().join("old.dendro");
-    previous_release_archive(&old);
+    let old = dir.path().join("v4.dendro");
+    v4_archive(&old);
+    let src = Archive::open(&old).unwrap();
 
-    // Out of it: nothing to carry, and no table created in the source.
-    let mut fresh = ArchiveMut::create_in_memory().unwrap();
-    let from_old = Archive::open(&old).unwrap();
-    let copied = fresh
-        .transaction(|tx| copy_documents_into(&from_old, tx))
+    let new = dir.path().join("v5.dendro");
+    let mut dst = ArchiveMut::create(&new).unwrap();
+    let copied = dst
+        .transaction(|tx| {
+            let docs = copy_documents_into(&src, tx)?;
+            let sources = copy_sources_into(&src, tx, &CopySpec::everything(), &Never)?;
+            Ok((docs, sources))
+        })
         .unwrap();
-    assert_eq!(copied, 0);
-    drop(from_old);
+    assert_eq!(copied.0.inserted, 0);
+    assert_eq!(copied.1, 1);
+    dst.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    drop(dst);
 
-    // Into it: the table is created inside the copy's transaction.
+    let reader = Archive::open(&new).unwrap();
+    assert_eq!(reader.schema_version().unwrap(), 5);
+    assert_eq!(reader.read_sources().unwrap().len(), 1);
+    assert_eq!(reader.document(KIND, "main").unwrap().unwrap().body, "1");
+}
+
+#[test]
+fn a_copy_of_documents_into_a_v4_archive_is_refused_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("v4.dendro");
+    v4_archive(&old);
+
     let mut src = ArchiveMut::create_in_memory().unwrap();
     src.put_document(KIND, "main", SCHEMA, "1").unwrap();
-    let src = Archive::open_bytes(src.serialize().unwrap()).unwrap();
+    let with_docs = Archive::open_bytes(src.serialize().unwrap()).unwrap();
+    let without =
+        Archive::open_bytes(ArchiveMut::create_in_memory().unwrap().serialize().unwrap()).unwrap();
+
     let mut db = ArchiveMut::open(&old).unwrap();
-    let copied = db.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
-    assert_eq!(copied, 1);
-    assert_eq!(db.document(KIND, "main").unwrap().unwrap().body, "1");
+    // A source with no documents copies into v4: nothing v5 is written.
+    db.transaction(|tx| copy_sources_into(&without, tx, &CopySpec::everything(), &Never))
+        .unwrap();
+    let got = db.transaction(|tx| copy_documents_into(&with_docs, tx));
+    assert!(
+        matches!(got, Err(Error::SchemaTooOld { found: 4, needs: 5 })),
+        "{got:?}"
+    );
+    // Through copy_sources_into too, and the whole transaction rolls back.
+    let mut with_source = ArchiveMut::create_in_memory().unwrap();
+    with_source.insert_source(&source()).unwrap();
+    with_source.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    let with_source = Archive::open_bytes(with_source.serialize().unwrap()).unwrap();
+    let got =
+        db.transaction(|tx| copy_sources_into(&with_source, tx, &CopySpec::everything(), &Never));
+    assert!(matches!(got, Err(Error::SchemaTooOld { .. })), "{got:?}");
+    assert_eq!(db.read_sources().unwrap().len(), 1, "only the v4 source");
+    assert_eq!(db.schema_version().unwrap(), 4);
+}
+
+#[test]
+fn the_wall_clock_is_stamped_at_millisecond_resolution() {
+    let mut db = ArchiveMut::create_in_memory().unwrap();
+    // A seconds-resolution clock stamps a whole number of seconds every
+    // time; a millisecond one does so one time in a thousand. Twenty puts a
+    // few milliseconds apart tell the two apart.
+    let mut stamps = Vec::new();
+    for i in 0..20 {
+        db.put_document(KIND, "main", SCHEMA, &i.to_string())
+            .unwrap();
+        stamps.push(db.document(KIND, "main").unwrap().unwrap().created_wall_ns);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    assert!(
+        stamps.iter().all(|t| t % 1_000_000 == 0),
+        "whole milliseconds: {stamps:?}"
+    );
+    assert!(
+        stamps.iter().any(|t| t % 1_000_000_000 != 0),
+        "finer than seconds: {stamps:?}"
+    );
+    assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
+fn any_rfc_8259_body_is_accepted_and_stored_exactly() {
+    let mut db = ArchiveMut::create_in_memory().unwrap();
+    let deep = format!("{}{}", "[".repeat(5_000), "]".repeat(5_000));
+    let bodies = [
+        // JSON.stringify("\ud800") in JavaScript: a lone surrogate, escaped.
+        r#""\ud800""#.to_string(),
+        r#"{"a":"\udc00 😀"}"#.to_string(),
+        // Deeper than serde_json's default limit of 128 and SQLite's 1000.
+        deep,
+        " 1.5e-3 ".to_string(),
+    ];
+    for (i, body) in bodies.iter().enumerate() {
+        let name = format!("d{i}");
+        db.put_document(KIND, &name, SCHEMA, body).unwrap();
+        assert_eq!(&db.document(KIND, &name).unwrap().unwrap().body, body);
+    }
+}
+
+#[test]
+fn a_conditional_put_names_the_revision_by_uuid_so_it_survives_a_copy() {
+    let mut src = ArchiveMut::create_in_memory().unwrap();
+    src.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    let read = src.document(KIND, "main").unwrap().unwrap();
+    let src = Archive::open_bytes(src.serialize().unwrap()).unwrap();
+
+    // The destination holds other revisions first, so the copy's id for
+    // the revision the editor read is not the id it read.
+    let mut dst = ArchiveMut::create_in_memory().unwrap();
+    dst.put_document("app.other", "x", "app.other/1", "{}")
+        .unwrap();
+    dst.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
+    let copied = dst.document(KIND, "main").unwrap().unwrap();
+    assert_eq!(copied.uuid, read.uuid);
+    assert_ne!(copied.id, read.id);
+    dst.put_document_if_current(KIND, "main", SCHEMA, "2", Some(&read.uuid))
+        .unwrap();
+    assert_eq!(dst.document(KIND, "main").unwrap().unwrap().body, "2");
+}
+
+#[test]
+fn a_copy_that_updates_a_document_it_supersedes_is_not_a_fork() {
+    let mut a = ArchiveMut::create_in_memory().unwrap();
+    a.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    let old = Archive::open_bytes(a.serialize().unwrap()).unwrap();
+    a.put_document(KIND, "main", SCHEMA, "2").unwrap();
+    a.put_document(KIND, "main", SCHEMA, "3").unwrap();
+    let new = Archive::open_bytes(a.serialize().unwrap()).unwrap();
+
+    let mut dst = ArchiveMut::create_in_memory().unwrap();
+    let first = dst.transaction(|tx| copy_documents_into(&old, tx)).unwrap();
+    assert_eq!(first.current, vec![key(KIND, "main")]);
+    let second = dst.transaction(|tx| copy_documents_into(&new, tx)).unwrap();
+    assert_eq!(second.inserted, 2);
+    assert_eq!(second.current, vec![key(KIND, "main")]);
+    assert!(second.forked.is_empty(), "3 supersedes 1 through 2");
+    // The older input copied after the newer one changes nothing.
+    let third = dst.transaction(|tx| copy_documents_into(&old, tx)).unwrap();
+    assert_eq!(third, Default::default());
+    assert_eq!(dst.document(KIND, "main").unwrap().unwrap().body, "3");
+
+    // A document the destination deleted is not current, so an unrelated
+    // revision brought back under its name displaces nothing.
+    dst.delete_document(KIND, "main").unwrap();
+    let mut other = ArchiveMut::create_in_memory().unwrap();
+    other.put_document(KIND, "main", SCHEMA, "9").unwrap();
+    let other = Archive::open_bytes(other.serialize().unwrap()).unwrap();
+    let fourth = dst
+        .transaction(|tx| copy_documents_into(&other, tx))
+        .unwrap();
+    assert_eq!(fourth.current, vec![key(KIND, "main")]);
+    assert!(fourth.forked.is_empty());
+}
+
+#[test]
+fn a_revision_held_with_different_contents_refuses_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let mut src = ArchiveMut::create(&src_path).unwrap();
+    src.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    drop(src);
+
+    // Each field the comparison covers, altered in turn in a copy.
+    for column in ["kind", "name", "schema", "body"] {
+        let dst_path = dir.path().join(format!("dst-{column}.dendro"));
+        let src = Archive::open(&src_path).unwrap();
+        let mut dst = ArchiveMut::create(&dst_path).unwrap();
+        dst.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
+        drop(dst);
+        let raw = rusqlite::Connection::open(&dst_path).unwrap();
+        raw.execute(&format!("UPDATE documents SET {column} = '2'"), [])
+            .unwrap();
+        drop(raw);
+
+        let mut dst = ArchiveMut::open(&dst_path).unwrap();
+        let got = dst.transaction(|tx| copy_documents_into(&src, tx));
+        assert!(
+            matches!(&got, Err(Error::Message(m)) if m.contains("different contents")),
+            "{column}: {got:?}"
+        );
+    }
 }
 
 #[cfg(feature = "write")]
@@ -471,11 +687,14 @@ mod during_a_recording {
             .put_document(KIND, "main", SCHEMA, r#"{"v":1}"#)
             .unwrap();
         let reader = Archive::open(&path).unwrap();
-        assert_eq!(reader.document(KIND, "main").unwrap().unwrap().id, v1);
+        let read = reader.document(KIND, "main").unwrap().unwrap();
+        assert_eq!(read.id, v1);
 
         // A conflict is the caller's answer, and the writer keeps going.
         match archive.put_document_if_current(KIND, "main", SCHEMA, "{}", None) {
-            Err(Error::DocumentConflict { current, .. }) => assert_eq!(current, Some(v1)),
+            Err(Error::DocumentConflict { current, .. }) => {
+                assert_eq!(current.as_deref(), Some(read.uuid.as_str()))
+            }
             other => panic!("expected a conflict, got {other:?}"),
         }
         assert!(matches!(
@@ -483,7 +702,7 @@ mod during_a_recording {
             Err(Error::Message(_))
         ));
         let v2 = archive
-            .put_document_if_current(KIND, "main", SCHEMA, r#"{"v":2}"#, Some(v1))
+            .put_document_if_current(KIND, "main", SCHEMA, r#"{"v":2}"#, Some(&read.uuid))
             .unwrap();
         w.wal(vec![row(2_000)]).unwrap();
         w.sync().unwrap();
@@ -510,17 +729,26 @@ mod during_a_recording {
     }
 
     #[test]
-    fn a_writer_reopening_an_archive_from_before_the_table_creates_it_on_first_write() {
+    fn a_writer_resuming_a_v4_archive_records_and_refuses_documents() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.dendro");
-        previous_release_archive(&path);
+        let path = dir.path().join("v4.dendro");
+        v4_archive(&path);
+        let id = Archive::open(&path).unwrap().read_sources().unwrap()[0].id;
 
         let mut archive = Writer::open(&path, Box::new(Never)).unwrap();
-        // A reader opened before the table exists sees it once it does.
-        let reader = Archive::open(&path).unwrap();
-        assert_eq!(reader.document(KIND, "main").unwrap(), None);
-        archive.put_document(KIND, "main", SCHEMA, "1").unwrap();
-        assert_eq!(reader.document(KIND, "main").unwrap().unwrap().body, "1");
+        let (mut w, _) = archive.resume_source(id, 1_000).unwrap();
+        match archive.put_document(KIND, "main", SCHEMA, "1") {
+            Err(Error::SchemaTooOld { found, needs }) => assert_eq!((found, needs), (4, 5)),
+            other => panic!("expected SchemaTooOld, got {other:?}"),
+        }
+        // The recording is unaffected by the refusal.
+        w.wal(vec![row(2_000)]).unwrap();
+        w.finalize((2_000, 0)).unwrap();
         archive.join().unwrap();
+
+        let reader = Archive::open(&path).unwrap();
+        assert_eq!(reader.schema_version().unwrap(), 4);
+        assert_eq!(reader.live_wal(id, "s").unwrap().len(), 1);
+        assert_eq!(reader.document(KIND, "main").unwrap(), None);
     }
 }

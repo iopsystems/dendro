@@ -230,9 +230,11 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   caller-chosen `schema` string versioning its shape. Revisions are
   appended, never overwritten, so a document keeps its history; a delete is
   a revision too. `ArchiveMut::put_document` writes one, `Writer::put_document`
-  writes one during a recording, `put_document_if_current` refuses to replace
-  a revision it did not read, and every copy carries them. See FORMAT.md
-  §3.6.
+  writes one during a recording, and `put_document_if_current` refuses to
+  replace a revision it did not read. The copies this crate makes carry
+  them; replication does not. Documents need a schema 5 archive: a v4 one,
+  created by 0.5.1 or earlier, reads as holding none and is copied forward
+  to take them. See FORMAT.md §3.6 and §8.
 - **Compaction.** Read cost is linear in segment count. Measured between 400
   segments and one, the fine archive read 18.2x slower and was 2.38x larger;
   compacting it with `rewrite::compact` recovered 18.6x and 2.37x, landing

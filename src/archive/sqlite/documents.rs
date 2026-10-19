@@ -3,9 +3,10 @@
 //! Everything else in an archive belongs to a source. A document belongs to
 //! the archive: a saved view, a report's selection, an event that spans
 //! every source. Revisions are appended and never changed, so a document
-//! keeps its history, and a copy carries every revision with its identity.
+//! keeps its history, and the copies this crate makes carry every revision
+//! with its identity. Replication does not (FORMAT.md §3.6).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -18,14 +19,14 @@ use crate::error::{Error, Result};
 /// caller's namespace.
 pub const RESERVED_KIND_PREFIX: &str = "dendro.";
 
-/// The table and its index, created with every new archive and, for an
-/// archive from before the table, on the first document write. Both
-/// statements are `IF NOT EXISTS` so the one text serves both.
+/// The table and its index, created with every new archive (schema v5). A
+/// v4 archive has neither and is never given them (FORMAT.md §8).
 pub(super) const DOCUMENTS_SQL: &str = "
-CREATE TABLE IF NOT EXISTS documents(
+CREATE TABLE documents(
   id INTEGER PRIMARY KEY,
   -- The revision's identity across files: minted at insert and carried by
-  -- every copy, so a copy that meets a revision it already holds skips it.
+  -- this crate's copies, so a copy that meets a revision it already holds
+  -- skips it.
   uuid TEXT NOT NULL UNIQUE,
   kind TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -40,7 +41,7 @@ CREATE TABLE IF NOT EXISTS documents(
   supersedes INTEGER REFERENCES documents(id),
   CHECK ((schema IS NULL) = (body IS NULL))
 );
-CREATE INDEX IF NOT EXISTS documents_by_name ON documents(kind, name, id);
+CREATE INDEX documents_by_name ON documents(kind, name, id);
 ";
 
 /// The current revision of one document: its newest, when that revision is
@@ -48,12 +49,13 @@ CREATE INDEX IF NOT EXISTS documents_by_name ON documents(kind, name, id);
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Document {
-    /// The revision's row id in this file. Every copy renumbers it, so it is
-    /// not an identity; it is what
-    /// [`put_document_if_current`](ArchiveMut::put_document_if_current)
-    /// compares against.
+    /// The revision's row id in this file. A copy renumbers it, so it is
+    /// not an identity.
     pub id: i64,
-    /// The revision's identity, carried by every copy.
+    /// The revision's identity, carried by the copies this crate makes, and
+    /// what [`put_document_if_current`](ArchiveMut::put_document_if_current)
+    /// compares against. Replication does not carry documents
+    /// (FORMAT.md §3.6).
     pub uuid: String,
     /// The caller's namespace for documents of one purpose.
     pub kind: String,
@@ -77,7 +79,7 @@ pub struct Document {
 pub struct Deletion {
     /// The revision's row id in this file.
     pub id: i64,
-    /// The revision's identity, carried by every copy.
+    /// The revision's identity, carried by the copies this crate makes.
     pub uuid: String,
     /// The deleted document's kind.
     pub kind: String,
@@ -170,12 +172,22 @@ fn has_documents(conn: &Connection) -> Result<bool> {
     .map_err(Error::sqlite("failed to look for the documents table"))
 }
 
-fn ensure_documents(conn: &Connection) -> Result<()> {
-    conn.execute_batch(DOCUMENTS_SQL)
-        .map_err(Error::sqlite("failed to create the documents table"))
+/// Refuse a document write into an archive whose schema has no
+/// `documents` table. Decided by the header, as the open gate is.
+fn check_writable(conn: &Connection) -> Result<()> {
+    let found: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Error::sqlite("failed to read the schema version"))?;
+    if found < super::DOCUMENTS_SCHEMA_VERSION {
+        return Err(Error::SchemaTooOld {
+            found,
+            needs: super::DOCUMENTS_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
 }
 
-/// The newest revision of `(kind, name)`, deletion or not.
+/// The newest revision of `(kind, name)`, deletion or not, whole.
 fn newest(conn: &Connection, kind: &str, name: &str) -> Result<Option<Revision>> {
     conn.query_row(
         &format!(
@@ -184,6 +196,34 @@ fn newest(conn: &Connection, kind: &str, name: &str) -> Result<Option<Revision>>
         ),
         rusqlite::params![kind, name],
         revision_from_row,
+    )
+    .optional()
+    .map_err(Error::sqlite(format!(
+        "failed to read document {kind}/{name}"
+    )))
+}
+
+/// The newest revision of `(kind, name)` without its body: what a write
+/// needs to supersede it, at the cost of a row lookup rather than a body.
+struct Head {
+    id: i64,
+    uuid: String,
+    /// Whether it is a deletion.
+    deleted: bool,
+}
+
+fn head(conn: &Connection, kind: &str, name: &str) -> Result<Option<Head>> {
+    conn.query_row(
+        "SELECT id, uuid, body IS NULL FROM documents WHERE kind = ?1 AND name = ?2 \
+         ORDER BY id DESC LIMIT 1",
+        rusqlite::params![kind, name],
+        |row| {
+            Ok(Head {
+                id: row.get(0)?,
+                uuid: row.get(1)?,
+                deleted: row.get(2)?,
+            })
+        },
     )
     .optional()
     .map_err(Error::sqlite(format!(
@@ -219,15 +259,40 @@ fn check_key(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn insert_revision(
-    conn: &Connection,
-    uuid: &str,
-    kind: &str,
-    name: &str,
-    content: Option<(&str, &str)>,
+/// Whether `body` is JSON (RFC 8259), without building it.
+///
+/// `IgnoredAny` walks the text and keeps nothing, so the check costs no
+/// memory beyond the text itself (a `serde_json::Value` of a 56 MB body
+/// peaked at several times its size). It also has no nesting limit and
+/// accepts an escaped lone surrogate (`"\ud800"`), both of which RFC 8259's
+/// grammar allows and JavaScript's `JSON.stringify` can produce; a parse into
+/// `Value` refuses both, and SQLite's `json_valid` refuses nesting past 1000.
+fn check_json(kind: &str, name: &str, body: &str) -> Result<()> {
+    serde_json::from_str::<serde::de::IgnoredAny>(body)
+        .map(|_| ())
+        .map_err(|e| Error::Message(format!("document {kind}/{name}: the body is not JSON: {e}")))
+}
+
+/// One revision's columns, borrowed. `content` is `(schema, body)`, `None`
+/// for a deletion.
+struct NewRevision<'a> {
+    uuid: &'a str,
+    kind: &'a str,
+    name: &'a str,
+    content: Option<(&'a str, &'a str)>,
     created_wall_ns: i64,
     supersedes: Option<i64>,
-) -> Result<i64> {
+}
+
+fn insert_revision(conn: &Connection, rev: &NewRevision<'_>) -> Result<i64> {
+    let NewRevision {
+        uuid,
+        kind,
+        name,
+        content,
+        created_wall_ns,
+        supersedes,
+    } = *rev;
     conn.execute(
         "INSERT INTO documents(uuid, kind, name, schema, body, created_wall_ns, supersedes) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -248,14 +313,14 @@ fn insert_revision(
 }
 
 /// `expected`: `None` writes unconditionally; `Some(e)` refuses unless the
-/// current document's id is `e` (`Some(None)`: unless there is none).
+/// current document's uuid is `e` (`Some(None)`: unless there is none).
 fn put(
     conn: &Connection,
     kind: &str,
     name: &str,
     schema: &str,
     body: &str,
-    expected: Option<Option<i64>>,
+    expected: Option<Option<&str>>,
 ) -> Result<i64> {
     check_key(kind, name)?;
     if schema.is_empty() {
@@ -263,37 +328,35 @@ fn put(
             "document {kind}/{name} needs a schema naming its body's type"
         )));
     }
-    if let Err(e) = serde_json::from_str::<serde_json::Value>(body) {
-        return Err(Error::Message(format!(
-            "document {kind}/{name}: the body is not JSON: {e}"
-        )));
-    }
-    ensure_documents(conn)?;
-    let newest = newest(conn, kind, name)?;
+    check_json(kind, name, body)?;
+    check_writable(conn)?;
+    let head = head(conn, kind, name)?;
     if let Some(expected) = expected {
-        let current = match &newest {
-            Some(Revision::Put(d)) => Some(d.id),
-            _ => None,
-        };
+        let current = head
+            .as_ref()
+            .filter(|h| !h.deleted)
+            .map(|h| h.uuid.as_str());
         if current != expected {
             return Err(Error::DocumentConflict {
                 kind: kind.to_string(),
                 name: name.to_string(),
-                expected,
-                current,
+                expected: expected.map(str::to_string),
+                current: current.map(str::to_string),
             });
         }
     }
     let uuid = super::mint_uuid(conn)?;
-    let created = wall_now_ns(conn)?;
+    let created_wall_ns = wall_now_ns(conn)?;
     insert_revision(
         conn,
-        &uuid,
-        kind,
-        name,
-        Some((schema, body)),
-        created,
-        newest.map(|r| r.id()),
+        &NewRevision {
+            uuid: &uuid,
+            kind,
+            name,
+            content: Some((schema, body)),
+            created_wall_ns,
+            supersedes: head.map(|h| h.id),
+        },
     )
 }
 
@@ -302,88 +365,193 @@ fn delete(conn: &Connection, kind: &str, name: &str) -> Result<Option<i64>> {
     if !has_documents(conn)? {
         return Ok(None);
     }
-    let Some(Revision::Put(current)) = newest(conn, kind, name)? else {
+    let Some(current) = head(conn, kind, name)?.filter(|h| !h.deleted) else {
         return Ok(None);
     };
     let uuid = super::mint_uuid(conn)?;
-    let created = wall_now_ns(conn)?;
-    insert_revision(conn, &uuid, kind, name, None, created, Some(current.id)).map(Some)
+    let created_wall_ns = wall_now_ns(conn)?;
+    insert_revision(
+        conn,
+        &NewRevision {
+            uuid: &uuid,
+            kind,
+            name,
+            content: None,
+            created_wall_ns,
+            supersedes: Some(current.id),
+        },
+    )
+    .map(Some)
+}
+
+/// What [`copy_documents_into`](crate::rewrite::copy_documents_into) did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CopiedDocuments {
+    /// Revisions inserted. A revision the destination already held is not
+    /// counted.
+    pub inserted: usize,
+    /// The `(kind, name)` of every document this copy inserted a revision
+    /// of, in `(kind, name)` order. Inserted revisions take the newest ids,
+    /// so each of these documents' newest revision, deletion included, came
+    /// from this input. A document whose revisions the destination already
+    /// held is not listed.
+    pub current: Vec<(String, String)>,
+    /// The subset of `current` where the destination held a different
+    /// current document before the copy, and the revision now current does
+    /// not supersede it, directly or through earlier revisions. That
+    /// document is now only in the history: two inputs held two versions of
+    /// one document, and the later one won. A caller combining archives
+    /// checks this to choose between them or rename one.
+    pub forked: Vec<(String, String)>,
 }
 
 /// Every revision `src` holds, oldest first, into `dst`, skipping any whose
-/// uuid `dst` already has. Returns how many were inserted.
+/// uuid `dst` already has, which must then match it. See
+/// [`copy_documents_into`](crate::rewrite::copy_documents_into).
 ///
-/// `supersedes` is renumbered through the uuids, so it names the same
-/// revision in `dst` that it named in `src`. Ids are assigned in `src`'s
-/// order after everything `dst` already holds, which keeps `src`'s own
-/// ordering, so the revision current in `src` is current in `dst` unless
-/// `dst` already held a newer revision of the same document or a later copy
-/// brings one.
-fn copy_documents(src: &Archive, dst: &Connection) -> Result<usize> {
+/// Read with one statement, row by row, so a copy holds one body at a time
+/// and sees one snapshot of `src` without a transaction of its own.
+fn copy_documents(src: &Archive, dst: &Connection) -> Result<CopiedDocuments> {
+    let mut report = CopiedDocuments::default();
     if !has_documents(&src.conn)? {
-        return Ok(0);
+        return Ok(report);
     }
-    let revisions = all_revisions(&src.conn)?;
-    if revisions.is_empty() {
-        return Ok(0);
-    }
-    ensure_documents(dst)?;
+    let mut stmt = src
+        .conn
+        .prepare(&format!("SELECT {COLUMNS} FROM documents ORDER BY id"))
+        .map_err(Error::sqlite("failed to query documents"))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(Error::sqlite("failed to query documents"))?;
+    let read = |e| Error::sqlite("failed to read a document revision")(e);
+    let mut ensured = false;
+    // Source id -> destination id, for renumbering `supersedes`.
     let mut ids: BTreeMap<i64, i64> = BTreeMap::new();
-    let mut inserted = 0usize;
-    for rev in &revisions {
-        let (uuid, kind, name, content, created) = match rev {
-            Revision::Put(d) => (
-                &d.uuid,
-                &d.kind,
-                &d.name,
-                Some((d.schema.as_str(), d.body.as_str())),
-                d.created_wall_ns,
-            ),
-            Revision::Delete(d) => (&d.uuid, &d.kind, &d.name, None, d.created_wall_ns),
+    // Per document this copy inserted into: the destination's current
+    // revision before the first insert (`None` if it had none), and the id
+    // of the last revision inserted.
+    let mut touched: BTreeMap<(String, String), (Option<i64>, i64)> = BTreeMap::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(Error::sqlite("failed to read a document revision"))?
+    {
+        if !ensured {
+            check_writable(dst)?;
+            ensured = true;
+        }
+        let src_id: i64 = row.get(0).map_err(read)?;
+        let uuid = row.get_ref(1).and_then(|v| Ok(v.as_str()?)).map_err(read)?;
+        let kind = row.get_ref(2).and_then(|v| Ok(v.as_str()?)).map_err(read)?;
+        let name = row.get_ref(3).and_then(|v| Ok(v.as_str()?)).map_err(read)?;
+        let schema = row
+            .get_ref(4)
+            .and_then(|v| Ok(v.as_str_or_null()?))
+            .map_err(read)?;
+        let body = row
+            .get_ref(5)
+            .and_then(|v| Ok(v.as_str_or_null()?))
+            .map_err(read)?;
+        let created_wall_ns: i64 = row.get(6).map_err(read)?;
+        let src_supersedes: Option<i64> = row.get(7).map_err(read)?;
+        let content = match (schema, body) {
+            (Some(s), Some(b)) => Some((s, b)),
+            _ => None,
         };
-        let held: Option<i64> = dst
-            .query_row("SELECT id FROM documents WHERE uuid = ?1", [uuid], |row| {
-                row.get(0)
-            })
+
+        // Compared in SQL, so the held body is not read out to compare it.
+        let held: Option<(i64, bool)> = dst
+            .query_row(
+                "SELECT id, kind IS ?2 AND name IS ?3 AND schema IS ?4 AND body IS ?5 \
+                 FROM documents WHERE uuid = ?1",
+                rusqlite::params![uuid, kind, name, content.map(|c| c.0), content.map(|c| c.1)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(Error::sqlite("failed to look up a document revision"))?;
-        if let Some(id) = held {
-            ids.insert(rev.id(), id);
+        if let Some((id, same)) = held {
+            if !same {
+                return Err(Error::Message(format!(
+                    "document revision {uuid} ({kind}/{name}) is in both archives with \
+                     different contents; a revision never changes, so one of the two files is \
+                     wrong, and the copy cannot tell which"
+                )));
+            }
+            ids.insert(src_id, id);
             continue;
         }
         // A pointer the source cannot resolve (a file this crate did not
         // write; ours are written superseding a row that exists) is carried
         // as unknown rather than failing the copy.
-        let supersedes = match rev.supersedes() {
+        let supersedes = match src_supersedes {
             None => None,
             Some(s) => match ids.get(&s) {
                 Some(&mapped) => Some(mapped),
                 None => {
                     tracing::warn!(
-                        "document {kind}/{name}: revision {} supersedes {s}, which the source \
-                         archive does not hold; copied as superseding nothing",
-                        rev.id()
+                        "document {kind}/{name}: revision {src_id} supersedes {s}, which the \
+                         source archive does not hold; copied as superseding nothing"
                     );
                     None
                 }
             },
         };
-        let id = insert_revision(dst, uuid, kind, name, content, created, supersedes)?;
-        ids.insert(rev.id(), id);
-        inserted += 1;
+        let key = (kind.to_string(), name.to_string());
+        let before = match touched.get(&key) {
+            Some(&(before, _)) => before,
+            None => head(dst, kind, name)?.filter(|h| !h.deleted).map(|h| h.id),
+        };
+        let id = insert_revision(
+            dst,
+            &NewRevision {
+                uuid,
+                kind,
+                name,
+                content,
+                created_wall_ns,
+                supersedes,
+            },
+        )?;
+        ids.insert(src_id, id);
+        touched.insert(key, (before, id));
+        report.inserted += 1;
     }
-    Ok(inserted)
+    // Every insert takes the newest id, so the last revision this copy
+    // inserted for a document is that document's newest.
+    for ((kind, name), (before, last)) in touched {
+        if let Some(before) = before {
+            if !descends_from(dst, last, before)? {
+                report.forked.push((kind.clone(), name.clone()));
+            }
+        }
+        report.current.push((kind, name));
+    }
+    Ok(report)
 }
 
-fn all_revisions(conn: &Connection) -> Result<Vec<Revision>> {
-    let mut stmt = conn
-        .prepare(&format!("SELECT {COLUMNS} FROM documents ORDER BY id"))
-        .map_err(Error::sqlite("failed to query documents"))?;
-    let rows = stmt
-        .query_map([], revision_from_row)
-        .map_err(Error::sqlite("failed to query documents"))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Error::sqlite("failed to read a document"))
+/// Whether revision `id` reaches `ancestor` by following `supersedes`.
+fn descends_from(conn: &Connection, id: i64, ancestor: i64) -> Result<bool> {
+    let mut at = Some(id);
+    let mut seen = BTreeSet::new();
+    while let Some(cur) = at {
+        if cur == ancestor {
+            return Ok(true);
+        }
+        // A cycle cannot be written by this crate; stop rather than spin.
+        if !seen.insert(cur) {
+            return Ok(false);
+        }
+        at = conn
+            .query_row(
+                "SELECT supersedes FROM documents WHERE id = ?1",
+                [cur],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::sqlite("failed to follow a document's history"))?
+            .flatten();
+    }
+    Ok(false)
 }
 
 impl Archive {
@@ -485,12 +653,14 @@ impl ArchiveMut {
     /// [`document_history`](Archive::document_history). Nothing is
     /// overwritten. `schema` names the body's type and version (say
     /// `"myapp.view/1"`) and is stored without being read. `body` must be
-    /// JSON, and is refused otherwise; it is stored as given.
+    /// JSON (RFC 8259, with no nesting limit), and is refused otherwise; it
+    /// is stored as given.
     ///
     /// `kind` and `name` must be non-empty, and a `kind` starting with
-    /// [`RESERVED_KIND_PREFIX`] is refused. An archive from before the
-    /// `documents` table gains it here, which changes no schema version
-    /// (FORMAT.md §8).
+    /// [`RESERVED_KIND_PREFIX`] is refused. A v4 archive, created by a
+    /// release before documents, is refused as [`Error::SchemaTooOld`]: it
+    /// is never migrated in place, and a copy of it made through
+    /// [`crate::rewrite`] is a v5 archive that takes documents.
     ///
     /// For an archive a [`Writer`](crate::writer::Writer) is recording, which
     /// an `ArchiveMut` cannot open, use
@@ -506,26 +676,31 @@ impl ArchiveMut {
     }
 
     /// [`put_document`](Self::put_document), refused with
-    /// [`Error::DocumentConflict`] unless the current document's id is
-    /// `expected` (`None`: unless there is no current document).
+    /// [`Error::DocumentConflict`] unless the current document is the
+    /// revision whose [`uuid`](Document::uuid) is `expected` (`None`: unless
+    /// there is no current document).
     ///
     /// For a caller that read a document, let someone edit it, and is saving
     /// the edit: if another revision landed in between, the save is refused
-    /// rather than silently replacing it.
+    /// rather than silently replacing it. The uuid, not the id, because a
+    /// copy renumbers ids: a caller that read the document from one file and
+    /// saves into a copy of it still names the same revision.
     pub fn put_document_if_current(
         &mut self,
         kind: &str,
         name: &str,
         schema: &str,
         body: &str,
-        expected: Option<i64>,
+        expected: Option<&str>,
     ) -> Result<i64> {
         self.transaction(|tx| tx.put_document_if_current(kind, name, schema, body, expected))
     }
 
     /// Delete document `(kind, name)` by writing a deletion revision, and
     /// return its id. The history is kept. `None`, and nothing written, when
-    /// there is no current document to delete.
+    /// there is no current document to delete. A reserved or empty `kind`,
+    /// or an empty `name`, is refused as [`put_document`](Self::put_document)
+    /// refuses it.
     pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<i64>> {
         self.transaction(|tx| tx.delete_document(kind, name))
     }
@@ -544,7 +719,7 @@ impl Transaction<'_> {
         name: &str,
         schema: &str,
         body: &str,
-        expected: Option<i64>,
+        expected: Option<&str>,
     ) -> Result<i64> {
         put(&self.tx, kind, name, schema, body, Some(expected))
     }
@@ -556,7 +731,7 @@ impl Transaction<'_> {
 
     /// Every document revision `src` holds, into this transaction's archive.
     /// See [`crate::rewrite::copy_documents_into`].
-    pub(crate) fn copy_documents_from(&self, src: &Archive) -> Result<usize> {
+    pub(crate) fn copy_documents_from(&self, src: &Archive) -> Result<CopiedDocuments> {
         copy_documents(src, &self.tx)
     }
 }

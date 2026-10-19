@@ -33,6 +33,15 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+This is 0.6.0, not 0.5.2. Archives this release creates are schema version
+5, which releases up to 0.5.1 refuse (`unsupported archive schema version
+5`). A patch release would reach `dendro = "0.5"` callers on a `cargo
+update`, and a process on the new build would then write files that their
+other processes, still on the old one, cannot open: the same break-by-upgrade
+the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
+`#[non_exhaustive]` allows, and `Error::UnsupportedSchema` now reports
+`reads: 4`.
+
 ### Added
 
 - Archive-level documents: named JSON documents that belong to the archive
@@ -41,27 +50,38 @@ cannot reach a failed release any other way.
   body's type and version. Writes append a revision and never overwrite one;
   the current revision is the newest, and a delete is a revision with no
   body. Written with `ArchiveMut::put_document`, `put_document_if_current`
-  (refused as the new `Error::DocumentConflict` when another revision
-  landed after the one the caller read) and `delete_document`, the same
-  three on `Transaction`, and on `Writer` for an archive being recorded,
-  which an `ArchiveMut` cannot open. Read with `Archive::document`,
-  `documents`, `document_kinds` and `document_history` (types
-  `archive::{Document, Deletion, Revision}`). Kinds beginning `dendro.`
-  (`archive::RESERVED_KIND_PREFIX`) are refused. The schema version is
-  unchanged: an archive from before the table reads as holding no
-  documents and gains the table on its first document write, and the
-  previous release reads an archive that has one.
+  (which takes the uuid of the revision the caller read, and is refused as
+  the new `Error::DocumentConflict` when another revision is current) and
+  `delete_document`; the same three on `Transaction`, and on `Writer` for an
+  archive being recorded, which an `ArchiveMut` cannot open. Read with
+  `Archive::document`, `documents`, `document_kinds` and `document_history`
+  (types `archive::{Document, Deletion, Revision}`). A body must be JSON
+  (RFC 8259, no nesting limit). Kinds beginning `dendro.`
+  (`archive::RESERVED_KIND_PREFIX`) are refused.
 - `rewrite::copy_documents_into`, which copies every document revision of
   one archive into a destination transaction, skipping revisions the
-  destination already holds (by uuid).
+  destination already holds (by uuid) and failing on one it holds with
+  different contents. It returns `archive::CopiedDocuments`: the revisions
+  inserted, the documents whose current revision came from this input, and
+  which of those displaced a current document they do not supersede
+  (`forked`), for a combine that must choose or rename.
+- `Archive::schema_version`, and `Error::SchemaTooOld`, returned for a
+  document written into a v4 archive.
 
 ### Changed
 
+- **Breaking (format):** the schema version is 5 (was 4). Every archive this
+  release creates has the `documents` table and is stamped 5; this release
+  reads 4 and 5. A v4 archive reads as holding no documents, and is still
+  written in place as v4 (a writer resumes it, metadata edits and compaction
+  run), but no document is written into it: copy it forward with
+  `rewrite::copy_sources_into` into a new archive, which is v5. The reason
+  is in FORMAT.md §8: 0.5.1's copier drops a table it does not know, and
+  documents are data people wrote.
 - `rewrite::copy_sources_into` also copies the source archive's documents,
   every revision, whatever the `CopySpec` selects. Called once per input,
-  as a combine does, it carries each input's documents, and where two
-  inputs hold revisions of one document the input copied last supplies the
-  current one.
+  as a combine does, it carries each input's documents; call
+  `copy_documents_into` first for the report.
 
 ## [0.5.1] - 2026-10-19
 
