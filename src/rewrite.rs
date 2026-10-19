@@ -774,6 +774,12 @@ pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
 /// complete afterwards for a specific reason: the buffer it copied is
 /// perpetually mid-source and would otherwise never produce a snapshot that
 /// did not warn.
+///
+/// The archive's documents come too, every revision of every one, whatever
+/// the spec's time bound and stream filter: a document belongs to the
+/// archive rather than to a source or a time, so no part of the spec
+/// selects it. See [`copy_documents_into`], which this calls in the same
+/// snapshot, for how revisions already in the destination are handled.
 pub fn copy_sources_into(
     src: &Archive,
     tx: &Transaction<'_>,
@@ -938,7 +944,26 @@ fn copy_sources_snapshotted(
             tx.insert_caller_rows(id, &name, &rows)?;
         }
     }
+    tx.copy_documents_from(src)?;
     Ok(copied)
+}
+
+/// Copy every document revision in `src` into the open destination
+/// transaction, returning how many were inserted. FORMAT.md §3.6.
+///
+/// [`copy_sources_into`] calls this, so a caller copying sources need not.
+/// It is public for an assembly that builds its sources some other way and
+/// still wants the documents.
+///
+/// A revision is identified by its uuid, and one the destination already
+/// holds is skipped, so copying the same archive twice, or a copy beside its
+/// original, adds each revision once. `supersedes` is renumbered to the
+/// destination's ids. Inserted revisions take ids after everything the
+/// destination holds, in `src`'s order, so where two inputs both hold
+/// revisions of one document, the input copied last supplies the current
+/// one and the other's stay in its history.
+pub fn copy_documents_into(src: &Archive, tx: &Transaction<'_>) -> Result<usize> {
+    src.read_snapshot(|src| tx.copy_documents_from(src))
 }
 
 /// Re-encode one segment with only the columns `keep` accepts, or `None` when
@@ -1125,7 +1150,14 @@ mod tests {
     #[test]
     fn every_schema_table_is_either_copied_or_deliberately_dropped() {
         /// Carried across by [`copy_sources_into`].
-        const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets", "caller_rows"];
+        const COPIED: &[&str] = &[
+            "sources",
+            "segments",
+            "wal",
+            "clock_offsets",
+            "caller_rows",
+            "documents",
+        ];
         /// Not carried, and correct not to be. Empty today: the schema version
         /// lives in the header stamp, not in a table.
         const NOT_CARRIED: &[&str] = &[];

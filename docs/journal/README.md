@@ -9,6 +9,7 @@ as ours or not ours, and links the entries that own each one.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
+| 2026-10-19 | [Archive documents: a place for what belongs to the whole archive](2026-10-19-archive-documents.md) | implemented |
 | 2026-10-01 | [Writer heartbeat: telling a source being written from one whose writer stopped](2026-10-01-writer-heartbeat.md) | implemented |
 | 2026-09-24 | [Read-optimized finished archives: a ladder from today's file to a flat layout](2026-09-24-two-forms-live-and-finalized.md) | open — step 1 (stream summaries) shelved in favour of identity in `caller_rows`; footer evidence revises steps 2 and 3 |
 | 2026-09-18 | [Replication: an archive's contents as frames, and the applier that reverses it](2026-09-18-replication-frames.md) | implemented |

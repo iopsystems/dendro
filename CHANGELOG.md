@@ -33,6 +33,36 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- Archive-level documents: named JSON documents that belong to the archive
+  rather than to a source, in a new `documents` table (FORMAT.md §3.6). A
+  document is `(kind, name)` with a caller-chosen `schema` string naming its
+  body's type and version. Writes append a revision and never overwrite one;
+  the current revision is the newest, and a delete is a revision with no
+  body. Written with `ArchiveMut::put_document`, `put_document_if_current`
+  (refused as the new `Error::DocumentConflict` when another revision
+  landed after the one the caller read) and `delete_document`, the same
+  three on `Transaction`, and on `Writer` for an archive being recorded,
+  which an `ArchiveMut` cannot open. Read with `Archive::document`,
+  `documents`, `document_kinds` and `document_history` (types
+  `archive::{Document, Deletion, Revision}`). Kinds beginning `dendro.`
+  (`archive::RESERVED_KIND_PREFIX`) are refused. The schema version is
+  unchanged: an archive from before the table reads as holding no
+  documents and gains the table on its first document write, and the
+  previous release reads an archive that has one.
+- `rewrite::copy_documents_into`, which copies every document revision of
+  one archive into a destination transaction, skipping revisions the
+  destination already holds (by uuid).
+
+### Changed
+
+- `rewrite::copy_sources_into` also copies the source archive's documents,
+  every revision, whatever the `CopySpec` selects. Called once per input,
+  as a combine does, it carries each input's documents, and where two
+  inputs hold revisions of one document the input copied last supplies the
+  current one.
+
 ## [0.5.1] - 2026-10-19
 
 ### Added

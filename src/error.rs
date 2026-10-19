@@ -104,6 +104,23 @@ pub enum Error {
         detail: String,
     },
 
+    /// A conditional document write found a different current revision
+    /// from the one the caller expected: another revision landed after the
+    /// caller read the document. See
+    /// [`ArchiveMut::put_document_if_current`](crate::archive::ArchiveMut::put_document_if_current).
+    DocumentConflict {
+        /// The document's kind.
+        kind: String,
+        /// The document's name.
+        name: String,
+        /// The current revision's id the caller expected; `None` for "no
+        /// current document".
+        expected: Option<i64>,
+        /// The current revision's id the archive holds; `None` when the
+        /// document is absent or deleted.
+        current: Option<i64>,
+    },
+
     /// The writer thread failed, and this is what it failed with.
     ///
     /// Shared rather than owned because every handle on the archive reports the
@@ -201,6 +218,16 @@ impl fmt::Display for Error {
                 f,
                 "the encoder returned a segment for {stream} that does not \
                  describe the rows it was given: {detail}"
+            ),
+            Error::DocumentConflict {
+                kind,
+                name,
+                expected,
+                current,
+            } => write!(
+                f,
+                "document {kind}/{name}: expected current revision {expected:?}, the archive \
+                 holds {current:?}; another revision was written after it was read"
             ),
             Error::Writer(e) => write!(f, "{e}"),
             Error::WriterGone => write!(

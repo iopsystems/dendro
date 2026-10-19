@@ -155,6 +155,20 @@ enum Msg {
         stream: String,
         rows: Vec<CallerRow>,
     },
+    /// Write a document revision (FORMAT.md §3.6) and hand its id back, or
+    /// the refusal. Archive-level, so it names no source. Replies because a
+    /// conditional write's conflict is the caller's to act on.
+    PutDocument {
+        put: Box<DocumentPut>,
+        reply: SyncSender<Result<i64>>,
+    },
+    /// Delete a document by writing a deletion revision; replies with its
+    /// id, or `None` when there was nothing to delete.
+    DeleteDocument {
+        kind: String,
+        name: String,
+        reply: SyncSender<Result<Option<i64>>>,
+    },
     /// One source's last clock observation; marks *that* source complete.
     ///
     /// Does not stop the writer: an archive may hold several sources and the
@@ -181,6 +195,18 @@ enum Msg {
     /// can count a tick's commits without racing the writer.
     #[cfg(any(test, feature = "test-support"))]
     Commits(SyncSender<u64>),
+}
+
+/// A document write crossing to the writer thread. Boxed in [`Msg`] so the
+/// four strings do not set every message's size.
+struct DocumentPut {
+    kind: String,
+    name: String,
+    schema: String,
+    body: String,
+    /// `None` writes unconditionally; `Some(e)` is
+    /// [`ArchiveMut::put_document_if_current`] with `e`.
+    expected: Option<Option<i64>>,
 }
 
 /// Where the writer thread leaves its failure so a *handle* can report it.
@@ -516,6 +542,96 @@ impl Writer {
     /// The archive being written — valid and readable while it is written.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Write a new revision of document `(kind, name)` through the writer
+    /// thread, and return its id once it is committed.
+    ///
+    /// [`ArchiveMut::put_document`], for an archive this writer is
+    /// recording: an `ArchiveMut` cannot open a file a writer holds, and
+    /// there is one writing connection, so a document written during a
+    /// recording goes through this thread like every other write. It is
+    /// ordered after everything queued before it and committed on its own.
+    /// A refusal (a reserved kind, a body that is not JSON) is returned and
+    /// does not stop the writer.
+    pub fn put_document(
+        &mut self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+    ) -> Result<i64> {
+        self.send_document(kind, name, schema, body, None)
+    }
+
+    /// [`ArchiveMut::put_document_if_current`] through the writer thread:
+    /// refused with [`Error::DocumentConflict`] unless the current
+    /// document's id is `expected`.
+    pub fn put_document_if_current(
+        &mut self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+        expected: Option<i64>,
+    ) -> Result<i64> {
+        self.send_document(kind, name, schema, body, Some(expected))
+    }
+
+    /// [`ArchiveMut::delete_document`] through the writer thread.
+    pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<i64>> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::WriterGone);
+        };
+        let (reply_tx, reply_rx) = sync_channel(0);
+        if tx
+            .send(Msg::DeleteDocument {
+                kind: kind.to_string(),
+                name: name.to_string(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(self.take_error());
+        }
+        match reply_rx.recv() {
+            Ok(deleted) => deleted,
+            Err(_) => Err(self.take_error()),
+        }
+    }
+
+    fn send_document(
+        &mut self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+        expected: Option<Option<i64>>,
+    ) -> Result<i64> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::WriterGone);
+        };
+        let (reply_tx, reply_rx) = sync_channel(0);
+        let put = Box::new(DocumentPut {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            schema: schema.to_string(),
+            body: body.to_string(),
+            expected,
+        });
+        if tx
+            .send(Msg::PutDocument {
+                put,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(self.take_error());
+        }
+        match reply_rx.recv() {
+            Ok(written) => written,
+            Err(_) => Err(self.take_error()),
+        }
     }
 
     /// Close the channel and join the writer, returning its stored result.
@@ -1891,6 +2007,30 @@ fn writer_loop(
                         patch.keys().collect::<Vec<_>>()
                     );
                 }
+            }
+            Ok(Msg::PutDocument { put, reply }) => {
+                // Never fatal: a document is not the recording, and the
+                // caller is waiting for the answer.
+                let DocumentPut {
+                    kind,
+                    name,
+                    schema,
+                    body,
+                    expected,
+                } = *put;
+                let written = with_retries("writing a document", || {
+                    db.transaction(|tx| match expected {
+                        None => tx.put_document(&kind, &name, &schema, &body),
+                        Some(e) => tx.put_document_if_current(&kind, &name, &schema, &body, e),
+                    })
+                });
+                let _ = reply.send(written);
+            }
+            Ok(Msg::DeleteDocument { kind, name, reply }) => {
+                let deleted = with_retries("deleting a document", || {
+                    db.transaction(|tx| tx.delete_document(&kind, &name))
+                });
+                let _ = reply.send(deleted);
             }
             Ok(Msg::ClockOffset {
                 source_id,

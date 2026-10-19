@@ -1,7 +1,8 @@
 //! What a publisher emits and a subscriber applies.
 //!
-//! One frame type per table in the set `rewrite` copies, so the frame set has
-//! a completeness check rather than a guess. No I/O here; [`wire`](super::wire)
+//! One frame type per per-source table in the set `rewrite` copies, so the
+//! frame set has a completeness check rather than a guess. The archive-level
+//! `documents` table has none; see the module docs. No I/O here; [`wire`](super::wire)
 //! turns these into bytes.
 
 use std::collections::BTreeMap;

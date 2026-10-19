@@ -1181,3 +1181,25 @@ fn a_merge_runs_on_inputs_built_by_hand() {
     assert!(!IdenticalMetadata.extend(&mut run, &MergeInput::new(&changed, &fields, 1)));
     assert_eq!(IdenticalMetadata.finish(run), one);
 }
+
+/// Compaction rewrites segments in place and reclaims pages; the archive's
+/// documents are in neither and come through untouched.
+#[test]
+fn compaction_keeps_the_archives_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    archive(&path, 20, 2, 3);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    db.put_document("app.view", "main", "app.view/1", "1")
+        .unwrap();
+    db.put_document("app.view", "main", "app.view/1", "2")
+        .unwrap();
+    let before = db.document_history("app.view", "main").unwrap();
+
+    let done = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
+    assert!(done.after < done.before, "the compaction did something");
+    assert_eq!(db.document_history("app.view", "main").unwrap(), before);
+    drop(db);
+    let reader = Archive::open(&path).unwrap();
+    assert_eq!(reader.document_history("app.view", "main").unwrap(), before);
+}

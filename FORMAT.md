@@ -23,7 +23,9 @@ independently. A stream is a sequence of immutable Parquet **segments** plus,
 while the source is live, a tail of **WAL rows** not yet sealed into one. A
 **row** is a timestamp, a wall-clock offset (§5), and an opaque payload; what
 the payload means, and what columns a segment has, is the caller's
-`SegmentEncoder` and no concern of the format.
+`SegmentEncoder` and no concern of the format. Beside its sources an
+archive holds **documents** (§3.6): named JSON revisions that belong to the
+archive as a whole and to no source.
 
 Three properties are the reason the format exists, and every rule below
 serves one of them:
@@ -88,7 +90,8 @@ stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Five tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
+Six tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`, and `documents` in
+`src/archive/sqlite/documents.rs`, `DOCUMENTS_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -136,7 +139,22 @@ CREATE TABLE caller_rows(
   blob BLOB NOT NULL                   -- opaque, the caller's
 );
 CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
+CREATE TABLE documents(                -- absent in archives before it existed
+  id INTEGER PRIMARY KEY,
+  uuid TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  schema TEXT,                         -- NULL on a deletion
+  body TEXT,                           -- JSON; NULL on a deletion
+  created_wall_ns INTEGER NOT NULL,
+  supersedes INTEGER REFERENCES documents(id),
+  CHECK ((schema IS NULL) = (body IS NULL))
+);
+CREATE INDEX documents_by_name ON documents(kind, name, id);
 ```
+
+Every table but `documents` is per source: its rows carry a `source_id`.
+`documents` belongs to the archive.
 
 Every timestamp is an `i64`: SQLite's only integer type, and the reason a
 negative value means before 1970 (`DESIGN.md` explains the two bugs `u64`
@@ -279,6 +297,58 @@ cannot destroy. The rules:
   copy's stream filter. Compaction and column projection do not touch it.
 - `verify` does not read it, and no read path interprets it.
 
+### 3.6 `documents`
+
+The archive's own store: named JSON documents that belong to no source,
+such as a saved view of the archive, a report's selection, or an event that
+spans every source. Each row is one **revision** of the document
+`(kind, name)`. The rules:
+
+- **Append-only.** A revision is never updated or deleted. Writing a
+  document inserts a revision; deleting one inserts a **deletion**, a
+  revision whose `schema` and `body` are both `NULL`. The history of
+  `(kind, name)` is its revisions in `id` order.
+- **The current revision is the newest by `id`.** If it is a deletion the
+  document does not currently exist. `supersedes` does not decide it.
+- **`supersedes`** is the `id` of the revision that was newest for
+  `(kind, name)` when this one was written, deletion included, or `NULL`
+  for the first. It records what the writer replaced. Two revisions with the
+  same `supersedes` are a **fork**: two writers each replaced the revision
+  they had read, and both are kept. The newer is current by the rule above;
+  a conditional write (`put_document_if_current`) refuses instead of forking
+  when the revision it read is no longer current.
+- **`uuid`** is the revision's identity, minted at insert in the form of
+  §3.1's and carried by every copy. A copy skips a revision whose `uuid` the
+  destination already holds, so copying an archive twice, or into an archive
+  that already holds a copy of it, adds each revision once.
+- **`kind`** is a namespace the caller chooses, such as `myapp.view`, and
+  **`name`** says which document of that kind. Both are non-empty. Kinds
+  beginning `dendro.` are reserved for this crate, which writes none today.
+- **`schema`** names the body's type and version, such as `myapp.view/1`.
+  The writer chooses it and the archive never reads it. It is how a body's
+  shape is versioned: a reader that does not recognize a revision's `schema`
+  must not interpret its body, and may walk the history back to the newest
+  revision whose `schema` it does recognize, saying that it is showing an
+  older revision. A writer that changes a body's shape writes a new
+  `schema`, never a new shape under an old one.
+- **`body`** is JSON text. A writer checks that it parses and stores it as
+  given; nothing else reads it.
+- **`created_wall_ns`** is the wall clock at insert, in nanoseconds since
+  the Unix epoch at millisecond resolution, from SQLite's own clock.
+  Provenance only: no rule orders by it.
+- **Copies.** `rewrite::copy_sources_into` carries every revision of every
+  document, whatever its time bound and stream filter select, and renumbers
+  `supersedes` to the destination's ids. Inserted revisions take ids after
+  everything the destination holds, in the source's order, so when several
+  archives are combined, the one copied last supplies the current revision
+  of a document they share. `vacuum_into` and `serialize` copy the file
+  whole. Compaction and retention do not touch the table. Replication does
+  not carry it (WIRE.md is per source).
+- **Archives without the table.** An archive created before the table
+  existed has no `documents` table, and a reader treats that as no
+  documents. The first document written to it creates the table, inside that
+  write's transaction (§8).
+
 ## 4. Reading
 
 The rules a reader must follow; `src/read.rs` is the reference.
@@ -394,9 +464,15 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   refuses a version above its own.
 - **What does not.** A nullable column an old reader can ignore (`uuid`,
   `caller_index`, `heartbeat` and `heartbeat_interval_ns` were added this
-  way); a new reserved metadata key
+  way); a new table an old reader never queries (`documents` was); a new
+  reserved metadata key
   (`producer_epoch`, `writer_sessions` were); a new event kind. Old copiers
   drop what they do not know, which degrades to "unknown", never to wrong.
+  For `documents` that was checked against the previous release's build
+  rather than argued: its open gate reads only the header, nothing in it
+  lists or refuses tables, its `verify` passes an archive holding documents,
+  and its writer resumes a source in one. Its `copy_sources_into` drops the
+  documents; its `vacuum_into` keeps them.
   One exception: a writer older than the heartbeat that resumes a source a
   newer writer left does not bump `heartbeat`, so a newer reader reads that
   source as stopped while it is being appended to.

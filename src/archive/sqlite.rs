@@ -8,6 +8,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
+mod documents;
+pub use documents::{Deletion, Document, Revision, RESERVED_KIND_PREFIX};
+
 /// Fixed at file creation and not changeable afterwards without leaving WAL
 /// mode and running a full `VACUUM`, so treat it as permanent.
 ///
@@ -746,6 +749,7 @@ impl Archive {
 
         db.conn
             .execute_batch(SCHEMA_SQL)
+            .and_then(|()| db.conn.execute_batch(documents::DOCUMENTS_SQL))
             .map_err(Error::sqlite("failed to create archive schema"))?;
         db.stamp_header()?;
         // Fold the stamp into the archive itself, now. In WAL mode every
@@ -2852,6 +2856,7 @@ impl ArchiveMut {
         db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
         db.conn
             .execute_batch(SCHEMA_SQL)
+            .and_then(|()| db.conn.execute_batch(documents::DOCUMENTS_SQL))
             .map_err(Error::sqlite("failed to create archive schema"))?;
         db.stamp_header()?;
         Ok(ArchiveMut::wrap(db))

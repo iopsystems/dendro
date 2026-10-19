@@ -9,11 +9,17 @@
 //! # Why this lives in dendro
 //!
 //! [`rewrite`] already copies an archive into another one, and
-//! the fixed set of tables it carries — `sources`, `segments`, `wal`,
-//! `clock_offsets`, `caller_rows` — is this crate's own statement of what an
-//! archive is. Replication is that same copy with the clock running, so the
-//! frame set has a completeness check rather than a guess: every one of those
-//! five has a [`Frame`](crate::replicate::Frame) variant, or the copy is lossy.
+//! the fixed set of per-source tables it carries — `sources`, `segments`,
+//! `wal`, `clock_offsets`, `caller_rows` — is this crate's own statement of
+//! what a source is. Replication is that same copy with the clock running, so
+//! the frame set has a completeness check rather than a guess: every one of
+//! those five has a [`Frame`](crate::replicate::Frame) variant, or the copy is
+//! lossy.
+//!
+//! The sixth table, `documents` (FORMAT.md §3.6), belongs to the archive
+//! rather than to a source, and a [`Handshake`](crate::replicate::Frame::Handshake)
+//! names a source. No frame carries it, so a subscriber's archive holds the
+//! sources it was sent and none of the publisher's documents.
 //!
 //! Two consequences follow from it being here rather than in a caller. The
 //! format cannot drift, because producer and consumer share these types. And
