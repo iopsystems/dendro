@@ -33,6 +33,13 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `ArchiveMut::update_source_labels`, which replaces one source's labels in
+  place, as `update_source_metadata` replaces its metadata. The source keeps
+  its `uuid`. An assembly of several archives uses it to tag each copied
+  source (an A/B arm) without rewriting segments.
+
 ## [0.5.0] - 2026-10-14
 
 ### Changed
