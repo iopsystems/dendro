@@ -33,7 +33,7 @@ use tracing::warn;
 
 use crate::archive::{Archive, ArchiveMut, CallerRow, Evicted, SegmentMeta, SourceMeta, WalRow};
 use crate::error::{Error, Result};
-use crate::segment::SegmentEncoder;
+use crate::segment::{EncodeContext, SegmentEncoder};
 
 /// Which streams a retention pass touches; `None` is the whole source.
 ///
@@ -2387,6 +2387,7 @@ fn seal_batch(
     // actually sealed, so every entry in the series is a projection of a row
     // that exists.
     let mut observation: Option<(i64, i64)> = None;
+    let uuid = db.source_uuid(source_id)?;
     for stream in batch {
         let rows = db.live_wal(source_id, &stream)?;
         if rows.is_empty() {
@@ -2411,7 +2412,8 @@ fn seal_batch(
         // for what it checks and why counting is the only check that works.
         // Split into parts of at most `max_rows`, each its own segment; see
         // `split_seal`.
-        let parts = split_seal(encoder, &stream, &rows, max_rows)?;
+        let ctx = EncodeContext::new(source_id, &stream).with_source_uuid(uuid.as_deref());
+        let parts = split_seal(encoder, &ctx, &rows, max_rows)?;
         let Some(tail) = parts.last() else {
             continue;
         };
@@ -2552,13 +2554,14 @@ fn encoded_part(stream: String, seq: u64, segment: crate::segment::Segment) -> E
 /// worse than an uncapped seal and loses nothing.
 fn split_seal(
     encoder: &(dyn SegmentEncoder + Send),
-    stream: &str,
+    ctx: &EncodeContext<'_>,
     rows: &[WalRow],
     max_rows: usize,
 ) -> Result<Vec<crate::segment::Segment>> {
+    let stream = ctx.stream;
     let max_rows = max_rows.max(1);
     if rows.len() <= max_rows {
-        return Ok(crate::segment::materialize(encoder, stream, rows)?
+        return Ok(crate::segment::materialize(encoder, ctx, rows)?
             .into_iter()
             .collect());
     }
@@ -2567,7 +2570,7 @@ fn split_seal(
     while start < rows.len() {
         let end = rows.len().min(start + max_rows);
         let part = &rows[start..end];
-        let segment = crate::segment::materialize_after(encoder, stream, &rows[..start], part)?;
+        let segment = crate::segment::materialize_after(encoder, ctx, &rows[..start], part)?;
         let tiles = segment.as_ref().is_some_and(|s| {
             (start == 0 || s.first_ts == part[0].ts)
                 && (end == rows.len() || s.last_ts == part[part.len() - 1].ts)
@@ -2579,7 +2582,7 @@ fn split_seal(
                  row cap of {max_rows}",
                 rows.len()
             );
-            return Ok(crate::segment::materialize(encoder, stream, rows)?
+            return Ok(crate::segment::materialize(encoder, ctx, rows)?
                 .into_iter()
                 .collect());
         };

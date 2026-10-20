@@ -10,12 +10,12 @@ use std::path::Path;
 
 use dendro::archive::{Archive, ArchiveMut, Revision, SourceMeta, WalRow};
 use dendro::rewrite::{copy_documents_into, copy_sources_into, CopySpec};
-use dendro::segment::{EncodeResult, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
 use dendro::Error;
 
 struct Never;
 impl SegmentEncoder for Never {
-    fn encode(&self, _stream: &str, _rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
         Ok(None)
     }
 }

@@ -129,7 +129,7 @@
 //! # use dendro::{archive::{SourceMeta, WalRow}, segment::{EncodeResult, SegmentEncoder}, writer::Writer};
 //! # struct MyEncoder;
 //! # impl SegmentEncoder for MyEncoder {
-//! #     fn encode(&self, _: &str, _: &[WalRow]) -> EncodeResult { Ok(None) }
+//! #     fn encode(&self, _: &dendro::segment::EncodeContext<'_>, _: &[WalRow]) -> EncodeResult { Ok(None) }
 //! # }
 //! # let seed = SourceMeta { labels: Default::default(), metadata: Default::default(), clock_anchor_wall_ns: 0 };
 //! # let rows: Vec<WalRow> = vec![];

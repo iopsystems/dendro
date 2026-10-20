@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
-use dendro::segment::{materialize, EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{materialize, EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::Error;
 
 fn source() -> SourceMeta {
@@ -38,7 +38,7 @@ fn rows(ts: &[i64]) -> Vec<WalRow> {
 /// `(rows, first_ts, last_ts)` triple cannot catch and counting can.
 struct DropsMiddle;
 impl SegmentEncoder for DropsMiddle {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.len() < 3 {
             return Ok(None);
         }
@@ -55,7 +55,7 @@ impl SegmentEncoder for DropsMiddle {
 /// Claims one more row than it was given.
 struct OverClaims;
 impl SegmentEncoder for OverClaims {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -71,7 +71,7 @@ impl SegmentEncoder for OverClaims {
 
 struct Panics;
 impl SegmentEncoder for Panics {
-    fn encode(&self, _stream: &str, _rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
         panic!("no");
     }
 }
@@ -80,19 +80,21 @@ impl SegmentEncoder for Panics {
 fn the_shared_check_refuses_a_hole_an_overclaim_and_a_panic() {
     let input = rows(&[1, 2, 3]);
     assert!(matches!(
-        materialize(&DropsMiddle, "s", &input).unwrap_err(),
+        materialize(&DropsMiddle, &EncodeContext::new(1, "s"), &input).unwrap_err(),
         Error::EncoderContract { .. }
     ));
     assert!(matches!(
-        materialize(&OverClaims, "s", &input).unwrap_err(),
+        materialize(&OverClaims, &EncodeContext::new(1, "s"), &input).unwrap_err(),
         Error::EncoderContract { .. }
     ));
-    match materialize(&Panics, "s", &input).unwrap_err() {
+    match materialize(&Panics, &EncodeContext::new(1, "s"), &input).unwrap_err() {
         Error::Encoder { source, .. } => assert!(source.to_string().contains("panicked: no")),
         other => panic!("{other}"),
     }
     // Empty input never reaches the encoder — a panicking one is not called.
-    assert!(materialize(&Panics, "s", &[]).unwrap().is_none());
+    assert!(materialize(&Panics, &EncodeContext::new(1, "s"), &[])
+        .unwrap()
+        .is_none());
 }
 
 /// The read path runs the same check: an encoder the seal would refuse is

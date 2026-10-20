@@ -896,7 +896,11 @@ fn copy_sources_snapshotted(
             // else: every catalog fact below comes from what actually
             // materializes. Cataloging the raw tail's span would claim rows
             // the bytes do not contain — at either end.
-            let materialized = crate::segment::materialize(encoder, &table, &tail)?;
+            // The rows are the source's, so the encoder is told the source
+            // they came from, not the copy being built.
+            let ctx = crate::segment::EncodeContext::new(rec.id, &table)
+                .with_source_uuid(rec.uuid.as_deref());
+            let materialized = crate::segment::materialize(encoder, &ctx, &tail)?;
             if let Some(materialized) = materialized {
                 let meta = SegmentMeta {
                     rows: materialized.rows,

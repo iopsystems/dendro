@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, SourceMeta, WalRow};
 use dendro::keys;
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 use dendro::Error;
 
@@ -16,7 +16,7 @@ use dendro::Error;
 struct Tags;
 
 impl SegmentEncoder for Tags {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }

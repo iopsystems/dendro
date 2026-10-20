@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
 use dendro::rewrite::{copy_sources_into, ColumnFilter, CopySpec};
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 
 /// Writes the rows, and indexes them by the one thing the archive cannot
@@ -28,7 +28,7 @@ fn series_of(r: &WalRow) -> u8 {
 }
 
 impl SegmentEncoder for Indexed {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -124,7 +124,7 @@ fn an_index_is_stored_beside_its_segment_and_read_back_without_it() {
 fn no_index_is_a_null_not_a_failure() {
     struct Plain;
     impl SegmentEncoder for Plain {
-        fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             if rows.is_empty() {
                 return Ok(None);
             }
@@ -165,7 +165,7 @@ fn a_column_projection_drops_the_index_it_can_no_longer_vouch_for() {
     // A real parquet segment, so the projection has something to decode.
     struct Parquet;
     impl SegmentEncoder for Parquet {
-        fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             use arrow::array::{ArrayRef, Int64Array};
             use arrow::datatypes::{DataType, Field, Schema};
             use arrow::record_batch::RecordBatch;

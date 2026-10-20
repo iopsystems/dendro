@@ -16,14 +16,14 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 
 /// Reports the timestamps it was handed, so a test can see exactly which rows
 /// reached the reader.
 struct Tags;
 
 impl SegmentEncoder for Tags {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -180,11 +180,12 @@ struct AppendsWhileEncoding {
 }
 
 impl SegmentEncoder for AppendsWhileEncoding {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        let stream = ctx.stream;
         if stream == "a" && !self.fired.replace(true) {
             append_concurrently(&self.path, self.id, 4);
         }
-        Tags.encode(stream, rows)
+        Tags.encode(ctx, rows)
     }
 }
 
@@ -254,11 +255,11 @@ fn a_dropped_trailing_row_stays_live_instead_of_being_pruned() {
     /// a record to complete would.
     struct DropsLast;
     impl SegmentEncoder for DropsLast {
-        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             if rows.len() < 2 {
                 return Ok(None);
             }
-            Tags.encode(stream, &rows[..rows.len() - 1])
+            Tags.encode(ctx, &rows[..rows.len() - 1])
         }
     }
 
@@ -313,7 +314,7 @@ fn an_encoder_cannot_invent_coverage() {
 
     struct Liar;
     impl SegmentEncoder for Liar {
-        fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             if rows.is_empty() {
                 return Ok(None);
             }
@@ -538,12 +539,12 @@ fn an_encoder_that_drops_a_middle_run_does_not_lose_the_rows() {
     /// Keeps the first and last row only — the shape that slipped through.
     struct DropsMiddle;
     impl SegmentEncoder for DropsMiddle {
-        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             if rows.len() < 3 {
-                return Tags.encode(stream, rows);
+                return Tags.encode(ctx, rows);
             }
             let ends = [rows[0].clone(), rows[rows.len() - 1].clone()];
-            Tags.encode(stream, &ends)
+            Tags.encode(ctx, &ends)
         }
     }
 
@@ -598,8 +599,8 @@ fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
 
     struct UnderstatesLast;
     impl SegmentEncoder for UnderstatesLast {
-        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
-            let Some(mut seg) = Tags.encode(stream, rows)? else {
+        fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+            let Some(mut seg) = Tags.encode(ctx, rows)? else {
                 return Ok(None);
             };
             if rows.len() > 1 {
@@ -650,11 +651,11 @@ fn a_copy_catalogs_the_tail_it_wrote() {
     /// would.
     struct DropsLast;
     impl SegmentEncoder for DropsLast {
-        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             if rows.len() < 2 {
                 return Ok(None);
             }
-            Tags.encode(stream, &rows[..rows.len() - 1])
+            Tags.encode(ctx, &rows[..rows.len() - 1])
         }
     }
 
@@ -709,11 +710,11 @@ fn a_clock_observation_comes_from_one_row() {
 
     struct DropsLast;
     impl SegmentEncoder for DropsLast {
-        fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+        fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
             if rows.len() < 2 {
                 return Ok(None);
             }
-            Tags.encode(stream, &rows[..rows.len() - 1])
+            Tags.encode(ctx, &rows[..rows.len() - 1])
         }
     }
 

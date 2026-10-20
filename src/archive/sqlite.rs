@@ -2084,6 +2084,26 @@ impl Archive {
         Ok(out)
     }
 
+    /// One source's uuid, or `None` for a source from before the column.
+    /// What an encoder is told as
+    /// [`EncodeContext::source_uuid`](crate::segment::EncodeContext::source_uuid).
+    pub(crate) fn source_uuid(&self, source_id: i64) -> Result<Option<String>> {
+        let column = if has_column(&self.conn, "sources", "uuid")? {
+            "uuid"
+        } else {
+            "NULL"
+        };
+        self.conn
+            .query_row(
+                &format!("SELECT {column} FROM sources WHERE id = ?1"),
+                [source_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to read the uuid of source {source_id}"
+            )))
+    }
+
     /// One source's metadata map, as stored.
     pub fn source_metadata(&self, source_id: i64) -> Result<BTreeMap<String, String>> {
         let encoded: String = self

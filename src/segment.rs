@@ -73,6 +73,50 @@ pub struct Segment {
     pub index: Option<Vec<u8>>,
 }
 
+/// Which stream an encode is for, and whose: what an encoder is told beside
+/// the rows. See [`SegmentEncoder::encode`].
+///
+/// A stream name is unique only within its source, and one writer can hold
+/// several sources with the same stream names (two hosts recording `cpu`),
+/// so an encoder that keeps per-stream state, such as labels a long table
+/// states once, keys it by source as well as by stream.
+///
+/// `#[non_exhaustive]`: fields are added without a breaking release. Read
+/// the fields; build one with [`new`](Self::new), which a caller only needs
+/// when it drives an encoder itself, in a test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EncodeContext<'a> {
+    /// The source's row id in this archive. Local to the file: a copy
+    /// renumbers it, so it names the source for the life of one handle on
+    /// one file, not across files.
+    pub source_id: i64,
+    /// The source's identity across files (FORMAT.md §3.1), or `None` for a
+    /// source from before the `uuid` column.
+    pub source_uuid: Option<&'a str>,
+    /// The stream whose rows these are.
+    pub stream: &'a str,
+}
+
+impl<'a> EncodeContext<'a> {
+    /// A context for `stream` of source `source_id`, with no uuid.
+    pub fn new(source_id: i64, stream: &'a str) -> Self {
+        EncodeContext {
+            source_id,
+            source_uuid: None,
+            stream,
+        }
+    }
+
+    /// The same context, with the source's uuid.
+    pub fn with_source_uuid(self, source_uuid: Option<&'a str>) -> Self {
+        EncodeContext {
+            source_uuid,
+            ..self
+        }
+    }
+}
+
 /// Turns a stream's WAL rows into one parquet segment.
 ///
 /// **This is the schema boundary.** dendro stores a WAL row as an opaque
@@ -102,10 +146,15 @@ pub struct Segment {
 /// that indexes `rows[0]` without checking panics inside the reader, and on the
 /// seal path the reader is the writer thread. Return `Ok(None)`.
 pub trait SegmentEncoder {
-    /// Encode `rows` — one stream's, in timestamp order — as one segment, or
-    /// `Ok(None)` for no segment. See the trait for what a returned segment
-    /// may claim, and for the empty slice this is called with.
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
+    /// Encode `rows` — the stream `ctx` names, in timestamp order — as one
+    /// segment, or `Ok(None)` for no segment. See the trait for what a
+    /// returned segment may claim, and for the empty slice this is called
+    /// with.
+    ///
+    /// `ctx` says which source the stream belongs to. The writer, a reader
+    /// materializing a tail, and a copy carrying one all pass the source the
+    /// rows are in: for a copy, the source it is copying from.
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult;
 
     /// A version for this encoding, or `None` to opt out.
     ///
@@ -123,7 +172,7 @@ pub trait SegmentEncoder {
     /// # use dendro::segment::{EncodeResult, SegmentEncoder};
     /// # struct MyEncoder;
     /// impl SegmentEncoder for MyEncoder {
-    ///     # fn encode(&self, _: &str, _: &[WalRow]) -> EncodeResult { Ok(None) }
+    ///     # fn encode(&self, _: &dendro::segment::EncodeContext<'_>, _: &[WalRow]) -> EncodeResult { Ok(None) }
     ///     fn version(&self) -> Option<&str> {
     ///         Some("3")
     ///     }
@@ -156,14 +205,19 @@ pub trait SegmentEncoder {
     /// starts after it has rows that refer to that schema and none that
     /// carry it.
     ///
-    /// The default ignores `before` and calls `encode(stream, rows)`, which
+    /// The default ignores `before` and calls `encode(ctx, rows)`, which
     /// is correct when every row can be decoded on its own. An encoder whose
     /// rows cannot must override this before its caller uses
     /// `seal_capped`; plain `SourceWriter::seal` never splits and never
     /// calls it.
-    fn encode_after(&self, stream: &str, before: &[WalRow], rows: &[WalRow]) -> EncodeResult {
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[WalRow],
+        rows: &[WalRow],
+    ) -> EncodeResult {
         let _ = before;
-        self.encode(stream, rows)
+        self.encode(ctx, rows)
     }
 }
 
@@ -190,10 +244,10 @@ pub trait SegmentEncoder {
 /// input without calling the encoder at all.
 pub fn materialize(
     encoder: &dyn SegmentEncoder,
-    stream: &str,
+    ctx: &EncodeContext<'_>,
     rows: &[WalRow],
 ) -> Result<Option<Segment>> {
-    materialize_after(encoder, stream, &[], rows)
+    materialize_after(encoder, ctx, &[], rows)
 }
 
 /// [`materialize`] for a part of a split seal: `rows` encoded after
@@ -202,18 +256,19 @@ pub fn materialize(
 /// the first part of a split is encoded exactly as an unsplit seal is.
 pub(crate) fn materialize_after(
     encoder: &dyn SegmentEncoder,
-    stream: &str,
+    ctx: &EncodeContext<'_>,
     before: &[WalRow],
     rows: &[WalRow],
 ) -> Result<Option<Segment>> {
+    let stream = ctx.stream;
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
         return Ok(None);
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if before.is_empty() {
-            encoder.encode(stream, rows)
+            encoder.encode(ctx, rows)
         } else {
-            encoder.encode_after(stream, before, rows)
+            encoder.encode_after(ctx, before, rows)
         }
     }));
     let segment = match outcome {
@@ -275,14 +330,19 @@ pub type EncodeResult =
     std::result::Result<Option<Segment>, Box<dyn std::error::Error + Send + Sync>>;
 
 impl<T: SegmentEncoder + ?Sized> SegmentEncoder for &T {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
-        (**self).encode(stream, rows)
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        (**self).encode(ctx, rows)
     }
     fn version(&self) -> Option<&str> {
         (**self).version()
     }
-    fn encode_after(&self, stream: &str, before: &[WalRow], rows: &[WalRow]) -> EncodeResult {
-        (**self).encode_after(stream, before, rows)
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[WalRow],
+        rows: &[WalRow],
+    ) -> EncodeResult {
+        (**self).encode_after(ctx, before, rows)
     }
 }
 

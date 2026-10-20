@@ -56,7 +56,7 @@ your job, expressed as a `SegmentEncoder`:
 
 ```rust
 pub trait SegmentEncoder {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult;
     fn version(&self) -> Option<&str> { None }
 }
 ```

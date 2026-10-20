@@ -20,7 +20,7 @@ use dendro::read;
 use dendro::rewrite::{
     compact, compact_stream, compact_with, CompactSpec, MergeInput, MetadataMerge,
 };
-use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{encode_batch, EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 use parquet::file::metadata::KeyValue;
 
@@ -29,7 +29,7 @@ use parquet::file::metadata::KeyValue;
 struct Widening;
 
 impl SegmentEncoder for Widening {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -343,7 +343,7 @@ fn compacting_one_stream_leaves_the_others_alone() {
 struct Relabeling;
 
 impl SegmentEncoder for Relabeling {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -511,7 +511,7 @@ fn unioning_still_stops_at_a_column_that_changed() {
 struct Described;
 
 impl SegmentEncoder for Described {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         use parquet::arrow::ArrowWriter;
         use parquet::file::metadata::KeyValue;
 
@@ -1041,7 +1041,7 @@ fn compaction_opens_only_the_segments_it_judges() {
 struct Doubling;
 
 impl SegmentEncoder for Doubling {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }

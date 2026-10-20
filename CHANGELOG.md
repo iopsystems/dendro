@@ -78,6 +78,19 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   `rewrite::copy_sources_into` into a new archive, which is v5. The reason
   is in FORMAT.md §8: 0.5.1's copier drops a table it does not know, and
   documents are data people wrote.
+- **Breaking:** `SegmentEncoder::encode` and `encode_after` take
+  `&segment::EncodeContext` in place of the stream name, and
+  `segment::materialize` takes one too. The context carries the stream
+  (`ctx.stream`), the source's row id in the archive (`ctx.source_id`) and
+  its uuid (`ctx.source_uuid`). Before, an encoder was told only the stream
+  name, which one writer with several sources (two hosts recording `cpu`)
+  repeats, so an encoder keeping per-stream state could not key it. The
+  writer, a reader materializing a tail and a copy all pass the source the
+  rows are in; a copy passes the source archive's, not the destination's.
+  The struct is `#[non_exhaustive]`, so fields are added without a break.
+  For an implementor: replace `stream: &str` with `ctx: &EncodeContext<'_>`
+  and read `ctx.stream`. A caller driving an encoder itself (a test) builds
+  one with `EncodeContext::new(source_id, stream)`.
 - `rewrite::copy_sources_into` also copies the source archive's documents,
   every revision, whatever the `CopySpec` selects. Called once per input,
   as a combine does, it carries each input's documents; call

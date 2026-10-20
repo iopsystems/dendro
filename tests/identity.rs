@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{sniff, sniff_bytes, Archive, ArchiveMut, Sniff, SourceMeta, WalRow};
 use dendro::rewrite::{copy_sources_into, shared_sources, CopySpec};
-use dendro::segment::{EncodeResult, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
 use dendro::Error;
 
 /// Never asked to encode anything here: the sources under test hold no rows.
 struct Never;
 impl SegmentEncoder for Never {
-    fn encode(&self, _stream: &str, _rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
         Ok(None)
     }
 }

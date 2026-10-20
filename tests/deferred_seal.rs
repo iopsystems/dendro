@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dendro::archive::{Archive, Evicted, SourceMeta, WalRow};
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::{SourceWriter, Writer};
 
 fn source() -> SourceMeta {
@@ -61,7 +61,8 @@ impl Anchored {
 }
 
 impl SegmentEncoder for Anchored {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        let stream = ctx.stream;
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(calls) = &self.calls {
             let _ = calls.lock().unwrap().send(n);

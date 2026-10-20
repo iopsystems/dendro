@@ -15,14 +15,14 @@ use std::sync::Arc;
 
 use dendro::archive::{Archive, ArchiveMut, CallerRow, SegmentMeta, SourceMeta, WalRow};
 use dendro::rewrite::{compact, copy_sources_into, CompactSpec, CopySpec};
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 
 /// Rows as a comma-joined list of timestamps: readable, and not parquet, so
 /// a copy passes them through and a compaction test uses [`Parquet`].
 struct Tags;
 
 impl SegmentEncoder for Tags {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -41,7 +41,7 @@ impl SegmentEncoder for Tags {
 struct Parquet;
 
 impl SegmentEncoder for Parquet {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -491,7 +491,10 @@ fn compaction_leaves_the_store_exactly_as_it_was() {
         let id = db.insert_source(&source()).unwrap();
         // Four one-row parquet segments, then caller rows across their span.
         for ts in 1..=4i64 {
-            let seg = Parquet.encode("s", &[wal_row("s", ts)]).unwrap().unwrap();
+            let seg = Parquet
+                .encode(&EncodeContext::new(1, "s"), &[wal_row("s", ts)])
+                .unwrap()
+                .unwrap();
             db.transaction(|tx| {
                 tx.insert_segment(
                     id,

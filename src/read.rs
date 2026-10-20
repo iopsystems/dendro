@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::archive::{Archive, Span};
 use crate::error::Result;
-use crate::segment::SegmentEncoder;
+use crate::segment::{EncodeContext, Segment, SegmentEncoder};
 
 /// A stream as the catalog sees it: how much is sealed, how much is live,
 /// and the span the two cover. **No BLOB is read** to answer this.
@@ -231,7 +231,7 @@ pub fn probe(
             return db.read_segment_bytes(source_id, stream, *seq);
         }
         let live = db.live_wal(source_id, stream)?;
-        Ok(crate::segment::materialize(encoder, stream, &live)?.map(|t| t.bytes))
+        Ok(materialize_tail(db, encoder, source_id, stream, &live)?.map(|t| t.bytes))
     })
 }
 
@@ -262,7 +262,7 @@ pub fn stream_range(
             .into_iter()
             .filter(|r| r.ts >= start && r.ts <= end)
             .collect();
-        if let Some(tail) = crate::segment::materialize(encoder, stream, &live)? {
+        if let Some(tail) = materialize_tail(db, encoder, source_id, stream, &live)? {
             segments.push(tail.bytes);
         }
         Ok(segments)
@@ -363,6 +363,24 @@ pub fn stream_segments(
 
 /// [`segment::check_encoder`](crate::segment::check_encoder) for a source
 /// named by id, inside the caller's snapshot.
+/// Materialize a stream's live tail, telling the encoder whose rows they
+/// are. The source's uuid is looked up only when there is a tail to encode,
+/// which a finalized archive never has.
+fn materialize_tail(
+    db: &Archive,
+    encoder: &dyn SegmentEncoder,
+    source_id: i64,
+    stream: &str,
+    live: &[crate::archive::WalRow],
+) -> Result<Option<Segment>> {
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let uuid = db.source_uuid(source_id)?;
+    let ctx = EncodeContext::new(source_id, stream).with_source_uuid(uuid.as_deref());
+    crate::segment::materialize(encoder, &ctx, live)
+}
+
 fn check_encoder_of(db: &Archive, source_id: i64, encoder: &dyn SegmentEncoder) -> Result<()> {
     if encoder.version().is_none() {
         return Ok(());
@@ -395,7 +413,7 @@ fn stream_segments_snapshotted(
     // The same contract the writer enforces when it seals, so a reader and
     // the next seal agree about the tail. This used to check less than the
     // writer, and an encoder the seal refused was materialized silently here.
-    if let Some(tail) = crate::segment::materialize(encoder, stream, &live)? {
+    if let Some(tail) = materialize_tail(db, encoder, source_id, stream, &live)? {
         segments.push(tail.bytes);
     }
     Ok(segments)
@@ -424,7 +442,7 @@ pub fn stream_indexes(
             .map(|(_, index)| index)
             .collect();
         let live = db.live_wal(source_id, stream)?;
-        if let Some(tail) = crate::segment::materialize(encoder, stream, &live)? {
+        if let Some(tail) = materialize_tail(db, encoder, source_id, stream, &live)? {
             out.push(tail.index);
         }
         Ok(out)

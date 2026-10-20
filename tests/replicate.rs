@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, CallerRow, SegmentMeta, SourceMeta, WalRow};
 use dendro::replicate::{Frame, IndexKind, Subscriber, NO_INDEX_STATE};
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 
 /// Rows as a comma-joined list of timestamps: readable, and not parquet, so a
@@ -21,7 +21,7 @@ use dendro::writer::Writer;
 struct Tags;
 
 impl SegmentEncoder for Tags {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
