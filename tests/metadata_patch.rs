@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{Archive, SourceMeta, WalRow};
 use dendro::keys;
-use dendro::segment::{EncodeResult, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
 use dendro::writer::Writer;
 
 struct Never;
 impl SegmentEncoder for Never {
-    fn encode(&self, _stream: &str, _rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
         Ok(None)
     }
 }

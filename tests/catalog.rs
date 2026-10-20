@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 
 use dendro::archive::{Archive, ArchiveMut, SegmentMeta, SourceMeta, WalRow};
 use dendro::read::{self, SegmentBytes};
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 
 struct Tags;
 impl SegmentEncoder for Tags {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }

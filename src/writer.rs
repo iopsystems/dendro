@@ -31,9 +31,11 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::archive::{Archive, ArchiveMut, CallerRow, Evicted, SegmentMeta, SourceMeta, WalRow};
+use crate::archive::{
+    Archive, ArchiveMut, CallerRow, Evicted, RevisionId, SegmentMeta, SourceMeta, WalRow,
+};
 use crate::error::{Error, Result};
-use crate::segment::SegmentEncoder;
+use crate::segment::{EncodeContext, SegmentEncoder};
 
 /// Which streams a retention pass touches; `None` is the whole source.
 ///
@@ -155,6 +157,20 @@ enum Msg {
         stream: String,
         rows: Vec<CallerRow>,
     },
+    /// Write a document revision (FORMAT.md §3.6) and hand its id back, or
+    /// the refusal. Archive-level, so it names no source. Replies because a
+    /// conditional write's conflict is the caller's to act on.
+    PutDocument {
+        put: Box<DocumentPut>,
+        reply: SyncSender<Result<RevisionId>>,
+    },
+    /// Delete a document by writing a deletion revision; replies with its
+    /// id, or `None` when there was nothing to delete.
+    DeleteDocument {
+        kind: String,
+        name: String,
+        reply: SyncSender<Result<Option<RevisionId>>>,
+    },
     /// One source's last clock observation; marks *that* source complete.
     ///
     /// Does not stop the writer: an archive may hold several sources and the
@@ -181,6 +197,18 @@ enum Msg {
     /// can count a tick's commits without racing the writer.
     #[cfg(any(test, feature = "test-support"))]
     Commits(SyncSender<u64>),
+}
+
+/// A document write crossing to the writer thread. Boxed in [`Msg`] so the
+/// four strings do not set every message's size.
+struct DocumentPut {
+    kind: String,
+    name: String,
+    schema: String,
+    body: String,
+    /// `None` writes unconditionally; `Some(e)` is
+    /// [`ArchiveMut::put_document_if_current`] with `e`.
+    expected: Option<Option<String>>,
 }
 
 /// Where the writer thread leaves its failure so a *handle* can report it.
@@ -516,6 +544,97 @@ impl Writer {
     /// The archive being written — valid and readable while it is written.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Write a new revision of document `(kind, name)` through the writer
+    /// thread, and return its id and uuid once it is committed.
+    ///
+    /// [`ArchiveMut::put_document`], for an archive this writer is
+    /// recording: an `ArchiveMut` cannot open a file a writer holds, and
+    /// there is one writing connection, so a document written during a
+    /// recording goes through this thread like every other write. It is
+    /// ordered after everything queued before it and committed on its own.
+    /// A refusal (a reserved kind, a body that is not JSON, a v4 archive
+    /// reopened with [`Writer::open`], which takes no documents) is returned
+    /// and does not stop the writer.
+    pub fn put_document(
+        &mut self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+    ) -> Result<RevisionId> {
+        self.send_document(kind, name, schema, body, None)
+    }
+
+    /// [`ArchiveMut::put_document_if_current`] through the writer thread:
+    /// refused with [`Error::DocumentConflict`] unless the current
+    /// document's uuid is `expected`.
+    pub fn put_document_if_current(
+        &mut self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+        expected: Option<&str>,
+    ) -> Result<RevisionId> {
+        self.send_document(kind, name, schema, body, Some(expected.map(str::to_string)))
+    }
+
+    /// [`ArchiveMut::delete_document`] through the writer thread.
+    pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<RevisionId>> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::WriterGone);
+        };
+        let (reply_tx, reply_rx) = sync_channel(0);
+        if tx
+            .send(Msg::DeleteDocument {
+                kind: kind.to_string(),
+                name: name.to_string(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(self.take_error());
+        }
+        match reply_rx.recv() {
+            Ok(deleted) => deleted,
+            Err(_) => Err(self.take_error()),
+        }
+    }
+
+    fn send_document(
+        &mut self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+        expected: Option<Option<String>>,
+    ) -> Result<RevisionId> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::WriterGone);
+        };
+        let (reply_tx, reply_rx) = sync_channel(0);
+        let put = Box::new(DocumentPut {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            schema: schema.to_string(),
+            body: body.to_string(),
+            expected,
+        });
+        if tx
+            .send(Msg::PutDocument {
+                put,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(self.take_error());
+        }
+        match reply_rx.recv() {
+            Ok(written) => written,
+            Err(_) => Err(self.take_error()),
+        }
     }
 
     /// Close the channel and join the writer, returning its stored result.
@@ -1892,6 +2011,32 @@ fn writer_loop(
                     );
                 }
             }
+            Ok(Msg::PutDocument { put, reply }) => {
+                // Never fatal: a document is not the recording, and the
+                // caller is waiting for the answer.
+                let DocumentPut {
+                    kind,
+                    name,
+                    schema,
+                    body,
+                    expected,
+                } = *put;
+                let written = with_retries("writing a document", || {
+                    db.transaction(|tx| match &expected {
+                        None => tx.put_document(&kind, &name, &schema, &body),
+                        Some(e) => {
+                            tx.put_document_if_current(&kind, &name, &schema, &body, e.as_deref())
+                        }
+                    })
+                });
+                let _ = reply.send(written);
+            }
+            Ok(Msg::DeleteDocument { kind, name, reply }) => {
+                let deleted = with_retries("deleting a document", || {
+                    db.transaction(|tx| tx.delete_document(&kind, &name))
+                });
+                let _ = reply.send(deleted);
+            }
             Ok(Msg::ClockOffset {
                 source_id,
                 ts,
@@ -2244,6 +2389,7 @@ fn seal_batch(
     // actually sealed, so every entry in the series is a projection of a row
     // that exists.
     let mut observation: Option<(i64, i64)> = None;
+    let uuid = db.source_uuid(source_id)?;
     for stream in batch {
         let rows = db.live_wal(source_id, &stream)?;
         if rows.is_empty() {
@@ -2268,7 +2414,8 @@ fn seal_batch(
         // for what it checks and why counting is the only check that works.
         // Split into parts of at most `max_rows`, each its own segment; see
         // `split_seal`.
-        let parts = split_seal(encoder, &stream, &rows, max_rows)?;
+        let ctx = EncodeContext::new(source_id, &stream).with_source_uuid(uuid.as_deref());
+        let parts = split_seal(encoder, &ctx, &rows, max_rows)?;
         let Some(tail) = parts.last() else {
             continue;
         };
@@ -2409,13 +2556,14 @@ fn encoded_part(stream: String, seq: u64, segment: crate::segment::Segment) -> E
 /// worse than an uncapped seal and loses nothing.
 fn split_seal(
     encoder: &(dyn SegmentEncoder + Send),
-    stream: &str,
+    ctx: &EncodeContext<'_>,
     rows: &[WalRow],
     max_rows: usize,
 ) -> Result<Vec<crate::segment::Segment>> {
+    let stream = ctx.stream;
     let max_rows = max_rows.max(1);
     if rows.len() <= max_rows {
-        return Ok(crate::segment::materialize(encoder, stream, rows)?
+        return Ok(crate::segment::materialize(encoder, ctx, rows)?
             .into_iter()
             .collect());
     }
@@ -2424,7 +2572,7 @@ fn split_seal(
     while start < rows.len() {
         let end = rows.len().min(start + max_rows);
         let part = &rows[start..end];
-        let segment = crate::segment::materialize_after(encoder, stream, &rows[..start], part)?;
+        let segment = crate::segment::materialize_after(encoder, ctx, &rows[..start], part)?;
         let tiles = segment.as_ref().is_some_and(|s| {
             (start == 0 || s.first_ts == part[0].ts)
                 && (end == rows.len() || s.last_ts == part[part.len() - 1].ts)
@@ -2436,7 +2584,7 @@ fn split_seal(
                  row cap of {max_rows}",
                 rows.len()
             );
-            return Ok(crate::segment::materialize(encoder, stream, rows)?
+            return Ok(crate::segment::materialize(encoder, ctx, rows)?
                 .into_iter()
                 .collect());
         };

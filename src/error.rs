@@ -104,6 +104,35 @@ pub enum Error {
         detail: String,
     },
 
+    /// The archive's schema predates what the write needs: a document
+    /// written into a v4 archive, which has no `documents` table. An archive
+    /// is never migrated in place (FORMAT.md §8); copy it into a new archive
+    /// with [`rewrite::copy_sources_into`](crate::rewrite::copy_sources_into),
+    /// which writes the current schema, and write there.
+    SchemaTooOld {
+        /// The `user_version` the archive carries.
+        found: i64,
+        /// The schema version the write needs.
+        needs: i64,
+    },
+
+    /// A conditional document write found a different current revision
+    /// from the one the caller expected: another revision landed after the
+    /// caller read the document. See
+    /// [`ArchiveMut::put_document_if_current`](crate::archive::ArchiveMut::put_document_if_current).
+    DocumentConflict {
+        /// The document's kind.
+        kind: String,
+        /// The document's name.
+        name: String,
+        /// The uuid of the current revision the caller expected; `None` for
+        /// "no current document".
+        expected: Option<String>,
+        /// The uuid of the current revision the archive holds; `None` when
+        /// the document is absent or deleted.
+        current: Option<String>,
+    },
+
     /// The writer thread failed, and this is what it failed with.
     ///
     /// Shared rather than owned because every handle on the archive reports the
@@ -201,6 +230,22 @@ impl fmt::Display for Error {
                 f,
                 "the encoder returned a segment for {stream} that does not \
                  describe the rows it was given: {detail}"
+            ),
+            Error::SchemaTooOld { found, needs } => write!(
+                f,
+                "this archive is schema v{found}, and the write needs v{needs}; an archive is \
+                 never migrated in place, so copy it into a new archive (which is v{needs}) \
+                 and write there"
+            ),
+            Error::DocumentConflict {
+                kind,
+                name,
+                expected,
+                current,
+            } => write!(
+                f,
+                "document {kind}/{name}: expected current revision {expected:?}, the archive \
+                 holds {current:?}; another revision was written after it was read"
             ),
             Error::Writer(e) => write!(f, "{e}"),
             Error::WriterGone => write!(

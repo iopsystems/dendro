@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 
 use dendro::archive::{sniff, sniff_bytes, Archive, ArchiveMut, Sniff, SourceMeta, WalRow};
 use dendro::rewrite::{copy_sources_into, shared_sources, CopySpec};
-use dendro::segment::{EncodeResult, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
 use dendro::Error;
 
 /// Never asked to encode anything here: the sources under test hold no rows.
 struct Never;
 impl SegmentEncoder for Never {
-    fn encode(&self, _stream: &str, _rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
         Ok(None)
     }
 }
@@ -60,19 +60,19 @@ fn create_stamps_the_header_and_a_copy_carries_it() {
     // Sniffed while the creating connection is still open: the stamp has to
     // be in the archive itself, not waiting in the sidecar for a checkpoint
     // — a rolling buffer is sniffed while its writer holds it.
-    assert_eq!(sniff(&path).unwrap(), Sniff::Stamped { version: 4 });
+    assert_eq!(sniff(&path).unwrap(), Sniff::Stamped { version: 5 });
     // In memory too — the browser's report path serializes straight to bytes.
     let mem = ArchiveMut::create_in_memory().unwrap();
     assert_eq!(
         sniff_bytes(&mem.serialize().unwrap()),
-        Sniff::Stamped { version: 4 }
+        Sniff::Stamped { version: 5 }
     );
     // `VACUUM INTO` is how a live archive is copied exactly; the stamp has to
     // survive it or every such copy would be refused as unstamped and lose the
     // header gate.
     let copy = dir.path().join("copy.dendro");
     db.vacuum_into(&copy).unwrap();
-    assert_eq!(sniff(&copy).unwrap(), Sniff::Stamped { version: 4 });
+    assert_eq!(sniff(&copy).unwrap(), Sniff::Stamped { version: 5 });
     Archive::open(&copy).unwrap();
 }
 
@@ -81,20 +81,49 @@ fn a_newer_schema_is_refused_by_name_on_every_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.dendro");
     drop(ArchiveMut::create(&path).unwrap());
-    restamp(&path, i64::from(dendro::archive::APPLICATION_ID), 5);
+    restamp(&path, i64::from(dendro::archive::APPLICATION_ID), 6);
     // Detection still says "an archive" — the sniff cannot read a version it
     // does not know — and the open is where the refusal lands.
-    assert_eq!(sniff(&path).unwrap(), Sniff::Stamped { version: 5 });
+    assert_eq!(sniff(&path).unwrap(), Sniff::Stamped { version: 6 });
     for result in [
         Archive::open(&path).map(drop),
         Archive::open(&path).map(drop),
         Archive::open_bytes(std::fs::read(&path).unwrap()).map(drop),
     ] {
         match result.unwrap_err() {
-            Error::UnsupportedSchema { found, writes, .. } => {
-                assert_eq!((found, writes), (5, 4));
+            Error::UnsupportedSchema {
+                found,
+                writes,
+                reads,
+            } => {
+                assert_eq!((found, writes, reads), (6, 5, 4));
             }
             other => panic!("expected UnsupportedSchema, got {other}"),
+        }
+    }
+}
+
+/// A build reads its own schema and the one before it (FORMAT.md §8), and
+/// nothing older: 4 and 5 open, 3 (a `.rez` format number) does not.
+#[test]
+fn the_schema_before_this_one_opens_and_the_one_before_that_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    for (version, opens) in [(3, false), (4, true), (5, true)] {
+        let path = dir.path().join(format!("v{version}.dendro"));
+        drop(ArchiveMut::create(&path).unwrap());
+        restamp(&path, i64::from(dendro::archive::APPLICATION_ID), version);
+        for result in [
+            Archive::open(&path).map(drop),
+            ArchiveMut::open(&path).map(drop),
+            Archive::open_bytes(std::fs::read(&path).unwrap()).map(drop),
+        ] {
+            match (opens, result) {
+                (true, Ok(())) => {}
+                (false, Err(Error::UnsupportedSchema { found, .. })) => {
+                    assert_eq!(found, version)
+                }
+                (_, other) => panic!("v{version}: {other:?}"),
+            }
         }
     }
 }

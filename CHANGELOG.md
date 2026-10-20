@@ -33,6 +33,89 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+This is 0.6.0, not 0.5.2. Archives this release creates are schema version
+5, which releases up to 0.5.1 refuse (`unsupported archive schema version
+5`). A patch release would reach `dendro = "0.5"` callers on a `cargo
+update`, and a process on the new build would then write files that their
+other processes, still on the old one, cannot open: the same break-by-upgrade
+the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
+`#[non_exhaustive]` allows, and `Error::UnsupportedSchema` now reports
+`reads: 4`.
+
+### Added
+
+- Archive-level documents: named JSON documents that belong to the archive
+  rather than to a source, in a new `documents` table (FORMAT.md §3.6). A
+  document is `(kind, name)` with a caller-chosen `schema` string naming its
+  body's type and version. Writes append a revision and never overwrite one;
+  the current revision is the newest, and a delete is a revision with no
+  body. Written with `ArchiveMut::put_document`, `put_document_if_current`
+  (which takes the uuid of the revision the caller read, and is refused as
+  the new `Error::DocumentConflict` when another revision is current) and
+  `delete_document`, which return the new revision's `archive::RevisionId`
+  (id and uuid), so conditional saves chain without a read between them;
+  the same three on `Transaction`, and on `Writer` for an archive being
+  recorded, which an `ArchiveMut` cannot open. Read with
+  `Archive::document`, `documents`, `document_kinds` and `document_history`
+  (types `archive::{Document, Deletion, Revision}`). A body must be JSON
+  (RFC 8259, no nesting limit). Kinds beginning `dendro.`
+  (`archive::RESERVED_KIND_PREFIX`) are refused.
+- `rewrite::copy_documents_into`, which copies every document revision of
+  one archive into a destination transaction, skipping revisions the
+  destination already holds (by uuid) and failing on one it holds with
+  different contents. It returns `archive::CopiedDocuments`: the revisions
+  inserted, the documents whose current revision came from this input, and
+  which of those displaced a revision they do not supersede (`forked`, each
+  an `archive::Fork` with the displaced and current revisions' uuids), for
+  a combine that must choose or rename.
+- `Archive::schema_version`, and `Error::SchemaTooOld`, returned for a
+  document written into a v4 archive.
+
+### Changed
+
+- **Breaking (format):** the schema version is 5 (was 4). Every archive this
+  release creates has the `documents` table and is stamped 5; this release
+  reads 4 and 5. A v4 archive reads as holding no documents, and is still
+  written in place as v4 (a writer resumes it, metadata edits and compaction
+  run), but no document is written into it: copy it forward with
+  `rewrite::copy_sources_into` into a new archive, which is v5. The reason
+  is in FORMAT.md §8: 0.5.1's copier drops a table it does not know, and
+  documents are data people wrote.
+- **Breaking (format):** on schema 5 the caller's per-segment index is a
+  row of a new `segment_indexes` table, keyed like its segment, instead of
+  the `segments.caller_index` column (FORMAT.md §3.2). SQLite stores a
+  row's columns in order and spills a large BLOB onto overflow pages, so an
+  index after the segment bytes was reachable only through them: reading
+  every index of a cold archive cost as much I/O as reading the segments.
+  `Archive::read_segment_indexes` now reads no segment row on v5. The table
+  cascades on segment delete, so retention, compaction and
+  `Transaction::delete_segment` remove an index with its segment. A v4
+  archive keeps its indexes in the column, is written there when written in
+  place, and is read through the same API; a copy into a new archive moves
+  them to the table. The Rust API is unchanged: `SegmentRow::caller_index`
+  and `insert_segment_with_index` carry the index as before.
+- **Breaking:** `SegmentEncoder::encode` and `encode_after` take
+  `&segment::EncodeContext` in place of the stream name, and
+  `segment::materialize` takes one too. The context carries the stream
+  (`ctx.stream`), the source's row id in the archive (`ctx.source_id`) and
+  its uuid (`ctx.source_uuid`). Before, an encoder was told only the stream
+  name, which one writer with several sources (two hosts recording `cpu`)
+  repeats, so an encoder keeping per-stream state could not key it. The
+  writer, a reader materializing a tail and a copy all pass the source the
+  rows are in; a copy passes the source archive's, not the destination's.
+  The struct is `#[non_exhaustive]`, so fields are added without a break.
+  For an implementor: replace `stream: &str` with `ctx: &EncodeContext<'_>`
+  and read `ctx.stream`; calls an implementation makes to its own `encode`
+  or `encode_after` (an `encode_after` that falls back to `encode`, say)
+  pass `ctx` instead of the stream too. metriken-storage needed about eight
+  lines in three files. A caller driving an encoder itself (a test) builds
+  one with `EncodeContext::new(source_id, stream)`. Key state that outlives
+  one archive by `source_uuid`: a copy renumbers `source_id`.
+- `rewrite::copy_sources_into` also copies the source archive's documents,
+  every revision, whatever the `CopySpec` selects. Called once per input,
+  as a combine does, it carries each input's documents; call
+  `copy_documents_into` first for the report.
+
 ## [0.5.1] - 2026-10-19
 
 ### Added

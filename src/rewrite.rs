@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::archive::{Archive, ArchiveMut, SegmentMeta, Transaction};
+use crate::archive::{Archive, ArchiveMut, CopiedDocuments, SegmentMeta, Transaction};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -774,6 +774,18 @@ pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
 /// complete afterwards for a specific reason: the buffer it copied is
 /// perpetually mid-source and would otherwise never produce a snapshot that
 /// did not warn.
+///
+/// The archive's documents come too, every revision of every one, whatever
+/// the spec's time bound and stream filter: a document belongs to the
+/// archive rather than to a source or a time, so no part of the spec
+/// selects it. See [`copy_documents_into`], which this calls in the same
+/// snapshot, for how revisions already in the destination are handled.
+/// Its report is not returned here; a caller that needs it (a combine
+/// checking which inputs' documents collide) calls
+/// [`copy_documents_into`] first, and the copy here then adds nothing,
+/// provided both calls run inside one
+/// [`src.read_snapshot`](Archive::read_snapshot); otherwise a revision
+/// written to `src` between them is copied here and is not in the report.
 pub fn copy_sources_into(
     src: &Archive,
     tx: &Transaction<'_>,
@@ -887,7 +899,11 @@ fn copy_sources_snapshotted(
             // else: every catalog fact below comes from what actually
             // materializes. Cataloging the raw tail's span would claim rows
             // the bytes do not contain — at either end.
-            let materialized = crate::segment::materialize(encoder, &table, &tail)?;
+            // The rows are the source's, so the encoder is told the source
+            // they came from, not the copy being built.
+            let ctx = crate::segment::EncodeContext::new(rec.id, &table)
+                .with_source_uuid(rec.uuid.as_deref());
+            let materialized = crate::segment::materialize(encoder, &ctx, &tail)?;
             if let Some(materialized) = materialized {
                 let meta = SegmentMeta {
                     rows: materialized.rows,
@@ -938,7 +954,36 @@ fn copy_sources_snapshotted(
             tx.insert_caller_rows(id, &name, &rows)?;
         }
     }
+    tx.copy_documents_from(src)?;
     Ok(copied)
+}
+
+/// Copy every document revision in `src` into the open destination
+/// transaction, and say what changed. FORMAT.md §3.6.
+///
+/// [`copy_sources_into`] calls this, so a caller copying sources need not.
+/// It is public for an assembly that builds its sources some other way, and
+/// for a caller that wants the report: call it before
+/// [`copy_sources_into`], whose own copy then adds nothing.
+///
+/// A revision is identified by its uuid, and one the destination already
+/// holds is skipped, so copying the same archive twice, or a copy beside its
+/// original, adds each revision once. A held revision must match the
+/// incoming one in kind, name, schema and body; a mismatch is an error,
+/// because a revision never changes and the copy cannot tell which file is
+/// wrong. `supersedes` is renumbered to the destination's ids. Inserted
+/// revisions take ids after everything the destination holds, in `src`'s
+/// order, so a shared document's current revision is the newest one this
+/// copy inserted. That is the input's own current revision unless the
+/// destination already held it; then an older revision the input brought
+/// becomes current, and [`CopiedDocuments::forked`] names the document.
+///
+/// `src` is read with one statement, which is one snapshot of it, and one
+/// body at a time. `src` may be a v4 archive, which holds none. A v4
+/// destination is refused as [`Error::SchemaTooOld`] when `src` holds any
+/// revision, since a v4 archive is never given documents (FORMAT.md §8).
+pub fn copy_documents_into(src: &Archive, tx: &Transaction<'_>) -> Result<CopiedDocuments> {
+    tx.copy_documents_from(src)
 }
 
 /// Re-encode one segment with only the columns `keep` accepts, or `None` when
@@ -1125,7 +1170,16 @@ mod tests {
     #[test]
     fn every_schema_table_is_either_copied_or_deliberately_dropped() {
         /// Carried across by [`copy_sources_into`].
-        const COPIED: &[&str] = &["sources", "segments", "wal", "clock_offsets", "caller_rows"];
+        const COPIED: &[&str] = &[
+            "sources",
+            "segments",
+            "wal",
+            "clock_offsets",
+            "caller_rows",
+            "documents",
+            // With its segment: `SegmentRow::caller_index`.
+            "segment_indexes",
+        ];
         /// Not carried, and correct not to be. Empty today: the schema version
         /// lives in the header stamp, not in a table.
         const NOT_CARRIED: &[&str] = &[];

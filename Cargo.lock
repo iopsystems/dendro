@@ -392,6 +392,7 @@ dependencies = [
  "bytes",
  "parquet",
  "rusqlite",
+ "serde_core",
  "serde_json",
  "tempfile",
  "tracing",

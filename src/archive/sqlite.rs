@@ -8,6 +8,11 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
+mod documents;
+pub use documents::{
+    CopiedDocuments, Deletion, Document, Fork, Revision, RevisionId, RESERVED_KIND_PREFIX,
+};
+
 /// Fixed at file creation and not changeable afterwards without leaving WAL
 /// mode and running a full `VACUUM`, so treat it as permanent.
 ///
@@ -67,13 +72,23 @@ const _: () = assert!(
     "the writer's page cache must be smaller than the reader's"
 );
 
-/// The schema this build writes and reads. Stamped into the header at
-/// creation as `user_version`.
+/// The schema this build writes. Stamped into the header at creation as
+/// `user_version`.
 ///
 /// Numbering starts at 4 because 1 through 3 were rezolus's `.rez` formats,
 /// which this crate does not read: a `.rez` recording is upgraded to a dendro
 /// archive by rezolus, and dendro reads only what dendro stamped.
-const SCHEMA_VERSION: i64 = 4;
+///
+/// 5 added the `documents` table (FORMAT.md §3.6, §8).
+const SCHEMA_VERSION: i64 = 5;
+
+/// The oldest schema this build reads: the one before its own (FORMAT.md
+/// §8). A v4 archive has no `documents` table and reads as holding no
+/// documents.
+const OLDEST_READ_SCHEMA_VERSION: i64 = 4;
+
+/// The first schema with the `documents` table.
+pub(crate) const DOCUMENTS_SCHEMA_VERSION: i64 = 5;
 
 /// `PRAGMA application_id`, stamped into the SQLite file header at creation:
 /// the ASCII bytes `dend`, four because the field is a 32-bit integer and the
@@ -618,6 +633,47 @@ pub struct PageStats {
 /// An open handle on a dendro archive.
 pub struct Archive {
     conn: Connection,
+    /// Where this file keeps per-segment caller indexes. Fixed by the file's
+    /// schema, so read once at open.
+    layout: IndexLayout,
+}
+
+/// Where an archive keeps the caller's per-segment index (FORMAT.md §3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexLayout {
+    /// Schema 5: the `segment_indexes` table, so reading an index does not
+    /// read past the segment's BLOB.
+    Table,
+    /// Schema 4: the `segments.caller_index` column, after `bytes` in the row.
+    Column,
+    /// A v4 archive from before the column: it holds no indexes, and one
+    /// written to it is dropped.
+    Absent,
+}
+
+impl IndexLayout {
+    fn of(conn: &Connection) -> Result<Self> {
+        if has_table(conn, "segment_indexes")? {
+            Ok(IndexLayout::Table)
+        } else if has_column(conn, "segments", "caller_index")? {
+            Ok(IndexLayout::Column)
+        } else {
+            Ok(IndexLayout::Absent)
+        }
+    }
+
+    /// `SELECT` list and `FROM` clause for segment rows with their index, the
+    /// segment aliased `s`.
+    fn segment_select(self, columns: &str) -> String {
+        match self {
+            IndexLayout::Table => format!(
+                "SELECT {columns}, i.bytes FROM segments s LEFT JOIN segment_indexes i \
+                 ON i.source_id = s.source_id AND i.stream = s.stream AND i.seq = s.seq"
+            ),
+            IndexLayout::Column => format!("SELECT {columns}, s.caller_index FROM segments s"),
+            IndexLayout::Absent => format!("SELECT {columns}, NULL FROM segments s"),
+        }
+    }
 }
 
 impl std::fmt::Debug for Archive {
@@ -716,7 +772,10 @@ impl Archive {
         // with `file:` stays a filename.
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| Error::Message(format!("failed to open {}: {e}", path.display())))?;
-        let db = Archive { conn };
+        let db = Archive {
+            conn,
+            layout: IndexLayout::Table,
+        };
 
         // ORDER IS LOAD-BEARING, and a reordering here fails invisibly — the
         // file is written with the wrong geometry and only a full VACUUM of
@@ -746,6 +805,7 @@ impl Archive {
 
         db.conn
             .execute_batch(SCHEMA_SQL)
+            .and_then(|()| db.conn.execute_batch(documents::DOCUMENTS_SQL))
             .map_err(Error::sqlite("failed to create archive schema"))?;
         db.stamp_header()?;
         // Fold the stamp into the archive itself, now. In WAL mode every
@@ -775,7 +835,10 @@ impl Archive {
         {
             return Err(Error::ReadOnly(ReadOnly::Media));
         }
-        let mut db = Archive { conn };
+        let mut db = Archive {
+            conn,
+            layout: IndexLayout::Absent,
+        };
         // The lock before the gate: `locking_mode` touches no file, and the
         // gate's first read is what acquires the lock, so a file someone else
         // holds is refused there as `InUse` before anything is written.
@@ -863,7 +926,10 @@ impl Archive {
             "failed to open {} read-only",
             path.display()
         )))?;
-        let mut db = Archive { conn };
+        let mut db = Archive {
+            conn,
+            layout: IndexLayout::Absent,
+        };
         let what = path.display().to_string();
         // ORDER MATTERS, twice over. The gate goes first of all: `cache_size`
         // is harmless, but issuing any statement against a file that is not
@@ -939,7 +1005,10 @@ impl Archive {
         // its own copy of the image.
         conn.deserialize_read_exact(rusqlite::MAIN_DB, &mut bytes.as_slice(), len, true)
             .map_err(Error::sqlite("failed to read the archive"))?;
-        let mut db = Archive { conn };
+        let mut db = Archive {
+            conn,
+            layout: IndexLayout::Absent,
+        };
         // The gate first, for the same reason as `open`; the catalog-less
         // copy that used to be diagnosed here is diagnosed inside it.
         db.adopt_schema("<bytes>")?;
@@ -961,7 +1030,8 @@ impl Archive {
     ///
     /// Decided from the header stamp, before any pragma that writes: the
     /// `application_id` must be [`APPLICATION_ID`], and the `user_version` it
-    /// vouches for must be [`SCHEMA_VERSION`]. Anything else is refused
+    /// vouches for must be one this build reads: [`SCHEMA_VERSION`] or the
+    /// one before it. Anything else is refused
     /// rather than guessed at, by name: not SQLite, an unstamped SQLite
     /// database (SQLite's default id, which is also what a `.rez` recording
     /// from before dendro carries), another application's database, or a
@@ -1005,13 +1075,17 @@ impl Archive {
             )));
         }
         match self.pragma_i64("user_version")? {
-            SCHEMA_VERSION => Ok(()),
-            other => Err(Error::UnsupportedSchema {
-                found: other,
-                writes: SCHEMA_VERSION,
-                reads: SCHEMA_VERSION,
-            }),
+            OLDEST_READ_SCHEMA_VERSION..=SCHEMA_VERSION => {}
+            other => {
+                return Err(Error::UnsupportedSchema {
+                    found: other,
+                    writes: SCHEMA_VERSION,
+                    reads: OLDEST_READ_SCHEMA_VERSION,
+                })
+            }
         }
+        self.layout = IndexLayout::of(&self.conn)?;
+        Ok(())
     }
 
     /// The pragmas that live on the connection, not in the file. Applied by
@@ -1097,6 +1171,15 @@ impl Archive {
         self.conn
             .pragma_update(None, name, value)
             .map_err(Error::sqlite(format!("failed to set pragma {name}")))
+    }
+
+    /// The archive's schema version, its header's `user_version`: 5 for an
+    /// archive this build created, 4 for one an earlier release created.
+    /// A v4 archive holds no documents and cannot be given any; copying it
+    /// into a new archive through [`crate::rewrite`] makes a v5 one
+    /// (FORMAT.md §8).
+    pub fn schema_version(&self) -> Result<i64> {
+        self.pragma_i64("user_version")
     }
 
     /// A fresh random (version 4) UUID, in the canonical 8-4-4-4-12 form.
@@ -1194,7 +1277,7 @@ impl Archive {
         source_id: i64,
         stream: &str,
     ) -> Result<Vec<(u64, Option<Vec<u8>>)>> {
-        read_segment_indexes_sql(&self.conn, source_id, stream)
+        read_segment_indexes_sql(&self.conn, self.layout, source_id, stream)
     }
 
     /// Segment metadata for one stream — `seq`, `rows` and the timestamp
@@ -1290,10 +1373,11 @@ impl Archive {
     pub fn read_segments(&self, source_id: i64, stream: &str) -> Result<Vec<SegmentRow>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT seq, rows, first_ts, last_ts, bytes, caller_index FROM segments \
-                 WHERE source_id = ?1 AND stream = ?2 ORDER BY seq",
-            )
+            .prepare(&format!(
+                "{} WHERE s.source_id = ?1 AND s.stream = ?2 ORDER BY s.seq",
+                self.layout
+                    .segment_select("s.seq, s.rows, s.first_ts, s.last_ts, s.bytes")
+            ))
             .map_err(Error::sqlite(format!(
                 "failed to query segments for {stream}"
             )))?;
@@ -1364,11 +1448,12 @@ impl Archive {
     ) -> Result<Vec<SegmentRow>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT seq, rows, first_ts, last_ts, bytes, caller_index FROM segments \
-                 WHERE source_id = ?1 AND stream = ?2 \
-                   AND last_ts >= ?3 AND first_ts <= ?4 ORDER BY seq",
-            )
+            .prepare(&format!(
+                "{} WHERE s.source_id = ?1 AND s.stream = ?2 \
+                   AND s.last_ts >= ?3 AND s.first_ts <= ?4 ORDER BY s.seq",
+                self.layout
+                    .segment_select("s.seq, s.rows, s.first_ts, s.last_ts, s.bytes")
+            ))
             .map_err(Error::sqlite(format!(
                 "failed to query segments for {stream}"
             )))?;
@@ -1886,9 +1971,43 @@ impl Archive {
                     ))
                 })
                 .map_err(Error::sqlite("failed to check references"))?;
-            violations
+            let mut found: Vec<String> = violations
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::sqlite("failed to read a reference violation"))
+                .map_err(Error::sqlite("failed to read a reference violation"))?;
+            // `segment_indexes` is WITHOUT ROWID, so the check reports its
+            // rows with no rowid; name them by their key instead. Read
+            // through `quote()`, as SQL literals, so a key of the wrong type
+            // (a BLOB stream written by another tool) is reported rather
+            // than failing the check.
+            if found.iter().any(|v| v.starts_with("segment_indexes ")) {
+                found.retain(|v| !v.starts_with("segment_indexes "));
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT quote(i.source_id), quote(i.stream), quote(i.seq) \
+                         FROM segment_indexes i \
+                         LEFT JOIN segments s ON s.source_id = i.source_id \
+                           AND s.stream = i.stream AND s.seq = i.seq \
+                         WHERE s.seq IS NULL ORDER BY i.source_id, i.stream, i.seq",
+                    )
+                    .map_err(Error::sqlite("failed to find orphan segment indexes"))?;
+                let orphans = stmt
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "segment_indexes (source_id {}, stream {}, seq {}) -> segments",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?
+                        ))
+                    })
+                    .map_err(Error::sqlite("failed to find orphan segment indexes"))?;
+                for orphan in orphans {
+                    found.push(
+                        orphan.map_err(Error::sqlite("failed to read an orphan segment index"))?,
+                    );
+                }
+            }
+            Ok(found)
         })();
         match references {
             Ok(violations) => problems.extend(violations.into_iter().map(Problem::ForeignKey)),
@@ -2058,6 +2177,26 @@ impl Archive {
             out.insert(key, next);
         }
         Ok(out)
+    }
+
+    /// One source's uuid, or `None` for a source from before the column.
+    /// What an encoder is told as
+    /// [`EncodeContext::source_uuid`](crate::segment::EncodeContext::source_uuid).
+    pub(crate) fn source_uuid(&self, source_id: i64) -> Result<Option<String>> {
+        let column = if has_column(&self.conn, "sources", "uuid")? {
+            "uuid"
+        } else {
+            "NULL"
+        };
+        self.conn
+            .query_row(
+                &format!("SELECT {column} FROM sources WHERE id = ?1"),
+                [source_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to read the uuid of source {source_id}"
+            )))
     }
 
     /// One source's metadata map, as stored.
@@ -2314,12 +2453,14 @@ impl ArchiveMut {
     /// than merely documented — inside it, a quiet stream's accumulated rows
     /// make the delete long enough to threaten the tick.
     pub fn transaction<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        let layout = self.db.layout;
         let tx = Transaction {
             tx: self
                 .db
                 .conn
                 .transaction()
                 .map_err(Error::sqlite("failed to begin transaction"))?,
+            layout,
         };
         // `?` drops `tx` on the error path, and `Transaction`'s drop behavior
         // is rollback — so a failure partway through leaves nothing behind.
@@ -2359,7 +2500,16 @@ impl ArchiveMut {
         meta: &SegmentMeta,
         bytes: &[u8],
     ) -> Result<()> {
-        insert_segment_sql(&self.db.conn, source_id, stream, seq, meta, bytes, None)
+        insert_segment_sql(
+            &self.db.conn,
+            self.db.layout,
+            source_id,
+            stream,
+            seq,
+            meta,
+            bytes,
+            None,
+        )
     }
 
     /// [`insert_segment`](Self::insert_segment), carrying the caller's index
@@ -2377,6 +2527,7 @@ impl ArchiveMut {
     ) -> Result<()> {
         insert_segment_sql(
             &self.db.conn,
+            self.db.layout,
             source_id,
             stream,
             seq,
@@ -2847,11 +2998,15 @@ impl ArchiveMut {
     pub fn create_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
             .map_err(Error::sqlite("failed to open an in-memory database"))?;
-        let db = Archive { conn };
+        let db = Archive {
+            conn,
+            layout: IndexLayout::Table,
+        };
         db.set_pragma("page_size", PAGE_SIZE)?;
         db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
         db.conn
             .execute_batch(SCHEMA_SQL)
+            .and_then(|()| db.conn.execute_batch(documents::DOCUMENTS_SQL))
             .map_err(Error::sqlite("failed to create archive schema"))?;
         db.stamp_header()?;
         Ok(ArchiveMut::wrap(db))
@@ -2915,6 +3070,7 @@ impl ArchiveMut {
 /// makes a crash between the two harmless — see `live_wal`.
 pub struct Transaction<'a> {
     tx: rusqlite::Transaction<'a>,
+    layout: IndexLayout,
 }
 
 impl Transaction<'_> {
@@ -2950,7 +3106,16 @@ impl Transaction<'_> {
         meta: &SegmentMeta,
         bytes: &[u8],
     ) -> Result<()> {
-        insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes, None)
+        insert_segment_sql(
+            &self.tx,
+            self.layout,
+            source_id,
+            stream,
+            seq,
+            meta,
+            bytes,
+            None,
+        )
     }
 
     /// Remove one sealed segment.
@@ -2983,7 +3148,16 @@ impl Transaction<'_> {
         bytes: &[u8],
         caller_index: Option<&[u8]>,
     ) -> Result<()> {
-        insert_segment_sql(&self.tx, source_id, stream, seq, meta, bytes, caller_index)
+        insert_segment_sql(
+            &self.tx,
+            self.layout,
+            source_id,
+            stream,
+            seq,
+            meta,
+            bytes,
+            caller_index,
+        )
     }
 
     /// Insert every WAL row for one tick — one stream each, typically.
@@ -3169,6 +3343,16 @@ fn mint_uuid(conn: &Connection) -> Result<String> {
     ))
 }
 
+/// Whether this connection's schema has a table named `table`.
+fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Error::sqlite(format!("failed to look for table {table}")))
+}
+
 /// Whether `table` (or view) has a column named `column`, per this
 /// connection's schema.
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -3186,27 +3370,35 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Every segment index for one stream, in `seq` order, WITHOUT the payload.
+/// The query [`read_segment_indexes_sql`] runs, for `?1` source and `?2`
+/// stream.
+fn segment_index_sql(layout: IndexLayout) -> String {
+    format!(
+        "{} WHERE s.source_id = ?1 AND s.stream = ?2 ORDER BY s.seq",
+        layout.segment_select("s.seq")
+    )
+}
+
+/// Every segment index for one stream, in `seq` order, without the
+/// segments' payload.
 ///
-/// The point of the column: answering "could this stream hold what I am
-/// looking for" does not mean reading the segment. `None` where the
-/// caller wrote no index, and for every segment of an archive written
-/// before the column existed.
+/// The point of an index: answering "could this stream hold what I am
+/// looking for" without reading the segment. `None` where the caller wrote
+/// no index, and for every segment of a v4 archive from before the
+/// `caller_index` column. On schema 5 the read touches no segment row; on
+/// schema 4 the index is a column after `bytes` and the read walks the
+/// BLOB's overflow pages to reach it (FORMAT.md §3.2).
 fn read_segment_indexes_sql(
     conn: &Connection,
+    layout: IndexLayout,
     source_id: i64,
     stream: &str,
 ) -> Result<Vec<(u64, Option<Vec<u8>>)>> {
-    let column = if has_column(conn, "segments", "caller_index")? {
-        "caller_index"
-    } else {
-        "NULL"
-    };
+    // `segments` contributes only its key here, which its primary-key index
+    // covers, so no segment row (and no BLOB) is read. On v4 the index is a
+    // column after `bytes`, and reading it walks the BLOB's overflow pages.
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT seq, {column} FROM segments \
-             WHERE source_id = ?1 AND stream = ?2 ORDER BY seq"
-        ))
+        .prepare(&segment_index_sql(layout))
         .map_err(Error::sqlite(format!("failed to query {stream} indexes")))?;
     let rows = stmt
         .query_map(rusqlite::params![source_id, stream], |row| {
@@ -3226,8 +3418,14 @@ fn read_segment_indexes_sql(
 /// Shared by `Archive::insert_segment` (its own commit) and
 /// `Transaction::insert_segment` (part of a batch): `Transaction` derefs to
 /// `Connection`, so both reach the same statement.
+///
+/// Where the index goes follows the file's layout: the `segment_indexes`
+/// table on v5, the `caller_index` column on v4, and nowhere on a v4
+/// archive from before that column, which can hold none.
+#[allow(clippy::too_many_arguments)]
 fn insert_segment_sql(
     conn: &Connection,
+    layout: IndexLayout,
     source_id: i64,
     stream: &str,
     seq: u64,
@@ -3235,23 +3433,89 @@ fn insert_segment_sql(
     bytes: &[u8],
     caller_index: Option<&[u8]>,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes, \
-         caller_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            source_id,
-            stream,
-            seq as i64,
-            meta.rows as i64,
-            meta.first_ts,
-            meta.last_ts,
-            bytes,
-            caller_index,
-        ],
-    )
-    .map_err(Error::sqlite(format!(
-        "failed to insert segment {stream}#{seq}"
-    )))?;
+    let failed = || Error::sqlite(format!("failed to insert segment {stream}#{seq}"));
+    let row = rusqlite::params![
+        source_id,
+        stream,
+        seq as i64,
+        meta.rows as i64,
+        meta.first_ts,
+        meta.last_ts,
+        bytes,
+    ];
+    match (layout, caller_index) {
+        (IndexLayout::Column, _) => {
+            conn.execute(
+                "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes, \
+                 caller_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    source_id,
+                    stream,
+                    seq as i64,
+                    meta.rows as i64,
+                    meta.first_ts,
+                    meta.last_ts,
+                    bytes,
+                    caller_index,
+                ],
+            )
+            .map_err(failed())?;
+        }
+        (IndexLayout::Table, index) => {
+            // The segment, the clearing of any index row already at its key,
+            // and its own index land together or not at all, whether or not
+            // the caller is inside a transaction: a savepoint nests in one
+            // and commits on its own outside one.
+            //
+            // A row can be there already when a segment was deleted on a
+            // connection without `foreign_keys` (the sqlite3 shell, say), so
+            // the cascade did not run. Left in place it would fail this
+            // insert's index at the key's uniqueness, or, for a segment
+            // with no index, be read back as this segment's.
+            conn.execute_batch("SAVEPOINT segment_insert")
+                .map_err(failed())?;
+            let key = rusqlite::params![source_id, stream, seq as i64];
+            let inserted = conn
+                .execute(
+                    "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, \
+                     bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    row,
+                )
+                .and_then(|_| {
+                    conn.execute(
+                        "DELETE FROM segment_indexes \
+                         WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+                        key,
+                    )
+                })
+                .and_then(|_| match index {
+                    Some(index) => conn.execute(
+                        "INSERT INTO segment_indexes(source_id, stream, seq, bytes) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![source_id, stream, seq as i64, index],
+                    ),
+                    None => Ok(0),
+                });
+            match inserted {
+                Ok(_) => conn
+                    .execute_batch("RELEASE segment_insert")
+                    .map_err(failed())?,
+                Err(e) => {
+                    let _ =
+                        conn.execute_batch("ROLLBACK TO segment_insert; RELEASE segment_insert");
+                    return Err(failed()(e));
+                }
+            }
+        }
+        (IndexLayout::Absent, _) => {
+            conn.execute(
+                "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                row,
+            )
+            .map_err(failed())?;
+        }
+    }
     Ok(())
 }
 
@@ -3284,13 +3548,27 @@ CREATE TABLE segments(
   first_ts INTEGER NOT NULL,
   last_ts INTEGER NOT NULL,
   bytes BLOB NOT NULL,
-  -- The caller's index over this segment, stored and never read. The
-  -- catalog knows a segment's stream and span and nothing about its
-  -- contents; this is where a caller that needs more puts it, so that an
-  -- archive with an index is still one file. Named for whose it is.
-  caller_index BLOB,
   PRIMARY KEY (source_id, stream, seq)
 );
+-- The caller's index over each segment, stored and never read. The catalog
+-- knows a segment's stream and span and nothing about its contents; this is
+-- where a caller that needs more puts it, so that an archive with an index
+-- is still one file. Its own table, not a column of `segments`: SQLite lays
+-- a row's columns out in order, and an index after `bytes` is reached only
+-- by walking the BLOB's overflow pages, which made reading every index of a
+-- cold archive cost as much I/O as reading the segments (schema 4 had it as
+-- the column `segments.caller_index`). WITHOUT ROWID keeps a stream's
+-- indexes together in key order. The cascade removes an index with its
+-- segment on every path that deletes one.
+CREATE TABLE segment_indexes(
+  source_id INTEGER NOT NULL,
+  stream TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  PRIMARY KEY (source_id, stream, seq),
+  FOREIGN KEY (source_id, stream, seq)
+    REFERENCES segments(source_id, stream, seq) ON DELETE CASCADE
+) WITHOUT ROWID;
 -- The catalog half of the design: it makes retention
 -- (`WHERE last_ts < cutoff`) and range reads indexed lookups rather than
 -- scans. `live_wal`'s subquery (`SELECT MAX(last_ts) FROM segments WHERE
@@ -3334,6 +3612,34 @@ CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On schema 5 the index read is answered from two indexes and never
+    /// visits a `segments` row, which is where the BLOB starts. Reading a
+    /// row would page in the BLOB's first overflow page at the least; that
+    /// is what made a cold read of every index cost as much I/O as the
+    /// segments on schema 4.
+    #[test]
+    fn reading_v5_indexes_touches_no_segment_row() {
+        let db = ArchiveMut::create_in_memory().unwrap();
+        assert_eq!(db.layout, IndexLayout::Table);
+        let plan: Vec<String> = db
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                segment_index_sql(IndexLayout::Table)
+            ))
+            .unwrap()
+            .query_map(rusqlite::params![1i64, "s"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(plan.len(), 2, "{plan:?}");
+        assert!(
+            plan[0].contains("COVERING INDEX sqlite_autoindex_segments_1"),
+            "{plan:?}"
+        );
+        assert!(plan[1].contains("SEARCH i USING PRIMARY KEY"), "{plan:?}");
+    }
 
     /// `vacuum_into` works on the read handle, whose `query_only` refused it,
     /// and leaves `query_only` set afterwards, after a failed dump too.

@@ -56,7 +56,7 @@ your job, expressed as a `SegmentEncoder`:
 
 ```rust
 pub trait SegmentEncoder {
-    fn encode(&self, stream: &str, rows: &[WalRow]) -> EncodeResult;
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult;
     fn version(&self) -> Option<&str> { None }
 }
 ```
@@ -157,6 +157,7 @@ Plus five that are not containers:
 | **tail** | The live WAL rows past a stream's newest segment, materialized on read. |
 | **catalog** | The SQLite tables describing sources, streams and segments. |
 | **encoder** | Your `SegmentEncoder`. The only thing that knows what a row means. |
+| **document** | Named JSON belonging to the archive rather than to a source: a saved view, a report's selection. Revisions are appended, never overwritten. |
 
 A source is a namespace, not a container. It makes a stream name unambiguous
 and gives its rows a shared wall-clock anchor: timestamps are
@@ -223,6 +224,17 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   computes per name, for a log of deltas), carried by every copy, and
   untouched by compaction. Column-slot transitions live here; see
   `CallerRow`.
+- **Somewhere for what belongs to the whole archive.** Everything above is
+  per source. A document is the archive's: a saved view, a report's
+  selection, an event that spans every source, stored as named JSON with a
+  caller-chosen `schema` string versioning its shape. Revisions are
+  appended, never overwritten, so a document keeps its history; a delete is
+  a revision too. `ArchiveMut::put_document` writes one, `Writer::put_document`
+  writes one during a recording, and `put_document_if_current` refuses to
+  replace a revision it did not read. The copies this crate makes carry
+  them; replication does not. Documents need a schema 5 archive: a v4 one,
+  created by 0.5.1 or earlier, reads as holding none and is copied forward
+  to take them. See FORMAT.md §3.6 and §8.
 - **Compaction.** Read cost is linear in segment count. Measured between 400
   segments and one, the fine archive read 18.2x slower and was 2.38x larger;
   compacting it with `rewrite::compact` recovered 18.6x and 2.37x, landing
@@ -242,7 +254,8 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   that a copy carries, so the set has a completeness check rather than a
   guess, and a round trip is tested here rather than asserted. **Transport is
   not included** — HTTP, a Unix socket or a file is yours, which is what keeps
-  this storage-shaped. A live tail ships rows and the subscriber seals its
+  this storage-shaped. Frames are per source, so the archive's documents are
+  not replicated. A live tail ships rows and the subscriber seals its
   own; a catch-up ships sealed segments, so "give me the last hour" needs no
   second mechanism. `Frame` and `wire` need no feature and no dependency.
   `ArchivePublisher` reads an archive, so it needs `archive`; `Subscriber`

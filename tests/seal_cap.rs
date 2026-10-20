@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use dendro::archive::{Archive, SourceMeta, WalRow};
-use dendro::segment::{EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 
 fn source() -> SourceMeta {
@@ -36,7 +36,7 @@ fn row(ts: i64, anchor: bool) -> WalRow {
 struct Wide;
 
 impl SegmentEncoder for Wide {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -56,7 +56,7 @@ impl SegmentEncoder for Wide {
 struct Long;
 
 impl SegmentEncoder for Long {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -106,13 +106,18 @@ impl Anchored {
 }
 
 impl SegmentEncoder for Anchored {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         Self::run(rows, false)
     }
 
-    fn encode_after(&self, stream: &str, before: &[WalRow], rows: &[WalRow]) -> EncodeResult {
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[WalRow],
+        rows: &[WalRow],
+    ) -> EncodeResult {
         if !self.after {
-            return self.encode(stream, rows);
+            return self.encode(ctx, rows);
         }
         Self::run(rows, before.iter().any(|r| r.row == b"A"))
     }

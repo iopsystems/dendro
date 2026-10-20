@@ -11,7 +11,8 @@ and this document has a bug.
 
 `DESIGN.md` says why the format is shaped this way. This says what it is.
 
-Schema version: **4** (`src/archive/sqlite.rs`, `SCHEMA_VERSION`). See
+Schema version: **5**, and this build also reads **4** (`src/archive/sqlite.rs`,
+`SCHEMA_VERSION`, `OLDEST_READ_SCHEMA_VERSION`). See
 [Compatibility](#8-compatibility) for what changes it.
 
 ## 1. The model
@@ -23,7 +24,9 @@ independently. A stream is a sequence of immutable Parquet **segments** plus,
 while the source is live, a tail of **WAL rows** not yet sealed into one. A
 **row** is a timestamp, a wall-clock offset (§5), and an opaque payload; what
 the payload means, and what columns a segment has, is the caller's
-`SegmentEncoder` and no concern of the format.
+`SegmentEncoder` and no concern of the format. Beside its sources an
+archive holds **documents** (§3.6): named JSON revisions that belong to the
+archive as a whole and to no source.
 
 Three properties are the reason the format exists, and every rule below
 serves one of them:
@@ -88,7 +91,8 @@ stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Five tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`). SQLite is a transactional allocator
+Seven tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`, and `documents` in
+`src/archive/sqlite/documents.rs`, `DOCUMENTS_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -111,10 +115,19 @@ CREATE TABLE segments(
   first_ts INTEGER NOT NULL,
   last_ts INTEGER NOT NULL,
   bytes BLOB NOT NULL,                 -- one parquet file, opaque
-  caller_index BLOB,                   -- the caller's index, never read
   PRIMARY KEY (source_id, stream, seq)
+  -- schema 4 has a last column here: caller_index BLOB (see segment_indexes)
 );
 CREATE INDEX segments_by_time ON segments(source_id, stream, last_ts);
+CREATE TABLE segment_indexes(          -- schema 5; a v4 archive has none
+  source_id INTEGER NOT NULL,
+  stream TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  bytes BLOB NOT NULL,                 -- the caller's index, never read
+  PRIMARY KEY (source_id, stream, seq),
+  FOREIGN KEY (source_id, stream, seq)
+    REFERENCES segments(source_id, stream, seq) ON DELETE CASCADE
+) WITHOUT ROWID;
 CREATE TABLE wal(
   source_id INTEGER NOT NULL REFERENCES sources(id),
   stream TEXT NOT NULL,
@@ -136,7 +149,22 @@ CREATE TABLE caller_rows(
   blob BLOB NOT NULL                   -- opaque, the caller's
 );
 CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
+CREATE TABLE documents(                -- schema 5; a v4 archive has none
+  id INTEGER PRIMARY KEY,
+  uuid TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  schema TEXT,                         -- NULL on a deletion
+  body TEXT,                           -- JSON; NULL on a deletion
+  created_wall_ns INTEGER NOT NULL,
+  supersedes INTEGER REFERENCES documents(id),
+  CHECK ((schema IS NULL) = (body IS NULL))
+);
+CREATE INDEX documents_by_name ON documents(kind, name, id);
 ```
+
+Every table but `documents` is per source: its rows carry a `source_id`.
+`documents` belongs to the archive.
 
 Every timestamp is an `i64`: SQLite's only integer type, and the reason a
 negative value means before 1970 (`DESIGN.md` explains the two bugs `u64`
@@ -193,14 +221,33 @@ what the **encoder reported** and never the input's span, and are what
 retention and range reads consult; `rows` is the row count. A segment is
 immutable once inserted.
 
-**`caller_index`** is whatever the caller's encoder returned alongside the
-segment, stored verbatim and never interpreted: a name set, a bloom filter,
-per-column extremes, anything that answers "could this segment hold what I am
-looking for" without opening it. `NULL` where the caller wrote none, and in
-archives from before the column. A verbatim copy carries it; a **column
-projection drops it**, because an index built over the original columns may
-describe columns the copy no longer has, and a wrong index is worse than
-none.
+**The caller's index** is whatever the caller's encoder returned alongside
+the segment, stored verbatim and never interpreted: a name set, a bloom
+filter, per-column extremes, anything that answers "could this segment hold
+what I am looking for" without opening it. On schema 5 it is a row of
+`segment_indexes` keyed like its segment, and a segment the caller wrote
+none for has no row. On schema 4 it is the last column of `segments`,
+`caller_index`, `NULL` where the caller wrote none; a v4 archive from before
+that column holds none, and an index written to one is dropped. A reader
+reads indexes through `Archive::read_segment_indexes` either way.
+
+It moved out of the segment row because SQLite stores a row's columns in
+declaration order and spills a large BLOB onto overflow pages: an index
+after `bytes` is reached only by walking them. Reading every index of a
+cold 9.6-hour archive that way read 110 MB in 470 to 620 ms, against 1.3 MB
+and 10 ms for the segments' keys alone. On schema 5 the read is answered
+from the `segments` primary-key index and `segment_indexes`, and touches no
+segment row. `WITHOUT ROWID` stores a stream's indexes together in key
+order.
+
+The cascade deletes an index with its segment on every path that deletes
+one: retention, compaction, `Transaction::delete_segment`. A writer
+connection enforces it (`foreign_keys=ON`); `verify` reports an index row
+without its segment as a foreign-key problem. A verbatim copy carries the
+index; a **column projection drops it**, because an index built over the
+original columns may describe columns the copy no longer has, and a wrong
+index is worse than none. A merged segment has none, since an index over
+one input cannot describe two.
 
 `bytes` is one Parquet file the crate never opens, with one exception:
 `rewrite::project_segment_columns`, an opt-in column projection that
@@ -278,6 +325,74 @@ cannot destroy. The rules:
 - A copy carries it verbatim within the copy's time bound and under the
   copy's stream filter. Compaction and column projection do not touch it.
 - `verify` does not read it, and no read path interprets it.
+
+### 3.6 `documents`
+
+The archive's own store: named JSON documents that belong to no source,
+such as a saved view of the archive, a report's selection, or an event that
+spans every source. Each row is one **revision** of the document
+`(kind, name)`. The rules:
+
+- **Append-only.** A revision is never updated or deleted. Writing a
+  document inserts a revision; deleting one inserts a **deletion**, a
+  revision whose `schema` and `body` are both `NULL`. The history of
+  `(kind, name)` is its revisions in `id` order.
+- **The current revision is the newest by `id`.** If it is a deletion the
+  document does not currently exist. `supersedes` does not decide it.
+- **`supersedes`** is the `id` of the revision that was newest for
+  `(kind, name)` when this one was written, deletion included, or `NULL`
+  for the first. It records what the writer replaced. Two revisions with the
+  same `supersedes` are a **fork**: two writers each replaced the revision
+  they had read, and both are kept. The newer is current by the rule above;
+  a conditional write (`put_document_if_current`) refuses instead of forking
+  when the revision it read is no longer current. It names that revision by
+  `uuid`, not `id`, because a copy renumbers ids.
+- **`uuid`** is the revision's identity, minted at insert in the form of
+  §3.1's and carried by the copies this crate makes. A copy skips a
+  revision whose `uuid` the destination already holds, so copying an archive
+  twice, or into an archive that already holds a copy of it, adds each
+  revision once. A revision never changes, so a held revision must equal the
+  incoming one in `kind`, `name`, `schema` and `body`; a copy that finds the
+  same `uuid` with different contents fails, because one of the two files is
+  wrong and the copy cannot tell which. (`created_wall_ns` and `supersedes`
+  are not compared: the first is provenance, the second a file-local id.)
+- **`kind`** is a namespace the caller chooses, such as `myapp.view`, and
+  **`name`** says which document of that kind. Both are non-empty. Kinds
+  beginning `dendro.` are reserved for this crate, which writes none today.
+- **`schema`** names the body's type and version, such as `myapp.view/1`.
+  The writer chooses it and the archive never reads it. It is how a body's
+  shape is versioned: a reader that does not recognize a revision's `schema`
+  must not interpret its body, and may walk the history back to the newest
+  revision whose `schema` it does recognize, saying that it is showing an
+  older revision. A writer that changes a body's shape writes a new
+  `schema`, never a new shape under an old one.
+- **`body`** is JSON text (RFC 8259). A writer checks that it parses and
+  stores it as given; nothing else reads it. The check sets no nesting limit
+  and accepts an escaped lone surrogate (`"\ud800"`), both of which the
+  grammar allows and JavaScript's `JSON.stringify` can produce.
+- **`created_wall_ns`** is the wall clock at insert, in nanoseconds since
+  the Unix epoch at millisecond resolution, from SQLite's own clock.
+  Provenance only: no rule orders by it.
+- **Copies.** `rewrite::copy_sources_into` and `rewrite::copy_documents_into`
+  carry every revision of every document, whatever the copy's time bound
+  and stream filter select, and renumber `supersedes` to the destination's
+  ids. Inserted revisions take ids after everything the destination holds,
+  in the source's order, so a shared document's current revision is the
+  newest one this copy inserted. That is the input's own current revision
+  unless the destination already held it; then an older revision the input
+  brought becomes current, and `CopiedDocuments::forked` names the
+  document.
+  `copy_documents_into` reports which documents' current revision came
+  from its input and which of those displaced a revision they do not
+  supersede (`CopiedDocuments::forked`, with both revisions' uuids), so a
+  combine can choose or rename. `vacuum_into` and `serialize` copy the file whole. Compaction and
+  retention do not touch the table. Replication does not carry it (WIRE.md
+  is per source).
+- **v4 archives.** A v4 archive has no `documents` table, and a reader
+  treats that as no documents. No document is ever written into one: a put,
+  or a copy that would insert a revision, is refused as
+  `Error::SchemaTooOld`, and the archive is copied forward into a new (v5)
+  archive instead (§8).
 
 ## 4. Reading
 
@@ -392,6 +507,8 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   to be correct, a change to the live-WAL rule, a change to what
   `first_ts`/`last_ts`/`rows` mean, a change to the time model. A reader
   refuses a version above its own.
+  Also a new table whose loss to an old copier loses data nobody can
+  regenerate: see version 5 below.
 - **What does not.** A nullable column an old reader can ignore (`uuid`,
   `caller_index`, `heartbeat` and `heartbeat_interval_ns` were added this
   way); a new reserved metadata key
@@ -421,10 +538,36 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   over time belongs in `caller_rows` (§3.5), keyed by the time it changed,
   never in field metadata: rows that span such a change fuse two series into
   one column, and the segment carries no evidence of it.
+- **Version 5 also moved the caller's index** from the `segments.caller_index`
+  column to the `segment_indexes` table (§3.2), on the same bump. A v5
+  build reads a v4 archive's column and writes into it when it writes a
+  v4 archive (below); a copy into a new archive moves each index to the
+  table.
+- **Version 5 added `documents` (§3.6).** An old reader would not misread
+  a v5 archive: checked against the 0.5.1 build on a v4-stamped file
+  holding the table, its open gate reads only the header, nothing in it
+  lists or refuses tables, its `verify` passes it, and its writer resumes a
+  source in it. The
+  bump is for the copiers. 0.5.1's `copy_sources_into` copies a fixed list
+  of tables and drops `documents`, and a document is something a person
+  wrote (a saved view, a report's selection), not a fact an old copier can
+  degrade to "unknown". A copy that silently loses it is wrong, so a build
+  that would make one must refuse the file instead. Releases up to 0.5.1
+  refuse every v5 archive as `unsupported archive schema version 5`.
+- **Writing a v4 archive.** A v5 build reads v4. It also writes into one
+  what v4 holds, so that a recording made before the upgrade can be resumed
+  and annotated in place: a writer resumes its sources, metadata and labels
+  are edited, compaction and retention run, and the file stays v4. It never
+  adds a v5 structure to it. A document written into a v4 archive, directly
+  or by a copy, is refused as `Error::SchemaTooOld`, and the archive is
+  copied forward instead: `rewrite::copy_sources_into` into a new archive,
+  which is v5. The header is never restamped.
 - **Versions 1 to 3 are not dendro's.** They are rezolus's `.rez` formats,
   never read here; rezolus upgrades them by copying into a new archive.
 - **What a release promises.** A build reads its own schema version and the
-  one before it, and writes only its own. A schema bump therefore ships with
+  one before it, and writes only its own: it creates archives of its own
+  version, and adds nothing of its own version to an older one (above). A
+  schema bump therefore ships with
   a reader for the previous version and a copy-forward through `rewrite`,
   and an archive is never migrated in place. Reserved metadata keys are never
   removed and never change meaning; a key that stops being written keeps its

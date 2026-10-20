@@ -12,7 +12,7 @@ use dendro::archive::{
     Archive, ArchiveMut, HeartbeatWatch, SourceMeta, SourceRow, WalRow, WriterState,
 };
 use dendro::rewrite::{copy_sources_into, CopySpec};
-use dendro::segment::{EncodeResult, SegmentEncoder};
+use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
 use dendro::writer::Writer;
 
 const BEAT: Duration = Duration::from_millis(40);
@@ -20,7 +20,7 @@ const BEAT: Duration = Duration::from_millis(40);
 struct Never;
 
 impl SegmentEncoder for Never {
-    fn encode(&self, _stream: &str, _rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
         Ok(None)
     }
 }

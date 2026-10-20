@@ -20,7 +20,7 @@ use dendro::read;
 use dendro::rewrite::{
     compact, compact_stream, compact_with, CompactSpec, MergeInput, MetadataMerge,
 };
-use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{encode_batch, EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 use parquet::file::metadata::KeyValue;
 
@@ -29,7 +29,7 @@ use parquet::file::metadata::KeyValue;
 struct Widening;
 
 impl SegmentEncoder for Widening {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -343,7 +343,7 @@ fn compacting_one_stream_leaves_the_others_alone() {
 struct Relabeling;
 
 impl SegmentEncoder for Relabeling {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -511,7 +511,7 @@ fn unioning_still_stops_at_a_column_that_changed() {
 struct Described;
 
 impl SegmentEncoder for Described {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         use parquet::arrow::ArrowWriter;
         use parquet::file::metadata::KeyValue;
 
@@ -1041,7 +1041,7 @@ fn compaction_opens_only_the_segments_it_judges() {
 struct Doubling;
 
 impl SegmentEncoder for Doubling {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
@@ -1180,4 +1180,26 @@ fn a_merge_runs_on_inputs_built_by_hand() {
     assert!(IdenticalMetadata.extend(&mut run, &MergeInput::new(&reordered, &fields, 1)));
     assert!(!IdenticalMetadata.extend(&mut run, &MergeInput::new(&changed, &fields, 1)));
     assert_eq!(IdenticalMetadata.finish(run), one);
+}
+
+/// Compaction rewrites segments in place and reclaims pages; the archive's
+/// documents are in neither and come through untouched.
+#[test]
+fn compaction_keeps_the_archives_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    archive(&path, 20, 2, 3);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    db.put_document("app.view", "main", "app.view/1", "1")
+        .unwrap();
+    db.put_document("app.view", "main", "app.view/1", "2")
+        .unwrap();
+    let before = db.document_history("app.view", "main").unwrap();
+
+    let done = compact(&mut db, &CompactSpec::to_rows(100)).unwrap();
+    assert!(done.after < done.before, "the compaction did something");
+    assert_eq!(db.document_history("app.view", "main").unwrap(), before);
+    drop(db);
+    let reader = Archive::open(&path).unwrap();
+    assert_eq!(reader.document_history("app.view", "main").unwrap(), before);
 }

@@ -26,7 +26,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::read;
-use dendro::segment::{encode_batch, EncodeResult, Segment, SegmentEncoder};
+use dendro::segment::{encode_batch, EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 
 /// A row is `columns` little-endian i64s; a segment is those as columns, plus
@@ -37,7 +37,7 @@ struct Wide {
 }
 
 impl SegmentEncoder for Wide {
-    fn encode(&self, _stream: &str, rows: &[WalRow]) -> EncodeResult {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
         if rows.is_empty() {
             return Ok(None);
         }
