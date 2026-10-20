@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
 This is 0.6.0, not 0.5.2. Archives this release creates are schema version
 5, which releases up to 0.5.1 refuse (`unsupported archive schema version
 5`). A patch release would reach `dendro = "0.5"` callers on a `cargo
