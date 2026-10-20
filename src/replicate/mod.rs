@@ -16,7 +16,11 @@
 //! those five has a [`Frame`](crate::replicate::Frame) variant, or the copy is
 //! lossy.
 //!
-//! The sixth table, `documents` (FORMAT.md §3.6), belongs to the archive
+//! `segment_indexes` holds one row per segment and travels inside that
+//! segment's frame, as `Segment::caller_index`, so it needs no frame of its
+//! own.
+//!
+//! The `documents` table (FORMAT.md §3.6) belongs to the archive
 //! rather than to a source, and a [`Handshake`](crate::replicate::Frame::Handshake)
 //! names a source. No frame carries it, so a subscriber's archive holds the
 //! sources it was sent and none of the publisher's documents.

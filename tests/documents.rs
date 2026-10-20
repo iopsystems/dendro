@@ -74,15 +74,19 @@ fn chain(db: &Archive, kind: &str, name: &str) -> Vec<Option<String>> {
 }
 
 /// A v4 archive, as releases up to 0.5.1 create it: this build's schema
-/// minus the `documents` table, stamped 4. The table and the stamp are the
-/// only differences between the two.
+/// without the `documents` and `segment_indexes` tables, with the index as
+/// the last column of `segments`, stamped 4. Those are the differences
+/// between the two schemas.
 fn v4_archive(path: &Path) {
     let mut db = ArchiveMut::create(path).unwrap();
     db.insert_source(&source()).unwrap();
     drop(db);
     let raw = rusqlite::Connection::open(path).unwrap();
-    raw.execute_batch("DROP TABLE documents; PRAGMA user_version = 4;")
-        .unwrap();
+    raw.execute_batch(
+        "DROP TABLE documents; DROP TABLE segment_indexes; \
+         ALTER TABLE segments ADD COLUMN caller_index BLOB; PRAGMA user_version = 4;",
+    )
+    .unwrap();
     let left: i64 = raw
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'documents%'",

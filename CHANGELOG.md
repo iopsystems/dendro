@@ -81,6 +81,19 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   `rewrite::copy_sources_into` into a new archive, which is v5. The reason
   is in FORMAT.md §8: 0.5.1's copier drops a table it does not know, and
   documents are data people wrote.
+- **Breaking (format):** on schema 5 the caller's per-segment index is a
+  row of a new `segment_indexes` table, keyed like its segment, instead of
+  the `segments.caller_index` column (FORMAT.md §3.2). SQLite stores a
+  row's columns in order and spills a large BLOB onto overflow pages, so an
+  index after the segment bytes was reachable only through them: reading
+  every index of a cold archive cost as much I/O as reading the segments.
+  `Archive::read_segment_indexes` now reads no segment row on v5. The table
+  cascades on segment delete, so retention, compaction and
+  `Transaction::delete_segment` remove an index with its segment. A v4
+  archive keeps its indexes in the column, is written there when written in
+  place, and is read through the same API; a copy into a new archive moves
+  them to the table. The Rust API is unchanged: `SegmentRow::caller_index`
+  and `insert_segment_with_index` carry the index as before.
 - **Breaking:** `SegmentEncoder::encode` and `encode_after` take
   `&segment::EncodeContext` in place of the stream name, and
   `segment::materialize` takes one too. The context carries the stream

@@ -1177,6 +1177,8 @@ mod tests {
             "clock_offsets",
             "caller_rows",
             "documents",
+            // With its segment: `SegmentRow::caller_index`.
+            "segment_indexes",
         ];
         /// Not carried, and correct not to be. Empty today: the schema version
         /// lives in the header stamp, not in a table.

@@ -91,7 +91,7 @@ stale; `Archive::vacuum_into` is the exact copy.
 
 ## 3. The catalog
 
-Six tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`, and `documents` in
+Seven tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`, and `documents` in
 `src/archive/sqlite/documents.rs`, `DOCUMENTS_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
@@ -115,10 +115,19 @@ CREATE TABLE segments(
   first_ts INTEGER NOT NULL,
   last_ts INTEGER NOT NULL,
   bytes BLOB NOT NULL,                 -- one parquet file, opaque
-  caller_index BLOB,                   -- the caller's index, never read
   PRIMARY KEY (source_id, stream, seq)
+  -- schema 4 has a last column here: caller_index BLOB (see segment_indexes)
 );
 CREATE INDEX segments_by_time ON segments(source_id, stream, last_ts);
+CREATE TABLE segment_indexes(          -- schema 5; a v4 archive has none
+  source_id INTEGER NOT NULL,
+  stream TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  bytes BLOB NOT NULL,                 -- the caller's index, never read
+  PRIMARY KEY (source_id, stream, seq),
+  FOREIGN KEY (source_id, stream, seq)
+    REFERENCES segments(source_id, stream, seq) ON DELETE CASCADE
+) WITHOUT ROWID;
 CREATE TABLE wal(
   source_id INTEGER NOT NULL REFERENCES sources(id),
   stream TEXT NOT NULL,
@@ -212,14 +221,33 @@ what the **encoder reported** and never the input's span, and are what
 retention and range reads consult; `rows` is the row count. A segment is
 immutable once inserted.
 
-**`caller_index`** is whatever the caller's encoder returned alongside the
-segment, stored verbatim and never interpreted: a name set, a bloom filter,
-per-column extremes, anything that answers "could this segment hold what I am
-looking for" without opening it. `NULL` where the caller wrote none, and in
-archives from before the column. A verbatim copy carries it; a **column
-projection drops it**, because an index built over the original columns may
-describe columns the copy no longer has, and a wrong index is worse than
-none.
+**The caller's index** is whatever the caller's encoder returned alongside
+the segment, stored verbatim and never interpreted: a name set, a bloom
+filter, per-column extremes, anything that answers "could this segment hold
+what I am looking for" without opening it. On schema 5 it is a row of
+`segment_indexes` keyed like its segment, and a segment the caller wrote
+none for has no row. On schema 4 it is the last column of `segments`,
+`caller_index`, `NULL` where the caller wrote none; a v4 archive from before
+that column holds none, and an index written to one is dropped. A reader
+reads indexes through `Archive::read_segment_indexes` either way.
+
+It moved out of the segment row because SQLite stores a row's columns in
+declaration order and spills a large BLOB onto overflow pages: an index
+after `bytes` is reached only by walking them. Reading every index of a
+cold 9.6-hour archive that way read 110 MB in 470 to 620 ms, against 1.3 MB
+and 10 ms for the segments' keys alone. On schema 5 the read is answered
+from the `segments` primary-key index and `segment_indexes`, and touches no
+segment row. `WITHOUT ROWID` stores a stream's indexes together in key
+order.
+
+The cascade deletes an index with its segment on every path that deletes
+one: retention, compaction, `Transaction::delete_segment`. A writer
+connection enforces it (`foreign_keys=ON`); `verify` reports an index row
+without its segment as a foreign-key problem. A verbatim copy carries the
+index; a **column projection drops it**, because an index built over the
+original columns may describe columns the copy no longer has, and a wrong
+index is worse than none. A merged segment has none, since an index over
+one input cannot describe two.
 
 `bytes` is one Parquet file the crate never opens, with one exception:
 `rewrite::project_segment_columns`, an opt-in column projection that
@@ -510,6 +538,11 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   over time belongs in `caller_rows` (§3.5), keyed by the time it changed,
   never in field metadata: rows that span such a change fuse two series into
   one column, and the segment carries no evidence of it.
+- **Version 5 also moved the caller's index** from the `segments.caller_index`
+  column to the `segment_indexes` table (§3.2), on the same bump. A v5
+  build reads a v4 archive's column and writes into it when it writes a
+  v4 archive (below); a copy into a new archive moves each index to the
+  table.
 - **Version 5 added `documents` (§3.6).** An old reader would not misread
   a v5 archive: checked against the 0.5.1 build on a v4-stamped file
   holding the table, its open gate reads only the header, nothing in it
