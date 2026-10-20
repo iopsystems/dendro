@@ -72,13 +72,37 @@ of the document `(kind, name)`: `uuid`, `schema`, `body` (JSON),
   archives that each carry a `default` view, and needs to know when one
   input's view displaced another's. `copy_documents_into` returns the
   revisions inserted, the documents whose current revision came from this
-  input, and `forked`: those where the destination's previous current
-  document is not an ancestor (through `supersedes`) of the new one. A
-  newer copy of the same document is an update, not a fork; a document the
-  destination had deleted is not displaced. `copy_sources_into` still
-  returns the source count, so a caller that wants the report calls
-  `copy_documents_into` first, and the copy inside `copy_sources_into` then
-  inserts nothing.
+  input, and `forked`: those where the destination's newest revision before
+  the copy is not an ancestor (through `supersedes`) of the new one. Each
+  fork is a `Fork` with both revisions' uuids, so a combine can rename the
+  displaced one. A newer copy of the same document is an update, not a
+  fork. A deletion counts as the baseline when the incoming chain shares a
+  revision with the destination's, so a delete in one input and an edit in
+  another are a fork in either order (the first build ignored deletions
+  there, and the delete-then-edit order resurrected the document without a
+  report); a document the destination had deleted, followed by an
+  unrelated one under its name, is not a fork. The baseline is captured
+  before the copy inserts anything for the document, not recomputed as its
+  revisions land. `copy_sources_into` still returns the source count: a
+  caller that wants the report calls `copy_documents_into` first, inside
+  the same `src.read_snapshot`, and the copy inside `copy_sources_into` then
+  inserts nothing. Returning the report from `copy_sources_into` was
+  considered and not done, because it would change the return type at
+  every caller for the one caller (a combine) that needs it.
+- **The current revision is not chosen by input.** A review constructed
+  the case: the destination holds A then B (current B); the input holds A,
+  C, B, also current B, and the copy inserts only C, which becomes current
+  because it is newest. Making the input's head current instead would need
+  either a pointer that is not derived from the rows, or a restatement
+  revision that neither file contains and that a repeated copy would have
+  to recognize by content. The id rule stays, `forked` names the document
+  (C does not supersede B), and the docs say so: a shared document's
+  current revision is the newest one the copy inserted.
+- **A write returns its revision (`RevisionId`).** `put_document`,
+  `put_document_if_current` and `delete_document` return the new
+  revision's id and uuid, so a caller can chain conditional saves without
+  reading the document back between them, which would leave a window for
+  another write.
 - **`schema` is the caller's and never read.** It is the body's type name
   and version (`rezolus.view/1`). dendro cannot interpret a body, so it
   cannot version one; what it can do is store the version beside it and
@@ -90,14 +114,14 @@ of the document `(kind, name)`: `uuid`, `schema`, `body` (JSON),
   build parsed into `serde_json::Value`, which a review measured at 528 MB
   peak for one 56 MB body, and which refuses two kinds of valid JSON:
   nesting past 128 and an escaped lone surrogate (`"\ud800"`, which
-  JavaScript's `JSON.stringify` produces). `serde::de::IgnoredAny` walks the
+  JavaScript's `JSON.stringify` produces). `serde_core::de::IgnoredAny` walks the
   text and keeps nothing, has no nesting limit, and accepts the surrogate;
   it still refuses trailing characters, control characters, bad escapes,
   `NaN` and comments (probed on serde_json 1.0.151). SQLite's `json_valid`
   was the other candidate: it accepts the surrogate and refuses nesting past
-  1000, so a deep but valid body would still be refused. `serde` was already
-  in the graph through serde_json; it is now a direct optional dependency
-  under `archive`.
+  1000, so a deep but valid body would still be refused. `serde_core`, which
+  serde_json 1.0.151 is built on, is a direct optional dependency under
+  `archive`; `serde` itself is not in the normal dependency graph.
 - **Hold one body at a time.** A put reads the previous revision's id and
   whether it is a deletion, not its body. A copy reads the source with one
   statement, row by row, binding each row's text straight into the insert,
@@ -211,8 +235,8 @@ caller that builds it without `..CopySpec::everything()`, and no caller has
 asked to drop documents. A combine calls `copy_sources_into` once per input,
 so it carries each input's documents; where two inputs hold revisions of
 one document (two edited copies of one report) the history holds both edits,
-the input copied last is current, and its `CopiedDocuments::forked` names the
-document. A copy into a v4 destination is refused when the source holds any
+the newest revision the later copy inserted is current, and that copy's
+`CopiedDocuments::forked` names the document. A copy into a v4 destination is refused when the source holds any
 revision.
 
 ## Alternatives not taken
@@ -259,8 +283,16 @@ that every touched file was restored):
   write into one statement deterministically.
 - Second build: 40 mutations, the first set re-anchored plus the review's
   survivors, the validator, the copy report, the content check and the v4
-  rules. Every one turned at least one test red, and every test is red
-  under at least one of them.
+  rules. All 40 turned at least one test red, and every test was red
+  under at least one of them. A second review then found two more that
+  the tests let through: recomputing the fork baseline at each insert, and
+  a writer open that creates the table in a v4 archive. Two tests were
+  added for them: a fork against a destination that holds A then B, and a
+  `sqlite_master` check in the writer v4 test.
+- Third build: 53 mutations, the 40 re-anchored plus those two, the
+  deletion baseline, the shared-ancestor rule, the `Fork` uuids, the
+  returned `RevisionId`, and a v4 restamp on writer open. All 53 turned at
+  least one test red.
 
 Memory, peak RSS by `/usr/bin/time -l`, one run each, release build, same
 harness and bodies (an array of short strings):

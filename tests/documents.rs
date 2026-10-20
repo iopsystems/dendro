@@ -102,8 +102,9 @@ fn a_put_supersedes_the_current_revision_and_keeps_the_old_one() {
     let first = db.document(KIND, "main").unwrap().unwrap();
     assert_eq!(
         (first.id, first.supersedes, first.body.as_str()),
-        (v1, None, r#"{"v":1}"#)
+        (v1.id, None, r#"{"v":1}"#)
     );
+    assert_eq!(first.uuid, v1.uuid, "the write returns the revision's uuid");
     assert_eq!((first.kind.as_str(), first.name.as_str()), (KIND, "main"));
     assert_eq!(first.schema, SCHEMA);
 
@@ -111,8 +112,9 @@ fn a_put_supersedes_the_current_revision_and_keeps_the_old_one() {
     let current = db.document(KIND, "main").unwrap().unwrap();
     assert_eq!(
         (current.id, current.supersedes, current.body.as_str()),
-        (v2, Some(v1), r#"{"v":2}"#)
+        (v2.id, Some(v1.id), r#"{"v":2}"#)
     );
+    assert_eq!(current.uuid, v2.uuid);
     assert_ne!(current.uuid, first.uuid);
     // Stamped with the wall clock: after 2020, and not after the second.
     assert!(first.created_wall_ns > 1_577_836_800_000_000_000);
@@ -168,7 +170,10 @@ fn a_delete_is_a_revision_and_the_history_survives_it() {
     let history = db.document_history(KIND, "main").unwrap();
     assert_eq!(history.len(), 2);
     match &history[1] {
-        Revision::Delete(d) => assert_eq!((d.id, d.supersedes), (gone, Some(v1))),
+        Revision::Delete(d) => {
+            assert_eq!((d.id, d.supersedes), (gone.id, Some(v1.id)));
+            assert_eq!(d.uuid, gone.uuid);
+        }
         other => panic!("expected a deletion, got {other:?}"),
     }
 
@@ -179,7 +184,7 @@ fn a_delete_is_a_revision_and_the_history_survives_it() {
     // A put after a delete continues the chain from the deletion.
     let v3 = db.put_document(KIND, "main", SCHEMA, "3").unwrap();
     let current = db.document(KIND, "main").unwrap().unwrap();
-    assert_eq!((current.id, current.supersedes), (v3, Some(gone)));
+    assert_eq!((current.id, current.supersedes), (v3.id, Some(gone.id)));
 }
 
 #[test]
@@ -217,8 +222,16 @@ fn a_conditional_put_is_refused_when_another_revision_landed() {
 
     // After a delete there is no current document, so `None` matches.
     db.delete_document(KIND, "main").unwrap();
-    db.put_document_if_current(KIND, "main", SCHEMA, "4", None)
+    let v4 = db
+        .put_document_if_current(KIND, "main", SCHEMA, "4", None)
         .unwrap();
+    // Saves chain on the returned uuid, with no read in between.
+    let v5 = db
+        .put_document_if_current(KIND, "main", SCHEMA, "5", Some(&v4.uuid))
+        .unwrap();
+    db.put_document_if_current(KIND, "main", SCHEMA, "6", Some(&v5.uuid))
+        .unwrap();
+    assert_eq!(db.document(KIND, "main").unwrap().unwrap().body, "6");
 }
 
 #[test]
@@ -388,7 +401,13 @@ fn two_edited_copies_combine_into_one_history_with_the_last_input_current() {
     assert!(from_a.forked.is_empty());
     assert_eq!(from_b.inserted, 1);
     assert_eq!(from_b.current, vec![key(KIND, "main")]);
-    assert_eq!(from_b.forked, vec![key(KIND, "main")]);
+    assert_eq!(from_b.forked.len(), 1);
+    let fork = &from_b.forked[0];
+    assert_eq!((fork.kind.as_str(), fork.name.as_str()), (KIND, "main"));
+    // Displaced: the first input's edit. Current: the second's.
+    let history = revisions(&combined, KIND, "main");
+    assert_eq!(fork.displaced, history[1].0);
+    assert_eq!(fork.current, history[2].0);
     // The shared base once, then each edit; the input copied last is current.
     let history = revisions(&combined, KIND, "main");
     let bodies: Vec<Option<&str>> = history.iter().map(|r| r.2.as_deref()).collect();
@@ -625,6 +644,85 @@ fn a_copy_that_updates_a_document_it_supersedes_is_not_a_fork() {
     assert!(fourth.forked.is_empty());
 }
 
+/// Copies of one base: `P` deletes the document, `Q` edits it. Combined in
+/// either order, the second input displaces the first: a delete against an
+/// edit is a fork whichever lands last.
+#[test]
+fn a_delete_and_an_edit_of_one_base_fork_in_either_order() {
+    let mut base = ArchiveMut::create_in_memory().unwrap();
+    base.put_document(KIND, "main", SCHEMA, r#""base""#)
+        .unwrap();
+    let base = base.serialize().unwrap();
+    let branch = |change: &dyn Fn(&mut ArchiveMut)| {
+        let mut copy = ArchiveMut::create_in_memory().unwrap();
+        let from = Archive::open_bytes(base.clone()).unwrap();
+        copy.transaction(|tx| copy_documents_into(&from, tx))
+            .unwrap();
+        change(&mut copy);
+        copy.serialize().unwrap()
+    };
+    let p = branch(&|db| {
+        db.delete_document(KIND, "main").unwrap();
+    });
+    let q = branch(&|db| {
+        db.put_document(KIND, "main", SCHEMA, r#""edit""#).unwrap();
+    });
+
+    for (first, second, body_after) in [(&p, &q, Some(r#""edit""#)), (&q, &p, None)] {
+        let mut dst = ArchiveMut::create_in_memory().unwrap();
+        let (a, b) = dst
+            .transaction(|tx| {
+                let a = copy_documents_into(&Archive::open_bytes(first.clone()).unwrap(), tx)?;
+                let b = copy_documents_into(&Archive::open_bytes(second.clone()).unwrap(), tx)?;
+                Ok((a, b))
+            })
+            .unwrap();
+        assert!(a.forked.is_empty());
+        assert_eq!(b.forked.len(), 1, "{body_after:?}: {b:?}");
+        let history = revisions(&dst, KIND, "main");
+        assert_eq!(history.len(), 3);
+        assert_eq!(b.forked[0].displaced, history[1].0);
+        assert_eq!(b.forked[0].current, history[2].0);
+        assert_eq!(
+            dst.document(KIND, "main").unwrap().map(|d| d.body),
+            body_after.map(str::to_string)
+        );
+    }
+}
+
+/// The destination holds A then B; the input holds A, C, D (D superseding
+/// C superseding A). Inserting C then D displaces B: the baseline is what
+/// the destination held, not the copy's own earlier insert.
+#[test]
+fn a_fork_is_measured_against_the_destination_not_the_copys_own_inserts() {
+    let mut base = ArchiveMut::create_in_memory().unwrap();
+    base.put_document(KIND, "main", SCHEMA, r#""A""#).unwrap();
+    let base = base.serialize().unwrap();
+    let from_base = || {
+        let mut copy = ArchiveMut::create_in_memory().unwrap();
+        let from = Archive::open_bytes(base.clone()).unwrap();
+        copy.transaction(|tx| copy_documents_into(&from, tx))
+            .unwrap();
+        copy
+    };
+    let mut dst = from_base();
+    dst.put_document(KIND, "main", SCHEMA, r#""B""#).unwrap();
+    let b = dst.document(KIND, "main").unwrap().unwrap().uuid;
+    let mut src = from_base();
+    src.put_document(KIND, "main", SCHEMA, r#""C""#).unwrap();
+    src.put_document(KIND, "main", SCHEMA, r#""D""#).unwrap();
+    let d = src.document(KIND, "main").unwrap().unwrap().uuid;
+    let src = Archive::open_bytes(src.serialize().unwrap()).unwrap();
+
+    let copied = dst.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
+    assert_eq!(copied.inserted, 2);
+    assert_eq!(copied.forked.len(), 1);
+    assert_eq!(
+        (&copied.forked[0].displaced, &copied.forked[0].current),
+        (&b, &d)
+    );
+}
+
 #[test]
 fn a_revision_held_with_different_contents_refuses_the_copy() {
     let dir = tempfile::tempdir().unwrap();
@@ -688,7 +786,7 @@ mod during_a_recording {
             .unwrap();
         let reader = Archive::open(&path).unwrap();
         let read = reader.document(KIND, "main").unwrap().unwrap();
-        assert_eq!(read.id, v1);
+        assert_eq!((read.id, &read.uuid), (v1.id, &v1.uuid));
 
         // A conflict is the caller's answer, and the writer keeps going.
         match archive.put_document_if_current(KIND, "main", SCHEMA, "{}", None) {
@@ -708,7 +806,8 @@ mod during_a_recording {
         w.sync().unwrap();
 
         let current = reader.document(KIND, "main").unwrap().unwrap();
-        assert_eq!((current.id, current.supersedes), (v2, Some(v1)));
+        assert_eq!((current.id, current.supersedes), (v2.id, Some(v1.id)));
+        assert_eq!(current.uuid, v2.uuid);
         assert_eq!(reader.live_wal(w.source_id(), "s").unwrap().len(), 2);
 
         let gone = archive.delete_document(KIND, "main").unwrap();
@@ -750,5 +849,15 @@ mod during_a_recording {
         assert_eq!(reader.schema_version().unwrap(), 4);
         assert_eq!(reader.live_wal(id, "s").unwrap().len(), 1);
         assert_eq!(reader.document(KIND, "main").unwrap(), None);
+        // Opening a v4 archive to write gives it no v5 structure.
+        let tables: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'documents%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 }

@@ -349,12 +349,15 @@ spans every source. Each row is one **revision** of the document
   carry every revision of every document, whatever the copy's time bound
   and stream filter select, and renumber `supersedes` to the destination's
   ids. Inserted revisions take ids after everything the destination holds,
-  in the source's order, so when several archives are combined, the one
-  copied last supplies the current revision of a document they share.
+  in the source's order, so a shared document's current revision is the
+  newest one this copy inserted. That is the input's own current revision
+  unless the destination already held it; then an older revision the input
+  brought becomes current, and `CopiedDocuments::forked` names the
+  document.
   `copy_documents_into` reports which documents' current revision came
-  from its input and which of those displaced a current document they do
-  not supersede (`CopiedDocuments::forked`), so a combine can choose or
-  rename. `vacuum_into` and `serialize` copy the file whole. Compaction and
+  from its input and which of those displaced a revision they do not
+  supersede (`CopiedDocuments::forked`, with both revisions' uuids), so a
+  combine can choose or rename. `vacuum_into` and `serialize` copy the file whole. Compaction and
   retention do not touch the table. Replication does not carry it (WIRE.md
   is per source).
 - **v4 archives.** A v4 archive has no `documents` table, and a reader
@@ -508,9 +511,10 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   never in field metadata: rows that span such a change fuse two series into
   one column, and the segment carries no evidence of it.
 - **Version 5 added `documents` (§3.6).** An old reader would not misread
-  a v5 archive: checked against the 0.5.1 build, its open gate reads only
-  the header, nothing in it lists or refuses tables, its `verify` passes an
-  archive holding documents, and its writer resumes a source in one. The
+  a v5 archive: checked against the 0.5.1 build on a v4-stamped file
+  holding the table, its open gate reads only the header, nothing in it
+  lists or refuses tables, its `verify` passes it, and its writer resumes a
+  source in it. The
   bump is for the copiers. 0.5.1's `copy_sources_into` copies a fixed list
   of tables and drops `documents`, and a document is something a person
   wrote (a saved view, a report's selection), not a fact an old copier can

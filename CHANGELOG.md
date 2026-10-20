@@ -52,8 +52,10 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   body. Written with `ArchiveMut::put_document`, `put_document_if_current`
   (which takes the uuid of the revision the caller read, and is refused as
   the new `Error::DocumentConflict` when another revision is current) and
-  `delete_document`; the same three on `Transaction`, and on `Writer` for an
-  archive being recorded, which an `ArchiveMut` cannot open. Read with
+  `delete_document`, which return the new revision's `archive::RevisionId`
+  (id and uuid), so conditional saves chain without a read between them;
+  the same three on `Transaction`, and on `Writer` for an archive being
+  recorded, which an `ArchiveMut` cannot open. Read with
   `Archive::document`, `documents`, `document_kinds` and `document_history`
   (types `archive::{Document, Deletion, Revision}`). A body must be JSON
   (RFC 8259, no nesting limit). Kinds beginning `dendro.`
@@ -63,8 +65,9 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   destination already holds (by uuid) and failing on one it holds with
   different contents. It returns `archive::CopiedDocuments`: the revisions
   inserted, the documents whose current revision came from this input, and
-  which of those displaced a current document they do not supersede
-  (`forked`), for a combine that must choose or rename.
+  which of those displaced a revision they do not supersede (`forked`, each
+  an `archive::Fork` with the displaced and current revisions' uuids), for
+  a combine that must choose or rename.
 - `Archive::schema_version`, and `Error::SchemaTooOld`, returned for a
   document written into a v4 archive.
 

@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use crate::archive::{Archive, ArchiveMut, CallerRow, Evicted, SegmentMeta, SourceMeta, WalRow};
+use crate::archive::{
+    Archive, ArchiveMut, CallerRow, Evicted, RevisionId, SegmentMeta, SourceMeta, WalRow,
+};
 use crate::error::{Error, Result};
 use crate::segment::{EncodeContext, SegmentEncoder};
 
@@ -160,14 +162,14 @@ enum Msg {
     /// conditional write's conflict is the caller's to act on.
     PutDocument {
         put: Box<DocumentPut>,
-        reply: SyncSender<Result<i64>>,
+        reply: SyncSender<Result<RevisionId>>,
     },
     /// Delete a document by writing a deletion revision; replies with its
     /// id, or `None` when there was nothing to delete.
     DeleteDocument {
         kind: String,
         name: String,
-        reply: SyncSender<Result<Option<i64>>>,
+        reply: SyncSender<Result<Option<RevisionId>>>,
     },
     /// One source's last clock observation; marks *that* source complete.
     ///
@@ -545,7 +547,7 @@ impl Writer {
     }
 
     /// Write a new revision of document `(kind, name)` through the writer
-    /// thread, and return its id once it is committed.
+    /// thread, and return its id and uuid once it is committed.
     ///
     /// [`ArchiveMut::put_document`], for an archive this writer is
     /// recording: an `ArchiveMut` cannot open a file a writer holds, and
@@ -561,7 +563,7 @@ impl Writer {
         name: &str,
         schema: &str,
         body: &str,
-    ) -> Result<i64> {
+    ) -> Result<RevisionId> {
         self.send_document(kind, name, schema, body, None)
     }
 
@@ -575,12 +577,12 @@ impl Writer {
         schema: &str,
         body: &str,
         expected: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<RevisionId> {
         self.send_document(kind, name, schema, body, Some(expected.map(str::to_string)))
     }
 
     /// [`ArchiveMut::delete_document`] through the writer thread.
-    pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<i64>> {
+    pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<RevisionId>> {
         let Some(tx) = self.tx.as_ref() else {
             return Err(Error::WriterGone);
         };
@@ -608,7 +610,7 @@ impl Writer {
         schema: &str,
         body: &str,
         expected: Option<Option<String>>,
-    ) -> Result<i64> {
+    ) -> Result<RevisionId> {
         let Some(tx) = self.tx.as_ref() else {
             return Err(Error::WriterGone);
         };

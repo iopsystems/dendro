@@ -125,6 +125,36 @@ impl Revision {
     }
 }
 
+/// The revision a write created: its id in this file and its uuid, which
+/// is what [`put_document_if_current`](ArchiveMut::put_document_if_current)
+/// takes, so a caller can chain conditional saves without reading the
+/// document back between them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RevisionId {
+    /// The revision's row id in this file.
+    pub id: i64,
+    /// The revision's identity, carried by the copies this crate makes.
+    pub uuid: String,
+}
+
+/// A document whose current revision a copy replaced with one that does
+/// not supersede it. See [`CopiedDocuments::forked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Fork {
+    /// The document's kind.
+    pub kind: String,
+    /// The document's name.
+    pub name: String,
+    /// The uuid of the revision that was current in the destination before
+    /// the copy, and is now only in the history. It can be a deletion.
+    pub displaced: String,
+    /// The uuid of the revision that is current now, which the copy
+    /// inserted. It can be a deletion.
+    pub current: String,
+}
+
 const COLUMNS: &str = "id, uuid, kind, name, schema, body, created_wall_ns, supersedes";
 
 fn revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Revision> {
@@ -268,7 +298,7 @@ fn check_key(kind: &str, name: &str) -> Result<()> {
 /// grammar allows and JavaScript's `JSON.stringify` can produce; a parse into
 /// `Value` refuses both, and SQLite's `json_valid` refuses nesting past 1000.
 fn check_json(kind: &str, name: &str, body: &str) -> Result<()> {
-    serde_json::from_str::<serde::de::IgnoredAny>(body)
+    serde_json::from_str::<serde_core::de::IgnoredAny>(body)
         .map(|_| ())
         .map_err(|e| Error::Message(format!("document {kind}/{name}: the body is not JSON: {e}")))
 }
@@ -321,7 +351,7 @@ fn put(
     schema: &str,
     body: &str,
     expected: Option<Option<&str>>,
-) -> Result<i64> {
+) -> Result<RevisionId> {
     check_key(kind, name)?;
     if schema.is_empty() {
         return Err(Error::Message(format!(
@@ -347,7 +377,7 @@ fn put(
     }
     let uuid = super::mint_uuid(conn)?;
     let created_wall_ns = wall_now_ns(conn)?;
-    insert_revision(
+    let id = insert_revision(
         conn,
         &NewRevision {
             uuid: &uuid,
@@ -357,10 +387,11 @@ fn put(
             created_wall_ns,
             supersedes: head.map(|h| h.id),
         },
-    )
+    )?;
+    Ok(RevisionId { id, uuid })
 }
 
-fn delete(conn: &Connection, kind: &str, name: &str) -> Result<Option<i64>> {
+fn delete(conn: &Connection, kind: &str, name: &str) -> Result<Option<RevisionId>> {
     check_key(kind, name)?;
     if !has_documents(conn)? {
         return Ok(None);
@@ -370,7 +401,7 @@ fn delete(conn: &Connection, kind: &str, name: &str) -> Result<Option<i64>> {
     };
     let uuid = super::mint_uuid(conn)?;
     let created_wall_ns = wall_now_ns(conn)?;
-    insert_revision(
+    let id = insert_revision(
         conn,
         &NewRevision {
             uuid: &uuid,
@@ -380,8 +411,8 @@ fn delete(conn: &Connection, kind: &str, name: &str) -> Result<Option<i64>> {
             created_wall_ns,
             supersedes: Some(current.id),
         },
-    )
-    .map(Some)
+    )?;
+    Ok(Some(RevisionId { id, uuid }))
 }
 
 /// What [`copy_documents_into`](crate::rewrite::copy_documents_into) did.
@@ -393,17 +424,25 @@ pub struct CopiedDocuments {
     pub inserted: usize,
     /// The `(kind, name)` of every document this copy inserted a revision
     /// of, in `(kind, name)` order. Inserted revisions take the newest ids,
-    /// so each of these documents' newest revision, deletion included, came
-    /// from this input. A document whose revisions the destination already
-    /// held is not listed.
+    /// so each of these documents' newest revision, deletion included, is
+    /// the newest one this copy inserted. That is the input's own current
+    /// revision unless the destination already held that one; then an
+    /// older revision the input brought is current, and the document is in
+    /// `forked`. A document whose revisions the destination already held is
+    /// not listed.
     pub current: Vec<(String, String)>,
-    /// The subset of `current` where the destination held a different
-    /// current document before the copy, and the revision now current does
-    /// not supersede it, directly or through earlier revisions. That
-    /// document is now only in the history: two inputs held two versions of
-    /// one document, and the later one won. A caller combining archives
-    /// checks this to choose between them or rename one.
-    pub forked: Vec<(String, String)>,
+    /// The documents in `current` whose new current revision does not
+    /// supersede, directly or through earlier revisions, the revision the
+    /// destination had as newest before the copy. That revision is now only
+    /// in the history: two inputs held two versions of one document, and the
+    /// later one won. A deletion counts on either side, so a delete in one
+    /// input and an edit in another are a fork in either order. A
+    /// destination whose newest revision was a deletion with no revision in
+    /// common with the incoming one is not forked: the document was gone,
+    /// and an unrelated one took its name. In `(kind, name)` order. A caller
+    /// combining archives checks this to choose between the two or rename
+    /// one.
+    pub forked: Vec<Fork>,
 }
 
 /// Every revision `src` holds, oldest first, into `dst`, skipping any whose
@@ -431,7 +470,10 @@ fn copy_documents(src: &Archive, dst: &Connection) -> Result<CopiedDocuments> {
     // Per document this copy inserted into: the destination's current
     // revision before the first insert (`None` if it had none), and the id
     // of the last revision inserted.
-    let mut touched: BTreeMap<(String, String), (Option<i64>, i64)> = BTreeMap::new();
+    let mut touched: BTreeMap<(String, String), (Option<Head>, i64)> = BTreeMap::new();
+    // The lowest id this copy can assign: everything below it the
+    // destination held before. Set when the first revision is inserted.
+    let mut first_inserted = i64::MAX;
     while let Some(row) = rows
         .next()
         .map_err(Error::sqlite("failed to read a document revision"))?
@@ -497,9 +539,12 @@ fn copy_documents(src: &Archive, dst: &Connection) -> Result<CopiedDocuments> {
             },
         };
         let key = (kind.to_string(), name.to_string());
-        let before = match touched.get(&key) {
-            Some(&(before, _)) => before,
-            None => head(dst, kind, name)?.filter(|h| !h.deleted).map(|h| h.id),
+        // The destination's newest revision before this copy touched the
+        // document, captured once: later inserts of this copy must not
+        // become the baseline.
+        let before = match touched.remove(&key) {
+            Some((before, _)) => before,
+            None => head(dst, kind, name)?,
         };
         let id = insert_revision(
             dst,
@@ -512,6 +557,7 @@ fn copy_documents(src: &Archive, dst: &Connection) -> Result<CopiedDocuments> {
                 supersedes,
             },
         )?;
+        first_inserted = first_inserted.min(id);
         ids.insert(src_id, id);
         touched.insert(key, (before, id));
         report.inserted += 1;
@@ -520,8 +566,18 @@ fn copy_documents(src: &Archive, dst: &Connection) -> Result<CopiedDocuments> {
     // inserted for a document is that document's newest.
     for ((kind, name), (before, last)) in touched {
         if let Some(before) = before {
-            if !descends_from(dst, last, before)? {
-                report.forked.push((kind.clone(), name.clone()));
+            let (reaches, shares) = ancestry(dst, last, before.id, first_inserted)?;
+            // A deletion with nothing in common with the incoming chain was
+            // a document that no longer existed; anything else the new
+            // revision does not supersede was displaced.
+            if !reaches && (!before.deleted || shares) {
+                let current = head(dst, &kind, &name)?.map(|h| h.uuid).unwrap_or_default();
+                report.forked.push(Fork {
+                    kind: kind.clone(),
+                    name: name.clone(),
+                    displaced: before.uuid,
+                    current,
+                });
             }
         }
         report.current.push((kind, name));
@@ -529,17 +585,21 @@ fn copy_documents(src: &Archive, dst: &Connection) -> Result<CopiedDocuments> {
     Ok(report)
 }
 
-/// Whether revision `id` reaches `ancestor` by following `supersedes`.
-fn descends_from(conn: &Connection, id: i64, ancestor: i64) -> Result<bool> {
+/// Follow `supersedes` back from revision `id`: whether the chain reaches
+/// `target`, and whether it passes through any revision below `first_new`,
+/// one the destination held before the copy.
+fn ancestry(conn: &Connection, id: i64, target: i64, first_new: i64) -> Result<(bool, bool)> {
     let mut at = Some(id);
     let mut seen = BTreeSet::new();
+    let mut shares = false;
     while let Some(cur) = at {
-        if cur == ancestor {
-            return Ok(true);
+        if cur == target {
+            return Ok((true, true));
         }
+        shares |= cur < first_new;
         // A cycle cannot be written by this crate; stop rather than spin.
         if !seen.insert(cur) {
-            return Ok(false);
+            break;
         }
         at = conn
             .query_row(
@@ -551,7 +611,7 @@ fn descends_from(conn: &Connection, id: i64, ancestor: i64) -> Result<bool> {
             .map_err(Error::sqlite("failed to follow a document's history"))?
             .flatten();
     }
-    Ok(false)
+    Ok((false, shares))
 }
 
 impl Archive {
@@ -646,7 +706,8 @@ impl Archive {
 }
 
 impl ArchiveMut {
-    /// Write a new revision of document `(kind, name)` and return its id.
+    /// Write a new revision of document `(kind, name)` and return its id and
+    /// uuid.
     ///
     /// The revision supersedes whatever was current, and becomes current
     /// itself; the earlier revisions stay in
@@ -671,7 +732,7 @@ impl ArchiveMut {
         name: &str,
         schema: &str,
         body: &str,
-    ) -> Result<i64> {
+    ) -> Result<RevisionId> {
         self.transaction(|tx| tx.put_document(kind, name, schema, body))
     }
 
@@ -692,23 +753,30 @@ impl ArchiveMut {
         schema: &str,
         body: &str,
         expected: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<RevisionId> {
         self.transaction(|tx| tx.put_document_if_current(kind, name, schema, body, expected))
     }
 
     /// Delete document `(kind, name)` by writing a deletion revision, and
-    /// return its id. The history is kept. `None`, and nothing written, when
+    /// return its id and uuid. The history is kept. `None`, and nothing
+    /// written, when
     /// there is no current document to delete. A reserved or empty `kind`,
     /// or an empty `name`, is refused as [`put_document`](Self::put_document)
     /// refuses it.
-    pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<i64>> {
+    pub fn delete_document(&mut self, kind: &str, name: &str) -> Result<Option<RevisionId>> {
         self.transaction(|tx| tx.delete_document(kind, name))
     }
 }
 
 impl Transaction<'_> {
     /// [`ArchiveMut::put_document`] as part of this transaction.
-    pub fn put_document(&self, kind: &str, name: &str, schema: &str, body: &str) -> Result<i64> {
+    pub fn put_document(
+        &self,
+        kind: &str,
+        name: &str,
+        schema: &str,
+        body: &str,
+    ) -> Result<RevisionId> {
         put(&self.tx, kind, name, schema, body, None)
     }
 
@@ -720,12 +788,12 @@ impl Transaction<'_> {
         schema: &str,
         body: &str,
         expected: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<RevisionId> {
         put(&self.tx, kind, name, schema, body, Some(expected))
     }
 
     /// [`ArchiveMut::delete_document`] as part of this transaction.
-    pub fn delete_document(&self, kind: &str, name: &str) -> Result<Option<i64>> {
+    pub fn delete_document(&self, kind: &str, name: &str) -> Result<Option<RevisionId>> {
         delete(&self.tx, kind, name)
     }
 

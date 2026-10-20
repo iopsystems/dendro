@@ -782,7 +782,10 @@ pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
 /// snapshot, for how revisions already in the destination are handled.
 /// Its report is not returned here; a caller that needs it (a combine
 /// checking which inputs' documents collide) calls
-/// [`copy_documents_into`] first, and the copy here then adds nothing.
+/// [`copy_documents_into`] first, and the copy here then adds nothing,
+/// provided both calls run inside one
+/// [`src.read_snapshot`](Archive::read_snapshot); otherwise a revision
+/// written to `src` between them is copied here and is not in the report.
 pub fn copy_sources_into(
     src: &Archive,
     tx: &Transaction<'_>,
@@ -970,9 +973,10 @@ fn copy_sources_snapshotted(
 /// because a revision never changes and the copy cannot tell which file is
 /// wrong. `supersedes` is renumbered to the destination's ids. Inserted
 /// revisions take ids after everything the destination holds, in `src`'s
-/// order, so where two inputs both hold revisions of one document, the
-/// input copied last supplies the current one and the other's stay in its
-/// history; [`CopiedDocuments::forked`] names those documents.
+/// order, so a shared document's current revision is the newest one this
+/// copy inserted. That is the input's own current revision unless the
+/// destination already held it; then an older revision the input brought
+/// becomes current, and [`CopiedDocuments::forked`] names the document.
 ///
 /// `src` is read with one statement, which is one snapshot of it, and one
 /// body at a time. `src` may be a v4 archive, which holds none. A v4

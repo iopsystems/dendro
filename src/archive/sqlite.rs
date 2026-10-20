@@ -9,7 +9,9 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 mod documents;
-pub use documents::{CopiedDocuments, Deletion, Document, Revision, RESERVED_KIND_PREFIX};
+pub use documents::{
+    CopiedDocuments, Deletion, Document, Fork, Revision, RevisionId, RESERVED_KIND_PREFIX,
+};
 
 /// Fixed at file creation and not changeable afterwards without leaving WAL
 /// mode and running a full `VACUUM`, so treat it as permanent.
