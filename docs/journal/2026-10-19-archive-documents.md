@@ -252,10 +252,12 @@ revision.
 
 ## Outcome
 
-Implemented on `feat/archive-documents` in two commits: the first build
-(`6511d10`), and the review fixes with the schema bump.
+Implemented on `feat/archive-documents`: the first build (`6511d10`), the
+review fixes with the schema bump (`e5d51c7`), and the second review's
+fixes (`4fc4f26`). The same branch also carries the segment index table
+and the encoder context ([their entry](2026-10-19-segment-index-table.md)).
 
-Tests: 20 in `tests/documents.rs` (18 of them also in the reader-only
+Tests: 22 in `tests/documents.rs` (20 of them also in the reader-only
 build), `compaction_keeps_the_archives_documents` in `tests/compaction.rs`,
 and `the_schema_before_this_one_opens_and_the_one_before_that_does_not` in
 `tests/identity.rs`.
