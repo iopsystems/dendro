@@ -1971,9 +1971,39 @@ impl Archive {
                     ))
                 })
                 .map_err(Error::sqlite("failed to check references"))?;
-            violations
+            let mut found: Vec<String> = violations
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::sqlite("failed to read a reference violation"))
+                .map_err(Error::sqlite("failed to read a reference violation"))?;
+            // `segment_indexes` is WITHOUT ROWID, so the check reports its
+            // rows with no rowid; name them by their key instead.
+            if found.iter().any(|v| v.starts_with("segment_indexes ")) {
+                found.retain(|v| !v.starts_with("segment_indexes "));
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT i.source_id, i.stream, i.seq FROM segment_indexes i \
+                         LEFT JOIN segments s ON s.source_id = i.source_id \
+                           AND s.stream = i.stream AND s.seq = i.seq \
+                         WHERE s.seq IS NULL ORDER BY i.source_id, i.stream, i.seq",
+                    )
+                    .map_err(Error::sqlite("failed to find orphan segment indexes"))?;
+                let orphans = stmt
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "segment_indexes (source_id {}, stream {:?}, seq {}) -> segments",
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?
+                        ))
+                    })
+                    .map_err(Error::sqlite("failed to find orphan segment indexes"))?;
+                for orphan in orphans {
+                    found.push(
+                        orphan.map_err(Error::sqlite("failed to read an orphan segment index"))?,
+                    );
+                }
+            }
+            Ok(found)
         })();
         match references {
             Ok(violations) => problems.extend(violations.into_iter().map(Problem::ForeignKey)),
@@ -3336,12 +3366,6 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Every segment index for one stream, in `seq` order, WITHOUT the payload.
-///
-/// The point of the column: answering "could this stream hold what I am
-/// looking for" does not mean reading the segment. `None` where the
-/// caller wrote no index, and for every segment of an archive written
-/// before the column existed.
 /// The query [`read_segment_indexes_sql`] runs, for `?1` source and `?2`
 /// stream.
 fn segment_index_sql(layout: IndexLayout) -> String {
@@ -3351,6 +3375,15 @@ fn segment_index_sql(layout: IndexLayout) -> String {
     )
 }
 
+/// Every segment index for one stream, in `seq` order, without the
+/// segments' payload.
+///
+/// The point of an index: answering "could this stream hold what I am
+/// looking for" without reading the segment. `None` where the caller wrote
+/// no index, and for every segment of a v4 archive from before the
+/// `caller_index` column. On schema 5 the read touches no segment row; on
+/// schema 4 the index is a column after `bytes` and the read walks the
+/// BLOB's overflow pages to reach it (FORMAT.md §3.2).
 fn read_segment_indexes_sql(
     conn: &Connection,
     layout: IndexLayout,
@@ -3424,12 +3457,20 @@ fn insert_segment_sql(
             )
             .map_err(failed())?;
         }
-        (IndexLayout::Table, Some(index)) => {
-            // Two rows that land together or not at all, whether or not the
-            // caller is inside a transaction: a savepoint nests in one and
-            // commits on its own outside one.
+        (IndexLayout::Table, index) => {
+            // The segment, the clearing of any index row already at its key,
+            // and its own index land together or not at all, whether or not
+            // the caller is inside a transaction: a savepoint nests in one
+            // and commits on its own outside one.
+            //
+            // A row can be there already when a segment was deleted on a
+            // connection without `foreign_keys` (the sqlite3 shell, say), so
+            // the cascade did not run. Left in place it would fail this
+            // insert's index at the key's uniqueness, or, for a segment
+            // with no index, be read back as this segment's.
             conn.execute_batch("SAVEPOINT segment_insert")
                 .map_err(failed())?;
+            let key = rusqlite::params![source_id, stream, seq as i64];
             let inserted = conn
                 .execute(
                     "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, \
@@ -3438,10 +3479,18 @@ fn insert_segment_sql(
                 )
                 .and_then(|_| {
                     conn.execute(
+                        "DELETE FROM segment_indexes \
+                         WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+                        key,
+                    )
+                })
+                .and_then(|_| match index {
+                    Some(index) => conn.execute(
                         "INSERT INTO segment_indexes(source_id, stream, seq, bytes) \
                          VALUES (?1, ?2, ?3, ?4)",
                         rusqlite::params![source_id, stream, seq as i64, index],
-                    )
+                    ),
+                    None => Ok(0),
                 });
             match inserted {
                 Ok(_) => conn
@@ -3454,7 +3503,7 @@ fn insert_segment_sql(
                 }
             }
         }
-        (IndexLayout::Table | IndexLayout::Absent, _) => {
+        (IndexLayout::Absent, _) => {
             conn.execute(
                 "INSERT INTO segments(source_id, stream, seq, rows, first_ts, last_ts, bytes) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

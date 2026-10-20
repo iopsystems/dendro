@@ -361,8 +361,6 @@ pub fn stream_segments(
     })
 }
 
-/// [`segment::check_encoder`](crate::segment::check_encoder) for a source
-/// named by id, inside the caller's snapshot.
 /// Materialize a stream's live tail, telling the encoder whose rows they
 /// are. The source's uuid is looked up only when there is a tail to encode,
 /// which a finalized archive never has.
@@ -381,6 +379,8 @@ fn materialize_tail(
     crate::segment::materialize(encoder, &ctx, live)
 }
 
+/// [`segment::check_encoder`](crate::segment::check_encoder) for a source
+/// named by id, inside the caller's snapshot.
 fn check_encoder_of(db: &Archive, source_id: i64, encoder: &dyn SegmentEncoder) -> Result<()> {
     if encoder.version().is_none() {
         return Ok(());

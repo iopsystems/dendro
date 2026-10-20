@@ -105,8 +105,12 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   rows are in; a copy passes the source archive's, not the destination's.
   The struct is `#[non_exhaustive]`, so fields are added without a break.
   For an implementor: replace `stream: &str` with `ctx: &EncodeContext<'_>`
-  and read `ctx.stream`. A caller driving an encoder itself (a test) builds
-  one with `EncodeContext::new(source_id, stream)`.
+  and read `ctx.stream`; calls an implementation makes to its own `encode`
+  or `encode_after` (an `encode_after` that falls back to `encode`, say)
+  pass `ctx` instead of the stream too. metriken-storage needed about eight
+  lines in three files. A caller driving an encoder itself (a test) builds
+  one with `EncodeContext::new(source_id, stream)`. Key state that outlives
+  one archive by `source_uuid`: a copy renumbers `source_id`.
 - `rewrite::copy_sources_into` also copies the source archive's documents,
   every revision, whatever the `CopySpec` selects. Called once per input,
   as a combine does, it carries each input's documents; call

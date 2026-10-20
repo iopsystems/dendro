@@ -81,18 +81,34 @@ pub struct Segment {
 /// so an encoder that keeps per-stream state, such as labels a long table
 /// states once, keys it by source as well as by stream.
 ///
+/// Key state that outlives one archive by `source_uuid`, which a copy
+/// carries unchanged; `source_id` is unique only within one file, and a
+/// copy renumbers it. `source_uuid` is `None` for a source from before the
+/// column, and a copy mints one for the destination that the encoder is not
+/// told.
+///
+/// A copy passes the source archive's id and uuid, because the rows it
+/// encodes (the live tail it carries across) are that source's, and an
+/// encoder's state about them was built under that key. A ranged copy can
+/// leave out earlier segments that a state-carrying encoder's output
+/// depended on, such as the segment that stated a long table's labels; the
+/// copy cannot tell, so such an encoder must not assume that what it
+/// emitted for a source before is in the destination.
+///
 /// `#[non_exhaustive]`: fields are added without a breaking release. Read
 /// the fields; build one with [`new`](Self::new), which a caller only needs
 /// when it drives an encoder itself, in a test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EncodeContext<'a> {
-    /// The source's row id in this archive. Local to the file: a copy
-    /// renumbers it, so it names the source for the life of one handle on
-    /// one file, not across files.
+    /// The source's row id in the archive the rows are in. Unique only
+    /// within that file: a copy renumbers it, so it names the source for
+    /// the life of one handle on one file, not across files.
     pub source_id: i64,
-    /// The source's identity across files (FORMAT.md §3.1), or `None` for a
-    /// source from before the `uuid` column.
+    /// The source's identity across files (FORMAT.md §3.1), which a copy
+    /// carries unchanged, or `None` for a source from before the `uuid`
+    /// column (a copy of such a source mints a uuid for the destination
+    /// that the encoder is not told).
     pub source_uuid: Option<&'a str>,
     /// The stream whose rows these are.
     pub stream: &'a str,

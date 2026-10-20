@@ -727,6 +727,26 @@ fn a_fork_is_measured_against_the_destination_not_the_copys_own_inserts() {
     );
 }
 
+/// The destination's newest revision is a deletion; the input brings an
+/// unrelated document under the same name, in two revisions. Nothing the
+/// destination held is in the incoming chain, so it is not a fork, however
+/// many revisions the input brings. (A mutation that tracked the last
+/// inserted id instead of the first passed every other test.)
+#[test]
+fn an_unrelated_document_of_several_revisions_under_a_deleted_name_is_not_a_fork() {
+    let mut dst = ArchiveMut::create_in_memory().unwrap();
+    dst.put_document(KIND, "main", SCHEMA, r#""old""#).unwrap();
+    dst.delete_document(KIND, "main").unwrap();
+    let mut src = ArchiveMut::create_in_memory().unwrap();
+    src.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    src.put_document(KIND, "main", SCHEMA, "2").unwrap();
+    let src = Archive::open_bytes(src.serialize().unwrap()).unwrap();
+    let copied = dst.transaction(|tx| copy_documents_into(&src, tx)).unwrap();
+    assert_eq!(copied.inserted, 2);
+    assert!(copied.forked.is_empty(), "{copied:?}");
+    assert_eq!(dst.document(KIND, "main").unwrap().unwrap().body, "2");
+}
+
 #[test]
 fn a_revision_held_with_different_contents_refuses_the_copy() {
     let dir = tempfile::tempdir().unwrap();

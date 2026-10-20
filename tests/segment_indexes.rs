@@ -327,16 +327,13 @@ fn an_index_and_its_segment_land_together_or_not_at_all() {
     let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&meta()).unwrap();
     drop(db);
-    // An index row already at (id, a, 0), with no segment: the next insert
-    // of segment 0 succeeds and its index insert collides.
-    let conn = raw(&path);
-    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute(
-        "INSERT INTO segment_indexes(source_id, stream, seq, bytes) VALUES (?1, 'a', 0, x'00')",
-        [id],
-    )
-    .unwrap();
-    drop(conn);
+    // Make the index insert fail after the segment insert has succeeded.
+    raw(&path)
+        .execute_batch(
+            "CREATE TRIGGER refuse_index BEFORE INSERT ON segment_indexes \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
 
     let m = SegmentMeta {
         rows: 1,
@@ -352,14 +349,63 @@ fn an_index_and_its_segment_land_together_or_not_at_all() {
         .transaction(|tx| tx.insert_segment_with_index(id, "a", 0, &m, b"x", Some(b"i")))
         .is_err());
     assert!(db.read_segment_meta(id, "a").unwrap().is_empty());
-    // And verify names the orphan.
+    // A segment with no index does not touch the table, so it lands.
+    db.insert_segment(id, "a", 0, &m, b"x").unwrap();
+    assert_eq!(db.read_segment_indexes(id, "a").unwrap(), vec![(0, None)]);
+}
+
+/// A segment deleted where the cascade did not run (a connection without
+/// `foreign_keys`, such as the sqlite3 shell) leaves its index behind. The
+/// next segment at that key must neither fail on it nor read it back.
+#[test]
+fn a_leftover_index_row_is_named_by_verify_and_replaced_by_the_next_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db.insert_source(&meta()).unwrap();
+    let m = SegmentMeta {
+        rows: 1,
+        first_ts: 1,
+        last_ts: 1,
+    };
+    db.insert_segment_with_index(id, "a", 0, &m, b"x", Some(b"old0"))
+        .unwrap();
+    db.insert_segment_with_index(id, "a", 1, &m, b"x", Some(b"old1"))
+        .unwrap();
+    drop(db);
+    let conn = raw(&path);
+    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM segments;")
+        .unwrap();
+    drop(conn);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM segment_indexes"), 2);
+
+    let mut db = ArchiveMut::open(&path).unwrap();
     let report = db.verify(Depth::Quick).unwrap();
-    assert!(
-        report
-            .problems
-            .iter()
-            .any(|p| matches!(p, Problem::ForeignKey(f) if f.contains("segment_indexes"))),
-        "{:?}",
-        report.problems
+    let orphans: Vec<&String> = report
+        .problems
+        .iter()
+        .filter_map(|p| match p {
+            Problem::ForeignKey(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        orphans,
+        vec![
+            &format!("segment_indexes (source_id {id}, stream \"a\", seq 0) -> segments"),
+            &format!("segment_indexes (source_id {id}, stream \"a\", seq 1) -> segments"),
+        ]
     );
+
+    // Without an index: the leftover is not read back as this segment's.
+    db.insert_segment(id, "a", 0, &m, b"x").unwrap();
+    // With one: the insert does not collide with the leftover.
+    db.transaction(|tx| tx.insert_segment_with_index(id, "a", 1, &m, b"x", Some(b"new1")))
+        .unwrap();
+    assert_eq!(
+        db.read_segment_indexes(id, "a").unwrap(),
+        vec![(0, None), (1, Some(b"new1".to_vec()))]
+    );
+    drop(db);
+    in_step(&path);
 }

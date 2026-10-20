@@ -92,9 +92,15 @@ Reading every index cold (`idxread`):
 | N=64, `a-64` (7.5 MB) | 2798 ms, 432 MB | 227 ms, 35 MB | 346 ms, 47 MB |
 | N=64, `fp` (270 KB) | 2250 ms, 424 MB | 43 ms, 6.2 MB | 156 ms, 18 MB |
 
-The keys alone (`segments.seq`) were 9 to 10 ms on the 9.6-hour archive and
-35 to 42 ms at N=64 in both runs, so that is the floor. A read of the table
-now scales with the index bytes rather than with the segment bytes.
+The keys alone (`segments.seq`) were 9 to 11 ms on the 9.6-hour archive,
+with one 25 ms outlier, and 35 to 42 ms at N=64 in both runs, so that is
+the floor. A read of the table now scales with the index bytes rather than
+with the segment bytes.
+
+Caveats on that table: each cell is one cold run. `idxread` evicts the file
+before each read but does not check resident pages before it, as the open
+bench does with `mincore`. The `read_segment_indexes` timer starts after
+`Archive::open`, so it leaves out the open itself.
 
 Open, cold, index on (catalog served from the index, no segment fetched):
 
@@ -129,9 +135,11 @@ What it does not change:
 - What remains of a cold N=64 open (about 1.4 s, 245 MB resident) is not the
   index read, which is 0.35 s through the API. I did not break the rest
   down.
-- Warm opens with the index were already 4 to 250 ms and barely moved,
-  except N=64 `a-64` (1003 to 246 ms) and `a-16` (518 to 234 ms), whose
-  earlier ranges were wide (270 to 1762 ms).
+- Warm opens with the index, before and now: N=1 3.4 to 4.7 ms against 4.0
+  to 5.1; N=4 12.5 to 17.5 against 14.7 to 19.6; N=16 `a-64` 75.6 to 63.5
+  and `b-64` 109.7 to 104.9, but `a-16` 64.5 to 114.1, slower, which I have
+  not explained; N=64 `b-64` 235 to 182, `a-64` 1003 to 246 and `a-16` 518
+  to 234, the last two from earlier ranges that were wide (270 to 1762 ms).
 
 Runs are single sessions; the earlier run is another session on the same
 machine, so cross-run differences carry that drift. No noise floor was
