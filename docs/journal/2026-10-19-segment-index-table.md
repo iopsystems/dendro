@@ -1,5 +1,5 @@
 ---
-status: open
+status: implemented
 opened: 2026-10-19
 updated: 2026-10-19
 ---
@@ -67,10 +67,75 @@ occupant labels stated once, an index built across seals) could not key it.
 
 ## Measurement
 
-Pending: cold and warm open with the metriken prototype adapted to the
-table, on the 9.6-hour archive and the N=1/4/16/64 bench archives, by the
-same cold-cache method as the prototype's (`msync(MS_INVALIDATE)` and a
-`mincore` check).
+The metriken prototype rebuilt against this branch (`proto/segment-index`
+`166bd59`, a path dependency and the `EncodeContext` signature, nothing
+else), with the prototype's bench (`index-bench`, release, `debug = 1`).
+Archives as before: a 30-minute slice of `metrics-9.6h.dendro` (352
+segments, 49 streams, 75.5 MB; the original N=1 file was gone, and the
+rebuilt one matches it in size and counts), copied into 1, 4, 16 and 64
+sources, and the 9.6-hour archive itself; each rewritten with no catalog
+index (`fp`, the 12-byte name fingerprint) and with the three-tier index
+(`a-16`, `a-64`, `b-64`). Index bytes per segment came out identical to
+the earlier run (12.0, 159.9, 333.1, 124.1). Cold means the file's pages
+were dropped (`msync(MS_INVALIDATE)` on a shared mapping) and `mincore`
+showed 0 resident before the open. Warm 5 reps, cold 3; medians, with the
+range. Apple M-series laptop, macOS, one session. "Before" is the earlier
+run's log (`tmp/index/logs/open.txt`), index in the `caller_index` column;
+"now" is the table.
+
+Reading every index cold (`idxread`):
+
+| Archive | before: `caller_index` column | now: `segment_indexes` | now, through `read_segment_indexes` |
+| --- | --- | --- | --- |
+| 9.6 h, `a-64` (1.9 MB of index) | 498 ms, 111 MB resident | 60 ms, 9.1 MB | 78 ms, 11.6 MB |
+| 9.6 h, `fp` (70 KB) | 622 ms, 110 MB | 11 ms, 1.6 MB | 32 ms, 4.4 MB |
+| N=64, `a-64` (7.5 MB) | 2798 ms, 432 MB | 227 ms, 35 MB | 346 ms, 47 MB |
+| N=64, `fp` (270 KB) | 2250 ms, 424 MB | 43 ms, 6.2 MB | 156 ms, 18 MB |
+
+The keys alone (`segments.seq`) were 9 to 10 ms on the 9.6-hour archive and
+35 to 42 ms at N=64 in both runs, so that is the floor. A read of the table
+now scales with the index bytes rather than with the segment bytes.
+
+Open, cold, index on (catalog served from the index, no segment fetched):
+
+| Archive | before (column) | now (table) |
+| --- | --- | --- |
+| N=1 `a-64` | 31.0 ms [31-32] | 24.0 ms [23-24] |
+| N=4 `a-64` | 176.9 [171-199] | 95.9 [90-96] |
+| N=16 `a-64` | 628.4 [566-735] | 451.3 [434-493] |
+| N=64 `a-16` | 2178 [2140-2850] | 1473 [1470-1477] |
+| N=64 `a-64` | 2239 [2184-4007] | 1538 [1521-1580] |
+| N=64 `b-64` | 2095 [2001-3086] | 1391 [1356-1399] |
+| 9.6 h `a-64` | (not run) | 351 [349-351] |
+| 9.6 h `b-64` | (not run) | 304 [302-308] |
+
+Resident after a cold N=64 open went from 427-432 MB to 244-257 MB.
+
+The no-index baseline moved too: N=64 `fp` cold, index off, 2977 ms before
+and 2476 ms now; warm, 1157 and 722. The prototype reads every segment's
+index on open even with the catalog index off (`index_rows=22528` in those
+lines), so the old baseline included the overflow walk for a 12-byte
+fingerprint. That is an inference from the log, not a separate
+measurement. Against its own baseline, the catalog index took 25 to 30% off
+a cold N=64 open before and 38 to 44% now.
+
+What it does not change:
+
+- On the 9.6-hour archive (one source), the catalog index opens cold no
+  faster than the fingerprint: `b-64` 304 ms, `fp` 306 to 309 ms. The
+  fingerprint already limits the open to one footer per stream (49
+  fetches), and that is cheap at one source. The index pays at many
+  sources.
+- What remains of a cold N=64 open (about 1.4 s, 245 MB resident) is not the
+  index read, which is 0.35 s through the API. I did not break the rest
+  down.
+- Warm opens with the index were already 4 to 250 ms and barely moved,
+  except N=64 `a-64` (1003 to 246 ms) and `a-16` (518 to 234 ms), whose
+  earlier ranges were wide (270 to 1762 ms).
+
+Runs are single sessions; the earlier run is another session on the same
+machine, so cross-run differences carry that drift. No noise floor was
+measured beyond the reps shown.
 
 ## Reopen
 
