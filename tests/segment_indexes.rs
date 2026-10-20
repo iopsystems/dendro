@@ -373,39 +373,84 @@ fn a_leftover_index_row_is_named_by_verify_and_replaced_by_the_next_segment() {
     db.insert_segment_with_index(id, "a", 1, &m, b"x", Some(b"old1"))
         .unwrap();
     drop(db);
+    // Only segment 0's: the check must name that key and no other.
     let conn = raw(&path);
-    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM segments;")
+    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM segments WHERE seq = 0;")
         .unwrap();
     drop(conn);
     assert_eq!(count(&path, "SELECT COUNT(*) FROM segment_indexes"), 2);
 
+    let orphans = |db: &ArchiveMut| -> Vec<String> {
+        db.verify(Depth::Quick)
+            .unwrap()
+            .problems
+            .into_iter()
+            .filter_map(|p| match p {
+                Problem::ForeignKey(f) => Some(f),
+                _ => None,
+            })
+            .collect()
+    };
     let mut db = ArchiveMut::open(&path).unwrap();
-    let report = db.verify(Depth::Quick).unwrap();
-    let orphans: Vec<&String> = report
-        .problems
-        .iter()
-        .filter_map(|p| match p {
-            Problem::ForeignKey(f) => Some(f),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        orphans,
-        vec![
-            &format!("segment_indexes (source_id {id}, stream \"a\", seq 0) -> segments"),
-            &format!("segment_indexes (source_id {id}, stream \"a\", seq 1) -> segments"),
-        ]
+        orphans(&db),
+        vec![format!(
+            "segment_indexes (source_id {id}, stream 'a', seq 0) -> segments"
+        )]
     );
 
     // Without an index: the leftover is not read back as this segment's.
     db.insert_segment(id, "a", 0, &m, b"x").unwrap();
+    assert_eq!(
+        db.read_segment_indexes(id, "a").unwrap(),
+        vec![(0, None), (1, Some(b"old1".to_vec()))]
+    );
+    drop(db);
+
     // With one: the insert does not collide with the leftover.
+    let conn = raw(&path);
+    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM segments WHERE seq = 1;")
+        .unwrap();
+    drop(conn);
+    let mut db = ArchiveMut::open(&path).unwrap();
     db.transaction(|tx| tx.insert_segment_with_index(id, "a", 1, &m, b"x", Some(b"new1")))
         .unwrap();
     assert_eq!(
         db.read_segment_indexes(id, "a").unwrap(),
         vec![(0, None), (1, Some(b"new1".to_vec()))]
     );
+    assert!(orphans(&db).is_empty());
     drop(db);
     in_step(&path);
+}
+
+/// An orphan whose key has the wrong type (a BLOB stream, written by some
+/// other tool) is a finding, not a failure to run the check.
+#[test]
+fn an_orphan_index_with_a_wrong_typed_key_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("typed.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db.insert_source(&meta()).unwrap();
+    drop(db);
+    let conn = raw(&path);
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "INSERT INTO segment_indexes(source_id, stream, seq, bytes) \
+         VALUES (?1, X'00FF', 0, X'01')",
+        [id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = Archive::open(&path).unwrap().verify(Depth::Quick).unwrap();
+    let want = format!("segment_indexes (source_id {id}, stream X'00FF', seq 0) -> segments");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::ForeignKey(f) if f == &want)),
+        "{:?}",
+        report.problems
+    );
 }

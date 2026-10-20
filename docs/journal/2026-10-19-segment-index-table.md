@@ -135,11 +135,11 @@ What it does not change:
 - What remains of a cold N=64 open (about 1.4 s, 245 MB resident) is not the
   index read, which is 0.35 s through the API. I did not break the rest
   down.
-- Warm opens with the index, before and now: N=1 3.4 to 4.7 ms against 4.0
-  to 5.1; N=4 12.5 to 17.5 against 14.7 to 19.6; N=16 `a-64` 75.6 to 63.5
-  and `b-64` 109.7 to 104.9, but `a-16` 64.5 to 114.1, slower, which I have
-  not explained; N=64 `b-64` 235 to 182, `a-64` 1003 to 246 and `a-16` 518
-  to 234, the last two from earlier ranges that were wide (270 to 1762 ms).
+- Warm opens with the index, medians before → now: N=1 4.0–5.1 → 3.4–4.7
+  ms; N=4 14.7–19.6 → 12.5–17.5; N=16 `a-64` 75.6 → 63.5, `b-64` 109.7 →
+  104.9, `a-16` 64.5 → 114.1 (slower, unexplained); N=64 `b-64` 235 → 182,
+  `a-64` 1003 → 246, `a-16` 518 → 234 (the last two from wide earlier
+  ranges, 270 to 1762 ms).
 
 Runs are single sessions; the earlier run is another session on the same
 machine, so cross-run differences carry that drift. No noise floor was

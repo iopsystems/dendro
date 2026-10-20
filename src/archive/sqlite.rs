@@ -1975,13 +1975,17 @@ impl Archive {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::sqlite("failed to read a reference violation"))?;
             // `segment_indexes` is WITHOUT ROWID, so the check reports its
-            // rows with no rowid; name them by their key instead.
+            // rows with no rowid; name them by their key instead. Read
+            // through `quote()`, as SQL literals, so a key of the wrong type
+            // (a BLOB stream written by another tool) is reported rather
+            // than failing the check.
             if found.iter().any(|v| v.starts_with("segment_indexes ")) {
                 found.retain(|v| !v.starts_with("segment_indexes "));
                 let mut stmt = self
                     .conn
                     .prepare(
-                        "SELECT i.source_id, i.stream, i.seq FROM segment_indexes i \
+                        "SELECT quote(i.source_id), quote(i.stream), quote(i.seq) \
+                         FROM segment_indexes i \
                          LEFT JOIN segments s ON s.source_id = i.source_id \
                            AND s.stream = i.stream AND s.seq = i.seq \
                          WHERE s.seq IS NULL ORDER BY i.source_id, i.stream, i.seq",
@@ -1990,10 +1994,10 @@ impl Archive {
                 let orphans = stmt
                     .query_map([], |row| {
                         Ok(format!(
-                            "segment_indexes (source_id {}, stream {:?}, seq {}) -> segments",
-                            row.get::<_, i64>(0)?,
+                            "segment_indexes (source_id {}, stream {}, seq {}) -> segments",
+                            row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?
+                            row.get::<_, String>(2)?
                         ))
                     })
                     .map_err(Error::sqlite("failed to find orphan segment indexes"))?;
