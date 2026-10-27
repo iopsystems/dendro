@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-27
+
 ### Added
 
 - `Frame::SourceUpdate` (wire kind 6, WIRE.md §4.6): a source's labels and
