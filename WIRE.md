@@ -86,7 +86,8 @@ only integer type, and the reason a negative value means before 1970.
 
 One kind per table in the set `rewrite` copies (`src/rewrite.rs`, `COPIED`) —
 `sources`, `caller_rows`, `wal`, `segments`, `clock_offsets` — so the frame set
-has a completeness check rather than a guess.
+has a completeness check rather than a guess, plus `SourceUpdate` for a change
+to a source's row in `sources` after its handshake.
 
 | `kind` | frame | lands in |
 |---|---|---|
@@ -95,6 +96,7 @@ has a completeness check rather than a guess.
 | 3 | `Rows` | `wal` |
 | 4 | `Segment` | `segments` |
 | 5 | `ClockOffset` | `clock_offsets` |
+| 6 | `SourceUpdate` | `sources` |
 
 ### 4.1 `Handshake` (kind 1)
 
@@ -222,10 +224,36 @@ i64          offset_ns
 One drift observation (`FORMAT.md` §5). Cheap to carry — a handful of rows per
 seal — and part of the source's identity.
 
+### 4.6 `SourceUpdate` (kind 6)
+
+```
+u32          source
+i64          ts                     ns since the Unix epoch
+map          labels
+map          metadata
+```
+
+A source's labels and metadata, sent when either changes after the source's
+handshake; the source's other fields (`uuid`, `clock_anchor_wall_ns`,
+`complete`) are not carried. Both maps are whole, not the keys that changed,
+and the subscriber replaces its copy's with them, so a key the publisher
+removed is removed. The copy keeps its own `encoder` and `writer_sessions`
+(`FORMAT.md` §6) where it has them, since its writer maintains them. A copy whose handshake was read
+before the publisher's writer recorded its session (the writer commits a new
+source's row and its `writer_sessions` separately) holds only its own
+sessions, and a `SourceUpdate` does not add the publisher's.
+
+`ts` is when the publisher saw the change. An archive records no time for a
+metadata change, so an archive publisher sends the wall time of the poll that
+read it. A subscriber does not store it.
+
 ## 5. Protocol rules
 
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
-   carry. A frame naming an ordinal with no handshake is refused.
+   carry. A frame naming an ordinal with no handshake is refused. A
+   `Handshake` may arrive at any point in the stream, for a source the
+   publisher has just seen. An `ArchivePublisher` assigns it the next
+   ordinal; a subscriber does not check that.
 2. The first `Index` frame carries complete current state (`Full`), including
    streams that exist but have never been observed.
 3. The first `Rows` frame carries the latest observation of every stream. **Not

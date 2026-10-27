@@ -265,7 +265,7 @@ fn head(conn: &Connection, kind: &str, name: &str) -> Result<Option<Head>> {
 /// `SystemTime::now` panics on `wasm32-unknown-unknown`, where an archive is
 /// assembled in memory, and SQLite's clock comes from its VFS there.
 /// Millisecond resolution, which is what `'subsec'` gives.
-fn wall_now_ns(conn: &Connection) -> Result<i64> {
+pub(super) fn wall_now_ns(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT CAST(ROUND(unixepoch('subsec') * 1000) AS INTEGER) * 1000000",
         [],

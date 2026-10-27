@@ -36,6 +36,19 @@ impl SegmentEncoder for Tags {
     }
 }
 
+/// [`Tags`] with a version, so the writer records `encoder` for its sources.
+struct VersionedTags;
+
+impl SegmentEncoder for VersionedTags {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        Tags.encode(ctx, rows)
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some("copy-1")
+    }
+}
+
 fn source_meta(name: &str) -> SourceMeta {
     SourceMeta {
         labels: BTreeMap::from([("source".to_string(), name.to_string())]),
@@ -803,4 +816,342 @@ fn an_unknown_frame_kind_is_skipped_not_fatal() {
     assert_eq!(reader.next_frame().unwrap(), Some(after));
     assert_eq!(reader.next_frame().unwrap(), None);
     assert_eq!(reader.skipped(), 1);
+}
+
+/// The identity the subscriber's copy holds for its one source.
+fn identity(path: &std::path::Path) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let db = Archive::open(path).unwrap();
+    let sources = db.read_sources().unwrap();
+    assert_eq!(sources.len(), 1);
+    let meta = sources.into_iter().next().unwrap().meta;
+    (meta.labels, meta.metadata)
+}
+
+fn source_updates(frames: &[Frame]) -> Vec<&Frame> {
+    frames
+        .iter()
+        .filter(|f| matches!(f, Frame::SourceUpdate { .. }))
+        .collect()
+}
+
+/// A metadata change after the handshake reaches a tailing subscriber as a
+/// `SourceUpdate`, ahead of the source's rows, and a poll with no change
+/// sends none.
+#[test]
+fn a_metadata_change_after_the_handshake_reaches_the_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("s", 1_000)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    let idle = publisher.next(&db).unwrap();
+    assert!(
+        source_updates(&idle).is_empty(),
+        "nothing changed: {idle:?}"
+    );
+
+    w.update_metadata(BTreeMap::from([("k".to_string(), "v".to_string())]))
+        .unwrap();
+    w.wal(vec![row("s", 2_000)]).unwrap();
+    w.sync().unwrap();
+
+    let frames = publisher.next(&db).unwrap();
+    assert_eq!(source_updates(&frames).len(), 1, "{frames:?}");
+    assert!(
+        matches!(frames.first(), Some(Frame::SourceUpdate { source: 0, metadata, .. })
+            if metadata.get("k").map(String::as_str) == Some("v")),
+        "the update precedes the source's rows: {frames:?}"
+    );
+    let applied = sub.apply_all(frames).unwrap();
+    assert_eq!((applied.source_updates, applied.rows), (1, 1));
+
+    let again = publisher.next(&db).unwrap();
+    assert!(source_updates(&again).is_empty(), "sent once: {again:?}");
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    let (labels, metadata) = identity(&copy);
+    assert_eq!(labels, source_meta("a").labels);
+    assert_eq!(metadata.get("k").map(String::as_str), Some("v"));
+}
+
+/// A `SourceUpdate` replaces both maps, so a key the publisher's source no
+/// longer has is removed from the copy rather than left behind.
+#[test]
+fn a_removed_key_is_removed_from_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut seed = source_meta("a");
+    seed.labels.insert("tier".to_string(), "client".to_string());
+    seed.metadata.insert("old".to_string(), "1".to_string());
+    seed.metadata
+        .insert(dendro::keys::ENCODER.to_string(), "tags-1".to_string());
+    let mut w = archive.add_source(seed).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    // The copy's writer records its own encoder, which differs from the
+    // publisher's `encoder` in the update.
+    let mut sub = Subscriber::new(Writer::create(&copy, Box::new(VersionedTags)).unwrap());
+    sub.apply_all(opening).unwrap();
+
+    let labels = BTreeMap::from([("source".to_string(), "renamed".to_string())]);
+    let metadata = BTreeMap::from([("new".to_string(), "2".to_string())]);
+    w.set_identity(labels.clone(), metadata.clone()).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        sub.apply_all(publisher.next(&db).unwrap())
+            .unwrap()
+            .source_updates,
+        1
+    );
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    // The copy's own writer sessions are its file's, and are kept.
+    let (got_labels, mut got_metadata) = identity(&copy);
+    assert_eq!(
+        got_metadata.remove(dendro::keys::ENCODER).as_deref(),
+        Some("copy-1"),
+        "the copy's encoder is kept"
+    );
+    let sessions = got_metadata
+        .remove(dendro::keys::WRITER_SESSIONS)
+        .expect("the copy's writer sessions are kept");
+    assert_eq!((got_labels, got_metadata), (labels, metadata));
+    let sessions: serde_json::Value = serde_json::from_str(&sessions).unwrap();
+    assert_eq!(sessions.as_array().map(Vec::len), Some(2), "{sessions}");
+}
+
+/// A change to the labels alone, with the metadata unchanged, is sent too.
+#[test]
+fn a_label_change_alone_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    // The stored metadata, which holds keys the writer added (`encoder`).
+    let metadata = db.read_sources().unwrap().remove(0).meta.metadata;
+    assert!(!metadata.is_empty());
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    let labels = BTreeMap::from([
+        ("source".to_string(), "a".to_string()),
+        ("tier".to_string(), "server".to_string()),
+    ]);
+    w.set_identity(labels.clone(), metadata.clone()).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        sub.apply_all(publisher.next(&db).unwrap())
+            .unwrap()
+            .source_updates,
+        1
+    );
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    // `writer_sessions` is the copy's own (`a_removed_key_is_removed_from_the_copy`).
+    let (got_labels, mut got_metadata) = identity(&copy);
+    let mut want_metadata = metadata;
+    got_metadata.remove(dendro::keys::WRITER_SESSIONS);
+    want_metadata.remove(dendro::keys::WRITER_SESSIONS);
+    assert_eq!((got_labels, got_metadata), (labels, want_metadata));
+}
+
+/// A source created after the publisher opened gets a handshake with the next
+/// ordinal and everything it holds, sealed segments included, on the next
+/// poll, and its rows after that arrive as rows.
+#[test]
+fn a_source_created_after_the_publisher_opened_is_handshaken_and_caught_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(source_meta("a")).unwrap();
+    a.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // Sealed and live rows, all written before the publisher's next poll.
+    let mut b = archive.add_source(source_meta("b")).unwrap();
+    b.wal(vec![row("s", 1_000), row("s", 2_000)]).unwrap();
+    b.seal(vec!["s".to_string()]).unwrap();
+    b.wal(vec![row("s", 3_000)]).unwrap();
+    b.sync().unwrap();
+
+    let frames = publisher.next(&db).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, Frame::Handshake { source: 1, labels, .. }
+                if labels == &source_meta("b").labels)),
+        "{frames:?}"
+    );
+    let applied = sub.apply_all(frames).unwrap();
+    assert_eq!((applied.sources, applied.segments, applied.rows), (1, 1, 1));
+
+    b.wal(vec![row("s", 4_000)]).unwrap();
+    b.sync().unwrap();
+    let frames = publisher.next(&db).unwrap();
+    assert!(
+        !frames.iter().any(|f| matches!(f, Frame::Handshake { .. })),
+        "handshaken once: {frames:?}"
+    );
+    assert_eq!(sub.apply_all(frames).unwrap().rows, 1);
+
+    drop((a, b));
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    let got = readable(&copy);
+    let want = readable(&origin);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[1].labels, want[1].labels);
+    assert_eq!(got[1].uuid, want[1].uuid);
+    assert_eq!(
+        got[1].streams["s"].iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1_000, 2_000, 3_000, 4_000]
+    );
+}
+
+/// A `SourceUpdate` for an ordinal no handshake introduced is refused, as
+/// every other frame kind is.
+#[test]
+fn a_source_update_without_a_handshake_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sub = subscriber(&dir.path().join("copy.dendro"));
+    let err = sub
+        .apply(Frame::SourceUpdate {
+            source: 3,
+            ts: 0,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no handshake"), "{err}");
+}
+
+/// A source created after a catching-up publisher opened is shipped from that
+/// publisher's `since`, as the sources it opened with were.
+#[test]
+fn a_source_created_later_is_caught_up_from_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(source_meta("a")).unwrap();
+    a.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) =
+        dendro::replicate::ArchivePublisher::catching_up(&db, 5_000).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // One segment before `since`, one after, and a live row.
+    let mut b = archive.add_source(source_meta("b")).unwrap();
+    b.wal(vec![row("s", 1_000), row("s", 2_000)]).unwrap();
+    b.seal(vec!["s".to_string()]).unwrap();
+    b.wal(vec![row("s", 6_000)]).unwrap();
+    b.seal(vec!["s".to_string()]).unwrap();
+    b.wal(vec![row("s", 7_000)]).unwrap();
+    b.sync().unwrap();
+
+    let applied = sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+    assert_eq!((applied.sources, applied.segments, applied.rows), (1, 1, 1));
+
+    drop((a, b));
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    assert_eq!(
+        readable(&copy)[1].streams["s"]
+            .iter()
+            .map(|r| r.0)
+            .collect::<Vec<_>>(),
+        vec![6_000, 7_000]
+    );
+}
+
+/// `events` is not one of the keys a copy keeps: an update replaces the
+/// copy's with the publisher's.
+#[test]
+fn an_update_replaces_the_copys_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    // The copy receives this in the handshake, so it holds `events` before
+    // the update.
+    let mut seed = source_meta("a");
+    seed.metadata.insert(
+        dendro::keys::EVENTS.to_string(),
+        r#"{"events":[{"timestamp":0,"description":"old"}]}"#.to_string(),
+    );
+    let mut w = archive.add_source(seed).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+    sub.sync().unwrap();
+
+    let events = r#"{"events":[{"timestamp":1,"description":"publisher"}]}"#;
+    w.update_metadata(BTreeMap::from([(
+        dendro::keys::EVENTS.to_string(),
+        events.to_string(),
+    )]))
+    .unwrap();
+    w.sync().unwrap();
+    sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    let (_, metadata) = identity(&copy);
+    assert_eq!(
+        metadata.get(dendro::keys::EVENTS).map(String::as_str),
+        Some(events)
+    );
 }

@@ -67,6 +67,7 @@ const KIND_INDEX: u8 = 2;
 const KIND_ROWS: u8 = 3;
 const KIND_SEGMENT: u8 = 4;
 const KIND_CLOCK_OFFSET: u8 = 5;
+const KIND_SOURCE_UPDATE: u8 = 6;
 
 const INDEX_FULL: u8 = 0;
 const INDEX_DELTA: u8 = 1;
@@ -238,6 +239,18 @@ pub fn encode_frame(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
             put_u32(out, *source);
             put_i64(out, *ts);
             put_i64(out, *offset_ns);
+        }
+        Frame::SourceUpdate {
+            source,
+            ts,
+            labels,
+            metadata,
+        } => {
+            put_u8(out, KIND_SOURCE_UPDATE);
+            put_u32(out, *source);
+            put_i64(out, *ts);
+            put_map(out, labels)?;
+            put_map(out, metadata)?;
         }
     }
 
@@ -461,6 +474,12 @@ fn decode_known(payload: &[u8]) -> Result<Option<Frame>> {
             ts: c.i64()?,
             offset_ns: c.i64()?,
         },
+        KIND_SOURCE_UPDATE => Frame::SourceUpdate {
+            source: c.u32()?,
+            ts: c.i64()?,
+            labels: c.map()?,
+            metadata: c.map()?,
+        },
         _ => return Ok(None),
     };
     c.finish()?;
@@ -665,6 +684,18 @@ mod tests {
                 source: 4,
                 ts: i64::MIN,
                 offset_ns: i64::MAX,
+            },
+            Frame::SourceUpdate {
+                source: 5,
+                ts: 1_700_000_000_000_000_000,
+                labels: map(&[("host", "a"), ("source", "x")]),
+                metadata: map(&[("metriken.layer.user", "{}")]),
+            },
+            Frame::SourceUpdate {
+                source: 6,
+                ts: -1,
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
             },
         ];
 

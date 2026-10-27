@@ -2113,6 +2113,14 @@ impl Archive {
             .map_err(Error::sqlite(format!("failed to size {stream}")))
     }
 
+    /// The wall clock in nanoseconds since the Unix epoch, read through
+    /// SQLite so it works where `SystemTime::now` panics
+    /// (`wasm32-unknown-unknown`).
+    /// Millisecond resolution.
+    pub(crate) fn wall_now_ns(&self) -> Result<i64> {
+        documents::wall_now_ns(&self.conn)
+    }
+
     /// The newest SEALED row of every stream, as `source -> stream ->
     /// last_ts`.
     ///
@@ -2881,6 +2889,34 @@ impl ArchiveMut {
         self.update_source_metadata(source_id, &metadata)
     }
 
+    /// Replace one source's labels and metadata together. The keys this
+    /// archive's writer maintains for the source,
+    /// [`ENCODER`](crate::keys::ENCODER) and
+    /// [`WRITER_SESSIONS`](crate::keys::WRITER_SESSIONS), keep their stored
+    /// values where the source has them: they describe this file's encoder
+    /// and writer sessions, which a new identity does not change, and a
+    /// copy's differ from its original's. Every other key is as given, so a
+    /// key absent from `metadata` is removed. That includes
+    /// [`EVENTS`](crate::keys::EVENTS), with any `writer_session` event dendro
+    /// appended at a resume; a caller that keeps it passes it back.
+    /// [`SourceWriter::set_identity`](crate::writer::SourceWriter::set_identity)
+    /// is this on the writer thread.
+    pub fn set_source_identity(
+        &mut self,
+        source_id: i64,
+        labels: &BTreeMap<String, String>,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let stored = self.db.source_metadata(source_id)?;
+        let mut metadata = metadata.clone();
+        for key in [crate::keys::ENCODER, crate::keys::WRITER_SESSIONS] {
+            if let Some(value) = stored.get(key) {
+                metadata.insert(key.to_string(), value.clone());
+            }
+        }
+        self.transaction(|tx| tx.set_source_identity(source_id, labels, &metadata))
+    }
+
     /// Replace one source's metadata map.
     ///
     /// In place rather than through a copy because metadata is a catalog
@@ -3243,6 +3279,33 @@ impl Transaction<'_> {
             .map_err(Error::sqlite(format!(
                 "failed to mark source {source_id} complete"
             )))?;
+        Ok(())
+    }
+
+    /// Replace a source's labels and metadata together, so a reader sees
+    /// both maps from before or both from after. Both are written as given;
+    /// [`ArchiveMut::set_source_identity`] is the form that keeps the keys
+    /// the archive's writer maintains.
+    pub fn set_source_identity(
+        &self,
+        source_id: i64,
+        labels: &BTreeMap<String, String>,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let labels = serde_json::to_string(labels)
+            .map_err(|e| Error::Message(format!("failed to encode source labels: {e}")))?;
+        let metadata = serde_json::to_string(metadata)
+            .map_err(|e| Error::Message(format!("failed to encode source metadata: {e}")))?;
+        let changed = self
+            .tx
+            .execute(
+                "UPDATE sources SET labels = ?1, metadata = ?2 WHERE id = ?3",
+                rusqlite::params![labels, metadata, source_id],
+            )
+            .map_err(Error::sqlite("failed to update source identity"))?;
+        if changed == 0 {
+            return Err(Error::Message(format!("no source with id {source_id}")));
+        }
         Ok(())
     }
 

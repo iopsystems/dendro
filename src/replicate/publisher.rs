@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::archive::Archive;
+use crate::archive::{Archive, SourceRow};
 use crate::error::{Error, Result};
 
 use super::frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
@@ -75,6 +75,10 @@ struct SourceCursor {
     /// Whether the opening batch has sent its `Full`. Only the first index
     /// batch is `Full`; see [`ArchivePublisher`].
     sent_full: bool,
+    /// The labels and metadata last sent, in the handshake or a
+    /// `SourceUpdate`, compared on each poll.
+    labels: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
 }
 
 /// Publishes an archive's contents as frames.
@@ -95,8 +99,10 @@ struct SourceCursor {
 /// [`tailing`](Self::tailing) starts from the archive's present and ships only
 /// what arrives after it.
 ///
-/// **Only the opening catch-up batch emits `Segment` frames.** Once tailing,
-/// rows are shipped as [`Rows`](Frame::Rows) and the subscriber seals its own;
+/// **Only a source's opening batch emits `Segment` frames**: the publisher's
+/// first batch, or the batch in which [`next`](Self::next) first sees a source
+/// created after it opened. After that a source's rows are shipped as
+/// [`Rows`](Frame::Rows) and the subscriber seals its own;
 /// shipping the publisher's segment as well would offer the subscriber a
 /// segment covering rows it already holds unsealed, which
 /// [`adopt_segment`](crate::writer::SourceWriter::adopt_segment) refuses.
@@ -135,6 +141,20 @@ struct SourceCursor {
 /// Archive-to-archive copying with no retention in play is unaffected, which is
 /// the case this publisher was built for.
 ///
+/// # Identity changes and new sources
+///
+/// Each [`next`](Self::next) reads the archive's sources again. A source whose
+/// labels or metadata differ from what was last sent gets a
+/// [`SourceUpdate`](Frame::SourceUpdate) carrying both maps, ahead of its other
+/// frames in that batch; its `ts` is the wall time of the poll, since the
+/// archive records no time for the change. A source created after the
+/// publisher opened gets a [`Handshake`](Frame::Handshake) with the next
+/// ordinal, then its segments and clock offsets from the `since` of
+/// [`catching_up`](Self::catching_up) (all of them for
+/// [`tailing`](Self::tailing)), its index entries and its live rows, as the
+/// opening catch-up ships them, then its first `Rows` frame. A change that is undone between two
+/// polls is not seen.
+///
 /// # Polling and the seal
 ///
 /// A tailing publisher reads the **live** WAL tail, which is by definition the
@@ -146,6 +166,9 @@ struct SourceCursor {
 /// segment frames are for.
 pub struct ArchivePublisher {
     sources: Vec<SourceCursor>,
+    /// Where a source created after opening starts: the `since` of
+    /// [`catching_up`](Self::catching_up), else its first row.
+    since: i64,
 }
 
 impl std::fmt::Debug for ArchivePublisher {
@@ -188,8 +211,41 @@ impl ArchivePublisher {
         // have returned, and the seam then reads as a hole.
         db.read_snapshot(|db| {
             let mut out = Vec::new();
+            let mut records = db.read_sources()?;
+            let mut polled_at = None;
             for cursor in &mut self.sources {
+                if let Some(rec) = records.iter().find(|r| r.id == cursor.source_id) {
+                    if rec.meta.labels != cursor.labels || rec.meta.metadata != cursor.metadata {
+                        let ts = match polled_at {
+                            Some(ts) => ts,
+                            None => *polled_at.insert(db.wall_now_ns()?),
+                        };
+                        cursor.labels = rec.meta.labels.clone();
+                        cursor.metadata = rec.meta.metadata.clone();
+                        out.push(Frame::SourceUpdate {
+                            source: cursor.ordinal,
+                            ts,
+                            labels: cursor.labels.clone(),
+                            metadata: cursor.metadata.clone(),
+                        });
+                    }
+                }
                 cursor.poll(db, &mut out)?;
+            }
+
+            records.retain(|r| !self.sources.iter().any(|c| c.source_id == r.id));
+            if !records.is_empty() {
+                let watermarks = db.sealed_watermarks()?;
+                for rec in records {
+                    let ordinal = next_ordinal(self.sources.len())?;
+                    // Everything the new source holds was written after this
+                    // publisher opened, so it is shipped from where the
+                    // publisher's own catch-up started.
+                    let since = Some(self.since);
+                    let mut cursor = open_source(db, &rec, ordinal, since, &watermarks, &mut out)?;
+                    cursor.poll(db, &mut out)?;
+                    self.sources.push(cursor);
+                }
             }
             Ok(out)
         })
@@ -212,100 +268,128 @@ impl ArchivePublisher {
         let watermarks = db.sealed_watermarks()?;
 
         for (ordinal, rec) in db.read_sources()?.into_iter().enumerate() {
-            let ordinal = u32::try_from(ordinal).map_err(|_| {
-                Error::Message("an archive with more than u32::MAX sources".to_string())
-            })?;
-            frames.push(Frame::Handshake {
-                source: ordinal,
-                uuid: rec.uuid.clone(),
-                labels: rec.meta.labels.clone(),
-                metadata: rec.meta.metadata.clone(),
-                clock_anchor_wall_ns: rec.meta.clock_anchor_wall_ns,
-                complete: rec.complete,
-            });
-
-            let mut cursor = SourceCursor {
+            let ordinal = next_ordinal(ordinal)?;
+            sources.push(open_source(
+                db,
+                &rec,
                 ordinal,
-                source_id: rec.id,
-                streams: BTreeMap::new(),
-                clock_after: None,
-                seq: 0,
-                index_state: NO_INDEX_STATE,
-                sent_full: false,
-            };
-
-            // Index entries first, so nothing below can reference identity that
-            // has not been sent (rule 4). Their own names rather than the
-            // streams', because a series kept under a name no stream uses is
-            // still the caller's to keep — the same rule `copy_sources_into`
-            // follows.
-            for name in db.caller_row_streams(rec.id)? {
-                cursor.streams.entry(name.clone()).or_default();
-                cursor.emit_index(db, &name, since.unwrap_or(i64::MIN), &mut frames)?;
-            }
-
-            for stream in db.all_streams(rec.id)? {
-                let entry = cursor.streams.entry(stream.clone()).or_default();
-                let watermark = watermarks
-                    .get(&rec.id)
-                    .and_then(|m| m.get(&stream))
-                    .copied();
-
-                match since {
-                    // Catch-up: every segment overlapping the window, whole.
-                    Some(since) => {
-                        for segment in db.segments_overlapping(rec.id, &stream, since, i64::MAX)? {
-                            frames.push(Frame::Segment {
-                                source: ordinal,
-                                stream: stream.clone(),
-                                meta: segment.meta,
-                                bytes: segment.bytes,
-                                caller_index: segment.caller_index,
-                            });
-                        }
-                        // Everything up to the watermark has now been shipped,
-                        // as segments. Starting the cursor there rather than at
-                        // nothing is what lets the seal check below work the
-                        // same way in both modes.
-                        entry.wal_after = watermark;
-                    }
-                    // Tailing: start past everything the archive already holds,
-                    // so the first poll ships only what arrived after this.
-                    None => {
-                        let live = db.live_wal_span(rec.id, &stream)?;
-                        cursor
-                            .streams
-                            .get_mut(&stream)
-                            .expect("just inserted")
-                            .wal_after = live.last_ts.or(watermark);
-                    }
-                }
-            }
-
-            // Clock offsets, bounded the same way.
-            for (ts, offset) in db.read_clock_offsets(rec.id)? {
-                match since {
-                    Some(since) if ts < since => continue,
-                    _ => {}
-                }
-                if since.is_none() {
-                    // Tailing: these are already in the archive's past.
-                    cursor.clock_after = Some(ts);
-                    continue;
-                }
-                frames.push(Frame::ClockOffset {
-                    source: ordinal,
-                    ts,
-                    offset_ns: offset,
-                });
-                cursor.clock_after = Some(ts);
-            }
-
-            sources.push(cursor);
+                since,
+                &watermarks,
+                &mut frames,
+            )?);
         }
 
-        Ok((ArchivePublisher { sources }, frames))
+        let since = since.unwrap_or(i64::MIN);
+        Ok((ArchivePublisher { sources, since }, frames))
     }
+}
+
+/// The ordinal for the source at `index` in the order the publisher read them.
+fn next_ordinal(index: usize) -> Result<u32> {
+    u32::try_from(index)
+        .map_err(|_| Error::Message("an archive with more than u32::MAX sources".to_string()))
+}
+
+/// One source's handshake and opening batch, and the cursor that tails it.
+/// `since` present means catch up from there; absent means start at the
+/// present.
+fn open_source(
+    db: &Archive,
+    rec: &SourceRow,
+    ordinal: u32,
+    since: Option<i64>,
+    watermarks: &BTreeMap<i64, BTreeMap<String, i64>>,
+    frames: &mut Vec<Frame>,
+) -> Result<SourceCursor> {
+    frames.push(Frame::Handshake {
+        source: ordinal,
+        uuid: rec.uuid.clone(),
+        labels: rec.meta.labels.clone(),
+        metadata: rec.meta.metadata.clone(),
+        clock_anchor_wall_ns: rec.meta.clock_anchor_wall_ns,
+        complete: rec.complete,
+    });
+
+    let mut cursor = SourceCursor {
+        ordinal,
+        source_id: rec.id,
+        streams: BTreeMap::new(),
+        clock_after: None,
+        seq: 0,
+        index_state: NO_INDEX_STATE,
+        sent_full: false,
+        labels: rec.meta.labels.clone(),
+        metadata: rec.meta.metadata.clone(),
+    };
+
+    // Index entries first, so nothing below can reference identity that
+    // has not been sent (rule 4). Their own names rather than the
+    // streams', because a series kept under a name no stream uses is
+    // still the caller's to keep — the same rule `copy_sources_into`
+    // follows.
+    for name in db.caller_row_streams(rec.id)? {
+        cursor.streams.entry(name.clone()).or_default();
+        cursor.emit_index(db, &name, since.unwrap_or(i64::MIN), frames)?;
+    }
+
+    for stream in db.all_streams(rec.id)? {
+        let entry = cursor.streams.entry(stream.clone()).or_default();
+        let watermark = watermarks
+            .get(&rec.id)
+            .and_then(|m| m.get(&stream))
+            .copied();
+
+        match since {
+            // Catch-up: every segment overlapping the window, whole.
+            Some(since) => {
+                for segment in db.segments_overlapping(rec.id, &stream, since, i64::MAX)? {
+                    frames.push(Frame::Segment {
+                        source: ordinal,
+                        stream: stream.clone(),
+                        meta: segment.meta,
+                        bytes: segment.bytes,
+                        caller_index: segment.caller_index,
+                    });
+                }
+                // Everything up to the watermark has now been shipped,
+                // as segments. Starting the cursor there rather than at
+                // nothing is what lets the seal check below work the
+                // same way in both modes.
+                entry.wal_after = watermark;
+            }
+            // Tailing: start past everything the archive already holds,
+            // so the first poll ships only what arrived after this.
+            None => {
+                let live = db.live_wal_span(rec.id, &stream)?;
+                cursor
+                    .streams
+                    .get_mut(&stream)
+                    .expect("just inserted")
+                    .wal_after = live.last_ts.or(watermark);
+            }
+        }
+    }
+
+    // Clock offsets, bounded the same way.
+    for (ts, offset) in db.read_clock_offsets(rec.id)? {
+        match since {
+            Some(since) if ts < since => continue,
+            _ => {}
+        }
+        if since.is_none() {
+            // Tailing: these are already in the archive's past.
+            cursor.clock_after = Some(ts);
+            continue;
+        }
+        frames.push(Frame::ClockOffset {
+            source: ordinal,
+            ts,
+            offset_ns: offset,
+        });
+        cursor.clock_after = Some(ts);
+    }
+
+    Ok(cursor)
 }
 
 impl SourceCursor {

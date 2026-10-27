@@ -42,6 +42,12 @@ pub struct Applied {
     pub clock_offsets: usize,
     /// Sources opened.
     pub sources: usize,
+    /// [`SourceUpdate`](Frame::SourceUpdate) frames handed to the writer. A
+    /// write that fails is logged and dropped, as
+    /// [`update_metadata`](crate::writer::SourceWriter::update_metadata)'s
+    /// is, and the copy keeps its previous identity until the next update or
+    /// a reconnect.
+    pub source_updates: usize,
     /// Whether this frame's sequence number skipped one, which means a `Rows`
     /// frame was lost in transit. The rows that did arrive are still good; see
     /// rule 6 in [the module docs](crate::replicate).
@@ -266,6 +272,22 @@ impl Subscriber {
                     ..Applied::default()
                 })
             }
+
+            // `ts` is the publisher's poll time; the archive has nowhere to
+            // keep it (FORMAT.md §3.1), so it is not written.
+            Frame::SourceUpdate {
+                source,
+                ts: _,
+                labels,
+                metadata,
+            } => {
+                let st = Self::source_mut(&mut self.sources, source)?;
+                st.writer.set_identity(labels, metadata)?;
+                Ok(Applied {
+                    source_updates: 1,
+                    ..Applied::default()
+                })
+            }
         }
     }
 
@@ -285,6 +307,7 @@ impl Subscriber {
             total.index_entries += one.index_entries;
             total.clock_offsets += one.clock_offsets;
             total.sources += one.sources;
+            total.source_updates += one.source_updates;
             total.gap |= one.gap;
         }
         Ok(total)

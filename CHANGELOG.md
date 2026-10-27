@@ -33,6 +33,34 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `Frame::SourceUpdate` (wire kind 6, WIRE.md §4.6): a source's labels and
+  metadata after its handshake, both maps whole, and `ts`, the publisher's
+  wall time when it saw the change. `Subscriber` replaces its copy's labels
+  and metadata with them, so a removed key is removed, and counts them in
+  `Applied::source_updates`. A `FrameReader` on dendro 0.3.0 or later that
+  does not know the kind skips it (WIRE.md §7); `wire::decode_payload`
+  refuses it.
+- `SourceWriter::set_identity` and `ArchiveMut::set_source_identity`, which
+  replace a source's labels and metadata in one transaction, keeping the
+  stored `encoder` and `writer_sessions`, which describe the file's own
+  encoder and writer sessions, and `Transaction::set_source_identity`, which
+  writes both maps as given.
+
+### Changed
+
+- `ArchivePublisher::next` reads the archive's sources on every poll. It sends
+  a `SourceUpdate` for a source whose labels or metadata changed since they
+  were last sent, ahead of that source's other frames, and a `Handshake`,
+  with the next ordinal, for a source created after the publisher opened,
+  followed by what the opening catch-up would ship for it: segments and clock
+  offsets from `catching_up`'s `since` (all of them for `tailing`), index
+  entries and live rows. Before this the publisher read the sources once,
+  when it opened, so a subscriber kept the identity it saw at connect and
+  never received a source added later. A caller of `next` that assumed a
+  fixed set of sources now sees handshakes after the first batch.
+
 ## [0.6.0] - 2026-10-19
 
 This is 0.6.0, not 0.5.2. Archives this release creates are schema version

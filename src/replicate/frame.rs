@@ -1,7 +1,9 @@
 //! What a publisher emits and a subscriber applies.
 //!
 //! One frame type per per-source table in the set `rewrite` copies, so the
-//! frame set has a completeness check rather than a guess. The archive-level
+//! frame set has a completeness check rather than a guess, plus
+//! [`SourceUpdate`](Frame::SourceUpdate) for a change to a row of `sources`
+//! after its handshake. The archive-level
 //! `documents` table has none; see the module docs. No I/O here; [`wire`](super::wire)
 //! turns these into bytes.
 
@@ -202,6 +204,27 @@ pub enum Frame {
         /// Wall time minus `ts` at that moment.
         offset_ns: i64,
     },
+
+    /// A source's labels and metadata, sent when either changes after the
+    /// source's handshake. Bound for `sources`.
+    ///
+    /// Carries the whole of both maps, not the keys that changed, and the
+    /// subscriber replaces its copy's with them, so a key the publisher
+    /// removed is removed. The copy keeps its own `encoder` and
+    /// `writer_sessions` where it has them, since its writer maintains them.
+    SourceUpdate {
+        /// Which source, by handshake ordinal.
+        source: u32,
+        /// When the publisher saw the change, in nanoseconds since the Unix
+        /// epoch. An archive records no time for a metadata change, so an
+        /// [`ArchivePublisher`](crate::replicate::ArchivePublisher) sends the
+        /// wall time of the poll that read it. Not stored by the subscriber.
+        ts: i64,
+        /// The source's labels. See [`SourceMeta::labels`](crate::archive::SourceMeta).
+        labels: BTreeMap<String, String>,
+        /// The source's metadata, reserved keys included.
+        metadata: BTreeMap<String, String>,
+    },
 }
 
 impl Frame {
@@ -212,7 +235,8 @@ impl Frame {
             | Frame::Index { source, .. }
             | Frame::Rows { source, .. }
             | Frame::Segment { source, .. }
-            | Frame::ClockOffset { source, .. } => *source,
+            | Frame::ClockOffset { source, .. }
+            | Frame::SourceUpdate { source, .. } => *source,
         }
     }
 }

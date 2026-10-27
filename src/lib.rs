@@ -241,7 +241,11 @@ pub mod keys {
     /// <stable id>? }, … ]}`. `kind` `producer_epoch` marks a counter reset;
     /// `writer_session` marks a resume; `id` lets a merge de-duplicate. The
     /// shape is open, so a viewer's own event schema can carry more fields,
-    /// and dendro appends to the array rather than replacing it.
+    /// and dendro appends to the array rather than replacing it, except
+    /// `ArchiveMut::set_source_identity` and `SourceWriter::set_identity`,
+    /// which write it as given; a replication
+    /// [`SourceUpdate`](crate::replicate::Frame::SourceUpdate) uses them, so a
+    /// copy's `events` becomes its original's.
     pub const EVENTS: &str = "events";
     /// The version of the **software that produced the source's values**, as
     /// an opaque string. dendro stores it, displays nothing, and never parses

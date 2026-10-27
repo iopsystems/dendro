@@ -132,6 +132,14 @@ enum Msg {
         source_id: i64,
         patch: BTreeMap<String, String>,
     },
+    /// Replace one source's labels and metadata, in order with the ticks
+    /// around it. A replication subscriber's
+    /// [`SourceUpdate`](crate::replicate::Frame::SourceUpdate).
+    SetIdentity {
+        source_id: i64,
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+    },
     /// One clock-drift observation, committed on its own.
     ///
     /// The writer records these itself at every seal and at finalize
@@ -806,7 +814,9 @@ pub struct SourceWriter {
     /// Set on a resumed source: every row this session commits must be
     /// stamped after it. See [`Writer::resume_source`].
     floor_ts: Option<i64>,
-    /// This source's stagger identity — its canonical label set. Held here
+    /// This source's stagger identity — its canonical label set at
+    /// `add_source`, which [`set_identity`](Self::set_identity) does not
+    /// change. Held here
     /// so the seal policy can desync tables ACROSS sources as well as
     /// within one; see `stagger_bucket`.
     stagger_key: String,
@@ -1044,6 +1054,34 @@ impl SourceWriter {
         self.send(Msg::UpdateMetadata {
             source_id: self.source_id,
             patch,
+        })
+    }
+
+    /// Replace this source's labels and metadata with these, ordered with
+    /// the ticks around it and committed on its own. Fire-and-forget like
+    /// `wal`, and never fatal, for the reason
+    /// [`update_metadata`](Self::update_metadata) gives.
+    ///
+    /// Both maps are replaced whole, so a key absent from them is removed,
+    /// except the keys this writer maintains, `encoder` and
+    /// `writer_sessions`, which keep their stored values where the source has
+    /// them; `events` is written
+    /// as given, including a `writer_session` event dendro appended at a
+    /// resume (see
+    /// [`ArchiveMut::set_source_identity`](crate::archive::ArchiveMut::set_source_identity)).
+    /// A recording adds keys with `update_metadata`; this is for a caller
+    /// carrying an identity somebody else changed, such as a replication
+    /// subscriber applying a
+    /// [`SourceUpdate`](crate::replicate::Frame::SourceUpdate).
+    pub fn set_identity(
+        &mut self,
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.send(Msg::SetIdentity {
+            source_id: self.source_id,
+            labels,
+            metadata,
         })
     }
 
@@ -2009,6 +2047,18 @@ fn writer_loop(
                         "metadata update for source {source_id} dropped ({e}); keys: {:?}",
                         patch.keys().collect::<Vec<_>>()
                     );
+                }
+            }
+            Ok(Msg::SetIdentity {
+                source_id,
+                labels,
+                metadata,
+            }) => {
+                // Never fatal, as `UpdateMetadata`.
+                if let Err(e) = with_retries("replacing source identity", || {
+                    db.set_source_identity(source_id, &labels, &metadata)
+                }) {
+                    warn!("identity update for source {source_id} dropped ({e})");
                 }
             }
             Ok(Msg::PutDocument { put, reply }) => {
