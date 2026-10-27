@@ -1155,3 +1155,84 @@ fn an_update_replaces_the_copys_events() {
         Some(events)
     );
 }
+
+/// A stream the publisher has shipped nothing of, sealed before a poll read
+/// it, arrives as segments rather than losing the sealed rows: on a source
+/// created after the publisher opened, and on a stream new to a source it
+/// opened with.
+#[test]
+fn a_stream_sealed_before_its_first_poll_ships_its_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(source_meta("a")).unwrap();
+    a.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // `b` is handshaken while empty, so its stream is first seen later.
+    let mut b = archive.add_source(source_meta("b")).unwrap();
+    b.sync().unwrap();
+    sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+
+    for w in [&mut a, &mut b] {
+        w.wal(vec![row("s", 1_000), row("s", 2_000)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+        w.wal(vec![row("s", 3_000)]).unwrap();
+        w.sync().unwrap();
+    }
+    let applied = sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+    assert_eq!((applied.segments, applied.rows), (2, 2));
+
+    drop((a, b));
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    for source in readable(&copy) {
+        assert_eq!(
+            source.streams["s"].iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000],
+            "{:?}",
+            source.labels
+        );
+    }
+}
+
+/// Under `catching_up`, a stream with only live rows when the publisher
+/// opened has no cursor; a seal before the first poll ships those rows as a
+/// segment too.
+#[test]
+fn a_live_only_stream_sealed_before_the_first_poll_is_caught_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(source_meta("a")).unwrap();
+    a.wal(vec![row("s", 1_000)]).unwrap();
+    a.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) =
+        dendro::replicate::ArchivePublisher::catching_up(&db, 0).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    a.wal(vec![row("s", 2_000)]).unwrap();
+    a.seal(vec!["s".to_string()]).unwrap();
+    a.wal(vec![row("s", 3_000)]).unwrap();
+    a.sync().unwrap();
+    sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+
+    drop(a);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+    assert_eq!(readable(&copy), readable(&origin));
+}

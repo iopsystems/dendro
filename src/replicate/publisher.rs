@@ -99,11 +99,14 @@ struct SourceCursor {
 /// [`tailing`](Self::tailing) starts from the archive's present and ships only
 /// what arrives after it.
 ///
-/// **Only a source's opening batch emits `Segment` frames**: the publisher's
-/// first batch, or the batch in which [`next`](Self::next) first sees a source
-/// created after it opened. After that a source's rows are shipped as
-/// [`Rows`](Frame::Rows) and the subscriber seals its own;
-/// shipping the publisher's segment as well would offer the subscriber a
+/// **`Segment` frames come only from a source's or a stream's opening
+/// batch**: the publisher's first batch, the batch in which
+/// [`next`](Self::next) first sees a source created after it opened, or the
+/// batch in which it first sees sealed rows of a stream it has shipped no row
+/// of (a stream with no segments when the publisher opened, or that did not
+/// exist then, sealed before a poll read its rows). After that a stream's
+/// rows are shipped as [`Rows`](Frame::Rows) and the subscriber seals its
+/// own; shipping the publisher's segment as well would offer the subscriber a
 /// segment covering rows it already holds unsealed, which
 /// [`adopt_segment`](crate::writer::SourceWriter::adopt_segment) refuses.
 ///
@@ -163,7 +166,8 @@ struct SourceCursor {
 /// the source seals would miss them. [`next`](Self::next) **detects that and
 /// returns an error** naming the stream rather than shipping a stream with a
 /// hole in it; the caller reconnects with `catching_up`, which is what the
-/// segment frames are for.
+/// segment frames are for. A stream this publisher has shipped no row of has
+/// nothing to have missed; its segments are shipped instead (see above).
 pub struct ArchivePublisher {
     sources: Vec<SourceCursor>,
     /// Where a source created after opening starts: the `since` of
@@ -499,6 +503,26 @@ impl SourceCursor {
             // watermark AT the cursor is the ordinary case (the publisher
             // shipped those rows and the source then sealed them) and only a
             // watermark PAST it means rows went by unread.
+            //
+            // No row of a stream with no cursor has been shipped: it had no
+            // segments when the publisher opened (or did not exist yet), and
+            // no poll has read its live tail since. The subscriber holds none
+            // of its rows, so its segments are shipped whole and the cursor
+            // starts at the watermark.
+            if let (Some(w), None) = (watermark, entry.wal_after) {
+                for segment in
+                    db.segments_overlapping(self.source_id, &stream, i64::MIN, i64::MAX)?
+                {
+                    out.push(Frame::Segment {
+                        source: self.ordinal,
+                        stream: stream.clone(),
+                        meta: segment.meta,
+                        bytes: segment.bytes,
+                        caller_index: segment.caller_index,
+                    });
+                }
+                entry.wal_after = Some(w);
+            }
             if let (Some(w), Some(after)) = (watermark, entry.wal_after) {
                 if w > after {
                     return Err(Error::Message(format!(

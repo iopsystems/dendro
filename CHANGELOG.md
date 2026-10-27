@@ -38,15 +38,17 @@ cannot reach a failed release any other way.
 - `Frame::SourceUpdate` (wire kind 6, WIRE.md §4.6): a source's labels and
   metadata after its handshake, both maps whole, and `ts`, the publisher's
   wall time when it saw the change. `Subscriber` replaces its copy's labels
-  and metadata with them, so a removed key is removed, and counts them in
-  `Applied::source_updates`. A `FrameReader` on dendro 0.3.0 or later that
-  does not know the kind skips it (WIRE.md §7); `wire::decode_payload`
-  refuses it.
+  and metadata with them, except the copy's `encoder` and `writer_sessions`
+  where it has them; any other key the publisher removed is removed. It
+  counts them in `Applied::source_updates`. A `FrameReader` on dendro 0.3.0
+  or later that does not know the kind skips it (WIRE.md §7);
+  `wire::decode_payload` before this release refuses it.
 - `SourceWriter::set_identity` and `ArchiveMut::set_source_identity`, which
   replace a source's labels and metadata in one transaction, keeping the
-  stored `encoder` and `writer_sessions`, which describe the file's own
-  encoder and writer sessions, and `Transaction::set_source_identity`, which
-  writes both maps as given.
+  source's `encoder` and `writer_sessions` where it has them, since they
+  describe the file's own encoder and writer sessions; every other key,
+  `events` included, is replaced. `Transaction::set_source_identity` writes
+  both maps as given.
 
 ### Changed
 
@@ -60,6 +62,17 @@ cannot reach a failed release any other way.
   when it opened, so a subscriber kept the identity it saw at connect and
   never received a source added later. A caller of `next` that assumed a
   fixed set of sources now sees handshakes after the first batch.
+
+### Fixed
+
+- `ArchivePublisher::next` ships the sealed rows of a stream it has shipped
+  no row of as `Segment` frames. A stream with no segments when the
+  publisher opened, or that did not exist then (or, under `catching_up`, one
+  that held only live rows), sealed before a poll read its rows, lost those
+  rows without an error: its cursor had nothing to compare the seal's
+  watermark with, and the live tail held only the rows after the seal. Every
+  stream of a source created after the publisher opened, and handshaken
+  before it had rows, took that path.
 
 ## [0.6.0] - 2026-10-19
 
