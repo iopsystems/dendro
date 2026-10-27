@@ -210,9 +210,8 @@ pub enum Frame {
     ///
     /// Carries the whole of both maps, not the keys that changed, and the
     /// subscriber replaces its copy's with them, so a key the publisher
-    /// removed is removed. The copy
-    /// keeps its own `encoder` and `writer_sessions`, which its writer
-    /// maintains.
+    /// removed is removed. The copy keeps its own `encoder` and
+    /// `writer_sessions` where it has them, since its writer maintains them.
     SourceUpdate {
         /// Which source, by handshake ordinal.
         source: u32,

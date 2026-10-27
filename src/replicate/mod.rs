@@ -52,7 +52,10 @@
 //! `caller_rows` and `wal`.
 //!
 //! 1. A [`Handshake`](crate::replicate::Frame::Handshake) identifies a source — uuid, metadata,
-//!    labels — and assigns the ordinal its later frames carry.
+//!    labels — and assigns the ordinal its later frames carry. A handshake may
+//!    arrive at any point in the stream, for a source the publisher has just
+//!    seen; a later change to the source's labels or metadata is a
+//!    [`SourceUpdate`](crate::replicate::Frame::SourceUpdate).
 //! 2. The first [`Index`](crate::replicate::Frame::Index) frame carries complete current state,
 //!    including streams that exist but have never been observed.
 //! 3. The first [`Rows`](crate::replicate::Frame::Rows) frame carries the latest observation of
@@ -82,8 +85,6 @@
 //!    [`CallerRowFloor`](crate::archive::CallerRowFloor). [`Subscriber`](crate::replicate::Subscriber)
 //!    records no entry kinds and has no retention of its own.
 //! 8. A reconnect is a new handshake and full state. There is no resume token.
-//!    A change to a source's labels or metadata after its handshake is a
-//!    [`SourceUpdate`](crate::replicate::Frame::SourceUpdate).
 //! 9. A row carries the [`IndexState`](crate::replicate::IndexState) it was built against, and a subscriber
 //!    that cannot match it **skips the row**. Misattribution is worse than a
 //!    gap.

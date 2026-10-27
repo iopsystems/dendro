@@ -99,8 +99,10 @@ struct SourceCursor {
 /// [`tailing`](Self::tailing) starts from the archive's present and ships only
 /// what arrives after it.
 ///
-/// **Only the opening catch-up batch emits `Segment` frames.** Once tailing,
-/// rows are shipped as [`Rows`](Frame::Rows) and the subscriber seals its own;
+/// **Only a source's opening batch emits `Segment` frames**: the publisher's
+/// first batch, or the batch in which [`next`](Self::next) first sees a source
+/// created after it opened. After that a source's rows are shipped as
+/// [`Rows`](Frame::Rows) and the subscriber seals its own;
 /// shipping the publisher's segment as well would offer the subscriber a
 /// segment covering rows it already holds unsealed, which
 /// [`adopt_segment`](crate::writer::SourceWriter::adopt_segment) refuses.
@@ -147,10 +149,10 @@ struct SourceCursor {
 /// frames in that batch; its `ts` is the wall time of the poll, since the
 /// archive records no time for the change. A source created after the
 /// publisher opened gets a [`Handshake`](Frame::Handshake) with the next
-/// ordinal, then what it holds from the `since` of
-/// [`catching_up`](Self::catching_up) (from its first row for
-/// [`tailing`](Self::tailing)), shipped as that catch-up ships it, then its
-/// first `Rows` frame. A change that is undone between two
+/// ordinal, then its segments and clock offsets from the `since` of
+/// [`catching_up`](Self::catching_up) (all of them for
+/// [`tailing`](Self::tailing)), its index entries and its live rows, as the
+/// opening catch-up ships them, then its first `Rows` frame. A change that is undone between two
 /// polls is not seen.
 ///
 /// # Polling and the seal

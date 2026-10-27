@@ -1109,3 +1109,49 @@ fn a_source_created_later_is_caught_up_from_since() {
         vec![6_000, 7_000]
     );
 }
+
+/// `events` is not one of the keys a copy keeps: an update replaces the
+/// copy's with the publisher's.
+#[test]
+fn an_update_replaces_the_copys_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    // The copy receives this in the handshake, so it holds `events` before
+    // the update.
+    let mut seed = source_meta("a");
+    seed.metadata.insert(
+        dendro::keys::EVENTS.to_string(),
+        r#"{"events":[{"timestamp":0,"description":"old"}]}"#.to_string(),
+    );
+    let mut w = archive.add_source(seed).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+    sub.sync().unwrap();
+
+    let events = r#"{"events":[{"timestamp":1,"description":"publisher"}]}"#;
+    w.update_metadata(BTreeMap::from([(
+        dendro::keys::EVENTS.to_string(),
+        events.to_string(),
+    )]))
+    .unwrap();
+    w.sync().unwrap();
+    sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    let (_, metadata) = identity(&copy);
+    assert_eq!(
+        metadata.get(dendro::keys::EVENTS).map(String::as_str),
+        Some(events)
+    );
+}

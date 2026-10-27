@@ -1064,7 +1064,8 @@ impl SourceWriter {
     ///
     /// Both maps are replaced whole, so a key absent from them is removed,
     /// except the keys this writer maintains, `encoder` and
-    /// `writer_sessions`, which keep their stored values; `events` is written
+    /// `writer_sessions`, which keep their stored values where the source has
+    /// them; `events` is written
     /// as given, including a `writer_session` event dendro appended at a
     /// resume (see
     /// [`ArchiveMut::set_source_identity`](crate::archive::ArchiveMut::set_source_identity)).

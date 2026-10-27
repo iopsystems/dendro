@@ -238,7 +238,7 @@ handshake; the source's other fields (`uuid`, `clock_anchor_wall_ns`,
 `complete`) are not carried. Both maps are whole, not the keys that changed,
 and the subscriber replaces its copy's with them, so a key the publisher
 removed is removed. The copy keeps its own `encoder` and `writer_sessions`
-(`FORMAT.md` §6), which its writer maintains. A copy whose handshake was read
+(`FORMAT.md` §6) where it has them, since its writer maintains them. A copy whose handshake was read
 before the publisher's writer recorded its session (the writer commits a new
 source's row and its `writer_sessions` separately) holds only its own
 sessions, and a `SourceUpdate` does not add the publisher's.
@@ -252,7 +252,8 @@ read it. A subscriber does not store it.
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
    carry. A frame naming an ordinal with no handshake is refused. A
    `Handshake` may arrive at any point in the stream, for a source the
-   publisher has just seen; its ordinal is one more than the highest assigned.
+   publisher has just seen. An `ArchivePublisher` assigns it the next
+   ordinal; a subscriber does not check that.
 2. The first `Index` frame carries complete current state (`Full`), including
    streams that exist but have never been observed.
 3. The first `Rows` frame carries the latest observation of every stream. **Not
