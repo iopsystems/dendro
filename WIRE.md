@@ -238,10 +238,12 @@ handshake; the source's other fields (`uuid`, `clock_anchor_wall_ns`,
 `complete`) are not carried. Both maps are whole, not the keys that changed,
 and the subscriber replaces its copy's with them, so a key the publisher
 removed is removed. The copy keeps its own `encoder` and `writer_sessions`
-(`FORMAT.md` §6) where it has them, since its writer maintains them. A copy whose handshake was read
-before the publisher's writer recorded its session (the writer commits a new
-source's row and its `writer_sessions` separately) holds only its own
-sessions, and a `SourceUpdate` does not add the publisher's.
+(`FORMAT.md` §6) where it has them, since its writer maintains them. A copy
+whose handshake was read before the publisher's writer recorded its session
+(the writer commits a new source's row and its `writer_sessions` separately)
+holds only its own sessions, and a `SourceUpdate` does not add the
+publisher's. `events` is replaced, so a copy's `events` may include
+`writer_session` events for sessions its `writer_sessions` does not list.
 
 `ts` is when the publisher saw the change. An archive records no time for a
 metadata change, so an archive publisher sends the wall time of the poll that

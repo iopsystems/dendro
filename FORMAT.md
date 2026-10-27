@@ -487,7 +487,8 @@ the rows changes shape; five things are guaranteed:
   later still. A clock that went backwards across a restart is refused at
   resume and per row (`Error::TimelineBackwards`), never written.
 - The session is recorded under `writer_sessions` and as a
-  `writer_session` event at its anchor.
+  `writer_session` event at its anchor. A later `set_source_identity`
+  writes `events` as given, so it can remove that event (§6).
 - `complete` is cleared at resume and set by the session's finalize.
 - The session sets `heartbeat_interval_ns` and bumps `heartbeat` (§3.1)
   until it finalizes the source. A writer that reopens an archive without
