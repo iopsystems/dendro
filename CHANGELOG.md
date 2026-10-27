@@ -65,14 +65,14 @@ cannot reach a failed release any other way.
 
 ### Fixed
 
-- `ArchivePublisher::next` ships the sealed rows of a stream it has shipped
-  no row of as `Segment` frames. A stream with no segments when the
-  publisher opened, or that did not exist then (or, under `catching_up`, one
-  that held only live rows), sealed before a poll read its rows, lost those
-  rows without an error: its cursor had nothing to compare the seal's
-  watermark with, and the live tail held only the rows after the seal. Every
-  stream of a source created after the publisher opened, and handshaken
-  before it had rows, took that path.
+- `ArchivePublisher::next` ships as `Segment` frames the sealed rows of a
+  stream that had no rows when a `tailing` publisher opened, no segments
+  when a `catching_up` one opened, or that did not exist then, and that was
+  sealed before a poll shipped any of its rows. Such a stream lost those
+  rows without an error: it had no cursor to compare the seal's watermark
+  with, and the live tail held only the rows after the seal. Every stream of
+  a source created after the publisher opened and handshaken while empty was
+  exposed to this.
 
 ## [0.6.0] - 2026-10-19
 

@@ -1189,12 +1189,27 @@ fn a_stream_sealed_before_its_first_poll_ships_its_segments() {
     let applied = sub.apply_all(publisher.next(&db).unwrap()).unwrap();
     assert_eq!((applied.segments, applied.rows), (2, 2));
 
+    // A stream with nothing after its seal: its cursor starts at the
+    // watermark, so a later poll does not ship its segment again.
+    a.wal(vec![row("t", 1_000)]).unwrap();
+    a.seal(vec!["t".to_string()]).unwrap();
+    a.sync().unwrap();
+    let applied = sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+    assert_eq!((applied.segments, applied.rows), (1, 0));
+    let applied = sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+    assert_eq!((applied.segments, applied.segments_held), (0, 0));
+
     drop((a, b));
     archive.join().unwrap();
     sub.sync().unwrap();
     sub.finish().unwrap();
 
-    for source in readable(&copy) {
+    let got = readable(&copy);
+    assert_eq!(
+        got[0].streams["t"].iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1_000]
+    );
+    for source in got {
         assert_eq!(
             source.streams["s"].iter().map(|r| r.0).collect::<Vec<_>>(),
             vec![1_000, 2_000, 3_000],

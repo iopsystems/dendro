@@ -102,9 +102,10 @@ struct SourceCursor {
 /// **`Segment` frames come only from a source's or a stream's opening
 /// batch**: the publisher's first batch, the batch in which
 /// [`next`](Self::next) first sees a source created after it opened, or the
-/// batch in which it first sees sealed rows of a stream it has shipped no row
-/// of (a stream with no segments when the publisher opened, or that did not
-/// exist then, sealed before a poll read its rows). After that a stream's
+/// batch in which it first sees sealed rows of a stream with no cursor yet (a
+/// stream that had no rows when a `tailing` publisher opened, no segments
+/// when a `catching_up` one opened, or that did not exist then, and that was
+/// sealed before a poll shipped any of its rows). After that a stream's
 /// rows are shipped as [`Rows`](Frame::Rows) and the subscriber seals its
 /// own; shipping the publisher's segment as well would offer the subscriber a
 /// segment covering rows it already holds unsealed, which
@@ -166,8 +167,8 @@ struct SourceCursor {
 /// the source seals would miss them. [`next`](Self::next) **detects that and
 /// returns an error** naming the stream rather than shipping a stream with a
 /// hole in it; the caller reconnects with `catching_up`, which is what the
-/// segment frames are for. A stream this publisher has shipped no row of has
-/// nothing to have missed; its segments are shipped instead (see above).
+/// segment frames are for. A stream with no cursor yet (one of those above)
+/// has nothing to have missed; its segments are shipped instead.
 pub struct ArchivePublisher {
     sources: Vec<SourceCursor>,
     /// Where a source created after opening starts: the `since` of
