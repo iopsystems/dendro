@@ -86,7 +86,8 @@ only integer type, and the reason a negative value means before 1970.
 
 One kind per table in the set `rewrite` copies (`src/rewrite.rs`, `COPIED`) —
 `sources`, `caller_rows`, `wal`, `segments`, `clock_offsets` — so the frame set
-has a completeness check rather than a guess.
+has a completeness check rather than a guess, plus `SourceUpdate` for a change
+to a source's row in `sources` after its handshake.
 
 | `kind` | frame | lands in |
 |---|---|---|
@@ -95,6 +96,7 @@ has a completeness check rather than a guess.
 | 3 | `Rows` | `wal` |
 | 4 | `Segment` | `segments` |
 | 5 | `ClockOffset` | `clock_offsets` |
+| 6 | `SourceUpdate` | `sources` |
 
 ### 4.1 `Handshake` (kind 1)
 
@@ -222,6 +224,26 @@ i64          offset_ns
 One drift observation (`FORMAT.md` §5). Cheap to carry — a handful of rows per
 seal — and part of the source's identity.
 
+### 4.6 `SourceUpdate` (kind 6)
+
+```
+u32          source
+i64          ts                     ns since the Unix epoch
+map          labels
+map          metadata
+```
+
+A source's labels and metadata after its handshake. Both maps are whole, not
+the keys that changed, and the subscriber replaces its copy's with them, so a
+key the publisher removed is removed. The copy keeps its own `encoder` and
+`writer_sessions` (`FORMAT.md` §6), which its writer maintains. Sent by a publisher that sees the
+source's identity change after the handshake; the source's other fields
+(`uuid`, `clock_anchor_wall_ns`, `complete`) are not carried.
+
+`ts` is when the publisher saw the change. An archive records no time for a
+metadata change, so an archive publisher sends the wall time of the poll that
+read it. A subscriber does not store it.
+
 ## 5. Protocol rules
 
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
@@ -252,6 +274,8 @@ seal — and part of the source's identity.
    entry's kind and has no retention of its own, so a subscriber archive has
    no retention path yet.
 8. A reconnect is a new handshake and full state. There is no resume token.
+   A source that appears after the stream started gets its handshake when the
+   publisher sees it, with the next ordinal.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
 
