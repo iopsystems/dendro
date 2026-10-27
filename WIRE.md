@@ -233,12 +233,15 @@ map          labels
 map          metadata
 ```
 
-A source's labels and metadata after its handshake. Both maps are whole, not
-the keys that changed, and the subscriber replaces its copy's with them, so a
-key the publisher removed is removed. The copy keeps its own `encoder` and
-`writer_sessions` (`FORMAT.md` §6), which its writer maintains. Sent by a publisher that sees the
-source's identity change after the handshake; the source's other fields
-(`uuid`, `clock_anchor_wall_ns`, `complete`) are not carried.
+A source's labels and metadata, sent when either changes after the source's
+handshake; the source's other fields (`uuid`, `clock_anchor_wall_ns`,
+`complete`) are not carried. Both maps are whole, not the keys that changed,
+and the subscriber replaces its copy's with them, so a key the publisher
+removed is removed. The copy keeps its own `encoder` and `writer_sessions`
+(`FORMAT.md` §6), which its writer maintains. A copy whose handshake was read
+before the publisher's writer recorded its session (the writer commits a new
+source's row and its `writer_sessions` separately) holds only its own
+sessions, and a `SourceUpdate` does not add the publisher's.
 
 `ts` is when the publisher saw the change. An archive records no time for a
 metadata change, so an archive publisher sends the wall time of the poll that
@@ -247,7 +250,9 @@ read it. A subscriber does not store it.
 ## 5. Protocol rules
 
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
-   carry. A frame naming an ordinal with no handshake is refused.
+   carry. A frame naming an ordinal with no handshake is refused. A
+   `Handshake` may arrive at any point in the stream, for a source the
+   publisher has just seen; its ordinal is one more than the highest assigned.
 2. The first `Index` frame carries complete current state (`Full`), including
    streams that exist but have never been observed.
 3. The first `Rows` frame carries the latest observation of every stream. **Not
@@ -274,8 +279,6 @@ read it. A subscriber does not store it.
    entry's kind and has no retention of its own, so a subscriber archive has
    no retention path yet.
 8. A reconnect is a new handshake and full state. There is no resume token.
-   A source that appears after the stream started gets its handshake when the
-   publisher sees it, with the next ordinal.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
 

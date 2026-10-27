@@ -42,8 +42,11 @@ pub struct Applied {
     pub clock_offsets: usize,
     /// Sources opened.
     pub sources: usize,
-    /// Source identities replaced by a
-    /// [`SourceUpdate`](Frame::SourceUpdate).
+    /// [`SourceUpdate`](Frame::SourceUpdate) frames handed to the writer. A
+    /// write that fails is logged and dropped, as
+    /// [`update_metadata`](crate::writer::SourceWriter::update_metadata)'s
+    /// is, and the copy keeps its previous identity until the next update or
+    /// a reconnect.
     pub source_updates: usize,
     /// Whether this frame's sequence number skipped one, which means a `Rows`
     /// frame was lost in transit. The rows that did arrive are still good; see

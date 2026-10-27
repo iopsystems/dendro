@@ -252,7 +252,8 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   archive's changes into frames and `Subscriber` applies them to another
   archive; `WIRE.md` specifies the bytes. There is one frame kind per table
   that a copy carries, so the set has a completeness check rather than a
-  guess, and a round trip is tested here rather than asserted. **Transport is
+  guess, plus `SourceUpdate` for a later change to a source's labels or
+  metadata, and a round trip is tested here rather than asserted. **Transport is
   not included** — HTTP, a Unix socket or a file is yours, which is what keeps
   this storage-shaped. Frames are per source, so the archive's documents are
   not replicated. A live tail ships rows and the subscriber seals its

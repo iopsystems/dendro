@@ -39,13 +39,14 @@ cannot reach a failed release any other way.
   metadata after its handshake, both maps whole, and `ts`, the publisher's
   wall time when it saw the change. `Subscriber` replaces its copy's labels
   and metadata with them, so a removed key is removed, and counts them in
-  `Applied::source_updates`. A subscriber on dendro 0.3.0 or later that does
-  not know the kind skips it (WIRE.md §7).
+  `Applied::source_updates`. A `FrameReader` on dendro 0.3.0 or later that
+  does not know the kind skips it (WIRE.md §7).
 - `ArchivePublisher::next` reads the archive's sources on every poll. It sends
   a `SourceUpdate` for a source whose labels or metadata changed since they
   were last sent, ahead of that source's other frames, and a `Handshake`,
   with the next ordinal, for a source created after the publisher opened,
-  followed by everything that source holds. Before this the publisher read
+  followed by what that source holds: from `catching_up`'s `since`, or all of
+  it for a `tailing` publisher. Before this the publisher read
   the sources once, when it opened, so a subscriber kept the identity it saw
   at connect and never received a source added later.
 - `SourceWriter::set_identity` and `ArchiveMut::set_source_identity`, which

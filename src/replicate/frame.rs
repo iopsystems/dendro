@@ -205,12 +205,12 @@ pub enum Frame {
         offset_ns: i64,
     },
 
-    /// A source's labels and metadata after its handshake changed them,
-    /// bound for `sources`.
+    /// A source's labels and metadata, sent when either changes after the
+    /// source's handshake. Bound for `sources`.
     ///
     /// Carries the whole of both maps, not the keys that changed, and the
     /// subscriber replaces its copy's with them, so a key the publisher
-    /// removed is removed. A patch would leave such a key behind. The copy
+    /// removed is removed. The copy
     /// keeps its own `encoder` and `writer_sessions`, which its writer
     /// maintains.
     SourceUpdate {

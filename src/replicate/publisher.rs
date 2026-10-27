@@ -147,8 +147,10 @@ struct SourceCursor {
 /// frames in that batch; its `ts` is the wall time of the poll, since the
 /// archive records no time for the change. A source created after the
 /// publisher opened gets a [`Handshake`](Frame::Handshake) with the next
-/// ordinal, then everything it holds, as a catch-up from its first row would
-/// ship it, then its first `Rows` frame. A change that is undone between two
+/// ordinal, then what it holds from the `since` of
+/// [`catching_up`](Self::catching_up) (from its first row for
+/// [`tailing`](Self::tailing)), shipped as that catch-up ships it, then its
+/// first `Rows` frame. A change that is undone between two
 /// polls is not seen.
 ///
 /// # Polling and the seal
@@ -162,6 +164,9 @@ struct SourceCursor {
 /// segment frames are for.
 pub struct ArchivePublisher {
     sources: Vec<SourceCursor>,
+    /// Where a source created after opening starts: the `since` of
+    /// [`catching_up`](Self::catching_up), else its first row.
+    since: i64,
 }
 
 impl std::fmt::Debug for ArchivePublisher {
@@ -232,9 +237,10 @@ impl ArchivePublisher {
                 for rec in records {
                     let ordinal = next_ordinal(self.sources.len())?;
                     // Everything the new source holds was written after this
-                    // publisher opened, so all of it is shipped.
-                    let mut cursor =
-                        open_source(db, &rec, ordinal, Some(i64::MIN), &watermarks, &mut out)?;
+                    // publisher opened, so it is shipped from where the
+                    // publisher's own catch-up started.
+                    let since = Some(self.since);
+                    let mut cursor = open_source(db, &rec, ordinal, since, &watermarks, &mut out)?;
                     cursor.poll(db, &mut out)?;
                     self.sources.push(cursor);
                 }
@@ -271,7 +277,8 @@ impl ArchivePublisher {
             )?);
         }
 
-        Ok((ArchivePublisher { sources }, frames))
+        let since = since.unwrap_or(i64::MIN);
+        Ok((ArchivePublisher { sources, since }, frames))
     }
 }
 

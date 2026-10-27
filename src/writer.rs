@@ -814,7 +814,9 @@ pub struct SourceWriter {
     /// Set on a resumed source: every row this session commits must be
     /// stamped after it. See [`Writer::resume_source`].
     floor_ts: Option<i64>,
-    /// This source's stagger identity — its canonical label set. Held here
+    /// This source's stagger identity — its canonical label set at
+    /// `add_source`, which [`set_identity`](Self::set_identity) does not
+    /// change. Held here
     /// so the seal policy can desync tables ACROSS sources as well as
     /// within one; see `stagger_bucket`.
     stagger_key: String,
@@ -1062,7 +1064,9 @@ impl SourceWriter {
     ///
     /// Both maps are replaced whole, so a key absent from them is removed,
     /// except the keys this writer maintains, `encoder` and
-    /// `writer_sessions`, which keep their stored values (see
+    /// `writer_sessions`, which keep their stored values; `events` is written
+    /// as given, including a `writer_session` event dendro appended at a
+    /// resume (see
     /// [`ArchiveMut::set_source_identity`](crate::archive::ArchiveMut::set_source_identity)).
     /// A recording adds keys with `update_metadata`; this is for a caller
     /// carrying an identity somebody else changed, such as a replication

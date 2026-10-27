@@ -82,9 +82,7 @@
 //!    [`CallerRowFloor`](crate::archive::CallerRowFloor). [`Subscriber`](crate::replicate::Subscriber)
 //!    records no entry kinds and has no retention of its own.
 //! 8. A reconnect is a new handshake and full state. There is no resume token.
-//!    A source that appears after the stream started gets its handshake when
-//!    the publisher sees it, with the next ordinal, and a change to a source's
-//!    labels or metadata after its handshake is a
+//!    A change to a source's labels or metadata after its handshake is a
 //!    [`SourceUpdate`](crate::replicate::Frame::SourceUpdate).
 //! 9. A row carries the [`IndexState`](crate::replicate::IndexState) it was built against, and a subscriber
 //!    that cannot match it **skips the row**. Misattribution is worse than a

@@ -2114,7 +2114,8 @@ impl Archive {
     }
 
     /// The wall clock in nanoseconds since the Unix epoch, read through
-    /// SQLite so it works where `SystemTime::now` panics (`wasm32`).
+    /// SQLite so it works where `SystemTime::now` panics
+    /// (`wasm32-unknown-unknown`).
     /// Millisecond resolution.
     pub(crate) fn wall_now_ns(&self) -> Result<i64> {
         documents::wall_now_ns(&self.conn)
@@ -2895,7 +2896,9 @@ impl ArchiveMut {
     /// values where the source has them: they describe this file's encoder
     /// and writer sessions, which a new identity does not change, and a
     /// copy's differ from its original's. Every other key is as given, so a
-    /// key absent from `metadata` is removed.
+    /// key absent from `metadata` is removed. That includes
+    /// [`EVENTS`](crate::keys::EVENTS), with any `writer_session` event dendro
+    /// appended at a resume; a caller that keeps it passes it back.
     /// [`SourceWriter::set_identity`](crate::writer::SourceWriter::set_identity)
     /// is this on the writer thread.
     pub fn set_source_identity(

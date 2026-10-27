@@ -36,6 +36,19 @@ impl SegmentEncoder for Tags {
     }
 }
 
+/// [`Tags`] with a version, so the writer records `encoder` for its sources.
+struct VersionedTags;
+
+impl SegmentEncoder for VersionedTags {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        Tags.encode(ctx, rows)
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some("copy-1")
+    }
+}
+
 fn source_meta(name: &str) -> SourceMeta {
     SourceMeta {
         labels: BTreeMap::from([("source".to_string(), name.to_string())]),
@@ -893,7 +906,9 @@ fn a_removed_key_is_removed_from_the_copy() {
 
     let db = Archive::open(&origin).unwrap();
     let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
-    let mut sub = subscriber(&copy);
+    // The copy's writer records its own encoder, which differs from the
+    // publisher's `encoder` in the update.
+    let mut sub = Subscriber::new(Writer::create(&copy, Box::new(VersionedTags)).unwrap());
     sub.apply_all(opening).unwrap();
 
     let labels = BTreeMap::from([("source".to_string(), "renamed".to_string())]);
@@ -916,7 +931,7 @@ fn a_removed_key_is_removed_from_the_copy() {
     let (got_labels, mut got_metadata) = identity(&copy);
     assert_eq!(
         got_metadata.remove(dendro::keys::ENCODER).as_deref(),
-        Some("tags-1"),
+        Some("copy-1"),
         "the copy's encoder is kept"
     );
     let sessions = got_metadata
@@ -1049,4 +1064,48 @@ fn a_source_update_without_a_handshake_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("no handshake"), "{err}");
+}
+
+/// A source created after a catching-up publisher opened is shipped from that
+/// publisher's `since`, as the sources it opened with were.
+#[test]
+fn a_source_created_later_is_caught_up_from_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(source_meta("a")).unwrap();
+    a.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) =
+        dendro::replicate::ArchivePublisher::catching_up(&db, 5_000).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // One segment before `since`, one after, and a live row.
+    let mut b = archive.add_source(source_meta("b")).unwrap();
+    b.wal(vec![row("s", 1_000), row("s", 2_000)]).unwrap();
+    b.seal(vec!["s".to_string()]).unwrap();
+    b.wal(vec![row("s", 6_000)]).unwrap();
+    b.seal(vec!["s".to_string()]).unwrap();
+    b.wal(vec![row("s", 7_000)]).unwrap();
+    b.sync().unwrap();
+
+    let applied = sub.apply_all(publisher.next(&db).unwrap()).unwrap();
+    assert_eq!((applied.sources, applied.segments, applied.rows), (1, 1, 1));
+
+    drop((a, b));
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+
+    assert_eq!(
+        readable(&copy)[1].streams["s"]
+            .iter()
+            .map(|r| r.0)
+            .collect::<Vec<_>>(),
+        vec![6_000, 7_000]
+    );
 }
