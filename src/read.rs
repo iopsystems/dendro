@@ -462,7 +462,8 @@ pub fn stream_indexes(
 pub enum SegmentBytes {
     /// Already resolved: the segments, oldest first, live tail included.
     Bytes(Vec<Vec<u8>>),
-    /// A stream in an archive on disk, reopened read-only per fetch.
+    /// A stream in an archive on disk, reopened with [`Archive::open`] per
+    /// fetch.
     AtPath {
         /// The archive holding it.
         path: PathBuf,
@@ -493,7 +494,7 @@ pub enum SegmentBytes {
 
 impl SegmentBytes {
     /// A stream whose bytes will be fetched from the archive at `path`,
-    /// through a read-only connection opened per fetch.
+    /// through an [`Archive::open`] handle opened per fetch.
     pub fn at_path(path: PathBuf, source_id: i64, stream: String) -> Self {
         SegmentBytes::AtPath {
             path,
@@ -522,9 +523,6 @@ impl SegmentBytes {
                 source_id,
                 stream,
             } => {
-                // Read-only: this is a pure read, and a read-write connection
-                // that happens to be the last one open checkpoints the archive
-                // on close. See [`Archive::open`].
                 let db = Archive::open(path)?;
                 stream_segments(&db, *source_id, stream, encoder)
             }

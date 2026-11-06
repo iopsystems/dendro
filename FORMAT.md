@@ -81,7 +81,11 @@ live archive must be on one host, on a local filesystem.
 ### 2.2 One file, or three
 
 While anyone has it open, SQLite adds `<path>-wal` (commits not yet folded
-in) and `<path>-shm`; a clean close removes them. Creation checkpoints the
+in) and `<path>-shm`. The last read-write connection to close removes them; a
+read-only connection leaves them. `Archive::open` reads a finished archive
+(at least one source, every source finalized) on a read-write connection, so
+its close removes them; it reads any other archive read-only. Creation
+checkpoints the
 catalog into `<path>`, so a plain copy of `<path>` alone is a valid archive
 that may hold none of the recent appends. A copy of an archive from before
 creation checkpointed can hold no catalog at all; such a copy is refused as
@@ -420,8 +424,10 @@ The rules a reader must follow; `src/read.rs` is the reference.
    schema; `read::stream_range` reads a window; `SegmentBytes` fetches a
    stream's payload only when it is read. Opening every stream to learn
    its names was measured at 91% of a query's time on streams it never read.
-6. **Read with `Archive::open`.** It is read-only and leaves the files as they
-   are. `ArchiveMut::open` is a read-write connection that takes the file
+6. **Read with `Archive::open`.** It refuses writes. On an archive with an
+   unfinished source it is read-only and leaves the files as they are; on a
+   finished one its close can checkpoint the sidecar into the archive and
+   remove it. `ArchiveMut::open` is a read-write connection that takes the file
    exclusively, and SQLite checkpoints the archive when it closes; it is for
    rewriting and recovery, not for reading.
 7. **A reader without the caller's encoder reads sealed segments only.** The

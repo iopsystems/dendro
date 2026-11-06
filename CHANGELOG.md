@@ -33,6 +33,20 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- `Archive::open` reads a finished archive (at least one source, every
+  source finalized) on a read-write connection with `query_only` set, so
+  its close removes the `-wal` and `-shm` sidecars when no other connection
+  is open. A read-only connection creates both and never removes them, so
+  every read of a finished archive left them beside it. When the writer's
+  close was not the last (a reader had the file open), the next
+  `Archive::open` of the finished archive checkpoints the remaining commits
+  when it closes. The checkpoint on close happens only if the archive is
+  still finished when the handle drops, so a writer that adds or resumes a
+  source meanwhile and is killed leaves its sidecar in place. An archive with an unfinished source is still opened
+  read-only and left as it is.
+
 ## [0.6.1] - 2026-10-27
 
 ### Added

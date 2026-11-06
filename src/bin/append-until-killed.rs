@@ -9,6 +9,9 @@
 //! ts `1..=rows`, seals once after `seal_after` (so the archive is killed
 //! holding both sealed segments and a live WAL tail), commits everything,
 //! prints `ready`, and then sleeps. It never finalizes and never joins.
+//!
+//! When `<path>` already exists, the rows go to a new source added to it
+//! (`Writer::open`, `add_source`) rather than to a new archive.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -51,7 +54,14 @@ fn main() {
         metadata: BTreeMap::new(),
         clock_anchor_wall_ns: 1_000,
     };
-    let (archive, mut w) = Writer::single(Path::new(path), Box::new(Tags), seed).expect("create");
+    let path = Path::new(path);
+    let (archive, mut w) = if path.exists() {
+        let mut archive = Writer::open(path, Box::new(Tags)).expect("open");
+        let w = archive.add_source(seed).expect("add source");
+        (archive, w)
+    } else {
+        Writer::single(path, Box::new(Tags), seed).expect("create")
+    };
     for ts in 1..=rows {
         w.wal(vec![WalRow {
             stream: "s".to_string(),

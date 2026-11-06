@@ -278,10 +278,16 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
 
 ## One file, or three
 
-An archive is **one file at rest**. After a clean finalize the sidecars are
-gone, and what is left is the file you hand someone. It is **three while
-open**: SQLite adds `-wal` and `-shm` whenever the file is opened, a read
-included, and removes them on a clean close.
+A finished archive is **one file at rest**. After a clean finalize with
+nothing else open the sidecars are gone, and what is left is the file you
+hand someone. It is **three while open**: SQLite adds `-wal` and `-shm`
+whenever the file is opened, a read included. The last read-write connection
+to close removes them. `Archive::open` reads a finished archive (at least one
+source, every source finalized) on a read-write connection with `query_only`
+set, which refuses writes, so its close removes them too. A reader opened
+before the finalize is read-only; when it closes last the sidecars stay until
+the next read. An archive with an unfinished source is read read-only, and
+its sidecars stay.
 
 An unclean kill leaves all three. Creation checkpoints the catalog into the
 archive, so the archive alone always opens; what it lacks is every commit
@@ -292,13 +298,14 @@ recovers all 400 rows. Copying only the archive at that moment recovers none
 of them. `CHECKPOINT_INTERVAL` bounds how much can be in the sidecar, and
 `Archive::vacuum_into` takes an exact copy without pausing the writer.
 
-dendro never rewrites an archive on its own. SQLite does: a read-write
-connection that is the last one open checkpoints on close, so `ArchiveMut::open`
-on a crashed archive folds the sidecar in and deletes it. `Archive::open` is the
-read handle. It leaves the files as they are, works on a live buffer, on a
-file you do not own, and on read-only media, and it is the only open the read
-paths use. `ArchiveMut::open` takes the file exclusively and is refused while
-anything else holds it. See
+dendro does not rewrite an unfinished archive on its own. SQLite does: a
+read-write connection that is the last one open checkpoints on close, so
+`ArchiveMut::open` on a crashed archive folds the sidecar in and deletes it.
+`Archive::open` is the read handle. On an unfinished archive it leaves the
+files as they are; it works on a live buffer, on a file you do not own, and
+on read-only media, and it is the only open the read paths use.
+`ArchiveMut::open` takes the file exclusively and is refused while anything
+else holds it. See
 [DESIGN.md](DESIGN.md#how-many-files-an-archive-is).
 
 ## Features

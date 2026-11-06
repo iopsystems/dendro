@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags};
 
 mod documents;
@@ -709,9 +710,9 @@ impl Archive {
     ///
     /// **An archive is three files on disk while it is open**, not one: SQLite
     /// puts recent commits in `<path>-wal` and the shared index in
-    /// `<path>-shm`. It cleans both up on a clean close, but not after an
-    /// unclean one — so anything that removes an archive has to remove them
-    /// too, or the next run finds a `-wal` beside a path it believes is free.
+    /// `<path>-shm`. The last read-write connection to close removes both,
+    /// and an unclean close leaves them — so anything that removes an archive
+    /// has to remove them too, or the next run finds a `-wal` beside a path it believes is free.
     /// That is worse than a stale main file: `O_EXCL` catches the main file
     /// and says so, while a stray sidecar is adopted silently by the newly
     /// created database and its frames replayed into it.
@@ -864,8 +865,8 @@ impl Archive {
         Ok(db)
     }
 
-    /// Open an archive to read it. This handle cannot write, and SQLite does
-    /// not write either.
+    /// Open an archive to read it. This handle refuses writes; on a finished
+    /// archive its close can checkpoint (below).
     ///
     /// The read handle. [`ArchiveMut::open`] is the write handle, and it differs
     /// in two ways a reader does not want: SQLite checkpoints a WAL database
@@ -873,10 +874,30 @@ impl Archive {
     /// archive and deletes its sidecars (measured at 45 KiB to 61 KiB on a
     /// killed archive with a 3.3 MB sidecar, from nothing but an open and a
     /// drop), and the durability pragmas it applies are themselves writes,
-    /// which read-only media refuses. This opens `SQLITE_OPEN_READ_ONLY` and
-    /// sets `query_only`, so neither applies. Use it for anything pointed at
-    /// a buffer another process is still appending to, at an artifact you do
-    /// not own, or at read-only media.
+    /// which read-only media refuses. For an archive with an unfinished
+    /// source this opens `SQLITE_OPEN_READ_ONLY` and sets `query_only`, so
+    /// neither applies, and the files are left as they are. Use it for
+    /// anything pointed at a buffer another process is still appending to,
+    /// at an artifact you do not own, or at read-only media.
+    ///
+    /// **A finished archive** (at least one source, every source finalized)
+    /// is reopened `SQLITE_OPEN_READ_WRITE`, with `query_only` set. A read-only connection creates the `-wal` and `-shm`
+    /// sidecars and never removes them, so every read of a finished archive
+    /// left both beside it. A read-write connection that is the last to close
+    /// checkpoints and removes them. That checkpoint can write to the
+    /// archive: a sidecar holding commits the writer's close did not fold in
+    /// (another connection had the file open then) is folded in by the
+    /// reader's close. Those are committed rows of finished sources, so what
+    /// a later read sees is unchanged. The checkpoint on close is disabled
+    /// at open and enabled when the handle drops only if the archive is
+    /// still finished, so a writer that resumes or adds a source while this
+    /// handle is open and is then killed leaves its sidecar for
+    /// [`ArchiveMut::open`]. One window remains: a writer that commits a new
+    /// source between that check and the close, and is killed before the
+    /// close takes its lock, has its committed rows folded in by the close.
+    /// On a file the process cannot write, SQLite opens the connection
+    /// read-only and nothing is removed; on read-only media the read-only
+    /// connection is kept.
     ///
     /// **Read-only media.** WAL mode must create the `-shm` sidecar beside
     /// the archive, and read-only media refuses. When that happens and no
@@ -895,18 +916,68 @@ impl Archive {
     /// Refused as [`Error::InUse`] while a [`ArchiveMut::open`] handle holds the
     /// file.
     pub fn open(path: &Path) -> Result<Self> {
-        match Self::open_at(path, None) {
+        let db = match Self::open_at(path, None) {
             Err(e) if is_readonly_media(&e) => {
                 if sidecar_exists(path, "-wal") {
                     return Err(e);
                 }
                 match immutable_uri(path) {
-                    Some(uri) => Self::open_at(path, Some(&uri)),
-                    None => Err(e),
+                    Some(uri) => return Self::open_at(path, Some(&uri)),
+                    None => return Err(e),
                 }
             }
-            other => other,
+            other => other?,
+        };
+        if db.is_finished()? {
+            if let Some(rw) = Self::open_finished_read_write(path) {
+                return Ok(rw);
+            }
         }
+        Ok(db)
+    }
+
+    /// Whether the archive holds at least one source and every source is
+    /// finalized.
+    fn is_finished(&self) -> Result<bool> {
+        let (sources, unfinished): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE complete = 0) FROM sources",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Error::sqlite("failed to count unfinished sources"))?;
+        Ok(sources > 0 && unfinished == 0)
+    }
+
+    /// The read handle on a read-write connection, for [`open`](Self::open)
+    /// on a finished archive. `None` when the open fails or the archive is
+    /// no longer finished (a writer resumed a source between the two opens);
+    /// the caller then keeps its read-only connection. On a file it cannot
+    /// write, SQLite opens the connection read-only without an error, and the
+    /// handle reads as the read-only one does.
+    fn open_finished_read_write(path: &Path) -> Option<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
+        let mut db = Archive {
+            conn,
+            layout: IndexLayout::Absent,
+        };
+        // The same order as `open_at`: the gate, the reader's cache, then
+        // `query_only`. Nothing before `query_only` writes. `synchronous`
+        // FULL because this connection's close may checkpoint into the
+        // archive.
+        db.adopt_schema(&path.display().to_string()).ok()?;
+        db.set_pragma("cache_size", READER_CACHE_SIZE_KIB).ok()?;
+        db.set_pragma("synchronous", "FULL").ok()?;
+        db.set_pragma("query_only", "1").ok()?;
+        // No checkpoint on close unless `Drop` finds the archive still
+        // finished: a writer may resume or add a source while this handle is
+        // open and then be killed, and its sidecar must then be left for
+        // `ArchiveMut::open`, as a read-only reader leaves it.
+        db.conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .ok()?;
+        db.is_finished().ok()?.then_some(db)
     }
 
     /// [`open`](Self::open) over either the plain path or the `immutable=1`
@@ -1811,9 +1882,11 @@ impl Archive {
     /// allows a second party. [`Archive::open`] sets `query_only`, and SQLite
     /// refuses `VACUUM INTO` under it ("attempt to write a readonly
     /// database") although the statement writes only `dest`. So `query_only`
-    /// is lifted for this one statement and restored on every path. The
-    /// archive itself stays unwritable: the connection is
-    /// `SQLITE_OPEN_READ_ONLY`, and SQLite refuses a write to it regardless.
+    /// is lifted for this one statement and restored on every path. On an
+    /// archive with an unfinished source the connection is also
+    /// `SQLITE_OPEN_READ_ONLY`, so SQLite refuses a write to the archive
+    /// regardless; on a finished one it is read-write (see
+    /// [`open`](Self::open)).
     pub fn vacuum_into(&self, dest: &Path) -> Result<()> {
         let dest = dest
             .to_str()
@@ -2400,6 +2473,24 @@ impl std::fmt::Debug for ArchiveMut {
     }
 }
 
+impl Drop for Archive {
+    /// Allow the close-time checkpoint of a read handle opened read-write
+    /// (see [`Archive::open`]) only if the archive is still finished. A
+    /// connection that never disabled it (a read-only one, or the write
+    /// handle's) is left alone.
+    fn drop(&mut self) {
+        let suppressed = self
+            .conn
+            .db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+            .unwrap_or(false);
+        if suppressed && self.is_finished().unwrap_or(false) {
+            let _ = self
+                .conn
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false);
+        }
+    }
+}
+
 impl ArchiveMut {
     /// Add the `heartbeat` columns to `sources` if this file predates them.
     /// A nullable column an older reader ignores, so the schema version is
@@ -2439,7 +2530,8 @@ impl ArchiveMut {
     /// This is also the recovery open: a read-write connection that is the
     /// last one on a WAL database checkpoints on close, so opening a killed
     /// archive this way and dropping the handle folds its sidecar in and
-    /// deletes it. [`Archive::open`] leaves the files as they are.
+    /// deletes it. [`Archive::open`] leaves an unfinished archive's files as
+    /// they are.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Archive::open_with_cache(path, READER_CACHE_SIZE_KIB, true)?;
         Ok(ArchiveMut::wrap(db))
@@ -3727,6 +3819,37 @@ mod tests {
             1,
             "restored on failure"
         );
+    }
+
+    /// The read handle on a finished archive is read-write (so its close can
+    /// remove the sidecars) and still refuses a write to the archive.
+    #[test]
+    fn the_read_handle_on_a_finished_archive_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.dendro");
+        let mut w = ArchiveMut::create(&path).unwrap();
+        let id = w
+            .insert_source(&SourceMeta {
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                clock_anchor_wall_ns: 1,
+            })
+            .unwrap();
+        w.mark_complete(id).unwrap();
+        drop(w);
+
+        let db = Archive::open(&path).unwrap();
+        assert!(
+            !db.conn.is_readonly(rusqlite::MAIN_DB).unwrap(),
+            "read-write"
+        );
+        assert_eq!(db.pragma_u32("query_only").unwrap(), 1);
+        assert!(db
+            .conn
+            .execute("UPDATE sources SET complete = 0", [])
+            .is_err());
+        drop(db);
+        assert!(Archive::open(&path).unwrap().read_sources().unwrap()[0].complete);
     }
 
     #[test]

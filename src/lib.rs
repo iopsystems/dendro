@@ -44,7 +44,7 @@
 //!
 //! | term | meaning |
 //! |---|---|
-//! | **archive** | The file. One SQLite database, holding everything below. One file at rest, three while it is open; see [`archive`]. |
+//! | **archive** | The file. One SQLite database, holding everything below. One file at rest once finished and read, three while it is open; see [`archive`]. |
 //! | **stream** | A named sequence of rows inside a source. Streams are independent: each accumulates, seals and expires on its own schedule. They are also **transient**: one can start late, stop early, have gaps, and stop existing once its rows are evicted. |
 //! | **segment** | An immutable Parquet BLOB holding one sealed run of a stream's rows. A stream is many segments end to end. |
 //! | **row** | One payload with a timestamp and a wall-clock offset. The timestamp is an `i64`, SQLite's only integer type, so negative means before 1970. The payload is opaque to dendro. |
@@ -154,15 +154,21 @@
 //!
 //! # One file, or three
 //!
-//! An archive is one file at rest and three while anyone has it open: SQLite
-//! adds a `-wal` and a `-shm` whenever the file is opened, a read included,
-//! and removes them on a clean close. An unclean kill leaves all three.
+//! An archive is three files while anyone has it open: SQLite adds a `-wal`
+//! and a `-shm` whenever the file is opened, a read included. The last
+//! read-write connection to close removes them; a read-only one leaves them.
+//! [`archive::Archive::open`] reads a finished archive (at least one source,
+//! every source finalized) on a read-write connection with `query_only` set,
+//! so a finished archive is one file once a read handle opened after the
+//! finalize closes last. A reader opened before the finalize is read-only,
+//! and when it closes last the sidecars stay until the next read. An unclean
+//! kill leaves all three.
 //! Creation checkpoints the catalog into the archive, so the archive alone
 //! always opens; every commit since the last checkpoint is in the sidecar
 //! until something opens the set and folds it back in.
 //!
-//! **dendro does not rewrite an archive on its own.** It does not migrate an
-//! older schema in place, and it does not normalize a crashed one. An open is
+//! **dendro does not rewrite an unfinished archive on its own.** It does not
+//! migrate an older schema in place, and it does not normalize a crashed one. An open is
 //! how you read a buffer another process is still appending to, and a reader
 //! that rearranges its subject cannot be pointed at production.
 //!
@@ -172,7 +178,10 @@
 //! 45 KiB to 61 KiB, with a 3.3 MB sidecar, from nothing but an open and a
 //! drop. That is recovery, and it is intentional: `ArchiveMut::open` takes the
 //! file exclusively. A reader must never do it by surprise, so
-//! [`archive::Archive::open`] is read-only and writes nothing to the archive. Use it
+//! [`archive::Archive::open`] opens an archive with an unfinished source
+//! read-only and writes nothing to it. On an archive that is finished both
+//! when it opens and when it closes, its close can fold committed rows of
+//! finished sources into the file. Use it
 //! for anything pointed at a live buffer, at an artifact you do not own, or
 //! at read-only media, where `ArchiveMut::open` is refused by name.
 //!
