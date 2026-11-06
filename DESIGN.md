@@ -201,22 +201,35 @@ a background optimization with no correctness role.
 
 ## How many files an archive is
 
-One, at rest. Three, while anyone has it open.
+One, once a finished archive is closed. Three, while anyone has it open.
 
 | state | on disk |
 |---|---|
 | after a clean `finalize` + `join` | **just the archive** |
 | while a writer has it open | archive, `-wal`, `-shm` |
-| while a *reader* has it open | archive, `-wal` (empty), `-shm` |
-| after that reader closes | **just the archive** |
+| while a reader has it open | archive, `-wal`, `-shm` |
+| after the last connection to a finished archive closes, if it can write the file and the directory | **just the archive** |
+| after a reader of an unfinished archive closes | archive, `-wal`, `-shm` |
 | after an unclean kill | all three, and see below |
 
 The sidecars are SQLite's, not dendro's: `-wal` holds commits not yet folded
 into the archive, and `-shm` is the cross-process index that lets readers find
-them. They appear whenever the file is opened, a read included, and SQLite
-removes them on a clean close. So the artifact you hand someone is a single
-file, and the three-file state is a property of the archive being *in use*,
-not of the format.
+them. They appear whenever the file is opened, a read-only open included. The
+last read-write connection to close checkpoints and removes them; a read-only
+connection never removes them.
+
+So `Archive::open` picks its connection by whether the archive is finished.
+With at least one source and every source finalized, it reopens the file
+read-write with `query_only` set, and its close removes the sidecars when no
+other connection is open. That close also folds in any commits the writer's
+close left in the sidecar, which happens when a reader (a viewer following
+the recording to its end) had the file open as the writer closed. Those are
+committed rows of finished sources, so the archive reads the same before and
+after. The checkpoint on close is disabled at open and enabled when the handle
+drops only if the archive is still finished, so a writer that resumes or adds
+a source while the reader is open and is then killed leaves its sidecar for
+`ArchiveMut::open`. With any source unfinished, `Archive::open` stays
+read-only and leaves the files as they are.
 
 **An unclean kill is the case to know about.** The sidecars survive it and
 hold every commit since the last checkpoint. Creation checkpoints the catalog
@@ -237,11 +250,12 @@ from the archive alone; the same run checkpointing every 200 ms recovers
 the shipped `CHECKPOINT_INTERVAL` of 10 s and a 1 s append cadence, that tail
 is about ten appends.
 
-**dendro never rewrites an archive on its own.** It does not migrate an older
-schema in place, and it does not normalize a crashed archive back to one
-file: an open is also how you read a rolling buffer another process is still
-appending to, and a reader that rearranges its subject cannot be pointed at
-production.
+**dendro does not rewrite an unfinished archive on its own.** It does not
+migrate an older schema in place, and it does not normalize a crashed archive
+back to one file: an open is also how you read a rolling buffer another
+process is still appending to, and a reader that rearranges its subject
+cannot be pointed at production. The one write a reader makes is the
+checkpoint on close of a finished archive, described above.
 
 **SQLite does rewrite, and a reader must know when.** A read-write connection
 that is the last one open checkpoints on close. So `ArchiveMut::open` on a
@@ -249,9 +263,10 @@ crashed archive folds the sidecar in and unlinks it, from nothing but an open
 and a drop: 45 KiB to 61 KiB in the measurement above. That is the recovery
 open, and it is intentional: `ArchiveMut::open` takes the file exclusively and is
 refused while anything else holds it. `Archive::open`, the read handle, opens
-`SQLITE_OPEN_READ_ONLY` with `query_only` set and writes nothing to the
-archive. What it gives up is recovery: it reads the sidecar but does not fold
-it back in.
+an archive with an unfinished source `SQLITE_OPEN_READ_ONLY` with
+`query_only` set and writes nothing to it. What it gives up there is
+recovery: it reads the sidecar of a killed archive but does not fold it back
+in.
 
 Read-only media needs one more step, and `Archive::open` takes it. WAL mode must
 create `-shm` beside the archive, which read-only media refuses. When that
