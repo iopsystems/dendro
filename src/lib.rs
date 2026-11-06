@@ -44,7 +44,7 @@
 //!
 //! | term | meaning |
 //! |---|---|
-//! | **archive** | The file. One SQLite database, holding everything below. One file once a finished archive is closed, three while it is open; see [`archive`]. |
+//! | **archive** | The file. One SQLite database, holding everything below. One file at rest once finished and read, three while it is open; see [`archive`]. |
 //! | **stream** | A named sequence of rows inside a source. Streams are independent: each accumulates, seals and expires on its own schedule. They are also **transient**: one can start late, stop early, have gaps, and stop existing once its rows are evicted. |
 //! | **segment** | An immutable Parquet BLOB holding one sealed run of a stream's rows. A stream is many segments end to end. |
 //! | **row** | One payload with a timestamp and a wall-clock offset. The timestamp is an `i64`, SQLite's only integer type, so negative means before 1970. The payload is opaque to dendro. |
@@ -157,9 +157,12 @@
 //! An archive is three files while anyone has it open: SQLite adds a `-wal`
 //! and a `-shm` whenever the file is opened, a read included. The last
 //! read-write connection to close removes them; a read-only one leaves them.
-//! [`archive::Archive::open`] reads a finished archive (every source
-//! finalized) on a read-write connection with `query_only` set, so a closed
-//! finished archive is one file. An unclean kill leaves all three.
+//! [`archive::Archive::open`] reads a finished archive (at least one source,
+//! every source finalized) on a read-write connection with `query_only` set,
+//! so a finished archive is one file once a read handle opened after the
+//! finalize closes last. A reader opened before the finalize is read-only,
+//! and when it closes last the sidecars stay until the next read. An unclean
+//! kill leaves all three.
 //! Creation checkpoints the catalog into the archive, so the archive alone
 //! always opens; every commit since the last checkpoint is in the sidecar
 //! until something opens the set and folds it back in.

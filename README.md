@@ -278,14 +278,16 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
 
 ## One file, or three
 
-A finished archive is **one file at rest**. After a clean finalize the
-sidecars are gone, and what is left is the file you hand someone. It is
-**three while open**: SQLite adds `-wal` and `-shm` whenever the file is
-opened, a read included. The last read-write connection to close removes
-them. `Archive::open` reads a finished archive (every source finalized) on a
-read-write connection with `query_only` set, which refuses writes, so its
-close removes them too; an archive with an unfinished source is read
-read-only, and its sidecars stay.
+A finished archive is **one file at rest**. After a clean finalize with
+nothing else open the sidecars are gone, and what is left is the file you
+hand someone. It is **three while open**: SQLite adds `-wal` and `-shm`
+whenever the file is opened, a read included. The last read-write connection
+to close removes them. `Archive::open` reads a finished archive (at least one
+source, every source finalized) on a read-write connection with `query_only`
+set, which refuses writes, so its close removes them too. A reader opened
+before the finalize is read-only; when it closes last the sidecars stay until
+the next read. An archive with an unfinished source is read read-only, and
+its sidecars stay.
 
 An unclean kill leaves all three. Creation checkpoints the catalog into the
 archive, so the archive alone always opens; what it lacks is every commit

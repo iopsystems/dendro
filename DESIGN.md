@@ -205,10 +205,11 @@ One, once a finished archive is closed. Three, while anyone has it open.
 
 | state | on disk |
 |---|---|
-| after a clean `finalize` + `join` | **just the archive** |
+| after a clean `finalize` + `join`, nothing else open | **just the archive** |
 | while a writer has it open | archive, `-wal`, `-shm` |
 | while a reader has it open | archive, `-wal`, `-shm` |
-| after the last connection to a finished archive closes, if it can write the file and the directory | **just the archive** |
+| after the last connection to a finished archive closes, when that connection is read-write (the writer's, or an `Archive::open` made after the finalize) and can write the file and the directory | **just the archive** |
+| after a reader opened before the finalize closes last | archive, `-wal`, `-shm`, until the next `Archive::open` closes |
 | after a reader of an unfinished archive closes | archive, `-wal`, `-shm` |
 | after an unclean kill | all three, and see below |
 
@@ -228,7 +229,9 @@ committed rows of finished sources, so the archive reads the same before and
 after. The checkpoint on close is disabled at open and enabled when the handle
 drops only if the archive is still finished, so a writer that resumes or adds
 a source while the reader is open and is then killed leaves its sidecar for
-`ArchiveMut::open`. With any source unfinished, `Archive::open` stays
+`ArchiveMut::open`. The exception is a writer that commits a new source
+between that check and the close and is killed before the close takes its
+lock; the close then folds in its committed rows. With any source unfinished, `Archive::open` stays
 read-only and leaves the files as they are.
 
 **An unclean kill is the case to know about.** The sidecars survive it and

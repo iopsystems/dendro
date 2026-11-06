@@ -711,8 +711,8 @@ impl Archive {
     /// **An archive is three files on disk while it is open**, not one: SQLite
     /// puts recent commits in `<path>-wal` and the shared index in
     /// `<path>-shm`. The last read-write connection to close removes both,
-    /// and an unclean close leaves them — so anything that removes an archive has to remove them
-    /// too, or the next run finds a `-wal` beside a path it believes is free.
+    /// and an unclean close leaves them — so anything that removes an archive
+    /// has to remove them too, or the next run finds a `-wal` beside a path it believes is free.
     /// That is worse than a stale main file: `O_EXCL` catches the main file
     /// and says so, while a stray sidecar is adopted silently by the newly
     /// created database and its frames replayed into it.
@@ -865,7 +865,8 @@ impl Archive {
         Ok(db)
     }
 
-    /// Open an archive to read it. This handle cannot write.
+    /// Open an archive to read it. This handle refuses writes; on a finished
+    /// archive its close can checkpoint (below).
     ///
     /// The read handle. [`ArchiveMut::open`] is the write handle, and it differs
     /// in two ways a reader does not want: SQLite checkpoints a WAL database
@@ -875,13 +876,12 @@ impl Archive {
     /// drop), and the durability pragmas it applies are themselves writes,
     /// which read-only media refuses. For an archive with an unfinished
     /// source this opens `SQLITE_OPEN_READ_ONLY` and sets `query_only`, so
-    /// neither applies; a finished archive is the exception below. Use it for anything pointed at
-    /// a buffer another process is still appending to, at an artifact you do
-    /// not own, or at read-only media.
+    /// neither applies, and the files are left as they are. Use it for
+    /// anything pointed at a buffer another process is still appending to,
+    /// at an artifact you do not own, or at read-only media.
     ///
     /// **A finished archive** (at least one source, every source finalized)
-    /// is the exception: it is reopened `SQLITE_OPEN_READ_WRITE`, with
-    /// `query_only` set. A read-only connection creates the `-wal` and `-shm`
+    /// is reopened `SQLITE_OPEN_READ_WRITE`, with `query_only` set. A read-only connection creates the `-wal` and `-shm`
     /// sidecars and never removes them, so every read of a finished archive
     /// left both beside it. A read-write connection that is the last to close
     /// checkpoints and removes them. That checkpoint can write to the
@@ -892,11 +892,12 @@ impl Archive {
     /// at open and enabled when the handle drops only if the archive is
     /// still finished, so a writer that resumes or adds a source while this
     /// handle is open and is then killed leaves its sidecar for
-    /// [`ArchiveMut::open`]. On a file the process cannot write, SQLite opens
-    /// the connection read-only and nothing is removed; on read-only media
-    /// the read-only connection is kept. An archive with an unfinished
-    /// source is opened read-only, and its reader leaves the files as they
-    /// are.
+    /// [`ArchiveMut::open`]. One window remains: a writer that commits a new
+    /// source between that check and the close, and is killed before the
+    /// close takes its lock, has its committed rows folded in by the close.
+    /// On a file the process cannot write, SQLite opens the connection
+    /// read-only and nothing is removed; on read-only media the read-only
+    /// connection is kept.
     ///
     /// **Read-only media.** WAL mode must create the `-shm` sidecar beside
     /// the archive, and read-only media refuses. When that happens and no
@@ -1881,9 +1882,9 @@ impl Archive {
     /// allows a second party. [`Archive::open`] sets `query_only`, and SQLite
     /// refuses `VACUUM INTO` under it ("attempt to write a readonly
     /// database") although the statement writes only `dest`. So `query_only`
-    /// is lifted for this one statement and restored on every path. The
-    /// statement writes only `dest`. On a live archive the connection is
-    /// also `SQLITE_OPEN_READ_ONLY`, so SQLite refuses a write to the archive
+    /// is lifted for this one statement and restored on every path. On an
+    /// archive with an unfinished source the connection is also
+    /// `SQLITE_OPEN_READ_ONLY`, so SQLite refuses a write to the archive
     /// regardless; on a finished one it is read-write (see
     /// [`open`](Self::open)).
     pub fn vacuum_into(&self, dest: &Path) -> Result<()> {
