@@ -318,6 +318,32 @@ fn documents_survive_reopening_and_the_exact_copies() {
         .is_sound());
 }
 
+/// `serialize` copies through SQLite's backup API, so the copy must carry
+/// commits still in the `-wal` file of a live, file-backed archive, and the
+/// bytes must open with `open_bytes`.
+#[test]
+fn serializing_a_live_archive_carries_its_wal_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    db.put_document(KIND, "main", SCHEMA, "1").unwrap();
+    db.put_document(KIND, "main", SCHEMA, "2").unwrap();
+    let wal = dir.path().join("a.dendro-wal");
+    assert!(
+        std::fs::metadata(&wal).unwrap().len() > 0,
+        "the commits must still be in the WAL for this test to cover it"
+    );
+    let want = revisions(&db, KIND, "main");
+    assert_eq!(want.len(), 2);
+
+    let copy = Archive::open_bytes(db.serialize().unwrap()).unwrap();
+    assert_eq!(revisions(&copy, KIND, "main"), want);
+    assert!(copy
+        .verify(dendro::archive::Depth::Full)
+        .unwrap()
+        .is_sound());
+}
+
 #[test]
 fn a_copy_carries_every_revision_with_its_identity() {
     let dir = tempfile::tempdir().unwrap();

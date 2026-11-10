@@ -108,6 +108,14 @@ set -- cargo check --no-default-features --features archive --target wasm32-unkn
 echo "+ $*"
 "$@"
 
+# The same build, linked. `check` never runs the linker, so a C dependency
+# that needs symbols the program must supply (sqlite-wasm-rs 0.6's
+# `rust_sqlite_wasm_host_*`) passes `check` and fails to link for every
+# caller that does not supply them. A cdylib links the whole dependency graph.
+set -- cargo rustc --no-default-features --features archive --target wasm32-unknown-unknown --lib --crate-type cdylib
+echo "+ $*"
+"$@"
+
 # The wire alone, which a producer serving frames compiles.
 set -- cargo check --no-default-features --target wasm32-unknown-unknown
 echo "+ $*"
