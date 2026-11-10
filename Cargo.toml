@@ -45,6 +45,10 @@ serde_core = { version = "1", optional = true }
 serde_json = { version = "1.0", optional = true }
 tracing = { version = "0.1", optional = true }
 
+# Below 0.6, which rusqlite 0.41 allows but which links only with host-supplied `rust_sqlite_wasm_host_*` symbols.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+sqlite-wasm-rs = { version = ">=0.5.1, <0.6", optional = true, default-features = false }
+
 [features]
 default = ["write"]
 # The archive: the SQLite container, its catalog, segments, reads, rewrites
@@ -58,6 +62,7 @@ archive = [
     "dep:rusqlite",
     "dep:serde_core",
     "dep:serde_json",
+    "dep:sqlite-wasm-rs",
     "dep:tracing",
 ]
 # The append side: the streaming writer, its checkpoint thread, and retention.

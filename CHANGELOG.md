@@ -42,6 +42,16 @@ cannot reach a failed release any other way.
   holds a `rusqlite::Error`, `Error` implements `From<rusqlite::Error>`,
   `Error::sqlite` takes a `rusqlite::Error`, and `Error::sqlite_code`
   returns a `rusqlite::ErrorCode`.
+- On wasm32-unknown-unknown, SQLite comes from sqlite-wasm-rs, not
+  libsqlite3-sys, and dendro holds it below 0.6 (0.5.5 bundles SQLite
+  3.53.0), as rusqlite 0.40 did: sqlite-wasm-rs 0.6 links only in a program
+  that supplies its `rust_sqlite_wasm_host_*` symbols. SQLite 3.53 predates
+  the fix for RUSTSEC-2026-0459, which needs a database opened together with
+  a `-wal` file. `Archive::open_bytes` opens an image in memory with no
+  `-wal` file. `Archive::open` and `ArchiveMut::open` also build for wasm32,
+  where a path names a file in sqlite-wasm-rs's in-memory VFS, which holds
+  only files the program put there; a program that puts an untrusted
+  database and `-wal` pair there and opens it by path can be exposed.
 - **Breaking:** the minimum supported Rust version is 1.89 (was 1.88), the
   floor rusqlite 0.41 sets.
 - `Archive::serialize` copies the database into a private in-memory database

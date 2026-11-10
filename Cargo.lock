@@ -394,6 +394,7 @@ dependencies = [
  "rusqlite",
  "serde_core",
  "serde_json",
+ "sqlite-wasm-rs",
  "tempfile",
  "tracing",
 ]
