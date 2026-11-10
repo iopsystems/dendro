@@ -33,6 +33,23 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** rusqlite is 0.41 (was 0.40), which bundles SQLite 3.54.1
+  through libsqlite3-sys 0.39. This clears RUSTSEC-2026-0459 (libsqlite3-sys
+  before 0.39, from a CVE in the bundled C SQLite). rusqlite types appear in
+  the public API, so a caller must use the same version: `Error::Sqlite`
+  holds a `rusqlite::Error`, `Error` implements `From<rusqlite::Error>`,
+  `Error::sqlite` takes a `rusqlite::Error`, and `Error::sqlite_code`
+  returns a `rusqlite::ErrorCode`.
+- **Breaking:** the minimum supported Rust version is 1.89 (was 1.88), the
+  floor rusqlite 0.41 sets.
+- `Archive::serialize` copies the database into a private in-memory database
+  with SQLite's backup API and serializes the copy, because rusqlite 0.41's
+  `Connection::serialize` takes `&mut self`. Its signature is unchanged,
+  `open_bytes` reads what it returns, and it holds one more copy of the
+  database in memory while it runs.
+
 ## [0.6.2] - 2026-11-06
 
 ### Changed

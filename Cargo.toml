@@ -2,11 +2,11 @@
 name = "dendro"
 version = "0.6.3-alpha.0"
 edition = "2021"
-# The floor the dependency graph sets (arrow/parquet 60 require 1.88). CI
+# The floor the dependency graph sets (rusqlite 0.41 requires 1.89). CI
 # builds on it, so raising it is a deliberate act rather than a drift. Note
 # this also configures clippy: MSRV-gated lints stop suggesting APIs newer
 # than this.
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/iopsystems/dendro"
 description = "A segmented-parquet archive with a write-ahead log, in a single SQLite file"
@@ -38,7 +38,7 @@ parquet = { version = "60.0.0", default-features = false, optional = true, featu
 ] }
 # `bundled` compiles SQLite from source: slower builds, no runtime system
 # dependency, and it is what lets the crate build for wasm32.
-rusqlite = { version = "0.40", optional = true, features = ["bundled", "blob", "serialize"] }
+rusqlite = { version = "0.41", optional = true, features = ["backup", "bundled", "blob", "serialize"] }
 # `serde_core::de::IgnoredAny`, which checks that a document body is JSON
 # without building it. serde_json is built on serde_core.
 serde_core = { version = "1", optional = true }
@@ -88,5 +88,5 @@ required-features = ["test-support"]
 [dev-dependencies]
 # Raw connections in tests that stage a concurrent writer beside a live
 # reader (`tests/read_seam.rs`), and a hand-built foreign database.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"

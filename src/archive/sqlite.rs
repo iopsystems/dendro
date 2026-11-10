@@ -689,9 +689,36 @@ impl Archive {
     /// Serialize the whole database to bytes — the inverse of
     /// [`open_bytes`](Self::open_bytes). Used to hand a report archive built in
     /// memory back to a caller (a browser download) without a filesystem.
+    ///
+    /// rusqlite's `Connection::serialize` takes `&mut self` and this method
+    /// takes `&self`, so the archive is first copied into a private in-memory
+    /// database with SQLite's backup API and that copy is serialized. The
+    /// copy costs one extra image of the database in memory while this runs.
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        let data = self
-            .conn
+        let mut copy = Connection::open_in_memory().map_err(Error::sqlite(
+            "failed to open an in-memory copy to serialize",
+        ))?;
+        // One step of -1 pages copies the whole database in a single call.
+        // `Backup::run_to_completion` is not used because it sleeps between
+        // steps, and a thread sleep panics on wasm32.
+        let step = rusqlite::backup::Backup::new(&self.conn, &mut copy)
+            .and_then(|backup| backup.step(-1))
+            .map_err(Error::sqlite("failed to copy the archive to serialize it"))?;
+        let code = match step {
+            rusqlite::backup::StepResult::Done => None,
+            rusqlite::backup::StepResult::Locked => Some(rusqlite::ffi::SQLITE_LOCKED),
+            // `Busy`, and `More`, which a step of -1 pages does not return.
+            _ => Some(rusqlite::ffi::SQLITE_BUSY),
+        };
+        if let Some(code) = code {
+            return Err(Error::sqlite("failed to copy the archive to serialize it")(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(code),
+                    Some(format!("the backup step returned {step:?}")),
+                ),
+            ));
+        }
+        let data = copy
             .serialize(rusqlite::MAIN_DB)
             .map_err(Error::sqlite("failed to serialize the archive"))?;
         Ok(data.to_vec())
