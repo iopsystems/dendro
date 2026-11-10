@@ -692,8 +692,10 @@ impl Archive {
     ///
     /// rusqlite's `Connection::serialize` takes `&mut self` and this method
     /// takes `&self`, so the archive is first copied into a private in-memory
-    /// database with SQLite's backup API and that copy is serialized. The
-    /// copy costs one extra image of the database in memory while this runs.
+    /// database with SQLite's backup API and that copy is serialized. This
+    /// holds one more image of the database in memory than
+    /// `Connection::serialize` did, and two more when the archive came from
+    /// [`open_bytes`](Self::open_bytes).
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut copy = Connection::open_in_memory().map_err(Error::sqlite(
             "failed to open an in-memory copy to serialize",
