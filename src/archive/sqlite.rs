@@ -2824,6 +2824,43 @@ impl ArchiveMut {
         self.evict_streams(source_id, cutoff_ts, evict, Some(floor))
     }
 
+    /// Delete the WAL rows of `source_id`'s streams that `discard` accepts
+    /// and that no segment holds: a stream's rows after its last segment's
+    /// `last_ts`, or every row of a stream with no segment. The streams'
+    /// segments, caller rows and the source's clock offsets are kept.
+    /// Returns the number of rows deleted. One transaction.
+    ///
+    /// For a stream whose unsealed rows cannot be sealed, such as rows the
+    /// caller's encoder cannot encode: the segments sealed before them stay
+    /// readable, and a reader no longer meets rows no segment will hold.
+    pub fn discard_live_rows(
+        &mut self,
+        source_id: i64,
+        discard: &dyn Fn(&str) -> bool,
+    ) -> Result<usize> {
+        let streams: Vec<String> = self
+            .db
+            .all_streams(source_id)?
+            .into_iter()
+            .filter(|s| discard(s))
+            .collect();
+        self.transaction(|tx| {
+            let mut deleted = 0;
+            for stream in &streams {
+                deleted += tx
+                    .tx
+                    .execute(
+                        &format!("DELETE FROM wal WHERE {LIVE_WAL_PREDICATE}"),
+                        rusqlite::params![source_id, stream],
+                    )
+                    .map_err(Error::sqlite(format!(
+                        "failed to discard {stream}'s live rows"
+                    )))?;
+            }
+            Ok(deleted)
+        })
+    }
+
     fn evict_streams(
         &mut self,
         source_id: i64,

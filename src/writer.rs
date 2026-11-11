@@ -123,6 +123,13 @@ enum Msg {
         floor: Option<CallerRowFloorFn>,
         reply: SyncSender<Result<Evicted>>,
     },
+    /// Delete the live WAL rows of the streams `streams` accepts, keeping
+    /// their segments.
+    DiscardLive {
+        source_id: i64,
+        streams: StreamFilter,
+        reply: SyncSender<Result<usize>>,
+    },
     /// Merge keys into one source's metadata, in order with the ticks around
     /// it. What a caller learns only from the rows themselves — a producer's
     /// epoch changing, a discontinuity worth an event — lands here as it
@@ -1211,6 +1218,24 @@ impl SourceWriter {
         rx.recv().map_err(|_| take_writer_error(&self.err))?
     }
 
+    /// Delete the WAL rows of this source's streams that `discard` accepts
+    /// and that no segment holds, keeping the streams' segments, and return
+    /// how many rows were deleted. The writer-side spelling of
+    /// [`ArchiveMut::discard_live_rows`](crate::archive::ArchiveMut::discard_live_rows).
+    ///
+    /// Rows written to those streams afterwards are live rows like any
+    /// others. Waits for the writer thread, as eviction does; on an error
+    /// the writer keeps running and the rows are kept.
+    pub fn discard_live_rows(&mut self, discard: StreamFilter) -> Result<usize> {
+        let (tx, rx) = sync_channel(0);
+        self.send(Msg::DiscardLive {
+            source_id: self.source_id,
+            streams: discard,
+            reply: tx,
+        })?;
+        rx.recv().map_err(|_| take_writer_error(&self.err))?
+    }
+
     /// Block until everything handed off so far has been committed.
     ///
     /// **It exists because the file lags the caller.** The append hand-offs
@@ -2036,6 +2061,18 @@ fn writer_loop(
                 if let Err(e) = reclaim_if_fragmented(db) {
                     warn!("reclaiming freed pages after retention failed ({e}); skipped");
                 }
+            }
+            Ok(Msg::DiscardLive {
+                source_id,
+                streams,
+                reply,
+            }) => {
+                // Never fatal, as a failed retention pass is not: the caller
+                // has the error and the rows are still there.
+                let discarded = with_retries("discarding live rows", || {
+                    db.discard_live_rows(source_id, &*streams)
+                });
+                let _ = reply.send(discarded);
             }
             Ok(Msg::UpdateMetadata { source_id, patch }) => {
                 // Never fatal: metadata is not the recording, and the caller

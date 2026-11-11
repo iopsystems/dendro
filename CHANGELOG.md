@@ -33,6 +33,15 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `SourceWriter::discard_live_rows` and `ArchiveMut::discard_live_rows`
+  delete the WAL rows of the streams a predicate accepts that no segment
+  holds, and keep the streams' segments. A caller whose encoder cannot seal
+  a stream's rows can remove them and keep what the stream sealed before;
+  `evict_streams_before` at `i64::MAX`, the only way before, deleted the
+  segments too.
+
 ## [0.7.0] - 2026-11-09
 
 ### Changed
