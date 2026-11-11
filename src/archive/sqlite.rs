@@ -2726,8 +2726,7 @@ impl ArchiveMut {
 
     /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
     /// and every WAL row stamped before it. This is what makes a bounded
-    /// rolling buffer possible — the whole reason a rolling buffer works — and it is
-    /// the only destructive operation the container has.
+    /// rolling buffer possible.
     ///
     /// Segment granularity is deliberate and visible to the caller: a segment
     /// goes only when its NEWEST row is out of the window (`last_ts <
@@ -2824,15 +2823,16 @@ impl ArchiveMut {
         self.evict_streams(source_id, cutoff_ts, evict, Some(floor))
     }
 
-    /// Delete the WAL rows of `source_id`'s streams that `discard` accepts
-    /// and that no segment holds: a stream's rows after its last segment's
-    /// `last_ts`, or every row of a stream with no segment. The streams'
-    /// segments, caller rows and the source's clock offsets are kept.
-    /// Returns the number of rows deleted. One transaction.
+    /// Delete the live WAL rows (FORMAT.md §3.3) of `source_id`'s streams
+    /// that `discard` accepts: a stream's rows after its newest segment's
+    /// `last_ts`, or every row of a stream with no segment. Rows at or
+    /// before that `last_ts`, the streams' segments, caller rows and the
+    /// source's clock offsets are kept. Returns the number of rows deleted.
+    /// One transaction.
     ///
-    /// For a stream whose unsealed rows cannot be sealed, such as rows the
-    /// caller's encoder cannot encode: the segments sealed before them stay
-    /// readable, and a reader no longer meets rows no segment will hold.
+    /// Use it for a stream whose live rows the encoder cannot seal: its
+    /// earlier segments stay readable, and a read no longer materializes
+    /// those rows.
     pub fn discard_live_rows(
         &mut self,
         source_id: i64,

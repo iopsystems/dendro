@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
+use dendro::archive::{Archive, ArchiveMut, SegmentMeta, SourceMeta, WalRow};
 use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 
@@ -190,4 +190,35 @@ fn the_archive_spelling_discards_the_same_rows() {
     drop(db);
     assert_eq!(segments(&path, id, "bad"), [(1_000, 2_000)]);
     assert!(wal(&path, "bad").is_empty());
+}
+
+/// Rows at or before the stream's newest segment that a prune has not yet
+/// removed (a crash between a seal's commit and its prune leaves them) are
+/// not live, and are kept.
+#[test]
+fn rows_a_segment_covers_but_the_prune_left_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unpruned.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db.insert_source(&source()).unwrap();
+    db.insert_segment(
+        id,
+        "bad",
+        0,
+        &SegmentMeta {
+            rows: 2,
+            first_ts: 1_000,
+            last_ts: 2_000,
+        },
+        b"x",
+    )
+    .unwrap();
+    db.insert_wal_rows(
+        id,
+        &[row("bad", 1_000), row("bad", 2_000), row("bad", 3_000)],
+    )
+    .unwrap();
+    assert_eq!(db.discard_live_rows(id, &|s| s == "bad").unwrap(), 1);
+    drop(db);
+    assert_eq!(wal(&path, "bad"), [1_000, 2_000]);
 }

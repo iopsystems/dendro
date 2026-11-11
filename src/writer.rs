@@ -124,7 +124,7 @@ enum Msg {
         reply: SyncSender<Result<Evicted>>,
     },
     /// Delete the live WAL rows of the streams `streams` accepts, keeping
-    /// their segments.
+    /// their segments, and take those streams off the deferred-seal list.
     DiscardLive {
         source_id: i64,
         streams: StreamFilter,
@@ -1218,14 +1218,17 @@ impl SourceWriter {
         rx.recv().map_err(|_| take_writer_error(&self.err))?
     }
 
-    /// Delete the WAL rows of this source's streams that `discard` accepts
-    /// and that no segment holds, keeping the streams' segments, and return
-    /// how many rows were deleted. The writer-side spelling of
+    /// Delete the live WAL rows of this source's streams that `discard`
+    /// accepts, the rows after each stream's newest sealed row, keeping the
+    /// streams' segments, and return how many rows were deleted. The
+    /// writer-side spelling of
     /// [`ArchiveMut::discard_live_rows`](crate::archive::ArchiveMut::discard_live_rows).
     ///
-    /// Rows written to those streams afterwards are live rows like any
-    /// others. Waits for the writer thread, as eviction does; on an error
-    /// the writer keeps running and the rows are kept.
+    /// A deferred seal of those streams is dropped. Rows written to them
+    /// afterwards are live rows like any others. The discard is not
+    /// replicated: a subscriber that already received the rows keeps them.
+    /// Waits for the writer thread, as eviction does. A failed discard
+    /// deletes nothing and does not stop the writer.
     pub fn discard_live_rows(&mut self, discard: StreamFilter) -> Result<usize> {
         let (tx, rx) = sync_channel(0);
         self.send(Msg::DiscardLive {
@@ -2072,6 +2075,13 @@ fn writer_loop(
                 let discarded = with_retries("discarding live rows", || {
                     db.discard_live_rows(source_id, &*streams)
                 });
+                // A deferred seal of a discarded stream would find no live
+                // rows, and warn about it if the stream never sealed.
+                if discarded.is_ok() {
+                    if let Some(held) = deferred.get_mut(&source_id) {
+                        held.retain(|stream, _| !streams(stream));
+                    }
+                }
                 let _ = reply.send(discarded);
             }
             Ok(Msg::UpdateMetadata { source_id, patch }) => {
