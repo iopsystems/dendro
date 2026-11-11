@@ -118,8 +118,11 @@ jobs:
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
           NOTES: ${{ steps.notes.outputs.notes }}
         run: |
-          FLAGS=""
-          if [ "$PRERELEASE" = "true" ]; then FLAGS="--prerelease"; fi
+          # release/0.3.x never holds the highest version, so its releases
+          # are never marked Latest; without the flag GitHub marks the newest
+          # release Latest, which would move it off the 0.7 line.
+          FLAGS="--latest=false"
+          if [ "$PRERELEASE" = "true" ]; then FLAGS="$FLAGS --prerelease"; fi
           gh release create "$TAG" \
             --title "dendro $TAG" \
             --notes-file "$NOTES" \

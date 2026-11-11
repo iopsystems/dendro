@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-11
+
 ### Changed
 
 - rusqlite is 0.41 (was 0.40), which bundles SQLite 3.54.0 or later through
