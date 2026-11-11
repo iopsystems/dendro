@@ -186,3 +186,38 @@ fn segment_bytes_resolve_lazily_by_path_and_by_shared_connection() {
     let by_conn = SegmentBytes::shared(shared, id, "a".to_string());
     assert_eq!(by_conn.all(&Tags).unwrap(), full);
 }
+
+/// `serialize` copies through SQLite's backup API, so the copy must carry
+/// commits still in the `-wal` file of a live, file-backed archive, and the
+/// bytes must open with `open_bytes`.
+#[test]
+fn serializing_a_live_archive_carries_its_wal_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db
+        .insert_source(&SourceMeta {
+            labels: BTreeMap::from([("source".to_string(), "x".to_string())]),
+            metadata: BTreeMap::new(),
+            clock_anchor_wall_ns: 0,
+        })
+        .unwrap();
+    db.insert_wal_rows(id, &[row("a", 5), row("a", 6)]).unwrap();
+    let wal = dir.path().join("s.dendro-wal");
+    assert!(
+        std::fs::metadata(&wal).unwrap().len() > 0,
+        "the commits must still be in the WAL for this test to cover it"
+    );
+
+    let copy = Archive::open_bytes(db.serialize().unwrap()).unwrap();
+    let cat = read::catalog(&copy).unwrap();
+    assert_eq!(cat.len(), 1);
+    assert_eq!(cat[0].labels["source"], "x");
+    let a = cat[0].streams.iter().find(|s| s.name == "a").unwrap();
+    assert_eq!(a.live.rows, 2);
+    assert_eq!(a.span(), Some((5, 6)));
+    assert!(copy
+        .verify(dendro::archive::Depth::Full)
+        .unwrap()
+        .is_sound());
+}
