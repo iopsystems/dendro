@@ -1219,8 +1219,9 @@ impl SourceWriter {
     }
 
     /// Delete the live WAL rows of this source's streams that `discard`
-    /// accepts, the rows after each stream's newest sealed row, keeping the
-    /// streams' segments, and return how many rows were deleted. The
+    /// accepts, the rows after each stream's newest sealed row or every row
+    /// of a stream with no segment, keeping the streams' segments, and
+    /// return how many rows were deleted. The
     /// writer-side spelling of
     /// [`ArchiveMut::discard_live_rows`](crate::archive::ArchiveMut::discard_live_rows).
     ///

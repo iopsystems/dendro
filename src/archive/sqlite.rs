@@ -2832,7 +2832,8 @@ impl ArchiveMut {
     ///
     /// Use it for a stream whose live rows the encoder cannot seal: its
     /// earlier segments stay readable, and a read no longer materializes
-    /// those rows.
+    /// those rows. The discard is not replicated: a subscriber that already
+    /// received the rows keeps them.
     pub fn discard_live_rows(
         &mut self,
         source_id: i64,
