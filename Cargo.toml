@@ -42,6 +42,12 @@ rusqlite = { version = "0.41", features = ["backup", "bundled", "blob", "seriali
 serde_json = "1.0"
 tracing = "0.1"
 
+# Below 0.6, which rusqlite 0.41 allows but which links only when the program
+# supplies `rust_sqlite_wasm_host_*` or enables sqlite-wasm-rs's `wasm-bindgen`
+# feature.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+sqlite-wasm-rs = { version = ">=0.5.1, <0.6", default-features = false }
+
 [features]
 default = ["write"]
 # The append side: the streaming writer, its checkpoint thread, and retention.

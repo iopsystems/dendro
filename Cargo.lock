@@ -386,6 +386,7 @@ dependencies = [
  "parquet",
  "rusqlite",
  "serde_json",
+ "sqlite-wasm-rs",
  "tempfile",
  "tracing",
 ]
