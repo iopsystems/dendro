@@ -33,6 +33,41 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- rusqlite is 0.41 (was 0.40), which bundles SQLite 3.54.0 or later through
+  libsqlite3-sys 0.39. On every target but wasm32-unknown-unknown, this
+  clears RUSTSEC-2026-0459 (libsqlite3-sys before 0.39, from a CVE in the
+  bundled C SQLite). rusqlite types appear in the public API
+  (`Error::Sqlite`, `From<rusqlite::Error>`, `Error::sqlite`,
+  `Error::sqlite_code`), so a caller that names them must use rusqlite 0.41
+  too. Only one package in a dependency graph may link `sqlite3`, so a graph
+  that also requires rusqlite 0.40, directly or through another crate,
+  resolves to dendro 0.3.4 and does not get this fix; `cargo update -p
+  dendro --precise 0.3.5` fails with a `links` conflict until that
+  requirement moves to 0.41.
+- On wasm32-unknown-unknown, SQLite comes from sqlite-wasm-rs, not
+  libsqlite3-sys, and dendro holds it below 0.6 (0.5.5 bundles SQLite
+  3.53.0), as rusqlite 0.40 did: sqlite-wasm-rs 0.6 links only in a program
+  that supplies its `rust_sqlite_wasm_host_*` symbols or enables its
+  `wasm-bindgen` feature. SQLite 3.53 predates the fix for
+  RUSTSEC-2026-0459, which needs a database opened together with a `-wal`
+  file. `Archive::open_bytes` opens an image in memory with no `-wal` file.
+  `Archive::open` and `ArchiveMut::open` also build for wasm32, where a path
+  names a file in sqlite-wasm-rs's in-memory VFS, which holds only files the
+  program put there; a program that puts an untrusted database and `-wal`
+  pair there and opens it by path can be exposed.
+- The minimum supported Rust version is 1.89 (was 1.85), the floor rusqlite
+  0.41 sets. With resolver 2, `cargo update` on an older toolchain moves to
+  0.3.5 and the build stops at cargo's rust-version check; with resolver 3
+  (or `incompatible-rust-versions = "fallback"`), cargo keeps 0.3.4.
+- `Archive::serialize` copies the database into a private in-memory database
+  with SQLite's backup API and serializes the copy, because rusqlite 0.41's
+  `Connection::serialize` takes `&mut self`. Its signature is unchanged,
+  `open_bytes` reads what it returns, and it holds one more copy of the
+  database in memory than before while it runs (two more for an archive
+  opened with `open_bytes`).
+
 ## [0.3.4] - 2026-10-02
 
 ### Added

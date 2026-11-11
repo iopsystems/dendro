@@ -2,12 +2,11 @@
 name = "dendro"
 version = "0.3.4"
 edition = "2021"
-# The floor the dependency graph sets (arrow/parquet 58 require 1.85). CI
+# The floor the dependency graph sets (rusqlite 0.41 requires 1.89). CI
 # builds on it, so raising it is a deliberate act rather than a drift. Note
 # this also configures clippy: MSRV-gated lints stop suggesting APIs newer
-# than this, which is why `seal.rs` can use `%` where clippy would otherwise
-# demand `is_multiple_of`.
-rust-version = "1.85"
+# than this.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/iopsystems/dendro"
 description = "A segmented-parquet archive with a write-ahead log, in a single SQLite file"
@@ -39,9 +38,15 @@ parquet = { version = "58.2.0", default-features = false, features = [
 ] }
 # `bundled` compiles SQLite from source: slower builds, no runtime system
 # dependency, and it is what lets the crate build for wasm32.
-rusqlite = { version = "0.40", features = ["bundled", "blob", "serialize"] }
+rusqlite = { version = "0.41", features = ["backup", "bundled", "blob", "serialize"] }
 serde_json = "1.0"
 tracing = "0.1"
+
+# Below 0.6, which rusqlite 0.41 allows but which links only when the program
+# supplies `rust_sqlite_wasm_host_*` or enables sqlite-wasm-rs's `wasm-bindgen`
+# feature.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+sqlite-wasm-rs = { version = ">=0.5.1, <0.6", default-features = false }
 
 [features]
 default = ["write"]
@@ -73,5 +78,5 @@ required-features = ["test-support"]
 [dev-dependencies]
 # Raw connections in tests that stage a concurrent writer beside a live
 # reader (`tests/read_seam.rs`), and a hand-built foreign database.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
