@@ -33,6 +33,17 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `SourceWriter::discard_live_rows` and `ArchiveMut::discard_live_rows`
+  delete the live WAL rows (the rows after a stream's newest sealed row, or
+  every row of a stream with no segment) of the streams a predicate accepts,
+  and keep the streams' segments. A caller
+  whose encoder cannot seal a stream's rows can remove them and keep what
+  the stream sealed before. Through a running writer the only way before was
+  `evict_streams_before` at `i64::MAX`, which deleted the segments too. The
+  discard is not replicated.
+
 ## [0.7.0] - 2026-11-09
 
 ### Changed

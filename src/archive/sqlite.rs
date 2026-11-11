@@ -2726,8 +2726,7 @@ impl ArchiveMut {
 
     /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
     /// and every WAL row stamped before it. This is what makes a bounded
-    /// rolling buffer possible — the whole reason a rolling buffer works — and it is
-    /// the only destructive operation the container has.
+    /// rolling buffer possible.
     ///
     /// Segment granularity is deliberate and visible to the caller: a segment
     /// goes only when its NEWEST row is out of the window (`last_ts <
@@ -2822,6 +2821,45 @@ impl ArchiveMut {
         floor: CallerRowFloor<'_>,
     ) -> Result<Evicted> {
         self.evict_streams(source_id, cutoff_ts, evict, Some(floor))
+    }
+
+    /// Delete the live WAL rows (FORMAT.md §3.3) of `source_id`'s streams
+    /// that `discard` accepts: a stream's rows after its newest segment's
+    /// `last_ts`, or every row of a stream with no segment. Rows at or
+    /// before that `last_ts`, the streams' segments, caller rows and the
+    /// source's clock offsets are kept. Returns the number of rows deleted.
+    /// One transaction.
+    ///
+    /// Use it for a stream whose live rows the encoder cannot seal: its
+    /// earlier segments stay readable, and a read no longer materializes
+    /// those rows. The discard is not replicated: a subscriber that already
+    /// received the rows keeps them.
+    pub fn discard_live_rows(
+        &mut self,
+        source_id: i64,
+        discard: &dyn Fn(&str) -> bool,
+    ) -> Result<usize> {
+        let streams: Vec<String> = self
+            .db
+            .all_streams(source_id)?
+            .into_iter()
+            .filter(|s| discard(s))
+            .collect();
+        self.transaction(|tx| {
+            let mut deleted = 0;
+            for stream in &streams {
+                deleted += tx
+                    .tx
+                    .execute(
+                        &format!("DELETE FROM wal WHERE {LIVE_WAL_PREDICATE}"),
+                        rusqlite::params![source_id, stream],
+                    )
+                    .map_err(Error::sqlite(format!(
+                        "failed to discard {stream}'s live rows"
+                    )))?;
+            }
+            Ok(deleted)
+        })
     }
 
     fn evict_streams(

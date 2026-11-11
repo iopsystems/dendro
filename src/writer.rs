@@ -123,6 +123,13 @@ enum Msg {
         floor: Option<CallerRowFloorFn>,
         reply: SyncSender<Result<Evicted>>,
     },
+    /// Delete the live WAL rows of the streams `streams` accepts, keeping
+    /// their segments, and take those streams off the deferred-seal list.
+    DiscardLive {
+        source_id: i64,
+        streams: StreamFilter,
+        reply: SyncSender<Result<usize>>,
+    },
     /// Merge keys into one source's metadata, in order with the ticks around
     /// it. What a caller learns only from the rows themselves — a producer's
     /// epoch changing, a discontinuity worth an event — lands here as it
@@ -1211,6 +1218,28 @@ impl SourceWriter {
         rx.recv().map_err(|_| take_writer_error(&self.err))?
     }
 
+    /// Delete the live WAL rows of this source's streams that `discard`
+    /// accepts, the rows after each stream's newest sealed row or every row
+    /// of a stream with no segment, keeping the streams' segments, and
+    /// return how many rows were deleted. The
+    /// writer-side spelling of
+    /// [`ArchiveMut::discard_live_rows`](crate::archive::ArchiveMut::discard_live_rows).
+    ///
+    /// A deferred seal of those streams is dropped. Rows written to them
+    /// afterwards are live rows like any others. The discard is not
+    /// replicated: a subscriber that already received the rows keeps them.
+    /// Waits for the writer thread, as eviction does. A failed discard
+    /// deletes nothing and does not stop the writer.
+    pub fn discard_live_rows(&mut self, discard: StreamFilter) -> Result<usize> {
+        let (tx, rx) = sync_channel(0);
+        self.send(Msg::DiscardLive {
+            source_id: self.source_id,
+            streams: discard,
+            reply: tx,
+        })?;
+        rx.recv().map_err(|_| take_writer_error(&self.err))?
+    }
+
     /// Block until everything handed off so far has been committed.
     ///
     /// **It exists because the file lags the caller.** The append hand-offs
@@ -2036,6 +2065,25 @@ fn writer_loop(
                 if let Err(e) = reclaim_if_fragmented(db) {
                     warn!("reclaiming freed pages after retention failed ({e}); skipped");
                 }
+            }
+            Ok(Msg::DiscardLive {
+                source_id,
+                streams,
+                reply,
+            }) => {
+                // Never fatal, as a failed retention pass is not: the caller
+                // has the error and the rows are still there.
+                let discarded = with_retries("discarding live rows", || {
+                    db.discard_live_rows(source_id, &*streams)
+                });
+                // A deferred seal of a discarded stream would find no live
+                // rows, and warn about it if the stream never sealed.
+                if discarded.is_ok() {
+                    if let Some(held) = deferred.get_mut(&source_id) {
+                        held.retain(|stream, _| !streams(stream));
+                    }
+                }
+                let _ = reply.send(discarded);
             }
             Ok(Msg::UpdateMetadata { source_id, patch }) => {
                 // Never fatal: metadata is not the recording, and the caller

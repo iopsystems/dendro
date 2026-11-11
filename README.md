@@ -208,6 +208,9 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   and `archive_bytes` are what a size cap consults. Freed pages return to the
   filesystem gradually, which is what bounds a rolling buffer. dendro
   supplies the mechanism and applies no policy of its own.
+  `discard_live_rows` deletes only a stream's live rows, the rows after its
+  newest segment or every row of a stream with no segment, for a stream
+  whose rows cannot be sealed.
 - **A lazy read.** `read::catalog` answers what sources and streams exist and
   what each spans, in one snapshot, without touching a segment;
   `read::probe` fetches the one segment a schema needs; `read::stream_range`
