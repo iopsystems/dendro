@@ -120,9 +120,11 @@ stream still inside its first seal period is not invisible.
 
 The container needs three things that a directory or a tar does not give you:
 
-1. **Transactions.** A seal inserts a segment, records a clock observation and
-   prunes the WAL. Either all of that lands or none does. In a tar-shaped
-   container the same guarantee costs a `.partial` file, a rename, a
+1. **Transactions.** A seal inserts its segments and records a clock
+   observation in one transaction: either all of that lands or none does. The
+   WAL prune that follows is a transaction of its own, and the watermark makes
+   a crash between the two harmless (see [the seal seam](#the-seal-seam)). In
+   a tar-shaped container the same guarantee costs a `.partial` file, a rename, a
    rename-aside, checkpoint manifests, and a two-sync ordering protocol, and
    every one of those is a state that can be left half-written and must be
    recovered from.
@@ -137,11 +139,12 @@ The container needs three things that a directory or a tar does not give you:
 SQLite is used as a transactional allocator with a queryable catalog, **not as
 a query engine**. It never looks inside a segment.
 
-dendro itself looks inside one in exactly one place, and it is named here
-because the sentence above invites the opposite conclusion:
-`rewrite::project_segment_columns` decodes a segment's Parquet to drop columns
-and re-encodes it with the archive's writer properties. Every other copy moves
-the BLOB verbatim. That is also why a segment is Parquet rather than a format
+dendro itself decodes a segment in two places, named here because the
+sentence above invites the opposite conclusion. `rewrite::project_segment_columns`
+decodes a segment's Parquet to drop columns, and compaction (`rewrite::compact`,
+`rewrite::compact_stream`) decodes the segments of a run to merge them. Both re-encode with the archive's writer
+properties unless the caller passes its own. A copy without a projection moves
+each sealed BLOB verbatim. That is also why a segment is Parquet rather than a format
 of the caller's choosing; see
 [the encoder boundary](docs/journal/2026-09-11-encoder-boundary.md).
 
@@ -179,13 +182,14 @@ Two constraints follow from it, and both are required:
   rows. In practice that means re-anchoring whatever repeats, such as
   schemas, names and metadata, once per segment rather than holding it in a
   cache the reader cannot see.
-- **An encoder may drop a leading run.** If your rows reference an anchor
-  that retention has since evicted, the rows before the next anchor cannot be
-  decoded. So `Segment` reports its own row count and first timestamp rather
-  than letting the catalog assume the input's; otherwise the catalog would
-  claim a span the bytes do not contain. `last_ts` is exempt: a dropped run is
-  always a *leading* one, because retention removes a prefix and never leaves
-  a hole.
+- **An encoder may drop a leading or a trailing run.** If your rows reference
+  an anchor that retention has since evicted, the rows before the next anchor
+  cannot be decoded; a record still incomplete at the end of the input cannot
+  be encoded yet. So `Segment` reports its own row count and first and last
+  timestamps rather than letting the catalog assume the input's; otherwise the
+  catalog would claim a span the bytes do not contain. A trailing run the
+  encoder drops stays live and is sealed by a later batch. An encoder may not
+  drop rows from the middle (`segment::materialize` refuses it).
 
 ## The seal seam
 
@@ -237,21 +241,25 @@ read-only and leaves the files as they are.
 **An unclean kill is the case to know about.** The sidecars survive it and
 hold every commit since the last checkpoint. Creation checkpoints the catalog
 into the archive, so the archive alone always opens; what it lacks is the
-sidecar's contents. Measured on the kill fixture in `tests/unclean_kill.rs`:
-400 appends with no seal, killed before any checkpoint, leave a 45 KiB
-archive and a 3.3 MB sidecar. Opening the set recovers all 400 rows and folds
-the sidecar in, after which the archive is 61 KiB. Copying only the archive
-at that moment recovers none of the 400.
+sidecar's contents. Measured with the kill fixture binary
+(`append-until-killed <path> 400 1000`, which `tests/unclean_kill.rs` drives
+with fewer rows), three runs with identical results on schema 5: 400 appends
+of 1-byte rows with no seal, killed before any checkpoint, leave a 64 KiB
+archive and a 3.3 MB sidecar. Opening the set recovers all 400 rows, and a
+read-write open's close folds the sidecar in, after which the archive is
+80 KiB. Copying only the archive before that open recovers none of the 400.
 
-The sidecar is large because each commit writes whole pages: a 400-commit
-run of 15-byte rows wrote 3.3 MB, about 8 KiB per commit.
+The sidecar is large because each commit writes whole pages: the run's 403
+commits (the 400 appends and the archive's setup) wrote 3,341,352 bytes,
+about 8 KiB per commit.
 
 This is what the checkpoint bounds, and the bound is stated in rows rather
-than bytes. A 400-append run killed with no checkpoint recovers **no rows**
-from the archive alone; the same run checkpointing every 200 ms recovers
-**390 of 400**, the remainder being the tail since the last checkpoint. At
-the shipped `CHECKPOINT_INTERVAL` of 10 s and a 1 s append cadence, that tail
-is about ten appends.
+than bytes. A run killed with no checkpoint recovers **no rows** from the
+archive alone; one that checkpointed recovers the rows its checkpoints moved.
+At the shipped `CHECKPOINT_INTERVAL` of 10 s and a 1 s append cadence, a copy
+of the archive alone misses about the last ten appends, provided no reader
+held a snapshot across the checkpoints (a held snapshot stops a checkpoint
+from moving anything; FORMAT.md §4, rule 2).
 
 **dendro does not rewrite an unfinished archive on its own.** It does not
 migrate an older schema in place, and it does not normalize a crashed archive
@@ -263,7 +271,7 @@ checkpoint on close of a finished archive, described above.
 **SQLite does rewrite, and a reader must know when.** A read-write connection
 that is the last one open checkpoints on close. So `ArchiveMut::open` on a
 crashed archive folds the sidecar in and unlinks it, from nothing but an open
-and a drop: 45 KiB to 61 KiB in the measurement above. That is the recovery
+and a drop: 64 KiB to 80 KiB in the measurement above. That is the recovery
 open, and it is intentional: `ArchiveMut::open` takes the file exclusively and is
 refused while anything else holds it. `Archive::open`, the read handle, opens
 an archive with an unfinished source `SQLITE_OPEN_READ_ONLY` with
@@ -367,12 +375,14 @@ and has no mutators. `ArchiveMut` is the write handle: `ArchiveMut::create`
 for a new archive, and `ArchiveMut::open` for an existing one, which takes
 SQLite's exclusive locking mode and is refused as `Error::InUse` while
 anything else holds the file. The writer thread caches each stream's next
-`seq` and its sealed watermark in memory and seeds them once at startup. It
-re-reads a source's watermarks after each successful retention pass it runs,
-since eviction can remove a stream's last segment. A second connection that
-could evict a stream's segments or insert one behind the writer's back would
-make that cache disagree with the file, and the next seal would collide or the
-next append would be dropped as out of order. `ArchiveMut::open` cannot be
+`seq`, its sealed watermark and its newest row in memory and seeds them once
+at startup. It re-reads a source's watermarks and newest rows after each
+successful retention pass it runs, since eviction can remove a stream's last
+segment, and its newest rows after a discard of live rows. A second connection
+that could evict a stream's segments, insert one, or insert WAL rows behind the
+writer's back would make that cache disagree with the file, and the next seal
+would collide, the next append would be dropped as out of order, or a tick
+would collide and be lost. `ArchiveMut::open` cannot be
 that connection, because the writer thread holds the file, and a writer thread
 cannot be started on a file a `ArchiveMut` holds, for the same reason. The
 streaming writer opens its own connection privately and without the exclusive
@@ -403,7 +413,8 @@ Neither choice affects read speed. Query time tracks segment *count*, which is
 
 | version | written by | notes |
 |---|---|---|
-| 4 | dendro | Current, and the only version this build reads. |
+| 5 | dendro | Current. Archive documents and the `segment_indexes` table. |
+| 4 | dendro | Read, and written in place without adding any schema-5 structure (FORMAT.md §8). |
 | 1 to 3 | rezolus `.rez` | Not read. rezolus upgrades a `.rez` recording to a dendro archive. |
 
 An archive is stamped in its SQLite header at creation: `application_id` is

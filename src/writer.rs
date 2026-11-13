@@ -170,7 +170,7 @@ enum Msg {
     },
     /// Rows for the caller's time-keyed store, in order with the ticks
     /// around them and committed on their own. See
-    /// [`CallerRow`](crate::archive::CallerRow).
+    /// [`crate::archive::CallerRow`].
     CallerRows {
         source_id: i64,
         stream: String,
@@ -930,15 +930,20 @@ impl SourceWriter {
     }
 
     /// How many of this source's appends have been dropped for arriving at
-    /// or below their stream's newest sealed row.
+    /// or below their stream's newest row, sealed or live, as it stood before
+    /// the tick that carried them.
     ///
     /// A non-zero count is a producer appending out of order within a stream,
-    /// which this container does not support. Such a row cannot be read: the
-    /// watermark that keeps the seal seam free of duplicates shadows it
-    /// exactly as it shadows an already-sealed row — so the writer drops it
-    /// rather than spending space on it, and logs once per stream. A different
-    /// stream or a different source has its own watermark and is not
-    /// affected.
+    /// which this container does not support. Below the newest sealed row such
+    /// a row cannot be read: the watermark that keeps the seal seam free of
+    /// duplicates shadows it exactly as it shadows an already-sealed row.
+    /// Below the newest live row it could be read, but a reader that tails the
+    /// stream by timestamp, such as a replication publisher, has already passed
+    /// it. At the newest row's timestamp it would collide with that row. The
+    /// writer drops it and logs once per stream. Within one tick a stream's
+    /// rows may arrive in any order; a second row at one timestamp in the tick
+    /// is dropped. A different stream or a different source has its own bound
+    /// and is not affected.
     ///
     /// Counted rather than returned because an append is deliberately
     /// fire-and-forget: reporting per call would make every tick a
@@ -1435,26 +1440,28 @@ impl WriterHealth {
         self.consecutive_dropped = 0;
     }
 
-    /// Record one row dropped for arriving at or below its stream's sealed
-    /// watermark: counted for the caller, and logged once per stream with
-    /// the numbers that explain it.
+    /// Count an append dropped as out of order. `bound` is the stream's
+    /// newest row before the tick, or `None` for a second row at one
+    /// timestamp within the tick. Logged once per stream.
     fn count_shadowed(
         &mut self,
         shadowed: &ShadowCounts,
         source_id: i64,
         stream: &str,
         ts: i64,
-        watermark: i64,
+        bound: Option<i64>,
     ) {
         if let Ok(mut counts) = shadowed.lock() {
             *counts.entry(source_id).or_insert(0) += 1;
         }
         if self.warned_shadowed.insert((source_id, stream.to_string())) {
+            let why = match bound {
+                Some(n) => format!("at or below the newest row the stream already holds ({n})"),
+                None => "a second row at that timestamp in one tick".to_string(),
+            };
             warn!(
-                "source {source_id}, stream {stream}: dropped an append at {ts}, which is at \
-                 or below the newest row already sealed there ({watermark}). Such a row is \
-                 invisible to every read path, so it is not stored. Append in order per \
-                 stream; later drops on this stream are counted, not logged"
+                "source {source_id}, stream {stream}: dropped an append at {ts}, {why}. Append \
+                 in order per stream; later drops on this stream are counted, not logged"
             );
         }
     }
@@ -1490,7 +1497,7 @@ fn commit_tick(
     db: &mut ArchiveMut,
     ticks: &[(i64, Vec<WalRow>)],
     floors: &BTreeMap<i64, i64>,
-    watermarks: &BTreeMap<i64, BTreeMap<String, i64>>,
+    newest: &mut BTreeMap<i64, BTreeMap<String, i64>>,
     shadowed: &ShadowCounts,
     health: &mut WriterHealth,
 ) -> Result<()> {
@@ -1524,42 +1531,58 @@ fn commit_tick(
         &kept
     };
 
-    // OUT OF ORDER. A row at or below its stream's newest SEALED row cannot
-    // be read: `live_wal`'s watermark is what keeps the seal seam free of
-    // duplicates, so it shadows this row exactly as it shadows one already
-    // sealed. Committing it would spend space, forever, on something no read
-    // path can reach.
+    // OUT OF ORDER. A row at or below its stream's newest row, sealed or
+    // live, is dropped rather than stored, and said out loud.
     //
-    // So it is dropped rather than stored — and said out loud, which is the
-    // part that was missing. A silent drop is a trap whatever the eventual
-    // answer for backfill is: the row was visible to `read_wal` and to
-    // nothing else, so it showed up for anyone debugging and for no one
-    // reading. See `docs/journal/2026-09-11-out-of-order-appends.md`.
+    // At or below the newest SEALED row it cannot be read: `live_wal`'s
+    // watermark is what keeps the seal seam free of duplicates, so it shadows
+    // this row exactly as it shadows one already sealed. At or below the
+    // newest LIVE row it can be read, but a reader that tails the stream by
+    // timestamp has already passed it: a replication publisher ships the rows
+    // after the newest it sent, and never this one. At the same timestamp it
+    // would collide with the row there, which costs the whole tick. See
+    // `docs/journal/2026-09-11-out-of-order-appends.md`.
     //
-    // Dropped per ROW, not per tick, unlike the floor above: the floor says a
-    // whole session is misaligned, while one late row among a tick's good
-    // ones is that row's problem alone.
+    // The bound is the newest row before this tick, so a stream's rows may
+    // arrive in any order within one tick; a second row at one
+    // `(source, stream, ts)` in the tick, in the same entry or another entry
+    // for the same source, is the only one of them dropped. Dropped per ROW,
+    // not per tick, unlike the floor above: the floor says a whole session is
+    // misaligned, while one late row among a tick's good ones is that row's
+    // problem alone.
     //
-    // The common tick costs one map lookup per row and nothing else — the
-    // rebuild below runs only once something has actually been shadowed.
-    let shadows = |source_id: i64, r: &WalRow| {
-        watermarks
+    // The common tick costs a map lookup and a set insertion per row; the
+    // rebuild below runs only once something is actually dropped.
+    let bound = |source_id: i64, stream: &str| {
+        newest
             .get(&source_id)
-            .and_then(|streams| streams.get(r.stream.as_str()))
-            .is_some_and(|w| r.ts <= *w)
+            .and_then(|streams| streams.get(stream))
+            .copied()
+    };
+    let late = |source_id: i64, r: &WalRow| bound(source_id, &r.stream).is_some_and(|n| r.ts <= n);
+    let repeats_within = || {
+        let mut seen = std::collections::BTreeSet::new();
+        ticks.iter().any(|(source_id, rows)| {
+            rows.iter()
+                .any(|r| !seen.insert((*source_id, r.stream.as_str(), r.ts)))
+        })
     };
     let rebuilt: Vec<(i64, Vec<WalRow>)>;
     let ticks: &[(i64, Vec<WalRow>)] = if ticks
         .iter()
-        .any(|(source_id, rows)| rows.iter().any(|r| shadows(*source_id, r)))
+        .any(|(source_id, rows)| rows.iter().any(|r| late(*source_id, r)))
+        || repeats_within()
     {
         let mut out: Vec<(i64, Vec<WalRow>)> = Vec::with_capacity(ticks.len());
+        let mut seen = std::collections::BTreeSet::new();
         for (source_id, rows) in ticks {
             let mut keep: Vec<WalRow> = Vec::with_capacity(rows.len());
             for r in rows {
-                if shadows(*source_id, r) {
-                    let w = watermarks[source_id][r.stream.as_str()];
-                    health.count_shadowed(shadowed, *source_id, &r.stream, r.ts, w);
+                let before = bound(*source_id, &r.stream);
+                if before.is_some_and(|n| r.ts <= n) {
+                    health.count_shadowed(shadowed, *source_id, &r.stream, r.ts, before);
+                } else if !seen.insert((*source_id, r.stream.clone(), r.ts)) {
+                    health.count_shadowed(shadowed, *source_id, &r.stream, r.ts, None);
                 } else {
                     keep.push(r.clone());
                 }
@@ -1574,11 +1597,24 @@ fn commit_tick(
         ticks
     };
 
+    // Raise the bound for the rows of `sources` that committed.
+    let advance = |newest: &mut BTreeMap<i64, BTreeMap<String, i64>>,
+                   committed: &[(i64, Vec<WalRow>)]| {
+        for (source_id, rows) in committed {
+            let streams = newest.entry(*source_id).or_default();
+            for r in rows {
+                let n = streams.entry(r.stream.clone()).or_insert(r.ts);
+                *n = (*n).max(r.ts);
+            }
+        }
+    };
+
     if ticks.is_empty() {
         return Ok(());
     }
     match with_retries("committing a tick", || db.insert_wal_rows_batch(ticks)) {
         Ok(()) => {
+            advance(newest, ticks);
             health.committed();
             Ok(())
         }
@@ -1588,7 +1624,10 @@ fn commit_tick(
                 match with_retries("committing a source's tick", || {
                     db.insert_wal_rows(*source_id, rows)
                 }) {
-                    Ok(()) => any = true,
+                    Ok(()) => {
+                        any = true;
+                        advance(newest, std::slice::from_ref(&(*source_id, rows.clone())));
+                    }
                     Err(e) if e.is_constraint() => {
                         if health.warned_collisions.insert(*source_id) {
                             warn!(
@@ -1609,6 +1648,26 @@ fn commit_tick(
         }
         Err(e) if e.is_retryable() => health.dropped(e),
         Err(e) => Err(e),
+    }
+}
+
+/// Re-read one source's newest-row bounds after `what` changed its rows. On
+/// failure the old bounds stay, which drops rows the file would take rather
+/// than accept rows below one it holds.
+fn refresh_newest(
+    db: &ArchiveMut,
+    newest: &mut BTreeMap<i64, BTreeMap<String, i64>>,
+    source_id: i64,
+    what: &str,
+) {
+    match db.newest_rows_of(source_id) {
+        Ok(fresh) => {
+            newest.insert(source_id, fresh);
+        }
+        Err(e) => warn!(
+            "re-reading source {source_id}'s newest rows after {what} failed ({e}); its \
+             streams keep their previous bounds until the next refresh or a restart"
+        ),
     }
 }
 
@@ -1843,6 +1902,11 @@ fn writer_loop(
     // true of the archive regardless, so the check here does not quietly
     // depend on a resume having happened.
     let mut watermarks: BTreeMap<i64, BTreeMap<String, i64>> = db.sealed_watermarks()?;
+    // Every stream's newest row, sealed or live: the bound `commit_tick`
+    // drops a late row against. Seeded from the file, advanced by each
+    // commit, and re-read for a source after anything that deletes its rows
+    // (retention, a discard); an adopted segment raises it in place.
+    let mut newest: BTreeMap<i64, BTreeMap<String, i64>> = db.newest_rows()?;
     // Per source, the streams whose last seal was deferred, with the
     // smallest `max_rows` asked for them. Their live rows are in no segment,
     // and the oldest of them is the one a caller's encoder may need to
@@ -1964,7 +2028,7 @@ fn writer_loop(
                 let _ = reply.send(resumed);
             }
             Ok(Msg::Wal { ticks }) => {
-                commit_tick(db, &ticks, &floors, &watermarks, shadowed, &mut health)?
+                commit_tick(db, &ticks, &floors, &mut newest, shadowed, &mut health)?
             }
             #[cfg(any(test, feature = "test-support"))]
             Ok(Msg::Commits(reply)) => {
@@ -2030,6 +2094,16 @@ fn writer_loop(
                 let adopted = with_retries("adopting a segment", || {
                     adopt_segment(db, source_id, &mut next_seq, &mut watermarks, &segment)
                 });
+                // `adopt_segment` only inserts, and refuses a segment at or
+                // below a live row, so the bound becomes the segment's end.
+                if matches!(adopted, Ok(true)) {
+                    let n = newest
+                        .entry(source_id)
+                        .or_default()
+                        .entry(segment.stream.clone())
+                        .or_insert(segment.meta.last_ts);
+                    *n = (*n).max(segment.meta.last_ts);
+                }
                 let _ = reply.send(adopted);
             }
             Ok(Msg::Evict {
@@ -2125,6 +2199,7 @@ fn writer_loop(
                          old watermark until a later retention pass or a restart re-reads it"
                     ),
                 }
+                refresh_newest(db, &mut newest, source_id, "retention");
                 // Same rule for the reclaim that follows: the caller was just
                 // told retention succeeded, and it did. Handing pages back is
                 // an optimization; a failure here is the next pass's problem,
@@ -2149,6 +2224,7 @@ fn writer_loop(
                     if let Some(held) = deferred.get_mut(&source_id) {
                         held.retain(|stream, _| !streams(stream));
                     }
+                    refresh_newest(db, &mut newest, source_id, "discarding live rows");
                 }
                 let _ = reply.send(discarded);
             }
@@ -2469,7 +2545,7 @@ fn adopt_segment(
     // inverted one would set a watermark below its own first row.
     if meta.rows == 0 || meta.first_ts > meta.last_ts {
         return Err(Error::Message(format!(
-            "source {source_id}: the segment offered for `{stream}` claims {} row(s) over              [{}, {}], which is not a segment that can exist",
+            "source {source_id}: the segment offered for `{stream}` claims {} row(s) over [{}, {}], which is not a segment that can exist",
             meta.rows, meta.first_ts, meta.last_ts
         )));
     }
@@ -2493,7 +2569,7 @@ fn adopt_segment(
         // one thing this layer cannot do.
         if meta.first_ts <= w {
             return Err(Error::Message(format!(
-                "source {source_id}: the segment offered for `{stream}` spans [{}, {}], which                  straddles the stream's newest sealed row ({w}); its rows at or below {w}                  could never be read, and splitting it would mean decoding it",
+                "source {source_id}: the segment offered for `{stream}` spans [{}, {}], which straddles the stream's newest sealed row ({w}); its rows at or below {w} could never be read, and splitting it would mean decoding it",
                 meta.first_ts, meta.last_ts
             )));
         }
@@ -2512,7 +2588,7 @@ fn adopt_segment(
     if let Some(first) = live.first_ts {
         if first <= meta.last_ts {
             return Err(Error::Message(format!(
-                "source {source_id}: the segment offered for `{stream}` ends at {}, at or                  after an unsealed row already in the WAL ({first}); adopting it would                  shadow rows no segment holds",
+                "source {source_id}: the segment offered for `{stream}` ends at {}, at or after an unsealed row already in the WAL ({first}); adopting it would shadow rows no segment holds",
                 meta.last_ts
             )));
         }
