@@ -269,6 +269,71 @@ fn a_frame_without_a_handshake_is_refused() {
     sub.finish().unwrap();
 }
 
+/// Tags with a version, to stand for an encoder that versions itself.
+struct Versioned(&'static str);
+impl SegmentEncoder for Versioned {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        Tags.encode(ctx, rows)
+    }
+    fn version(&self) -> Option<&str> {
+        Some(self.0)
+    }
+}
+
+/// A handshake whose source was written by an encoder version other than
+/// the subscriber's is refused, and creates no source: the subscriber would
+/// seal the publisher's rows with an encoder not known to decode them. It
+/// used to be accepted, and the copy's `encoder` key was replaced with the
+/// subscriber's own.
+#[test]
+fn a_handshake_from_another_encoder_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encoder.dendro");
+    let mut sub = Subscriber::new(Writer::create(&path, Box::new(Versioned("sub-B"))).unwrap());
+    let with_encoder = |version: &str| {
+        let Frame::Handshake {
+            source,
+            uuid,
+            labels,
+            mut metadata,
+            clock_anchor_wall_ns,
+            complete,
+        } = handshake(false)
+        else {
+            unreachable!()
+        };
+        metadata.insert(dendro::keys::ENCODER.to_string(), version.to_string());
+        Frame::Handshake {
+            source,
+            uuid,
+            labels,
+            metadata,
+            clock_anchor_wall_ns,
+            complete,
+        }
+    };
+
+    let err = sub.apply(with_encoder("pub-A")).unwrap_err().to_string();
+    assert!(err.contains("pub-A") && err.contains("sub-B"), "{err}");
+
+    // The same version is accepted, and the key is the publisher's.
+    sub.apply(with_encoder("sub-B")).unwrap();
+    sub.sync().unwrap();
+    let db = Archive::open(&path).unwrap();
+    let sources = db.read_sources().unwrap();
+    assert_eq!(sources.len(), 1, "the refused handshake created no source");
+    assert_eq!(
+        sources[0]
+            .meta
+            .metadata
+            .get(dendro::keys::ENCODER)
+            .map(String::as_str),
+        Some("sub-B")
+    );
+    drop(db);
+    sub.finish().unwrap();
+}
+
 /// `complete` travels: a copy of a finished source answers "was this
 /// finished" the same way, and a copy of a live one says it may be missing
 /// data after its last row — which it is, because the publisher is still
@@ -899,20 +964,20 @@ fn a_removed_key_is_removed_from_the_copy() {
     let mut seed = source_meta("a");
     seed.labels.insert("tier".to_string(), "client".to_string());
     seed.metadata.insert("old".to_string(), "1".to_string());
-    seed.metadata
-        .insert(dendro::keys::ENCODER.to_string(), "tags-1".to_string());
     let mut w = archive.add_source(seed).unwrap();
     w.sync().unwrap();
 
     let db = Archive::open(&origin).unwrap();
     let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
-    // The copy's writer records its own encoder, which differs from the
-    // publisher's `encoder` in the update.
+    // The copy's writer records its own encoder. The handshake carries no
+    // `encoder` (the origin's encoder is unversioned), and the update below
+    // carries a different one, which the copy must not take.
     let mut sub = Subscriber::new(Writer::create(&copy, Box::new(VersionedTags)).unwrap());
     sub.apply_all(opening).unwrap();
 
     let labels = BTreeMap::from([("source".to_string(), "renamed".to_string())]);
-    let metadata = BTreeMap::from([("new".to_string(), "2".to_string())]);
+    let mut metadata = BTreeMap::from([("new".to_string(), "2".to_string())]);
+    metadata.insert(dendro::keys::ENCODER.to_string(), "tags-1".to_string());
     w.set_identity(labels.clone(), metadata.clone()).unwrap();
     w.sync().unwrap();
     assert_eq!(
@@ -937,6 +1002,7 @@ fn a_removed_key_is_removed_from_the_copy() {
     let sessions = got_metadata
         .remove(dendro::keys::WRITER_SESSIONS)
         .expect("the copy's writer sessions are kept");
+    metadata.remove(dendro::keys::ENCODER);
     assert_eq!((got_labels, got_metadata), (labels, metadata));
     let sessions: serde_json::Value = serde_json::from_str(&sessions).unwrap();
     assert_eq!(sessions.as_array().map(Vec::len), Some(2), "{sessions}");

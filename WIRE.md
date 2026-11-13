@@ -319,9 +319,10 @@ is handed, so whatever decides who may hand it anything is the transport's.
   because §2 refuses a payload with trailing bytes.
 - **What this does not version.** The row payload, the segment's columns and
   the index blob are the caller's. `Handshake.metadata` carries the archive's
-  `encoder` key (`FORMAT.md` §6), and a subscriber whose encoder disagrees is
-  refused by the same check every other read path runs
-  (`segment::check_encoder`).
+  `encoder` key (`FORMAT.md` §6). A `Subscriber` refuses a `Handshake` whose
+  `encoder` differs from the version its own encoder reports, by the rule
+  every read path applies (`segment::check_encoder`): either side reporting
+  no version is not a mismatch.
 - **The archive schema version is separate** and is not carried here. A
   publisher and a subscriber on different archive schema versions can still
   speak protocol 1; what each can store is decided by its own file.

@@ -280,6 +280,9 @@ pub struct Writer {
     path: PathBuf,
     err: ErrorSlot,
     shadowed: ShadowCounts,
+    /// The encoder's [`version`](SegmentEncoder::version), copied before the
+    /// encoder moves to the writer thread.
+    encoder_version: Option<String>,
 }
 
 impl Writer {
@@ -407,6 +410,7 @@ impl Writer {
         let thread_err = Arc::clone(&err);
         let shadowed: ShadowCounts = Arc::new(Mutex::new(BTreeMap::new()));
         let thread_shadowed = Arc::clone(&shadowed);
+        let encoder_version = encoder.version().map(str::to_string);
         // A spawn failure removes the file, sidecars included. It leaves a
         // VALID empty source at the caller's chosen path — which used to be
         // the argument for keeping it — but valid is not the same as useful:
@@ -438,7 +442,14 @@ impl Writer {
             path: path.to_path_buf(),
             err,
             shadowed,
+            encoder_version,
         })
+    }
+
+    /// The version the archive's encoder reports, which the writer records
+    /// under [`keys::ENCODER`](crate::keys::ENCODER) for each source it adds.
+    pub fn encoder_version(&self) -> Option<&str> {
+        self.encoder_version.as_deref()
     }
 
     /// Open one source in this archive and return its writer handle.

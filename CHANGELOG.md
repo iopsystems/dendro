@@ -33,7 +33,19 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `Writer::encoder_version`, the version the archive's encoder reports.
+
 ### Fixed
+
+- A `Subscriber` accepted a `Handshake` whose source was written with an
+  encoder version other than its own, though WIRE.md §7 said such a
+  subscriber is refused. It then sealed the publisher's rows with an
+  encoder not known to decode them, and its copy's `encoder` key named its
+  own version. The handshake is now refused before any source row is
+  written; either side reporting no version is not a mismatch, as on every
+  read path.
 
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every

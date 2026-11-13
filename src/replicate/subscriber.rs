@@ -134,6 +134,24 @@ impl Subscriber {
                 clock_anchor_wall_ns,
                 complete,
             } => {
+                // The subscriber seals this source's rows with its own
+                // encoder, so one that disagrees with the encoder that wrote
+                // them is refused, by the rule every read path applies
+                // (`segment::check_encoder`): either side reporting no version
+                // is not a mismatch. Checked before the source row is written.
+                if let (Some(wrote), Some(own)) = (
+                    metadata.get(crate::keys::ENCODER),
+                    self.writer.encoder_version(),
+                ) {
+                    if wrote != own {
+                        return Err(Error::Message(format!(
+                            "replication handshake for ordinal {source}: its source was \
+                             written with encoder version {wrote:?} and this subscriber \
+                             encodes with {own:?}; the rows are the encoder's bytes, so a \
+                             different version is not known to decode them"
+                        )));
+                    }
+                }
                 let writer = self.writer.add_source_with_uuid(
                     SourceMeta {
                         labels,
