@@ -33,6 +33,13 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
+  did not write because they were at or below the newest timestamp the
+  connection had already delivered for their stream, or repeated a
+  `(stream, ts)` within the frame.
+
 ### Fixed
 
 - `FrameReader::next_frame` returned `Ok(None)`, the clean end of a stream,
@@ -52,6 +59,15 @@ cannot reach a failed release any other way.
   no `ClockOffset` frame with the observation `(0, 0)`, so the copy's
   `clock_offsets` held an entry no publisher made. It now finalizes such a
   source with no observation. Present since 0.2.0.
+- A `Rows` frame that repeated one row the connection had already
+  delivered, such as a frame an at-least-once transport sent twice, lost
+  every row in it: the repeat collided in the subscriber's WAL, and a
+  collision costs the writer the whole tick. `Applied::rows` still counted
+  them all. The subscriber now drops the repeats and writes the rest. A row
+  older than one the connection already delivered for its stream, which
+  0.7.1 wrote, is now dropped too and counted the same way.
+  `Applied::rows` counts the rows handed to the writer, which commits them
+  by the next `Subscriber::sync`. Present since 0.2.0.
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
   source's handle reported `WriterGone` and `Writer::join` returned "the
@@ -566,7 +582,6 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   rather than the cutoff, because a segment spanning the cutoff is kept with
   rows older than it; and asked inside the pass, because a seal between a
   caller's own query and the pass can create such a segment.
-
 - `SourceWriter::evict_before` was documented as fire-and-forget. It waits for
   the pass and returns its result; the doc now says so.
 
@@ -586,7 +601,6 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   This does **not** reinstate the interval index. A per-interval counter kept by
   the producer's own loop needs no clock and does not alias; dividing an
   observation timestamp still does.
-
 - The `write` feature's description said `std::thread::spawn` "panics at
   runtime" on wasm32. This crate uses
   `std::thread::Builder::spawn`, which returns `io::Result` and is reported by
@@ -635,7 +649,6 @@ The Rust API broke separately. Neither implies the other.
   begins. `encode` returns a whole frame and `decode_payload` takes the payload
   alone, because `FrameReader` has already consumed the prefix; a caller pairing
   the two by hand needed a bare `4`.
-
 - **Replication**: frame types and a wire codec,
   `Subscriber` (apply frames to an archive) and `ArchivePublisher` (tail one).
   Transport is not included. One frame kind per table that `rewrite` carries, so
