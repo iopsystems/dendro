@@ -25,7 +25,7 @@ pub struct Applied {
     /// WAL rows handed to the writer. Like [`SourceWriter::wal`], the hand-off
     /// is not the commit: [`sync`](Subscriber::sync) is the point at which
     /// they are on disk, and a row the writer drops (one at or below its
-    /// stream's newest sealed row, counted in
+    /// stream's newest row, sealed or live, counted in
     /// [`dropped_out_of_order`](crate::writer::SourceWriter::dropped_out_of_order),
     /// or one in a tick the writer gave up on after retries) is counted here
     /// too.

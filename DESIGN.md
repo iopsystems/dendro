@@ -367,12 +367,14 @@ and has no mutators. `ArchiveMut` is the write handle: `ArchiveMut::create`
 for a new archive, and `ArchiveMut::open` for an existing one, which takes
 SQLite's exclusive locking mode and is refused as `Error::InUse` while
 anything else holds the file. The writer thread caches each stream's next
-`seq` and its sealed watermark in memory and seeds them once at startup. It
-re-reads a source's watermarks after each successful retention pass it runs,
-since eviction can remove a stream's last segment. A second connection that
-could evict a stream's segments or insert one behind the writer's back would
-make that cache disagree with the file, and the next seal would collide or the
-next append would be dropped as out of order. `ArchiveMut::open` cannot be
+`seq`, its sealed watermark and its newest row in memory and seeds them once
+at startup. It re-reads a source's watermarks and newest rows after each
+successful retention pass it runs, since eviction can remove a stream's last
+segment, and its newest rows after a discard of live rows. A second connection
+that could evict a stream's segments, insert one, or insert WAL rows behind the
+writer's back would make that cache disagree with the file, and the next seal
+would collide, the next append would be dropped as out of order, or a tick
+would collide and be lost. `ArchiveMut::open` cannot be
 that connection, because the writer thread holds the file, and a writer thread
 cannot be started on a file a `ArchiveMut` holds, for the same reason. The
 streaming writer opens its own connection privately and without the exclusive
