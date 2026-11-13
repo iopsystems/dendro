@@ -35,6 +35,27 @@ cannot reach a failed release any other way.
 
 ### Fixed
 
+- A seal whose encoder returned a segment with a `last_ts` that is not the
+  timestamp of one of its input rows panicked the writer thread, so every
+  source's handle reported `WriterGone` and `Writer::join` returned "the
+  archive writer thread panicked". The span passed the contract check
+  whenever the count of input rows inside it matched `rows`, for example one
+  row over `[20, 25]` from rows at 10, 20 and 30. Present since 0.1.0.
+  `segment::materialize` now refuses as `Error::EncoderContract` a segment
+  whose `first_ts` or `last_ts` is not an input row's timestamp, on the
+  seal, copy and read paths. An encoder whose `first_ts` was off a row
+  sealed without error in 0.7.1 and is now refused, which ends the writer
+  as any encoder breach does.
+- `read::stream_range` returned nothing from the live tail for an encoder
+  that needs an earlier row of the tail to encode the rest, such as one
+  that states a schema in the first row after a seal. Present since 0.1.0.
+  When the tail holds a row in the range it is now encoded whole, as
+  `read::read_archive` encodes it, so the tail segment can hold rows before
+  `start` and after `end`, as a sealed segment at the edge can; filter by
+  timestamp; a caller that read only the tail and relied on it being cut to
+  the range must now filter. When the tail holds a row in the range, an
+  encoder error on any live row now fails the ranged read, as it fails
+  `read_archive`.
 - `ArchiveMut::open` and `Writer::open` refused a SQLite database that is
   not an archive as `Error::NotAnArchive`, then modified it: the refused
   read-write connection was the last one on the file, and SQLite
