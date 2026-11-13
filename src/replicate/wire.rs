@@ -29,10 +29,38 @@ pub const PROTOCOL_VERSION: u16 = 1;
 ///
 /// A corrupt or hostile four-byte length is otherwise an allocation of up to
 /// 4 GiB, which is an out-of-memory rather than an error. 64 MiB is eight
-/// times the default `SealPolicy::max_bytes`, so the largest frame a caller on
-/// the default policy can produce — a `Segment` — has ample headroom, and a
-/// caller that seals larger than this is asking for a bound it chose.
+/// times the default `SealPolicy::max_bytes`. A publisher splits an interval's
+/// rows to stay under it; a `Segment` cannot be split, so one whose frame
+/// exceeds it cannot be sent.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes a `Rows` frame's body takes before its first row: kind, source,
+/// `seq`, `index_state` and the row count (WIRE.md §4.3).
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+pub(crate) const ROWS_FRAME_HEADER_BYTES: usize = 1 + 4 + 8 + 8 + 8 + 4;
+
+/// The bytes one row adds to a `Rows` frame's body.
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+pub(crate) fn rows_frame_row_bytes(row: &WalRow) -> usize {
+    4 + row.stream.len() + 8 + 8 + 4 + row.row.len()
+}
+
+/// The bytes of a `Segment` frame's body (WIRE.md §4.4).
+#[cfg_attr(not(feature = "archive"), allow(dead_code))]
+pub(crate) fn segment_frame_bytes(
+    stream: &str,
+    bytes: &[u8],
+    caller_index: Option<&[u8]>,
+) -> usize {
+    1 + 4
+        + (4 + stream.len())
+        + 8
+        + 8
+        + 8
+        + (4 + bytes.len())
+        + 1
+        + caller_index.map_or(0, |i| 4 + i.len())
+}
 
 /// The bytes a frame's length prefix occupies, and therefore the offset at
 /// which its payload begins.
@@ -895,6 +923,51 @@ mod tests {
         bytes.truncate(bytes.len() - 3);
         let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
         assert!(reader.next_frame().is_err());
+    }
+
+    /// The size arithmetic the publisher splits by is the encoder's own.
+    #[test]
+    fn frame_sizes_match_the_encoding() {
+        let rows: Vec<WalRow> = ["s", "stream-two"]
+            .iter()
+            .enumerate()
+            .map(|(i, stream)| WalRow {
+                stream: stream.to_string(),
+                ts: i as i64,
+                wall_offset: 3,
+                row: vec![7; 10 * (i + 1)],
+            })
+            .collect();
+        let expected =
+            ROWS_FRAME_HEADER_BYTES + rows.iter().map(rows_frame_row_bytes).sum::<usize>();
+        let frame = Frame::Rows {
+            source: 1,
+            seq: 2,
+            index_state: (3, 4),
+            rows,
+        };
+        assert_eq!(
+            encode(&frame).unwrap().len() - LENGTH_PREFIX_BYTES,
+            expected
+        );
+
+        for caller_index in [None, Some(vec![1u8; 5])] {
+            let frame = Frame::Segment {
+                source: 1,
+                stream: "s".to_string(),
+                meta: SegmentMeta {
+                    rows: 1,
+                    first_ts: 1,
+                    last_ts: 1,
+                },
+                bytes: vec![9; 20],
+                caller_index: caller_index.clone(),
+            };
+            assert_eq!(
+                encode(&frame).unwrap().len() - LENGTH_PREFIX_BYTES,
+                segment_frame_bytes("s", &[9; 20], caller_index.as_deref())
+            );
+        }
     }
 
     #[test]

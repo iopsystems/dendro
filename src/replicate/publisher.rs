@@ -52,7 +52,7 @@ fn fold_index_state(state: IndexState, ts: i64, blob: &[u8]) -> IndexState {
 }
 
 /// How far a stream has been published.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StreamCursor {
     /// Newest WAL row timestamp emitted, if any.
     wal_after: Option<i64>,
@@ -64,6 +64,7 @@ struct StreamCursor {
 }
 
 /// One source, and everything the publisher remembers about it between polls.
+#[derive(Clone)]
 struct SourceCursor {
     ordinal: u32,
     source_id: i64,
@@ -209,7 +210,36 @@ impl ArchivePublisher {
     ///
     /// Index frames for a source precede its rows (rule 4), so a row can never
     /// reference identity the subscriber has not received.
+    ///
+    /// An interval whose rows exceed [`MAX_FRAME_BYTES`](super::wire::MAX_FRAME_BYTES)
+    /// is split across several `Rows` frames with one `seq`.
+    ///
+    /// # Errors
+    ///
+    /// A call that returns `Err` leaves the publisher as it was, so a later
+    /// call ships everything that call would have. It fails when a seal has
+    /// outrun a stream's cursor (see [Polling and the seal](Self#polling-and-the-seal)),
+    /// and when one row, or a segment of a stream first seen sealed, makes a
+    /// frame larger than `MAX_FRAME_BYTES` on its own. That second error
+    /// repeats on every call until the row is discarded
+    /// (`SourceWriter::discard_live_rows`) or evicted, or, for a segment, until
+    /// the segment is evicted, and it holds back every source, because one
+    /// call answers for all of them.
     pub fn next(&mut self, db: &Archive) -> Result<Vec<Frame>> {
+        // A call that fails returns no frames, so it must not move any cursor
+        // either: the frames it built for earlier sources, and the index and
+        // clock entries it built for the failing one, would otherwise be
+        // counted as sent and never sent. The state is a few small maps per
+        // source, so it is copied rather than tracked.
+        let saved = self.sources.clone();
+        let result = self.next_inner(db);
+        if result.is_err() {
+            self.sources = saved;
+        }
+        result
+    }
+
+    fn next_inner(&mut self, db: &Archive) -> Result<Vec<Frame>> {
         // ONE snapshot over every read, for the reason `copy_sources_into`
         // takes one: a seal committing between two autocommit reads inserts a
         // segment the first did not see and shadows the rows the second would
@@ -465,8 +495,10 @@ impl SourceCursor {
         Ok(())
     }
 
-    /// One poll of one source: index entries, then clock offsets, then exactly
-    /// one `Rows` frame.
+    /// One poll of one source: index entries, then clock offsets, then the
+    /// segments of streams first seen sealed, then the interval's `Rows`
+    /// frames — one, or several sharing a `seq` when the rows exceed one
+    /// frame.
     fn poll(&mut self, db: &Archive, out: &mut Vec<Frame>) -> Result<()> {
         for name in db.caller_row_streams(self.source_id)? {
             self.emit_index(db, &name, i64::MIN, out)?;
@@ -484,10 +516,15 @@ impl SourceCursor {
             self.clock_after = Some(ts);
         }
 
+        // The row cursors move only once the frames are built. `next` also
+        // restores every cursor when a poll fails; this keeps the poll itself
+        // from leaving a half-moved set if it is ever called on its own.
         let watermarks = db.sealed_watermarks()?;
+        let mut segments = Vec::new();
         let mut rows = Vec::new();
+        let mut cursors: Vec<(String, Option<i64>)> = Vec::new();
         for stream in db.all_streams(self.source_id)? {
-            let entry = self.streams.entry(stream.clone()).or_default();
+            let after = self.streams.get(&stream).and_then(|e| e.wal_after);
             let watermark = watermarks
                 .get(&self.source_id)
                 .and_then(|m| m.get(&stream))
@@ -510,11 +547,25 @@ impl SourceCursor {
             // no poll has read its live tail since. The subscriber holds none
             // of its rows, so its segments are shipped whole and the cursor
             // starts at the watermark.
-            if let (Some(w), None) = (watermark, entry.wal_after) {
+            let mut after = after;
+            if let (Some(w), None) = (watermark, after) {
                 for segment in
                     db.segments_overlapping(self.source_id, &stream, i64::MIN, i64::MAX)?
                 {
-                    out.push(Frame::Segment {
+                    let size = super::wire::segment_frame_bytes(
+                        &stream,
+                        &segment.bytes,
+                        segment.caller_index.as_deref(),
+                    );
+                    if size > super::wire::MAX_FRAME_BYTES {
+                        return Err(Error::Message(format!(
+                            "source {}: a segment of stream `{stream}` makes a {size}-byte \
+                             replication frame, above the {}-byte limit",
+                            self.source_id,
+                            super::wire::MAX_FRAME_BYTES
+                        )));
+                    }
+                    segments.push(Frame::Segment {
                         source: self.ordinal,
                         stream: stream.clone(),
                         meta: segment.meta,
@@ -522,20 +573,19 @@ impl SourceCursor {
                         caller_index: segment.caller_index,
                     });
                 }
-                entry.wal_after = Some(w);
+                after = Some(w);
             }
-            if let (Some(w), Some(after)) = (watermark, entry.wal_after) {
-                if w > after {
+            if let (Some(w), Some(a)) = (watermark, after) {
+                if w > a {
                     return Err(Error::Message(format!(
                         "source {}: stream `{stream}` sealed past this publisher's cursor \
-                         (watermark {w}, last row shipped {after}); those rows are no longer \
-                         in the live tail. Reconnect with `catching_up` from {after}",
+                         (watermark {w}, last row shipped {a}); those rows are no longer \
+                         in the live tail. Reconnect with `catching_up` from {a}",
                         self.source_id
                     )));
                 }
             }
 
-            let after = entry.wal_after;
             let mut newest = after;
             for row in db.live_wal(self.source_id, &stream)? {
                 if after.is_some_and(|a| row.ts <= a) {
@@ -544,22 +594,110 @@ impl SourceCursor {
                 newest = Some(newest.map_or(row.ts, |n| n.max(row.ts)));
                 rows.push(row);
             }
-            entry.wal_after = newest;
+            cursors.push((stream, newest));
         }
         // Timestamp order across the source's streams, which is the order the
         // rows were observed in and the order a subscriber's WAL wants them.
         rows.sort_by_key(|r| (r.ts, r.stream.clone()));
+        let parts = split_rows(rows, super::wire::MAX_FRAME_BYTES).map_err(|size| {
+            Error::Message(format!(
+                "source {}: a row makes a {size}-byte replication frame on its own, above \
+                 the {}-byte limit",
+                self.source_id,
+                super::wire::MAX_FRAME_BYTES
+            ))
+        })?;
 
-        // Always, even empty: rule 6. The empty frame is the keepalive, and it
-        // is what makes a sequence gap mean a lost reading rather than a quiet
-        // source.
-        out.push(Frame::Rows {
-            source: self.ordinal,
-            seq: self.seq,
-            index_state: self.index_state,
-            rows,
-        });
+        for (stream, newest) in cursors {
+            self.streams.entry(stream).or_default().wal_after = newest;
+        }
+        out.extend(segments);
+        // Always at least one, even empty: rule 6. The empty frame is the
+        // keepalive, and it is what makes a sequence gap mean a lost reading
+        // rather than a quiet source. Every part of one interval carries the
+        // interval's `seq`.
+        for rows in parts {
+            out.push(Frame::Rows {
+                source: self.ordinal,
+                seq: self.seq,
+                index_state: self.index_state,
+                rows,
+            });
+        }
         self.seq += 1;
         Ok(())
+    }
+}
+
+/// Split one interval's rows into `Rows` frame bodies of at most `limit`
+/// bytes each, in order. Always at least one part, empty when there are no
+/// rows. `Err` carries the body size of a row that exceeds `limit` alone.
+fn split_rows(
+    rows: Vec<crate::archive::WalRow>,
+    limit: usize,
+) -> std::result::Result<Vec<Vec<crate::archive::WalRow>>, usize> {
+    let header = super::wire::ROWS_FRAME_HEADER_BYTES;
+    let mut parts = vec![Vec::new()];
+    let mut size = header;
+    for row in rows {
+        let bytes = super::wire::rows_frame_row_bytes(&row);
+        if header + bytes > limit {
+            return Err(header + bytes);
+        }
+        if size + bytes > limit {
+            parts.push(Vec::new());
+            size = header;
+        }
+        size += bytes;
+        parts.last_mut().expect("never empty").push(row);
+    }
+    Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_rows;
+    use crate::archive::WalRow;
+    use crate::replicate::wire::{rows_frame_row_bytes, ROWS_FRAME_HEADER_BYTES};
+
+    fn row(ts: i64, len: usize) -> WalRow {
+        WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn no_rows_is_one_empty_part() {
+        assert_eq!(
+            split_rows(Vec::new(), 100).unwrap(),
+            vec![Vec::<WalRow>::new()]
+        );
+    }
+
+    #[test]
+    fn rows_split_at_the_limit_in_order() {
+        let each = rows_frame_row_bytes(&row(0, 10));
+        // Room for exactly two rows per part.
+        let limit = ROWS_FRAME_HEADER_BYTES + 2 * each;
+        let rows: Vec<WalRow> = (0..5).map(|ts| row(ts, 10)).collect();
+        let parts = split_rows(rows, limit).unwrap();
+        let ts: Vec<Vec<i64>> = parts
+            .iter()
+            .map(|p| p.iter().map(|r| r.ts).collect())
+            .collect();
+        assert_eq!(ts, vec![vec![0, 1], vec![2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn a_row_too_large_for_any_frame_is_an_error() {
+        let big = row(0, 100);
+        let size = ROWS_FRAME_HEADER_BYTES + rows_frame_row_bytes(&big);
+        assert_eq!(
+            split_rows(vec![row(1, 1), big], size - 1).unwrap_err(),
+            size
+        );
     }
 }

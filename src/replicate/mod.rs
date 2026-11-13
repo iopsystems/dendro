@@ -67,7 +67,8 @@
 //!    Time is the ordering axis; both already carry timestamps and
 //!    `caller_rows` is already time-keyed.
 //! 6. Every interval the publisher **serves** produces a `Rows` frame, empty
-//!    when nothing was observed; the empty frame is also the keepalive.
+//!    when nothing was observed; the empty frame is also the keepalive. An
+//!    interval whose rows exceed one frame produces several, with one `seq`.
 //!    [`seq`](crate::replicate::Frame::Rows) counts intervals rather than
 //!    frames — the producer advances it once per interval it was meant to
 //!    serve — so an interval it could **not** serve, because it would have had
