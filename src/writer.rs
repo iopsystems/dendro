@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,8 @@ enum Msg {
         /// else. `None` mints a fresh one, which is what an ordinary
         /// `add_source` does.
         uuid: Option<String>,
+        /// The new handle's liveness token; see `SourceWriter::_alive`.
+        alive: Weak<()>,
         reply: SyncSender<Result<i64>>,
     },
     /// Reopen an existing source for a new writer session: verify it, refuse
@@ -71,6 +73,8 @@ enum Msg {
     ResumeSource {
         source_id: i64,
         clock_anchor_wall_ns: i64,
+        /// The new handle's liveness token; see `SourceWriter::_alive`.
+        alive: Weak<()>,
         reply: SyncSender<Result<Resumed>>,
     },
     /// One tick's WAL rows for every source in the archive, across all
@@ -476,10 +480,12 @@ impl Writer {
             return Err("the archive writer thread has already been joined".into());
         };
         let (reply_tx, reply_rx) = sync_channel(0);
+        let alive = Arc::new(());
         if tx
             .send(Msg::AddSource {
                 seed: Box::new(seed),
                 uuid: uuid.map(str::to_string),
+                alive: Arc::downgrade(&alive),
                 reply: reply_tx,
             })
             .is_err()
@@ -499,6 +505,7 @@ impl Writer {
             path: self.path.clone(),
             floor_ts: None,
             shadowed: Arc::clone(&self.shadowed),
+            _alive: alive,
         })
     }
 
@@ -528,10 +535,12 @@ impl Writer {
             return Err(Error::WriterGone);
         };
         let (reply_tx, reply_rx) = sync_channel(0);
+        let alive = Arc::new(());
         if tx
             .send(Msg::ResumeSource {
                 source_id,
                 clock_anchor_wall_ns,
+                alive: Arc::downgrade(&alive),
                 reply: reply_tx,
             })
             .is_err()
@@ -551,6 +560,7 @@ impl Writer {
                 path: self.path.clone(),
                 floor_ts: resumed.last_ts,
                 shadowed: Arc::clone(&self.shadowed),
+                _alive: alive,
             },
             resumed.last_ts,
         ))
@@ -833,6 +843,12 @@ pub struct SourceWriter {
     /// source, against an archive that holds at most a handful.
     path: PathBuf,
     shadowed: ShadowCounts,
+    /// Held only to be dropped with the handle. The writer keeps a `Weak` to
+    /// it and stops this source's heartbeat once it cannot upgrade, so a
+    /// handle dropped without `finalize` reads as a stopped writer, not a
+    /// running one. A token rather than a message from `Drop`: `send` would
+    /// block on the bounded channel, and `try_send` can lose the message.
+    _alive: Arc<()>,
 }
 
 impl std::fmt::Debug for SourceWriter {
@@ -1772,9 +1788,11 @@ fn writer_loop(
         checkpoint_every,
         heartbeat_every,
     } = cadence;
-    // Sources added or resumed and not yet finalized: the ones whose
-    // heartbeat this writer bumps.
-    let mut beating: BTreeSet<i64> = BTreeSet::new();
+    // Sources added or resumed and not yet finalized, each with the liveness
+    // tokens of its handles: the ones whose heartbeat this writer bumps,
+    // while any of their handles lives. A list, because `resume_source` on
+    // a source whose earlier handle still lives gives it a second one.
+    let mut beating: BTreeMap<i64, Vec<Weak<()>>> = BTreeMap::new();
     let mut last_beat = Instant::now();
     // Next segment sequence number, per (source, stream). Keyed by both
     // because `seq` is scoped to a source's stream in the `segments` table:
@@ -1833,8 +1851,12 @@ fn writer_loop(
             // Best-effort, like the checkpoint: a missed beat is one a reader
             // tolerates (it waits several intervals), and failing the writer
             // over one would cost the recording.
+            beating.retain(|_, handles| {
+                handles.retain(|alive| alive.strong_count() > 0);
+                !handles.is_empty()
+            });
             if !beating.is_empty() {
-                let ids: Vec<i64> = beating.iter().copied().collect();
+                let ids: Vec<i64> = beating.keys().copied().collect();
                 if let Err(e) = db.transaction(|tx| tx.beat(&ids)) {
                     warn!("failed to bump the heartbeat: {e}");
                 }
@@ -1865,7 +1887,12 @@ fn writer_loop(
             Ok(Msg::Sync(reply)) => {
                 let _ = reply.send(());
             }
-            Ok(Msg::AddSource { seed, uuid, reply }) => {
+            Ok(Msg::AddSource {
+                seed,
+                uuid,
+                alive,
+                reply,
+            }) => {
                 let inserted = db
                     .insert_source_with_uuid(&seed, uuid.as_deref())
                     .and_then(|id| {
@@ -1885,13 +1912,14 @@ fn writer_loop(
                 // and the caller decides whether to give up.
                 if let Ok(id) = &inserted {
                     added += 1;
-                    beating.insert(*id);
+                    beating.entry(*id).or_default().push(alive);
                 }
                 let _ = reply.send(inserted);
             }
             Ok(Msg::ResumeSource {
                 source_id,
                 clock_anchor_wall_ns,
+                alive,
                 reply,
             }) => {
                 let resumed = resume_source(db, source_id, clock_anchor_wall_ns, encoder);
@@ -1907,7 +1935,7 @@ fn writer_loop(
                 }
                 if resumed.is_ok() {
                     added += 1;
-                    beating.insert(source_id);
+                    beating.entry(source_id).or_default().push(alive);
                 }
                 let _ = reply.send(resumed);
             }

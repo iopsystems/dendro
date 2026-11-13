@@ -272,8 +272,9 @@ pub enum WriterState {
     /// [`STOPPED_AFTER_INTERVALS`] intervals.
     Live,
     /// The heartbeat has not changed for [`STOPPED_AFTER_INTERVALS`]
-    /// intervals: the writer was killed, this file is a copy, or a writer
-    /// is blocked for that long (a stalled disk). A later observation that
+    /// intervals: the writer was killed, the source's handle was dropped
+    /// without finalizing, this file is a copy, or a writer is blocked for
+    /// that long (a stalled disk). A later observation that
     /// finds the heartbeat changed returns [`Live`](Self::Live) again.
     Stopped,
     /// The source has no heartbeat: no writer since the columns existed has

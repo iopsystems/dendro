@@ -497,8 +497,8 @@ the rows changes shape; five things are guaranteed:
   writes `events` as given, so it can remove that event (§6).
 - `complete` is cleared at resume and set by the session's finalize.
 - The session sets `heartbeat_interval_ns` and bumps `heartbeat` (§3.1)
-  until it finalizes the source. A writer that reopens an archive without
-  those columns adds them.
+  until it finalizes the source or every handle to it is dropped. A writer
+  that reopens an archive without those columns adds them.
 
 ## 8. Compatibility
 
