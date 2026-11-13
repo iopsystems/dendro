@@ -75,6 +75,11 @@ cannot reach a failed release any other way.
   are now copied into the destination's WAL, where they stay live. A
   stream projected with `CopySpec::keep_columns` still leaves them out,
   because a WAL row cannot be projected. Present since 0.1.0.
+- A source whose `SourceWriter` was dropped without `finalize` kept its
+  heartbeat going for as long as its `Writer` ran, so `HeartbeatWatch`
+  reported a running writer for a source nothing could append to. Its
+  heartbeat now stops when its handle is dropped, and a reader sees it as
+  stopped; the writer's other sources go on beating. Present since 0.3.4.
 
 ## [0.7.1] - 2026-11-11
 

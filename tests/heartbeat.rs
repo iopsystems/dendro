@@ -52,6 +52,20 @@ fn watch_for(path: &std::path::Path, watch: &mut HeartbeatWatch, beats: u32) -> 
     seen
 }
 
+/// Whether `heartbeat()` reaches `at_least` within a generous deadline. A
+/// poll rather than a fixed sleep, so a loaded host that stalls the writer
+/// delays the answer instead of changing it.
+fn beats_reach(heartbeat: impl Fn() -> i64, at_least: i64) -> bool {
+    let deadline = Instant::now() + BEAT * 50;
+    while Instant::now() < deadline {
+        if heartbeat() >= at_least {
+            return true;
+        }
+        std::thread::sleep(BEAT / 2);
+    }
+    false
+}
+
 /// An idle writer still beats; a reader sees it live throughout, and the
 /// row says how often it beats.
 #[test]
@@ -93,6 +107,79 @@ fn a_writer_that_stops_without_finalizing_reads_as_stopped() {
     let states = watch_for(&path, &mut watch, 5);
     assert_eq!(states.first(), Some(&WriterState::Live), "{states:?}");
     assert_eq!(states.last(), Some(&WriterState::Stopped), "{states:?}");
+}
+
+/// A source whose handle is dropped without finalizing stops beating while
+/// the writer and its other sources go on. Nothing can append to it, so a
+/// reader must not be told a writer is running it.
+#[test]
+fn a_dropped_handle_stops_its_sources_beat_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dropped.dendro");
+    let mut writer = Writer::create_beating_every(&path, Box::new(Never), BEAT).unwrap();
+    let dropped = writer.add_source(meta()).unwrap();
+    let kept = writer.add_source(meta()).unwrap();
+    let (dropped_id, kept_id) = (dropped.source_id(), kept.source_id());
+    let kept_start = source(&path).heartbeat.unwrap_or(0);
+    drop(dropped);
+
+    let row = |id: i64| {
+        Archive::open(&path)
+            .unwrap()
+            .read_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap()
+    };
+    let (mut watch_dropped, mut watch_kept) = (HeartbeatWatch::new(), HeartbeatWatch::new());
+    let end = Instant::now() + BEAT * 8;
+    let (mut seen_dropped, mut seen_kept) = (Vec::new(), Vec::new());
+    while Instant::now() < end {
+        let now = Instant::now();
+        seen_dropped.push(watch_dropped.observe(&row(dropped_id), now));
+        seen_kept.push(watch_kept.observe(&row(kept_id), now));
+        std::thread::sleep(BEAT / 2);
+    }
+    assert_eq!(
+        seen_dropped.last(),
+        Some(&WriterState::Stopped),
+        "{seen_dropped:?}"
+    );
+    // Not a state check on the kept source: a loaded host can stall the
+    // writer past three intervals, which reads as stopped. That its count
+    // keeps moving is what shows it was never dropped from the beat.
+    let since = row(kept_id).heartbeat.unwrap();
+    assert!(
+        beats_reach(
+            || row(kept_id).heartbeat.unwrap(),
+            since.max(kept_start) + 3
+        ),
+        "{seen_kept:?}"
+    );
+    writer.finalize_single(kept, (2_000, 0)).unwrap();
+}
+
+/// A source with two live handles (a resume while the first handle still
+/// lives) keeps beating until both are dropped.
+#[test]
+fn a_source_beats_while_any_of_its_handles_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two.dendro");
+    let mut writer = Writer::create_beating_every(&path, Box::new(Never), BEAT).unwrap();
+    let first = writer.add_source(meta()).unwrap();
+    let (second, _) = writer.resume_source(first.source_id(), 3_000).unwrap();
+    drop(second);
+    let start = source(&path).heartbeat.unwrap_or(0);
+    assert!(
+        beats_reach(|| source(&path).heartbeat.unwrap(), start + 3),
+        "the first handle still lives, so the source still beats"
+    );
+    drop(first);
+    let mut watch = HeartbeatWatch::new();
+    let states = watch_for(&path, &mut watch, 8);
+    assert_eq!(states.last(), Some(&WriterState::Stopped), "{states:?}");
+    writer.join().unwrap();
 }
 
 /// A copy of a running source carries its heartbeat as it stood, and reads
