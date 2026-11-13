@@ -297,8 +297,8 @@ its sidecars stay.
 An unclean kill leaves all three. Creation checkpoints the catalog into the
 archive, so the archive alone always opens; what it lacks is every commit
 since the last checkpoint, which is in the sidecar. Measured on the kill
-fixture in `tests/unclean_kill.rs`, 400 appends with no seal and no
-checkpoint leave a 45 KiB archive and a 3.3 MB sidecar. Opening the set
+fixture `append-until-killed`, 400 appends with no seal and no checkpoint
+leave a 64 KiB archive and a 3.3 MB sidecar. Opening the set
 recovers all 400 rows. Copying only the archive at that moment recovers none
 of them. `CHECKPOINT_INTERVAL` bounds how much can be in the sidecar, and
 `Archive::vacuum_into` takes an exact copy without pausing the writer.
