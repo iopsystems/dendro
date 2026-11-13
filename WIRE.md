@@ -25,8 +25,8 @@ The logical split survives as frame kinds that demultiplex to `caller_rows` and
 `wal`.
 
 A stream has no end marker. It ends when the transport ends, and a stream that
-stops *inside* a frame lost that frame; a reader reports that as an error, not
-as the end (`FrameReader::next_frame`).
+stops *inside* a frame, its length prefix included, lost that frame; a reader
+reports that as an error, not as the end (`FrameReader::next_frame`).
 
 ## 2. Framing
 
@@ -116,8 +116,9 @@ Applied with `Transaction::insert_source_with_uuid`, so the subscriber's copy
 the column existed; the subscriber mints its own, which claims only that the
 two are not known to differ.
 
-`source` is unique within one connection and is reassigned from zero on a
-reconnect. It is an ordinal, not an identity — the uuid is the identity.
+`source` is unique within one connection, and a subscriber refuses a second
+handshake for it (rule 1). It is reassigned from zero on a reconnect. It is an
+ordinal, not an identity — the uuid is the identity.
 
 ### 4.2 `Index` (kind 2)
 
@@ -257,8 +258,10 @@ read it. A subscriber does not store it.
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
    carry. A frame naming an ordinal with no handshake is refused. A
    `Handshake` may arrive at any point in the stream, for a source the
-   publisher has just seen. An `ArchivePublisher` assigns it the next
-   ordinal; a subscriber does not check that.
+   publisher has just seen. An ordinal names one source for the life of a
+   connection: an `ArchivePublisher` assigns each new source the next one,
+   and a `Subscriber` refuses a `Handshake` for an ordinal an earlier one
+   assigned.
 2. The first `Index` frame carries complete current state (`Full`), including
    streams that exist but have never been observed.
 3. The first `Rows` frame carries the latest observation of every stream. **Not
@@ -288,6 +291,12 @@ read it. A subscriber does not store it.
 8. A reconnect is a new handshake and full state. There is no resume token.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
+10. A subscriber drops a row at or below the newest timestamp the connection
+    has already delivered for that row's stream, and a second row at one
+    `(stream, ts)` within a frame, and counts them (`Applied::rows_repeated`).
+    A frame delivered twice therefore writes nothing twice, and a row sent
+    after a newer row of its stream in an earlier frame is dropped the same
+    way. Within a frame, a stream's rows may be in any order.
 
 Before the first `Full` for a source, a subscriber skips rows: it has no
 identity to attribute them to. Rule 2 makes that free on a clean connect, and
@@ -323,9 +332,10 @@ is handed, so whatever decides who may hand it anything is the transport's.
   because §2 refuses a payload with trailing bytes.
 - **What this does not version.** The row payload, the segment's columns and
   the index blob are the caller's. `Handshake.metadata` carries the archive's
-  `encoder` key (`FORMAT.md` §6), and a subscriber whose encoder disagrees is
-  refused by the same check every other read path runs
-  (`segment::check_encoder`).
+  `encoder` key (`FORMAT.md` §6). A `Subscriber` refuses a `Handshake` whose
+  `encoder` differs from the version its own encoder reports, by the rule
+  every read path applies (`segment::check_encoder`): either side reporting
+  no version is not a mismatch.
 - **The archive schema version is separate** and is not carried here. A
   publisher and a subscriber on different archive schema versions can still
   speak protocol 1; what each can store is decided by its own file.

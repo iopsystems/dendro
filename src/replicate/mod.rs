@@ -55,7 +55,9 @@
 //!    labels — and assigns the ordinal its later frames carry. A handshake may
 //!    arrive at any point in the stream, for a source the publisher has just
 //!    seen; a later change to the source's labels or metadata is a
-//!    [`SourceUpdate`](crate::replicate::Frame::SourceUpdate).
+//!    [`SourceUpdate`](crate::replicate::Frame::SourceUpdate). An ordinal names
+//!    one source for the life of a connection, and a subscriber refuses a
+//!    second handshake for it.
 //! 2. The first [`Index`](crate::replicate::Frame::Index) frame carries complete current state,
 //!    including streams that exist but have never been observed.
 //! 3. The first [`Rows`](crate::replicate::Frame::Rows) frame carries the latest observation of

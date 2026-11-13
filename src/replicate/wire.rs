@@ -600,14 +600,27 @@ impl<R: Read> FrameReader<R> {
 
     /// Read one length-prefixed payload into `buf`, or `None` at a clean end.
     fn read_payload(&mut self) -> Result<Option<()>> {
+        // Counted rather than `read_exact`, whose `UnexpectedEof` cannot say
+        // how many bytes it read: zero bytes is the end of the stream, and one
+        // to three is a frame cut inside its length prefix.
         let mut len = [0u8; LENGTH_PREFIX_BYTES];
-        match self.inner.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => {
-                return Err(Error::Message(format!(
-                    "failed to read a replication frame length: {e}"
-                )))
+        let mut got = 0;
+        while got < LENGTH_PREFIX_BYTES {
+            match self.inner.read(&mut len[got..]) {
+                Ok(0) if got == 0 => return Ok(None),
+                Ok(0) => {
+                    return Err(Error::Message(format!(
+                        "a replication stream ended {got} byte(s) into a frame's \
+                         {LENGTH_PREFIX_BYTES}-byte length"
+                    )))
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(Error::Message(format!(
+                        "failed to read a replication frame length: {e}"
+                    )))
+                }
             }
         }
         let len = u32::from_le_bytes(len) as usize;
@@ -923,6 +936,38 @@ mod tests {
         bytes.truncate(bytes.len() - 3);
         let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
         assert!(reader.next_frame().is_err());
+    }
+
+    /// A stream that stops inside a frame's length prefix also lost a frame.
+    /// Only a stream that stops between frames has ended cleanly.
+    #[test]
+    fn a_stream_cut_inside_a_length_prefix_is_an_error() {
+        let frame = Frame::ClockOffset {
+            source: 0,
+            ts: 1,
+            offset_ns: 2,
+        };
+        for cut in 1..LENGTH_PREFIX_BYTES {
+            let mut bytes = Vec::new();
+            write_preamble(&mut bytes).unwrap();
+            encode_frame(&frame, &mut bytes).unwrap();
+            let next = bytes.len();
+            encode_frame(&frame, &mut bytes).unwrap();
+            bytes.truncate(next + cut);
+            let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
+            assert_eq!(reader.next_frame().unwrap(), Some(frame.clone()));
+            assert!(
+                reader.next_frame().is_err(),
+                "{cut} byte(s) of a length prefix read as a clean end"
+            );
+        }
+        // Zero bytes of the next prefix is the clean end.
+        let mut bytes = Vec::new();
+        write_preamble(&mut bytes).unwrap();
+        encode_frame(&frame, &mut bytes).unwrap();
+        let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.next_frame().unwrap(), Some(frame));
+        assert_eq!(reader.next_frame().unwrap(), None);
     }
 
     /// The size arithmetic the publisher splits by is the encoder's own.

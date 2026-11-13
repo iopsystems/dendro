@@ -33,8 +33,49 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
+  did not write because they were at or below the newest timestamp the
+  connection had already delivered for their stream, or repeated a
+  `(stream, ts)` within the frame.
+- `Writer::encoder_version`, the version the archive's encoder reports.
+
 ### Fixed
 
+- `FrameReader::next_frame` returned `Ok(None)`, the clean end of a stream,
+  for a stream that stopped one to three bytes into a frame's four-byte
+  length prefix, so a cut that landed there read as the end of the
+  recording. It is now an error, as a cut anywhere else in a frame already
+  was. Present since 0.2.0.
+- `Subscriber::apply` accepted a `Handshake` for an ordinal an earlier
+  handshake on the connection had already assigned. It created a second
+  source and sent every later frame for that ordinal to it, and the first
+  source stopped receiving with nothing said. Such a handshake is now
+  refused, before any source row is written. Present since 0.2.0. A caller
+  that fed a reconnect's frames to the same `Subscriber` now gets this
+  error where it used to get a duplicate source; open a new `Subscriber`
+  per connection.
+- `Subscriber::finish` finalized a complete source whose publisher had sent
+  no `ClockOffset` frame with the observation `(0, 0)`, so the copy's
+  `clock_offsets` held an entry no publisher made. It now finalizes such a
+  source with no observation. Present since 0.2.0.
+- A `Rows` frame that repeated one row the connection had already
+  delivered, such as a frame an at-least-once transport sent twice, lost
+  every row in it: the repeat collided in the subscriber's WAL, and a
+  collision costs the writer the whole tick. `Applied::rows` still counted
+  them all. The subscriber now drops the repeats and writes the rest. A row
+  older than one the connection already delivered for its stream, which
+  0.7.1 wrote, is now dropped too and counted the same way.
+  `Applied::rows` counts the rows handed to the writer, which commits them
+  by the next `Subscriber::sync`. Present since 0.2.0.
+- A `Subscriber` accepted a `Handshake` whose source was written with an
+  encoder version other than its own, though WIRE.md §7 said such a
+  subscriber is refused. It then sealed the publisher's rows with an
+  encoder not known to decode them, and its copy's `encoder` key named its
+  own version. The handshake is now refused before any source row is
+  written; either side reporting no version is not a mismatch, as on every
+  read path.
 - `ArchivePublisher::next` put every row of a source since the last poll
   into one `Rows` frame. Past `MAX_FRAME_BYTES` (64 MiB) that frame could
   not be encoded, and the publisher's cursor had already moved past its
@@ -53,7 +94,6 @@ cannot reach a failed release any other way.
   and holds back every source until the row is discarded or evicted, or the
   segment evicted.
   Present since 0.2.0.
-
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
   source's handle reported `WriterGone` and `Writer::join` returned "the
@@ -568,7 +608,6 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   rather than the cutoff, because a segment spanning the cutoff is kept with
   rows older than it; and asked inside the pass, because a seal between a
   caller's own query and the pass can create such a segment.
-
 - `SourceWriter::evict_before` was documented as fire-and-forget. It waits for
   the pass and returns its result; the doc now says so.
 
@@ -588,7 +627,6 @@ the minor exists to prevent (see 0.2.0 below). `Error` gains variants, which
   This does **not** reinstate the interval index. A per-interval counter kept by
   the producer's own loop needs no clock and does not alias; dividing an
   observation timestamp still does.
-
 - The `write` feature's description said `std::thread::spawn` "panics at
   runtime" on wasm32. This crate uses
   `std::thread::Builder::spawn`, which returns `io::Result` and is reported by
@@ -637,7 +675,6 @@ The Rust API broke separately. Neither implies the other.
   begins. `encode` returns a whole frame and `decode_payload` takes the payload
   alone, because `FrameReader` has already consumed the prefix; a caller pairing
   the two by hand needed a bare `4`.
-
 - **Replication**: frame types and a wire codec,
   `Subscriber` (apply frames to an archive) and `ArchivePublisher` (tail one).
   Transport is not included. One frame kind per table that `rewrite` carries, so

@@ -269,6 +269,175 @@ fn a_frame_without_a_handshake_is_refused() {
     sub.finish().unwrap();
 }
 
+/// A second handshake for an ordinal already in use on the connection is
+/// refused, and creates no source. It used to replace the first source's
+/// state, so every later frame for that ordinal went to the second source
+/// with nothing said.
+#[test]
+fn a_handshake_for_an_ordinal_in_use_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reused.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(false)).unwrap();
+
+    let meta = source_meta("b");
+    let err = sub
+        .apply(Frame::Handshake {
+            source: 0,
+            uuid: None,
+            labels: meta.labels,
+            metadata: meta.metadata,
+            clock_anchor_wall_ns: meta.clock_anchor_wall_ns,
+            complete: false,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ordinal 0"), "{err}");
+
+    // The first source still owns the ordinal.
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000])).unwrap();
+    sub.sync().unwrap();
+    let db = Archive::open(&path).unwrap();
+    let sources = db.read_sources().unwrap();
+    assert_eq!(sources.len(), 1, "the refused handshake created no source");
+    assert_eq!(sources[0].meta.labels["source"], "a");
+    assert_eq!(wal_ts(&db, sources[0].id, "s"), vec![1_000]);
+    drop(db);
+    sub.finish().unwrap();
+}
+
+/// A frame that repeats rows the connection already delivered (an
+/// at-least-once transport redelivering it) writes its new rows and counts
+/// the repeats. One repeated row used to collide in the WAL and cost the
+/// whole frame, while `Applied::rows` reported every row as written.
+#[test]
+fn a_repeated_row_costs_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repeat.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(false)).unwrap();
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000, 2_000]))
+        .unwrap();
+
+    let applied = sub
+        .apply(Frame::Rows {
+            source: 0,
+            seq: 1,
+            index_state: NO_INDEX_STATE,
+            rows: vec![row("s", 2_000), row("s", 3_000), row("u", 3_000)],
+        })
+        .unwrap();
+    assert_eq!((applied.rows, applied.rows_repeated), (2, 1));
+
+    // Within a frame a stream's rows may arrive in any order; only a second
+    // row at one timestamp is a repeat.
+    let applied = sub
+        .apply(Frame::Rows {
+            source: 0,
+            seq: 2,
+            index_state: NO_INDEX_STATE,
+            rows: vec![row("s", 5_000), row("s", 4_000), row("s", 5_000)],
+        })
+        .unwrap();
+    assert_eq!((applied.rows, applied.rows_repeated), (2, 1));
+    sub.sync().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    assert_eq!(
+        wal_ts(&db, id, "s"),
+        vec![1_000, 2_000, 3_000, 4_000, 5_000]
+    );
+    assert_eq!(wal_ts(&db, id, "u"), vec![3_000]);
+    drop(db);
+    sub.finish().unwrap();
+}
+
+/// A complete source whose publisher sent no clock observation is finalized
+/// with none. `finish` used to record `(0, 0)`, an observation nothing made.
+#[test]
+fn finishing_without_a_clock_observation_records_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nooffset.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(true)).unwrap();
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000])).unwrap();
+    sub.finish().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let src = db.read_sources().unwrap().remove(0);
+    assert!(src.complete, "the publisher's source was complete");
+    assert!(
+        db.read_clock_offsets(src.id).unwrap().is_empty(),
+        "no observation arrived, so none is recorded"
+    );
+}
+
+/// Tags with a version, to stand for an encoder that versions itself.
+struct Versioned(&'static str);
+impl SegmentEncoder for Versioned {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        Tags.encode(ctx, rows)
+    }
+    fn version(&self) -> Option<&str> {
+        Some(self.0)
+    }
+}
+
+/// A handshake whose source was written by an encoder version other than
+/// the subscriber's is refused, and creates no source: the subscriber would
+/// seal the publisher's rows with an encoder not known to decode them. It
+/// used to be accepted, and the copy's `encoder` key was replaced with the
+/// subscriber's own.
+#[test]
+fn a_handshake_from_another_encoder_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encoder.dendro");
+    let mut sub = Subscriber::new(Writer::create(&path, Box::new(Versioned("sub-B"))).unwrap());
+    let with_encoder = |version: &str| {
+        let Frame::Handshake {
+            source,
+            uuid,
+            labels,
+            mut metadata,
+            clock_anchor_wall_ns,
+            complete,
+        } = handshake(false)
+        else {
+            unreachable!()
+        };
+        metadata.insert(dendro::keys::ENCODER.to_string(), version.to_string());
+        Frame::Handshake {
+            source,
+            uuid,
+            labels,
+            metadata,
+            clock_anchor_wall_ns,
+            complete,
+        }
+    };
+
+    let err = sub.apply(with_encoder("pub-A")).unwrap_err().to_string();
+    assert!(err.contains("pub-A") && err.contains("sub-B"), "{err}");
+
+    // The same version is accepted, and the key is the publisher's.
+    sub.apply(with_encoder("sub-B")).unwrap();
+    sub.sync().unwrap();
+    let db = Archive::open(&path).unwrap();
+    let sources = db.read_sources().unwrap();
+    assert_eq!(sources.len(), 1, "the refused handshake created no source");
+    assert_eq!(
+        sources[0]
+            .meta
+            .metadata
+            .get(dendro::keys::ENCODER)
+            .map(String::as_str),
+        Some("sub-B")
+    );
+    drop(db);
+    sub.finish().unwrap();
+}
+
 /// `complete` travels: a copy of a finished source answers "was this
 /// finished" the same way, and a copy of a live one says it may be missing
 /// data after its last row — which it is, because the publisher is still
@@ -1016,20 +1185,20 @@ fn a_removed_key_is_removed_from_the_copy() {
     let mut seed = source_meta("a");
     seed.labels.insert("tier".to_string(), "client".to_string());
     seed.metadata.insert("old".to_string(), "1".to_string());
-    seed.metadata
-        .insert(dendro::keys::ENCODER.to_string(), "tags-1".to_string());
     let mut w = archive.add_source(seed).unwrap();
     w.sync().unwrap();
 
     let db = Archive::open(&origin).unwrap();
     let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
-    // The copy's writer records its own encoder, which differs from the
-    // publisher's `encoder` in the update.
+    // The copy's writer records its own encoder. The handshake carries no
+    // `encoder` (the origin's encoder is unversioned), and the update below
+    // carries a different one, which the copy must not take.
     let mut sub = Subscriber::new(Writer::create(&copy, Box::new(VersionedTags)).unwrap());
     sub.apply_all(opening).unwrap();
 
     let labels = BTreeMap::from([("source".to_string(), "renamed".to_string())]);
-    let metadata = BTreeMap::from([("new".to_string(), "2".to_string())]);
+    let mut metadata = BTreeMap::from([("new".to_string(), "2".to_string())]);
+    metadata.insert(dendro::keys::ENCODER.to_string(), "tags-1".to_string());
     w.set_identity(labels.clone(), metadata.clone()).unwrap();
     w.sync().unwrap();
     assert_eq!(
@@ -1054,6 +1223,7 @@ fn a_removed_key_is_removed_from_the_copy() {
     let sessions = got_metadata
         .remove(dendro::keys::WRITER_SESSIONS)
         .expect("the copy's writer sessions are kept");
+    metadata.remove(dendro::keys::ENCODER);
     assert_eq!((got_labels, got_metadata), (labels, metadata));
     let sessions: serde_json::Value = serde_json::from_str(&sessions).unwrap();
     assert_eq!(sessions.as_array().map(Vec::len), Some(2), "{sessions}");
