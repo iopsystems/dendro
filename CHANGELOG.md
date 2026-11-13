@@ -33,6 +33,20 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Fixed
+
+- `ArchiveMut::open` and `Writer::open` refused a SQLite database that is
+  not an archive as `Error::NotAnArchive`, then modified it: the refused
+  read-write connection was the last one on the file, and SQLite
+  checkpoints a WAL database when that connection closes, so a foreign
+  database with commits in its `-wal` had them folded into its main file
+  and the `-wal` deleted. The same happened to an archive refused for its
+  schema version. A refused open no longer folds a `-wal` that holds
+  commits into the main file: both are left as they were, though a refused
+  `Writer::open` can leave a `-shm` beside them. A non-WAL database with a
+  hot rollback journal is still rolled back by the open. Present since
+  0.1.0.
+
 ## [0.7.1] - 2026-11-11
 
 ### Added
