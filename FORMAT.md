@@ -284,11 +284,16 @@ sealed segment and live rows is a stream, not an absence.
 
 A row at or below the watermark can never be read, so a writer **drops** it
 rather than storing it, counts it, and logs once per stream; a resumed source
-refuses it at the call instead. Producers must append monotonically **per
-stream**. The watermark is per `(source, stream)`, so the same timestamp is
-accepted on a sibling stream or on another source, and backfilling either is
-not out of order. Late samples *within* one stream remain unsupported; see
-[out-of-order appends](docs/journal/2026-09-11-out-of-order-appends.md).
+refuses it at the call instead. A writer drops a row at or below its stream's
+newest live row the same way: it would be readable, but a reader that tails a
+stream by timestamp has passed it. The bound is the stream's newest row before
+the tick, so a stream's rows may arrive in any order within one tick; a second
+row at one timestamp in the tick is dropped the same way. Producers must
+append monotonically **per stream**. The watermark is per `(source, stream)`,
+so the same timestamp is accepted on a sibling stream or on another source,
+and backfilling either is not out of order. Late samples *within* one stream
+remain unsupported; see [out-of-order
+appends](docs/journal/2026-09-11-out-of-order-appends.md).
 
 **Retention and live rows.** Eviction deletes by timestamp and does not
 know which rows have been sealed. A live row older than the cutoff, one a

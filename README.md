@@ -87,10 +87,13 @@ Read these before you build on it. The first two are behaviors that can
 surprise a caller; the rest are boundaries.
 
 - **Out-of-order appends are dropped, not stored.** A row whose timestamp is
-  at or below its stream's newest sealed segment cannot be read, because the
-  watermark that keeps the seal seam free of duplicates shadows it. The
-  writer drops it, counts it in `SourceWriter::dropped_out_of_order`, and
-  logs once per stream. A resumed source refuses such a row at the call.
+  at or below its stream's newest row, sealed or live, is dropped, counted in
+  `SourceWriter::dropped_out_of_order`, and logged once per stream. Below the
+  newest sealed row it cannot be read, because the watermark that keeps the
+  seal seam free of duplicates shadows it; below the newest live row a
+  tailing replication publisher would never ship it. Within one tick a
+  stream's rows may arrive in any order, and a second row at one timestamp
+  is dropped. A resumed source refuses such a row at the call.
   dendro is for producers that append monotonically **per stream**. The
   restriction is per `(source, stream)`: a sibling stream or another source
   accepts the same timestamp, and backfilling either is not out of order.

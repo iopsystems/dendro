@@ -2324,6 +2324,59 @@ impl Archive {
             .map_err(Error::sqlite("failed to read a sealed watermark"))
     }
 
+    /// Every stream's newest row timestamp, sealed or live: the larger of its
+    /// newest segment's `last_ts` and its newest WAL row's `ts`. The writer
+    /// refuses a row at or below it (see `SourceWriter::dropped_out_of_order`).
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn newest_rows(&self) -> Result<BTreeMap<i64, BTreeMap<String, i64>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_id, stream, MAX(ts) FROM ( \
+                   SELECT source_id, stream, ts FROM wal \
+                   UNION ALL SELECT source_id, stream, last_ts FROM segments \
+                 ) GROUP BY source_id, stream",
+            )
+            .map_err(Error::sqlite("failed to query newest rows"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(Error::sqlite("failed to query newest rows"))?;
+        let mut out: BTreeMap<i64, BTreeMap<String, i64>> = BTreeMap::new();
+        for row in rows {
+            let (source_id, stream, ts) =
+                row.map_err(Error::sqlite("failed to read a newest row"))?;
+            out.entry(source_id).or_default().insert(stream, ts);
+        }
+        Ok(out)
+    }
+
+    /// [`newest_rows`](Self::newest_rows) for one source.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn newest_rows_of(&self, source_id: i64) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT stream, MAX(ts) FROM ( \
+                   SELECT stream, ts FROM wal WHERE source_id = ?1 \
+                   UNION ALL SELECT stream, last_ts FROM segments WHERE source_id = ?1 \
+                 ) GROUP BY stream",
+            )
+            .map_err(Error::sqlite("failed to query newest rows"))?;
+        let rows = stmt
+            .query_map([source_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(Error::sqlite("failed to query newest rows"))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(Error::sqlite("failed to read a newest row"))
+    }
+
     /// The next `seq` for every stream that has sealed at least once:
     /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
     /// archive seeds its numbering from, so it continues each stream's

@@ -1,13 +1,14 @@
 // Drives the writer and reads the counter it keeps.
 #![cfg(all(feature = "write", feature = "test-support"))]
 
-//! An append at or below its stream's newest sealed row used to be committed,
-//! charged for, and invisible — `read_wal` showed it and no read path did.
-//! It is now dropped and said out loud.
+//! An append at or below its stream's newest row is dropped and said out
+//! loud. Below the newest sealed row it would be invisible to every read
+//! path; below the newest live row a reader tailing the stream by timestamp
+//! has already passed it.
 //!
-//! The watermark is per `(source, stream)`, so this is a constraint WITHIN a
+//! The bound is per `(source, stream)`, so this is a constraint WITHIN a
 //! stream and nowhere else: a different stream, or a different source, has
-//! its own watermark and takes the same timestamp happily. That is the
+//! its own bound and takes the same timestamp happily. That is the
 //! property these tests pin, because it is what makes the restriction
 //! acceptable rather than merely documented.
 
@@ -262,20 +263,18 @@ fn sealed_watermarks_are_per_source_and_per_stream() {
     archive.join().unwrap();
 }
 
-/// A deferred seal has not raised anything yet: until the segment commits,
-/// an append it would eventually shadow is still legal and still readable.
+/// Rows of one stream that arrive out of order within one tick are kept:
+/// the bound is the stream's newest row before the tick, and the encoder
+/// orders what it is given.
 #[test]
-fn the_watermark_moves_with_the_commit_not_the_request() {
+fn rows_out_of_order_within_one_tick_are_kept() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
     let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
 
-    // Never sealed, so there is no watermark at all: out-of-order rows
-    // within one unsealed span are the encoder's to order, and are kept.
-    w.wal(vec![row("s", 300)]).unwrap();
-    w.wal(vec![row("s", 100)]).unwrap();
+    w.wal(vec![row("s", 300), row("s", 100)]).unwrap();
     w.sync().unwrap();
-    assert_eq!(w.dropped_out_of_order(), 0, "no segment, no watermark");
+    assert_eq!(w.dropped_out_of_order(), 0, "one tick, no bound yet");
     archive.finalize_single(w, (300, 0)).unwrap();
 
     let db = Archive::open(&path).unwrap();
@@ -315,4 +314,67 @@ fn an_eviction_of_every_segment_lifts_the_stream_watermark() {
     assert_eq!(live, vec![15]);
     drop(db);
     archive.finalize_single(w, (15, 0)).unwrap();
+}
+
+/// A row at or below its stream's newest LIVE row is dropped and counted,
+/// the same as one at or below the newest sealed row. It used to be stored
+/// and readable, and a tailing replication publisher, which ships rows after
+/// the newest it has sent, never shipped it. Within one tick a stream's rows
+/// may arrive in any order; only a second row at one timestamp is dropped.
+#[test]
+fn a_row_at_or_below_the_newest_live_row_is_dropped_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
+
+    w.wal(vec![row("s", 100)]).unwrap();
+    w.wal(vec![row("s", 50)]).unwrap();
+    w.wal(vec![row("s", 100)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_out_of_order(), 2, "50 and the second 100");
+
+    // One tick, out of order within it: both taken. A repeat in it: dropped.
+    w.wal(vec![row("s", 300), row("s", 200), row("s", 300)])
+        .unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_out_of_order(), 3);
+
+    // Another stream is unaffected.
+    w.wal(vec![row("t", 50)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_out_of_order(), 3);
+
+    let db = Archive::open(&path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    let ts = |stream: &str| -> Vec<i64> {
+        db.read_wal(id, stream)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ts)
+            .collect()
+    };
+    assert_eq!(ts("s"), vec![100, 200, 300]);
+    assert_eq!(ts("t"), vec![50]);
+    drop(db);
+    archive.finalize_single(w, (300, 0)).unwrap();
+}
+
+/// The newest-row bound is what the file holds, so a stream whose live rows
+/// are discarded accepts rows below them again.
+#[test]
+fn a_discard_lifts_the_newest_row_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
+    w.wal(vec![row("s", 100)]).unwrap();
+    w.sync().unwrap();
+    w.discard_live_rows(Box::new(|s: &str| s == "s")).unwrap();
+    w.wal(vec![row("s", 10)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        w.dropped_out_of_order(),
+        0,
+        "the discarded row bounds nothing"
+    );
+    archive.finalize_single(w, (10, 0)).unwrap();
 }
