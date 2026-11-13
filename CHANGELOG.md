@@ -33,6 +33,20 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Fixed
+
+- A seal whose encoder returned a segment with a `last_ts` that is not the
+  timestamp of one of its input rows panicked the writer thread, so every
+  source's handle reported `WriterGone` and `Writer::join` returned "the
+  archive writer thread panicked". The span passed the contract check
+  whenever the count of input rows inside it matched `rows`, for example one
+  row over `[20, 25]` from rows at 10, 20 and 30. Present since 0.1.0.
+  `segment::materialize` now refuses as `Error::EncoderContract` a segment
+  whose `first_ts` or `last_ts` is not an input row's timestamp, on the
+  seal, copy and read paths. An encoder whose `first_ts` was off a row
+  sealed without error in 0.7.1 and is now refused, which ends the writer
+  as any encoder breach does.
+
 ## [0.7.1] - 2026-11-11
 
 ### Added
