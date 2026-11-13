@@ -33,8 +33,24 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
+  did not write because they were at or below the newest timestamp the
+  connection had already delivered for their stream, or repeated a
+  `(stream, ts)` within the frame.
+
 ### Fixed
 
+- A `Rows` frame that repeated one row the connection had already
+  delivered, such as a frame an at-least-once transport sent twice, lost
+  every row in it: the repeat collided in the subscriber's WAL, and a
+  collision costs the writer the whole tick. `Applied::rows` still counted
+  them all. The subscriber now drops the repeats and writes the rest. A row
+  older than one the connection already delivered for its stream, which
+  0.7.1 wrote, is now dropped too and counted the same way.
+  `Applied::rows` counts the rows handed to the writer, which commits them
+  by the next `Subscriber::sync`. Present since 0.2.0.
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
   source's handle reported `WriterGone` and `Writer::join` returned "the

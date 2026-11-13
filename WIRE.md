@@ -284,6 +284,12 @@ read it. A subscriber does not store it.
 8. A reconnect is a new handshake and full state. There is no resume token.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
+10. A subscriber drops a row at or below the newest timestamp the connection
+    has already delivered for that row's stream, and a second row at one
+    `(stream, ts)` within a frame, and counts them (`Applied::rows_repeated`).
+    A frame delivered twice therefore writes nothing twice, and a row sent
+    after a newer row of its stream in an earlier frame is dropped the same
+    way. Within a frame, a stream's rows may be in any order.
 
 Before the first `Full` for a source, a subscriber skips rows: it has no
 identity to attribute them to. Rule 2 makes that free on a clean connect, and

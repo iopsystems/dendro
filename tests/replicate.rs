@@ -269,6 +269,53 @@ fn a_frame_without_a_handshake_is_refused() {
     sub.finish().unwrap();
 }
 
+/// A frame that repeats rows the connection already delivered (an
+/// at-least-once transport redelivering it) writes its new rows and counts
+/// the repeats. One repeated row used to collide in the WAL and cost the
+/// whole frame, while `Applied::rows` reported every row as written.
+#[test]
+fn a_repeated_row_costs_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repeat.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(false)).unwrap();
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000, 2_000]))
+        .unwrap();
+
+    let applied = sub
+        .apply(Frame::Rows {
+            source: 0,
+            seq: 1,
+            index_state: NO_INDEX_STATE,
+            rows: vec![row("s", 2_000), row("s", 3_000), row("u", 3_000)],
+        })
+        .unwrap();
+    assert_eq!((applied.rows, applied.rows_repeated), (2, 1));
+
+    // Within a frame a stream's rows may arrive in any order; only a second
+    // row at one timestamp is a repeat.
+    let applied = sub
+        .apply(Frame::Rows {
+            source: 0,
+            seq: 2,
+            index_state: NO_INDEX_STATE,
+            rows: vec![row("s", 5_000), row("s", 4_000), row("s", 5_000)],
+        })
+        .unwrap();
+    assert_eq!((applied.rows, applied.rows_repeated), (2, 1));
+    sub.sync().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    assert_eq!(
+        wal_ts(&db, id, "s"),
+        vec![1_000, 2_000, 3_000, 4_000, 5_000]
+    );
+    assert_eq!(wal_ts(&db, id, "u"), vec![3_000]);
+    drop(db);
+    sub.finish().unwrap();
+}
+
 /// `complete` travels: a copy of a finished source answers "was this
 /// finished" the same way, and a copy of a live one says it may be missing
 /// data after its last row — which it is, because the publisher is still
