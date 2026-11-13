@@ -371,6 +371,78 @@ fn projection_trims_columns_and_drops_a_stream_left_with_none() {
     assert!(db.all_streams(rec_id).unwrap().is_empty());
 }
 
+/// A projected copy leaves out the live rows the encoder made no segment of:
+/// a WAL row is the caller's opaque bytes, and copying it would carry the
+/// columns the projection drops. Without a projection, or for a stream the
+/// filter does not project, they are copied.
+#[test]
+fn a_projected_stream_leaves_out_unencoded_live_rows_and_an_unprojected_one_keeps_them() {
+    /// Leaves the newest row for a later seal.
+    struct HoldsLast;
+    impl SegmentEncoder for HoldsLast {
+        fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+            ReadingEncoder.encode(ctx, &rows[..rows.len().saturating_sub(1)])
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let mut src = ArchiveMut::create(&src_path).unwrap();
+    let id = src.insert_source(&seed("probe")).unwrap();
+    src.insert_wal_rows(id, &[row("temps", 10, 7, "a"), row("temps", 20, 8, "b")])
+        .unwrap();
+    drop(src);
+    let src = Archive::open(&src_path).unwrap();
+
+    let live_after = |spec: &CopySpec<'_>, name: &str| {
+        let path = dir.path().join(name);
+        let mut dst = ArchiveMut::create(&path).unwrap();
+        dst.transaction(|tx| rewrite::copy_sources_into(&src, tx, spec, &HoldsLast))
+            .unwrap();
+        let db = Archive::open(&path).unwrap();
+        let rec_id = db.read_sources().unwrap()[0].id;
+        let live: Vec<i64> = db
+            .live_wal(rec_id, "temps")
+            .unwrap()
+            .iter()
+            .map(|r| r.ts)
+            .collect();
+        live
+    };
+    assert_eq!(
+        live_after(&CopySpec::everything(), "plain.dendro"),
+        vec![20]
+    );
+    let projected = CopySpec {
+        keep_columns: Some(&Keep(&["value"])),
+        ..CopySpec::everything()
+    };
+    assert!(live_after(&projected, "projected.dendro").is_empty());
+
+    /// Projects every stream but `temps`, which it copies whole.
+    struct SparesTemps;
+    impl ColumnFilter for SparesTemps {
+        fn keep(&self, field: &Field) -> bool {
+            matches!(field.name().as_str(), "timestamp" | "value")
+        }
+        fn is_data(&self, field: &Field) -> bool {
+            field.name() != "timestamp"
+        }
+        fn projects(&self, stream: &str) -> bool {
+            stream != "temps"
+        }
+    }
+    let spared = CopySpec {
+        keep_columns: Some(&SparesTemps),
+        ..CopySpec::everything()
+    };
+    assert_eq!(
+        live_after(&spared, "spared.dendro"),
+        vec![20],
+        "a stream the filter does not project is copied as a plain copy is"
+    );
+}
+
 /// A stream the filter declines to project is copied byte for byte beside
 /// one it trims.
 #[test]

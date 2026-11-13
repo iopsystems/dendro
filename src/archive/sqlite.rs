@@ -179,6 +179,14 @@ fn sidecar_exists(path: &Path, suffix: &str) -> bool {
     Path::new(&p).exists()
 }
 
+/// The length of the sidecar beside `path` with `suffix`, or `None` when it
+/// does not exist or cannot be read.
+fn sidecar_len(path: &Path, suffix: &str) -> Option<u64> {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(suffix);
+    std::fs::metadata(Path::new(&p)).ok().map(|m| m.len())
+}
+
 /// `path` as a SQLite URI with `immutable=1`, or `None` for a path that is
 /// not UTF-8. Every byte outside the unreserved set is percent-encoded, so a
 /// `?` or `#` in a filename stays part of the filename.
@@ -638,6 +646,11 @@ pub struct Archive {
     /// Where this file keeps per-segment caller indexes. Fixed by the file's
     /// schema, so read once at open.
     layout: IndexLayout,
+    /// Set only on the read handle [`Archive::open`] opens read-write for a
+    /// finished archive: its close may checkpoint, and `Drop` allows that
+    /// only if the archive is still finished. Every other connection keeps
+    /// whatever close behaviour it was opened with.
+    checkpoint_if_finished: bool,
 }
 
 /// Where an archive keeps the caller's per-segment index (FORMAT.md §3.2).
@@ -806,6 +819,7 @@ impl Archive {
         let db = Archive {
             conn,
             layout: IndexLayout::Table,
+            checkpoint_if_finished: false,
         };
 
         // ORDER IS LOAD-BEARING, and a reordering here fails invisibly — the
@@ -866,9 +880,17 @@ impl Archive {
         {
             return Err(Error::ReadOnly(ReadOnly::Media));
         }
+        // No checkpoint on close until the gate has accepted the file. A
+        // read-write connection that is the last one on a WAL database
+        // checkpoints when it closes, so a refused open of a foreign database
+        // with commits in its `-wal` would fold them into its main file and
+        // delete the sidecar.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .map_err(Error::sqlite(format!("failed to open {}", path.display())))?;
         let mut db = Archive {
             conn,
             layout: IndexLayout::Absent,
+            checkpoint_if_finished: false,
         };
         // The lock before the gate: `locking_mode` touches no file, and the
         // gate's first read is what acquires the lock, so a file someone else
@@ -876,11 +898,28 @@ impl Archive {
         if exclusive {
             db.take_exclusive_lock()?;
         }
-        // The gate FIRST. `apply_connection_pragmas` writes `synchronous` and
-        // friends, and a file that is not ours must be refused untouched —
-        // before this ordering, a foreign SQLite database had its pragmas
-        // rewritten and then failed on a missing table.
-        db.adopt_schema(&path.display().to_string())?;
+        // The gate before `apply_connection_pragmas`, which writes
+        // `synchronous` and friends: a file that is not ours must be refused
+        // untouched.
+        if let Err(e) = db.adopt_schema(&path.display().to_string()) {
+            // A 0-byte `-wal` has nothing to fold in, and the close
+            // checkpoint is what removes the empty `-wal` (and `-shm`) this
+            // connection created beside a database that was closed cleanly.
+            // Any longer `-wal` is left as it is. Looked up beside the file
+            // SQLite opened, which is a symlink's target.
+            let opened = db.conn.path().map(Path::new);
+            if opened.and_then(|p| sidecar_len(p, "-wal")) == Some(0) {
+                let _ = db
+                    .conn
+                    .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false);
+            }
+            return Err(e);
+        }
+        // The file is an archive: restore the checkpoint on close, which is
+        // how `ArchiveMut::open` recovers a killed archive's sidecar.
+        db.conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)
+            .map_err(Error::sqlite(format!("failed to open {}", path.display())))?;
         // `page_size`, `auto_vacuum` and `journal_mode` persist in the file;
         // these do not, and forgetting them silently downgrades durability
         // (synchronous falls back to NORMAL) on every subsequent write.
@@ -991,6 +1030,7 @@ impl Archive {
         let mut db = Archive {
             conn,
             layout: IndexLayout::Absent,
+            checkpoint_if_finished: false,
         };
         // The same order as `open_at`: the gate, the reader's cache, then
         // `query_only`. Nothing before `query_only` writes. `synchronous`
@@ -1007,6 +1047,7 @@ impl Archive {
         db.conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
             .ok()?;
+        db.checkpoint_if_finished = true;
         db.is_finished().ok()?.then_some(db)
     }
 
@@ -1030,6 +1071,7 @@ impl Archive {
         let mut db = Archive {
             conn,
             layout: IndexLayout::Absent,
+            checkpoint_if_finished: false,
         };
         let what = path.display().to_string();
         // ORDER MATTERS, twice over. The gate goes first of all: `cache_size`
@@ -1109,6 +1151,7 @@ impl Archive {
         let mut db = Archive {
             conn,
             layout: IndexLayout::Absent,
+            checkpoint_if_finished: false,
         };
         // The gate first, for the same reason as `open`; the catalog-less
         // copy that used to be diagnosed here is diagnosed inside it.
@@ -2505,15 +2548,11 @@ impl std::fmt::Debug for ArchiveMut {
 
 impl Drop for Archive {
     /// Allow the close-time checkpoint of a read handle opened read-write
-    /// (see [`Archive::open`]) only if the archive is still finished. A
-    /// connection that never disabled it (a read-only one, or the write
-    /// handle's) is left alone.
+    /// (see [`Archive::open`]) only if the archive is still finished. Any
+    /// other connection keeps the close behaviour it had when its open
+    /// returned.
     fn drop(&mut self) {
-        let suppressed = self
-            .conn
-            .db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
-            .unwrap_or(false);
-        if suppressed && self.is_finished().unwrap_or(false) {
+        if self.checkpoint_if_finished && self.is_finished().unwrap_or(false) {
             let _ = self
                 .conn
                 .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false);
@@ -3197,6 +3236,7 @@ impl ArchiveMut {
         let db = Archive {
             conn,
             layout: IndexLayout::Table,
+            checkpoint_if_finished: false,
         };
         db.set_pragma("page_size", PAGE_SIZE)?;
         db.apply_connection_pragmas(WRITER_CACHE_SIZE_KIB)?;
