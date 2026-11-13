@@ -39,6 +39,7 @@ cannot reach a failed release any other way.
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a
   `(stream, ts)` within the frame.
+- `Writer::encoder_version`, the version the archive's encoder reports.
 
 ### Fixed
 
@@ -68,10 +69,6 @@ cannot reach a failed release any other way.
   0.7.1 wrote, is now dropped too and counted the same way.
   `Applied::rows` counts the rows handed to the writer, which commits them
   by the next `Subscriber::sync`. Present since 0.2.0.
-- `Writer::encoder_version`, the version the archive's encoder reports.
-
-### Fixed
-
 - A `Subscriber` accepted a `Handshake` whose source was written with an
   encoder version other than its own, though WIRE.md §7 said such a
   subscriber is refused. It then sealed the publisher's rows with an
