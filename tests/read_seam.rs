@@ -757,6 +757,52 @@ fn a_copy_catalogs_the_tail_it_wrote() {
         (1, 2),
         "the catalog must describe the bytes, which stop at ts=2"
     );
+    // The row the encoder left out stays live in the copy, as it does in the
+    // source until the next seal there.
+    let live: Vec<i64> = db.live_wal(1, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(live, vec![3], "the unsealed row is carried as a WAL row");
+    // And only that row: one at or below the segment's `last_ts` would be
+    // shadowed, held by no read.
+    let raw: Vec<i64> = db.read_wal(1, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(raw, vec![3], "no WAL row the segment already covers");
+}
+
+/// A tail the encoder makes no segment of is carried as WAL rows, not
+/// dropped.
+#[test]
+#[cfg(feature = "write")]
+fn a_copy_carries_a_tail_the_encoder_makes_no_segment_of() {
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+
+    struct NotYet;
+    impl SegmentEncoder for NotYet {
+        fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
+            Ok(None)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let dst_path = dir.path().join("dst.dendro");
+    let mut src = ArchiveMut::create(&src_path).unwrap();
+    let id = src.insert_source(&source()).unwrap();
+    let rows: Vec<WalRow> = (1..=2i64)
+        .map(|ts| WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: ts * 10,
+            row: vec![ts as u8],
+        })
+        .collect();
+    src.insert_wal_rows(id, &rows).unwrap();
+
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &NotYet))
+        .unwrap();
+
+    let db = Archive::open(&dst_path).unwrap();
+    assert!(db.read_segment_meta(1, "s").unwrap().is_empty());
+    assert_eq!(db.live_wal(1, "s").unwrap(), rows, "carried as they were");
 }
 
 /// A clock observation pairs a timestamp with ITS OWN row's offset.

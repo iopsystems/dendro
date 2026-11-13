@@ -265,8 +265,10 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   `ArchivePublisher` reads an archive, so it needs `archive`; `Subscriber`
   needs `write`, because it drives the writer.
 - **Rewriting.** Combine, trim and time-bound archives without decoding a
-  segment: the Parquet BLOBs pass through byte-identical and only the catalog
-  changes. Column projection is the one exception, and it is opt-in.
+  segment: sealed Parquet BLOBs pass through byte-identical. A stream's live
+  tail is encoded into one segment, and the live rows the encoder leaves out
+  of it are carried as WAL rows. Column projection, which decodes and
+  re-encodes segments, is the one other exception, and it is opt-in.
 - **One call to describe an archive.** `read::describe` answers what is in
   it, what it spans, and what it occupies, per source and per stream, without
   reading a segment.

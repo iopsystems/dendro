@@ -67,6 +67,14 @@ cannot reach a failed release any other way.
   `Writer::open` can leave a `-shm` beside them. A non-WAL database with a
   hot rollback journal is still rolled back by the open. Present since
   0.1.0.
+- `rewrite::copy_sources_into`, and every copy built on it, lost the live
+  rows of a source that its encoder left out of the tail's segment: a
+  trailing run it drops (a record still incomplete), or the whole tail when
+  it returns no segment. The source keeps those rows live until its next
+  seal; the copy encoded the tail and copied only the segment. Those rows
+  are now copied into the destination's WAL, where they stay live. A
+  stream projected with `CopySpec::keep_columns` still leaves them out,
+  because a WAL row cannot be projected. Present since 0.1.0.
 
 ## [0.7.1] - 2026-11-11
 
