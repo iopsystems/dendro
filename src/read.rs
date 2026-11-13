@@ -236,12 +236,14 @@ pub fn probe(
 }
 
 /// A stream's segments overlapping `[start, end]`, oldest first, with the
-/// live tail trimmed to the range and spliced on as the newest.
+/// live tail spliced on as the newest when it holds a row in the range.
 ///
-/// Whole segments at the edges — a segment is an immutable BLOB and is not
-/// cut — so a caller gets a little more than it asked for at each end; the
-/// tail is rows, and IS trimmed, since it is materialized here anyway. One
-/// snapshot.
+/// Sealed segments are returned whole, since a segment is an immutable BLOB,
+/// and the tail is encoded whole, as [`read_archive`] encodes it, because an
+/// encoder may need rows outside the range to encode the rows in it. A
+/// caller gets rows outside `[start, end]` at both ends and filters by
+/// timestamp. When the tail holds a row in the range, an encoder error on
+/// any live row fails the read. One snapshot.
 pub fn stream_range(
     db: &Archive,
     source_id: i64,
@@ -257,11 +259,10 @@ pub fn stream_range(
             .into_iter()
             .map(|s| s.bytes)
             .collect();
-        let live: Vec<_> = db
-            .live_wal(source_id, stream)?
-            .into_iter()
-            .filter(|r| r.ts >= start && r.ts <= end)
-            .collect();
+        let live = db.live_wal(source_id, stream)?;
+        if !live.iter().any(|r| r.ts >= start && r.ts <= end) {
+            return Ok(segments);
+        }
         if let Some(tail) = materialize_tail(db, encoder, source_id, stream, &live)? {
             segments.push(tail.bytes);
         }
