@@ -99,6 +99,9 @@ to a source's row in `sources` after its handshake.
 | 5 | `ClockOffset` | `clock_offsets` |
 | 6 | `SourceUpdate` | `sources` |
 
+The high bit of `kind` (`0x80`) marks a kind a reader must understand to apply
+the stream correctly; see §7. No kind above sets it.
+
 ### 4.1 `Handshake` (kind 1)
 
 ```
@@ -328,8 +331,17 @@ is handed, so whatever decides who may hand it anything is the transport's.
   skippable, so an older subscriber degrades to not applying it rather than to
   misreading it. `FrameReader` skips one and counts it (`skipped()`). Before
   dendro 0.3.0 it returned an error instead, so a subscriber built on 0.2.x
-  stops at the first kind it does not know. Adding a field to an existing frame *does* bump the version,
-  because §2 refuses a payload with trailing bytes.
+  stops at the first kind it does not know. Adding a field to an existing
+  frame *does* bump the version, because §2 refuses a payload with trailing
+  bytes.
+- **A kind that must not be skipped.** A new kind whose absence would make a
+  reader apply later frames wrongly (one that removes or replaces what the
+  subscriber holds, say) sets the high bit of `kind`. A reader that does not
+  know such a kind refuses the stream there instead of skipping it, and the
+  frames before it stand. `FrameReader` does this in releases after 0.7.1.
+  Readers on 0.7.x and earlier do not know the bit and skip such a frame like
+  any other unknown kind, so a producer that sends one to an older subscriber gets that
+  subscriber's skip, not its refusal.
 - **What this does not version.** The row payload, the segment's columns and
   the index blob are the caller's. `Handshake.metadata` carries the archive's
   `encoder` key (`FORMAT.md` §6). A `Subscriber` refuses a `Handshake` whose

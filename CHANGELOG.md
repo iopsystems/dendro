@@ -35,6 +35,13 @@ cannot reach a failed release any other way.
 
 ### Added
 
+- The high bit of a replication frame's `kind`
+  (`wire::KIND_MUST_UNDERSTAND`) marks a kind a reader must understand.
+  `FrameReader::next_frame` returns an error for an unknown kind with the
+  bit set, and still skips one without it. No kind dendro writes sets it,
+  so existing streams read as before. A reader on 0.7.x or earlier skips
+  such a frame (WIRE.md §7).
+
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a
