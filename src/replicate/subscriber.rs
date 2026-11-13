@@ -82,6 +82,10 @@ struct SourceState {
 
 /// Applies replication frames to an archive.
 ///
+/// **One `Subscriber` per connection.** After a reconnect, [`finish`](Self::finish)
+/// this one and open a new one: the new connection's ordinals restart at zero,
+/// and a reused subscriber refuses their handshakes.
+///
 /// Owns a [`Writer`], because the subscriber's archive is written the way every
 /// other archive is: one writer, one file, with the checkpoint thread,
 /// retention and seal machinery it already has. What arrives over the wire
@@ -134,6 +138,17 @@ impl Subscriber {
                 clock_anchor_wall_ns,
                 complete,
             } => {
+                // Checked before the source row is written. Replacing the
+                // state would send every later frame for this ordinal to the
+                // new source, and the first would stop receiving with nothing
+                // said.
+                if self.sources.contains_key(&source) {
+                    return Err(Error::Message(format!(
+                        "replication handshake for ordinal {source}, which an earlier \
+                         handshake on this connection already assigned; an ordinal names \
+                         one source for the life of a connection"
+                    )));
+                }
                 let writer = self.writer.add_source_with_uuid(
                     SourceMeta {
                         labels,
