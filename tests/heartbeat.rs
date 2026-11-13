@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use dendro::archive::{
     Archive, ArchiveMut, HeartbeatWatch, SourceMeta, SourceRow, WalRow, WriterState,
+    STOPPED_AFTER_INTERVALS,
 };
 use dendro::rewrite::{copy_sources_into, CopySpec};
 use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
@@ -66,8 +67,64 @@ fn beats_reach(heartbeat: impl Fn() -> i64, at_least: i64) -> bool {
     false
 }
 
-/// An idle writer still beats; a reader sees it live throughout, and the
-/// row says how often it beats.
+/// The shortest wall-clock gap between consecutive heartbeat changes over
+/// `changes` changes, polled at `BEAT / 4` while `between` runs once per poll
+/// (to keep a writer busy). `None` if the count did not move that often
+/// within a generous deadline.
+///
+/// The shortest gap, not every gap: a loaded host can stall the writer and
+/// stretch some gaps, but a writer that beats on schedule has short ones,
+/// and a writer slower than a reader's stopped threshold has none.
+fn shortest_beat_gap(
+    path: &std::path::Path,
+    changes: usize,
+    mut between: impl FnMut(),
+) -> Option<Duration> {
+    let deadline = Instant::now() + BEAT * 100;
+    let mut last = (source(path).heartbeat.unwrap(), Instant::now());
+    let mut seen_first = false;
+    let mut shortest: Option<Duration> = None;
+    let mut seen = 0;
+    while seen < changes && Instant::now() < deadline {
+        between();
+        std::thread::sleep(BEAT / 4);
+        let now = (source(path).heartbeat.unwrap(), Instant::now());
+        if now.0 != last.0 {
+            // The first change ends a gap that began before polling did.
+            if seen_first {
+                let gap = now.1 - last.1;
+                shortest = Some(shortest.map_or(gap, |s| s.min(gap)));
+            }
+            seen_first = true;
+            seen += 1;
+            last = now;
+        }
+    }
+    (seen == changes).then_some(shortest).flatten()
+}
+
+/// A gap a reader's `HeartbeatWatch` sees as a running writer.
+fn under_stopped_threshold(gap: Option<Duration>) -> bool {
+    gap.is_some_and(|g| g < BEAT * STOPPED_AFTER_INTERVALS)
+}
+
+/// What a reader watching `path` sees across one beat: it observes, waits for
+/// the heartbeat to change, and observes again. A changed heartbeat reads as
+/// live however long the beat took, so this does not depend on the host
+/// keeping the writer on schedule.
+fn live_across_a_beat(path: &std::path::Path, watch: &mut HeartbeatWatch) -> WriterState {
+    let seen = source(path);
+    watch.observe(&seen, Instant::now());
+    let before = seen.heartbeat.unwrap();
+    assert!(
+        beats_reach(|| source(path).heartbeat.unwrap(), before + 1),
+        "the writer did not beat within the deadline"
+    );
+    watch.observe(&source(path), Instant::now())
+}
+
+/// An idle writer still beats; a reader sees it live, and the row says how
+/// often it beats.
 #[test]
 fn an_idle_writer_beats_and_reads_as_live() {
     let dir = tempfile::tempdir().unwrap();
@@ -77,10 +134,10 @@ fn an_idle_writer_beats_and_reads_as_live() {
 
     let first = source(&path);
     assert_eq!(first.heartbeat_interval_ns, Some(BEAT.as_nanos() as i64));
+    let gap = shortest_beat_gap(&path, 5, || {});
+    assert!(under_stopped_threshold(gap), "shortest gap {gap:?}");
     let mut watch = HeartbeatWatch::new();
-    let states = watch_for(&path, &mut watch, 8);
-    assert!(states.iter().all(|s| *s == WriterState::Live), "{states:?}");
-    assert!(source(&path).heartbeat.unwrap() > first.heartbeat.unwrap() + 3);
+    assert_eq!(live_across_a_beat(&path, &mut watch), WriterState::Live);
 
     writer.finalize_single(handle, (2_000, 0)).unwrap();
     assert_eq!(
@@ -205,10 +262,9 @@ fn a_copy_of_a_running_source_reads_as_stopped() {
     let mut watch = HeartbeatWatch::new();
     let states = watch_for(&copied, &mut watch, 5);
     assert_eq!(states.last(), Some(&WriterState::Stopped), "{states:?}");
-    // The original, still being written, stays live.
+    // The original, still being written, reads as live.
     let mut original = HeartbeatWatch::new();
-    let states = watch_for(&path, &mut original, 5);
-    assert!(states.iter().all(|s| *s == WriterState::Live), "{states:?}");
+    assert_eq!(live_across_a_beat(&path, &mut original), WriterState::Live);
 }
 
 /// A file from before the columns reads as unknown, and a writer that
@@ -255,7 +311,7 @@ fn a_resumed_source_continues_its_count() {
     let path = dir.path().join("resume.dendro");
     let mut writer = Writer::create_beating_every(&path, Box::new(Never), BEAT).unwrap();
     let handle = writer.add_source(meta()).unwrap();
-    std::thread::sleep(BEAT * 3);
+    assert!(beats_reach(|| source(&path).heartbeat.unwrap(), 2));
     drop(handle);
     writer.join().unwrap();
     drop(writer);
@@ -340,27 +396,29 @@ fn a_nonpositive_interval_reads_as_unknown() {
     );
 }
 
-/// A writer kept busy with ticks still beats on time.
+/// A writer that receives appends between polls still beats at its interval.
+/// This does not catch a writer that skips a beat only while a message is
+/// queued: the appends here drain faster than a beat comes due.
 #[test]
 fn a_busy_writer_beats() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("busy.dendro");
     let mut writer = Writer::create_beating_every(&path, Box::new(Never), BEAT).unwrap();
     let mut handle = writer.add_source(meta()).unwrap();
-    let first = source(&path).heartbeat.unwrap();
-    let end = Instant::now() + BEAT * 5;
     let mut ts = 10_000i64;
-    while Instant::now() < end {
-        ts += 1;
-        handle
-            .wal(vec![WalRow {
-                stream: "s".to_string(),
-                ts,
-                wall_offset: 0,
-                row: vec![0],
-            }])
-            .unwrap();
-    }
+    let gap = shortest_beat_gap(&path, 5, || {
+        for _ in 0..20 {
+            ts += 1;
+            handle
+                .wal(vec![WalRow {
+                    stream: "s".to_string(),
+                    ts,
+                    wall_offset: 0,
+                    row: vec![0],
+                }])
+                .unwrap();
+        }
+    });
     handle.sync().unwrap();
-    assert!(source(&path).heartbeat.unwrap() >= first + 3);
+    assert!(under_stopped_threshold(gap), "shortest gap {gap:?}");
 }
