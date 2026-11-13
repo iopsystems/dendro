@@ -25,8 +25,8 @@ The logical split survives as frame kinds that demultiplex to `caller_rows` and
 `wal`.
 
 A stream has no end marker. It ends when the transport ends, and a stream that
-stops *inside* a frame lost that frame; a reader reports that as an error, not
-as the end (`FrameReader::next_frame`).
+stops *inside* a frame, its length prefix included, lost that frame; a reader
+reports that as an error, not as the end (`FrameReader::next_frame`).
 
 ## 2. Framing
 
@@ -115,8 +115,9 @@ Applied with `Transaction::insert_source_with_uuid`, so the subscriber's copy
 the column existed; the subscriber mints its own, which claims only that the
 two are not known to differ.
 
-`source` is unique within one connection and is reassigned from zero on a
-reconnect. It is an ordinal, not an identity — the uuid is the identity.
+`source` is unique within one connection, and a subscriber refuses a second
+handshake for it (rule 1). It is reassigned from zero on a reconnect. It is an
+ordinal, not an identity — the uuid is the identity.
 
 ### 4.2 `Index` (kind 2)
 
@@ -254,8 +255,10 @@ read it. A subscriber does not store it.
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
    carry. A frame naming an ordinal with no handshake is refused. A
    `Handshake` may arrive at any point in the stream, for a source the
-   publisher has just seen. An `ArchivePublisher` assigns it the next
-   ordinal; a subscriber does not check that.
+   publisher has just seen. An ordinal names one source for the life of a
+   connection: an `ArchivePublisher` assigns each new source the next one,
+   and a `Subscriber` refuses a `Handshake` for an ordinal an earlier one
+   assigned.
 2. The first `Index` frame carries complete current state (`Full`), including
    streams that exist but have never been observed.
 3. The first `Rows` frame carries the latest observation of every stream. **Not

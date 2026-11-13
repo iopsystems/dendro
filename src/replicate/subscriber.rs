@@ -99,6 +99,10 @@ struct SourceState {
 
 /// Applies replication frames to an archive.
 ///
+/// **One `Subscriber` per connection.** After a reconnect, [`finish`](Self::finish)
+/// this one and open a new one: the new connection's ordinals restart at zero,
+/// and a reused subscriber refuses their handshakes.
+///
 /// Owns a [`Writer`], because the subscriber's archive is written the way every
 /// other archive is: one writer, one file, with the checkpoint thread,
 /// retention and seal machinery it already has. What arrives over the wire
@@ -151,6 +155,17 @@ impl Subscriber {
                 clock_anchor_wall_ns,
                 complete,
             } => {
+                // Checked before the source row is written. Replacing the
+                // state would send every later frame for this ordinal to the
+                // new source, and the first would stop receiving with nothing
+                // said.
+                if self.sources.contains_key(&source) {
+                    return Err(Error::Message(format!(
+                        "replication handshake for ordinal {source}, which an earlier \
+                         handshake on this connection already assigned; an ordinal names \
+                         one source for the life of a connection"
+                    )));
+                }
                 let writer = self.writer.add_source_with_uuid(
                     SourceMeta {
                         labels,
@@ -386,7 +401,8 @@ impl Subscriber {
     ///
     /// The finalize observation is the newest [`ClockOffset`](Frame::ClockOffset)
     /// frame seen, so the copy's drift series ends where the publisher's did
-    /// rather than at a timestamp this process invented.
+    /// rather than at a timestamp this process invented. A source that received
+    /// none is finalized with none.
     pub fn finish(mut self) -> Result<()> {
         for (_, st) in std::mem::take(&mut self.sources) {
             let SourceState {
@@ -396,7 +412,10 @@ impl Subscriber {
                 ..
             } = st;
             if complete {
-                writer.finalize(last_offset.unwrap_or((0, 0)))?;
+                match last_offset {
+                    Some(offset) => writer.finalize(offset)?,
+                    None => writer.finalize_without_offset()?,
+                }
             } else {
                 drop(writer);
             }

@@ -269,6 +269,43 @@ fn a_frame_without_a_handshake_is_refused() {
     sub.finish().unwrap();
 }
 
+/// A second handshake for an ordinal already in use on the connection is
+/// refused, and creates no source. It used to replace the first source's
+/// state, so every later frame for that ordinal went to the second source
+/// with nothing said.
+#[test]
+fn a_handshake_for_an_ordinal_in_use_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reused.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(false)).unwrap();
+
+    let meta = source_meta("b");
+    let err = sub
+        .apply(Frame::Handshake {
+            source: 0,
+            uuid: None,
+            labels: meta.labels,
+            metadata: meta.metadata,
+            clock_anchor_wall_ns: meta.clock_anchor_wall_ns,
+            complete: false,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ordinal 0"), "{err}");
+
+    // The first source still owns the ordinal.
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000])).unwrap();
+    sub.sync().unwrap();
+    let db = Archive::open(&path).unwrap();
+    let sources = db.read_sources().unwrap();
+    assert_eq!(sources.len(), 1, "the refused handshake created no source");
+    assert_eq!(sources[0].meta.labels["source"], "a");
+    assert_eq!(wal_ts(&db, sources[0].id, "s"), vec![1_000]);
+    drop(db);
+    sub.finish().unwrap();
+}
+
 /// A frame that repeats rows the connection already delivered (an
 /// at-least-once transport redelivering it) writes its new rows and counts
 /// the repeats. One repeated row used to collide in the WAL and cost the
@@ -314,6 +351,26 @@ fn a_repeated_row_costs_only_itself() {
     assert_eq!(wal_ts(&db, id, "u"), vec![3_000]);
     drop(db);
     sub.finish().unwrap();
+}
+
+/// A complete source whose publisher sent no clock observation is finalized
+/// with none. `finish` used to record `(0, 0)`, an observation nothing made.
+#[test]
+fn finishing_without_a_clock_observation_records_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nooffset.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(true)).unwrap();
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000])).unwrap();
+    sub.finish().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let src = db.read_sources().unwrap().remove(0);
+    assert!(src.complete, "the publisher's source was complete");
+    assert!(
+        db.read_clock_offsets(src.id).unwrap().is_empty(),
+        "no observation arrived, so none is recorded"
+    );
 }
 
 /// `complete` travels: a copy of a finished source answers "was this
