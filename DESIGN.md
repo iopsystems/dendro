@@ -409,10 +409,15 @@ Neither choice affects read speed. Query time tracks segment *count*, which is
 An archive is stamped in its SQLite header at creation: `application_id` is
 `0x6465_6e64` (`dend`) and `user_version` is the schema version, so
 `archive::sniff` classifies a file from its first 100 bytes without opening
-it, and every open refuses anything else as `Error::NotAnArchive` *before*
-applying a single pragma: a file that is not SQLite, a SQLite database with
-another application's id, or one with SQLite's default id of `0`, which is
-what a `.rez` recording carries. The stamp is the identity. Nothing is
+it, and every open refuses anything else as `Error::NotAnArchive`: a file
+that is not SQLite, a SQLite database with another application's id, or one
+with SQLite's default id of `0`, which is what a `.rez` recording carries.
+The refusal comes before any pragma that writes, and a refused read-write
+open does not fold a `-wal` that holds commits into the main file, so both
+are left as they were. A refused `Writer::open` can leave a `-shm` sidecar
+beside such a `-wal`. SQLite also rolls back a hot rollback journal (a
+non-WAL database whose writer was killed) on the first read of any
+read-write open. The stamp is the identity. Nothing is
 inferred from the catalog, so there is no version table and no fallback.
 
 dendro's numbering starts at 4 because 1 to 3 were rezolus's formats. They

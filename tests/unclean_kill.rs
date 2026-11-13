@@ -15,7 +15,7 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-use dendro::archive::{Archive, WalRow};
+use dendro::archive::{Archive, ArchiveMut, WalRow};
 use dendro::read;
 use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 
@@ -105,6 +105,30 @@ fn an_unclean_kill_keeps_every_committed_append() {
         "a killed source is not complete, which is how a reader knows"
     );
     assert!(sources[0].uuid.is_some(), "identity survives a kill");
+}
+
+/// The recovery open: `ArchiveMut::open` on a killed archive, then a drop,
+/// folds the sidecar into the archive and removes it, and the archive alone
+/// then reads every committed row.
+#[test]
+fn a_write_open_and_drop_folds_a_killed_archives_sidecar_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("killed.dendro");
+    write_then_kill(&path, 5, 3);
+    assert!(
+        sidecar(&path).exists(),
+        "a killed writer leaves its -wal behind"
+    );
+
+    drop(ArchiveMut::open(&path).expect("a killed archive opens for writing"));
+    assert!(
+        !sidecar(&path).exists(),
+        "the write handle's close checkpoints and removes the sidecar"
+    );
+    assert_eq!(
+        rows_of(&Archive::open(&path).unwrap()),
+        vec!["1,2,3".to_string(), "4,5".to_string()],
+    );
 }
 
 /// The archive file ALONE — what a `cp` of a live recording gets you — opens

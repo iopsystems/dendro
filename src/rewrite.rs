@@ -2,11 +2,12 @@
 //! decoding a segment.
 //!
 //! Every one of those produces a new archive from existing ones by passing the
-//! parquet BLOBs through byte-identical and changing only the catalog around
-//! them. A ranged copy is the same operation with a time bound, so they share
-//! this one implementation rather than each growing their own — the WAL-tail
-//! handling below is subtle enough that a second implementation would be a
-//! second set of bugs.
+//! sealed parquet BLOBs through byte-identical. A stream's live tail is
+//! encoded into one segment, and the live rows the encoder leaves out of it
+//! are carried as WAL rows. A ranged copy is the same operation with a time
+//! bound, so they share this one implementation rather than each growing
+//! their own — the WAL-tail handling below is subtle enough that a second
+//! implementation would be a second set of bugs.
 //!
 //! Two decisions here are the caller's, because they are about what rows MEAN:
 //! which streams to keep ([`CopySpec::keep_streams`](crate::rewrite::CopySpec::keep_streams)) and which columns of a
@@ -684,7 +685,9 @@ pub struct CopySpec<'a> {
     pub start: i64,
     /// The other end of that bound, inclusive. A segment is carried whole
     /// when it overlaps `[start, end]` at all, so a copy holds a little more
-    /// than it asked for at each edge.
+    /// than it asked for at each edge. A stream's live tail is one unit the
+    /// same way: when any of its rows overlaps, its segment and the live rows
+    /// after it are carried.
     pub end: i64,
     /// Keep only the streams this accepts; `None` keeps every stream.
     ///
@@ -700,7 +703,10 @@ pub struct CopySpec<'a> {
     /// this accepts, decoding and re-encoding it. `None` is the fast path —
     /// segment BLOBs pass through byte-identical. This is the only copy that
     /// touches segment bytes; see [`project_segment_columns`]. A stream left
-    /// with no data column is dropped.
+    /// with no data column is dropped. Live rows the encoder leaves out of
+    /// the tail's segment are not copied for a projected stream, because a
+    /// WAL row cannot be projected; without a projection they are copied as
+    /// WAL rows.
     pub keep_columns: Option<&'a dyn ColumnFilter>,
     /// Writer properties for a projected segment (`keep_columns`), which is
     /// re-encoded. `None` uses the archive's own
@@ -904,6 +910,18 @@ fn copy_sources_snapshotted(
             let ctx = crate::segment::EncodeContext::new(rec.id, &table)
                 .with_source_uuid(rec.uuid.as_deref());
             let materialized = crate::segment::materialize(encoder, &ctx, &tail)?;
+            // The rows after the segment (all of them when there is none) are
+            // the ones the encoder left for a later seal. They stay live in
+            // the copy as they do in the source. Under a projection they are
+            // left out: a WAL row is opaque bytes, so carrying it would carry
+            // the columns the projection drops.
+            let unsealed = match &materialized {
+                Some(m) => &tail[tail.partition_point(|r| r.ts <= m.last_ts)..],
+                None => &tail[..],
+            };
+            if keep_columns.is_none() && !unsealed.is_empty() {
+                tx.insert_wal_rows(id, unsealed)?;
+            }
             if let Some(materialized) = materialized {
                 let meta = SegmentMeta {
                     rows: materialized.rows,

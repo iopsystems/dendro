@@ -69,6 +69,29 @@ impl SegmentEncoder for OverClaims {
     }
 }
 
+/// Claims the right count over a span whose given end is five past a row's
+/// timestamp: `[15, 30]` or `[10, 25]` from rows at 10, 20 and 30, two rows
+/// either way.
+struct OffRowEnd {
+    first: bool,
+}
+impl SegmentEncoder for OffRowEnd {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        let (first_ts, last_ts) = if self.first {
+            (rows[0].ts + 5, rows[2].ts)
+        } else {
+            (rows[0].ts, rows[1].ts + 5)
+        };
+        Ok(Some(Segment {
+            bytes: b"x".to_vec(),
+            rows: 2,
+            first_ts,
+            last_ts,
+            index: None,
+        }))
+    }
+}
+
 struct Panics;
 impl SegmentEncoder for Panics {
     fn encode(&self, _ctx: &EncodeContext<'_>, _rows: &[WalRow]) -> EncodeResult {
@@ -77,8 +100,18 @@ impl SegmentEncoder for Panics {
 }
 
 #[test]
-fn the_shared_check_refuses_a_hole_an_overclaim_and_a_panic() {
+fn the_shared_check_refuses_a_hole_an_overclaim_an_off_row_span_and_a_panic() {
     let input = rows(&[1, 2, 3]);
+    let spaced = rows(&[10, 20, 30]);
+    for first in [true, false] {
+        let err =
+            materialize(&OffRowEnd { first }, &EncodeContext::new(1, "s"), &spaced).unwrap_err();
+        assert!(
+            matches!(&err, Error::EncoderContract { detail, .. }
+                if detail.contains(if first { "first_ts 15" } else { "last_ts 25" })),
+            "{err}"
+        );
+    }
     assert!(matches!(
         materialize(&DropsMiddle, &EncodeContext::new(1, "s"), &input).unwrap_err(),
         Error::EncoderContract { .. }

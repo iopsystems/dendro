@@ -29,12 +29,12 @@ use crate::error::{Error, Result};
 /// here means a dropped trailing row stays live and is sealed by the
 /// next batch.
 ///
-/// The writer validates these against the rows it supplied - see
-/// `writer::seal_batch`. The check that matters is CONTIGUITY: the writer
-/// counts how many of the rows it handed over fall inside `[first_ts,
-/// last_ts]`, and requires that to equal `rows`. A hole anywhere inside the
-/// claimed span would be rows that end up in no segment and no WAL, because
-/// the prune deletes everything up to `last_ts`.
+/// [`materialize`] validates these against the rows the caller supplied, on
+/// the seal, copy and read paths. The check that matters is CONTIGUITY: the
+/// rows inside `[first_ts, last_ts]` must number `rows`. A hole anywhere
+/// inside the claimed span would be rows that end up in no segment and no
+/// WAL, because the prune deletes everything up to `last_ts`. Each end must
+/// also be the timestamp of an input row.
 ///
 /// So an encoder may drop a LEADING or a TRAILING run - both narrow the span
 /// without holing it, and a trailing drop leaves those rows live for
@@ -251,8 +251,8 @@ pub trait SegmentEncoder {
 /// inside the claimed span would be rows that end up in no segment and no
 /// WAL, because the prune deletes everything up to `last_ts`. An encoder may
 /// still drop a LEADING or TRAILING run — both narrow the span without
-/// holing it. `first_ts`/`last_ts` must also lie inside the input's span,
-/// and a segment claiming no rows is refused (return `None` instead).
+/// holing it. `first_ts` and `last_ts` must each be the timestamp of an input
+/// row, and a segment claiming no rows is refused (return `None` instead).
 ///
 /// A panic inside the encoder is the encoder's failure and is returned as
 /// [`Error::Encoder`], not propagated: on the writer thread a propagating
@@ -308,10 +308,12 @@ pub(crate) fn materialize_after(
             });
         }
     };
-    let covered = rows
-        .iter()
-        .filter(|r| r.ts >= segment.first_ts && r.ts <= segment.last_ts)
-        .count() as u64;
+    let (mut covered, mut first_on_row, mut last_on_row) = (0u64, false, false);
+    for r in rows {
+        covered += u64::from(r.ts >= segment.first_ts && r.ts <= segment.last_ts);
+        first_on_row |= r.ts == segment.first_ts;
+        last_on_row |= r.ts == segment.last_ts;
+    }
     if segment.rows == 0
         || segment.first_ts > segment.last_ts
         || segment.first_ts < first.ts
@@ -330,6 +332,19 @@ pub(crate) fn materialize_after(
                 first.ts,
                 last.ts
             ),
+        });
+    }
+    if let Some((end, ts)) = [
+        (!first_on_row).then_some(("first_ts", segment.first_ts)),
+        (!last_on_row).then_some(("last_ts", segment.last_ts)),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return Err(Error::EncoderContract {
+            stream: stream.to_string(),
+            detail: format!("its {end} {ts} is not the timestamp of any row it was given"),
         });
     }
     Ok(Some(segment))
