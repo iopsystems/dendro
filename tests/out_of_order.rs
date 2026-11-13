@@ -282,3 +282,37 @@ fn the_watermark_moves_with_the_commit_not_the_request() {
     let id = db.read_sources().unwrap()[0].id;
     assert_eq!(db.live_wal(id, "s").unwrap().len(), 2, "both are readable");
 }
+
+/// A writer's own retention pass that evicts every segment of a stream
+/// leaves it with no watermark, so a row below the old one is readable and
+/// is taken. The writer kept the old watermark in its cache and dropped the
+/// row as out of order.
+#[test]
+fn an_eviction_of_every_segment_lifts_the_stream_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
+    for ts in [10, 20] {
+        w.wal(vec![row("s", ts), row("t", ts)]).unwrap();
+        w.seal(vec!["s".to_string(), "t".to_string()]).unwrap();
+    }
+    w.sync().unwrap();
+
+    // `s` loses both segments; `t` keeps its newer one.
+    let only_s: Box<dyn Fn(&str) -> bool + Send> = Box::new(|s: &str| s == "s");
+    w.evict_streams_before(100, only_s).unwrap();
+    w.wal(vec![row("s", 15), row("t", 15)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        w.dropped_out_of_order(),
+        1,
+        "only `t`, whose watermark of 20 still stands, drops its row"
+    );
+
+    let db = Archive::open(&path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(live, vec![15]);
+    drop(db);
+    archive.finalize_single(w, (15, 0)).unwrap();
+}

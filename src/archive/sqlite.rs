@@ -2260,6 +2260,26 @@ impl Archive {
         Ok(out)
     }
 
+    /// [`sealed_watermarks`](Self::sealed_watermarks) for one source: each of
+    /// its streams that holds a segment, with that stream's newest `last_ts`.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn sealed_watermarks_of(&self, source_id: i64) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT stream, MAX(last_ts) FROM segments WHERE source_id = ?1 \
+                 GROUP BY stream",
+            )
+            .map_err(Error::sqlite("failed to query sealed watermarks"))?;
+        let rows = stmt
+            .query_map([source_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(Error::sqlite("failed to query sealed watermarks"))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(Error::sqlite("failed to read a sealed watermark"))
+    }
+
     /// The next `seq` for every stream that has sealed at least once:
     /// `MAX(seq) + 1` per `(source_id, stream)`. What a writer reopening an
     /// archive seeds its numbering from, so it continues each stream's

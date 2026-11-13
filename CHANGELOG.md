@@ -33,6 +33,19 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Fixed
+
+- After a writer retention pass (`SourceWriter::evict_before` and its
+  variants) evicted every segment of a stream, the writer still dropped
+  that stream's appends at or below its old newest sealed row as out of
+  order, and counted them in `dropped_out_of_order`. The archive has no
+  watermark for such a stream, so those rows are readable; the writer kept
+  the old watermark in memory until it restarted. It now re-reads the
+  source's watermarks after each successful retention pass. A resumed
+  source's handle still refuses rows at or before its previous session's
+  newest row. Rows accepted this way at or below a running replication
+  publisher's last shipped row are not replicated. Present since 0.1.0.
+
 ## [0.7.1] - 2026-11-11
 
 ### Added

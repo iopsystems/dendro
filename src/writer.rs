@@ -1790,8 +1790,10 @@ fn writer_loop(
     // or before it are refused. See `resume_source`.
     let mut floors: BTreeMap<i64, i64> = BTreeMap::new();
     // Every stream's newest SEALED row — the watermark a reader compares
-    // against. Advanced by `seal_batch`, and held here rather than queried
-    // per append because an append is the hot path; see `commit_tick`.
+    // against. Advanced by `seal_batch`, re-read for a source after a
+    // retention pass (which can evict a stream to nothing), and held here
+    // rather than queried per append because an append is the hot path; see
+    // `commit_tick`.
     //
     // Seeded from the catalog, which on a reopened archive is defense in
     // depth rather than the thing doing the work: a resumed source also
@@ -2057,6 +2059,21 @@ fn writer_loop(
                     // The caller has the error; the writer stays up. Retention
                     // failing is not a reason to lose the recording.
                     continue;
+                }
+                // A stream whose segments were all evicted has no watermark
+                // in the file, so its next rows are live whatever their
+                // timestamp. Re-read this source's watermarks so the cache
+                // agrees. On failure the old ones stay, which drops rows the
+                // file would serve rather than accept rows it would not.
+                match db.sealed_watermarks_of(source_id) {
+                    Ok(fresh) => {
+                        watermarks.insert(source_id, fresh);
+                    }
+                    Err(e) => warn!(
+                        "re-reading source {source_id}'s watermarks after retention failed \
+                         ({e}); a stream evicted to nothing still drops rows at or below its \
+                         old watermark until a later retention pass or a restart re-reads it"
+                    ),
                 }
                 // Same rule for the reclaim that follows: the caller was just
                 // told retention succeeded, and it did. Handing pages back is

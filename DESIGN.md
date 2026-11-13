@@ -363,20 +363,22 @@ those two ticks, plus whatever the caller has staged but not handed over.
 Nothing committed is lost.
 
 The rule is enforced by the types and by a lock. `Archive` is the read handle
-and has no mutators. `ArchiveMut` is the write handle: `ArchiveMut::create` for a new
-archive, and `ArchiveMut::open` for an existing one, which takes SQLite's
-exclusive locking mode and is refused as `Error::InUse` while anything else
-holds the file. The writer thread caches each stream's next `seq` and its
-sealed watermark in memory and seeds them once at startup; a second
-connection that could evict a stream's segments or insert one behind the
-writer's back would make that cache disagree with the file, and the next
-seal would collide or the next append would be dropped as out of order.
-`ArchiveMut::open` cannot be that connection, because the writer thread holds the
-file, and a writer thread cannot be started on a file a `ArchiveMut` holds, for
-the same reason. The streaming writer opens its own connection privately and
-without the exclusive lock, because its readers must coexist with it. A raw
-SQLite connection can still write behind the writer's back; dendro cannot
-prevent that and does not claim to.
+and has no mutators. `ArchiveMut` is the write handle: `ArchiveMut::create`
+for a new archive, and `ArchiveMut::open` for an existing one, which takes
+SQLite's exclusive locking mode and is refused as `Error::InUse` while
+anything else holds the file. The writer thread caches each stream's next
+`seq` and its sealed watermark in memory and seeds them once at startup. It
+re-reads a source's watermarks after each successful retention pass it runs,
+since eviction can remove a stream's last segment. A second connection that
+could evict a stream's segments or insert one behind the writer's back would
+make that cache disagree with the file, and the next seal would collide or the
+next append would be dropped as out of order. `ArchiveMut::open` cannot be
+that connection, because the writer thread holds the file, and a writer thread
+cannot be started on a file a `ArchiveMut` holds, for the same reason. The
+streaming writer opens its own connection privately and without the exclusive
+lock, because its readers must coexist with it. A raw SQLite connection can
+still write behind the writer's back; dendro cannot prevent that and does not
+claim to.
 
 ## Segment encoding choices
 
