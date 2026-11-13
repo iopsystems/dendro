@@ -1,10 +1,11 @@
-//! Rewriting an archive: combining, trimming and time-bounding, without
-//! decoding a segment.
+//! Rewriting an archive: combining, trimming and time-bounding it, and
+//! compacting its segments.
 //!
-//! Every one of those produces a new archive from existing ones by passing the
-//! sealed parquet BLOBs through byte-identical. A stream's live tail is
-//! encoded into one segment, and the live rows the encoder leaves out of it
-//! are carried as WAL rows. A ranged copy is the same operation with a time
+//! Combining, trimming and time-bounding each produce a new archive from
+//! existing ones by passing the sealed parquet BLOBs through byte-identical,
+//! unless a column projection is asked for. A stream's live tail is encoded
+//! into one segment, and the live rows the encoder leaves out of it are
+//! carried as WAL rows. A ranged copy is the same operation with a time
 //! bound, so they share this one implementation rather than each growing
 //! their own — the WAL-tail handling below is subtle enough that a second
 //! implementation would be a second set of bugs.
@@ -257,10 +258,13 @@ pub struct Compacted {
 /// reclaims at the end; a caller driving streams individually must finish
 /// with [`ArchiveMut::incremental_vacuum`](crate::archive::ArchiveMut::incremental_vacuum).
 ///
-/// **Concurrency.** In place, on this connection, so the archive must have no
-/// other writer — the same single-writer rule everything else here obeys. A
-/// reader on another connection is unaffected: each merge is one transaction,
-/// and until it commits a reader sees the segments exactly as they were.
+/// **Concurrency.** In place, on this connection. A handle from
+/// [`ArchiveMut::open`](crate::archive::ArchiveMut::open) holds the file
+/// exclusively, so no writer or reader has it open while this runs. A handle
+/// from [`ArchiveMut::create`](crate::archive::ArchiveMut::create) takes no
+/// such lock, and a reader on another connection sees each merge whole or not
+/// at all. Each merge is one transaction, so a crash leaves either the run's
+/// segments or the merged one.
 pub fn compact_stream(
     db: &mut ArchiveMut,
     source_id: i64,
@@ -1007,8 +1011,9 @@ pub fn copy_documents_into(src: &Archive, tx: &Transaction<'_>) -> Result<Copied
 /// Re-encode one segment with only the columns `keep` accepts, or `None` when
 /// nothing but structural columns survive.
 ///
-/// This is the only operation in this module that touches segment bytes; every
-/// other copy passes the parquet BLOB through verbatim. Row count, timestamps
+/// This and compaction ([`compact`], [`compact_stream`]) are the operations in
+/// this module that decode segment bytes; a copy without a projection passes each parquet BLOB through
+/// verbatim. Row count, timestamps
 /// and column values are unchanged by a projection, so a projected segment
 /// reuses its source's catalog entry as-is.
 ///

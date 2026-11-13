@@ -940,7 +940,7 @@ impl Archive {
     /// The read handle. [`ArchiveMut::open`] is the write handle, and it differs
     /// in two ways a reader does not want: SQLite checkpoints a WAL database
     /// when the last read-write connection to it closes, which rewrites the
-    /// archive and deletes its sidecars (measured at 45 KiB to 61 KiB on a
+    /// archive and deletes its sidecars (measured at 64 KiB to 80 KiB on a
     /// killed archive with a 3.3 MB sidecar, from nothing but an open and a
     /// drop), and the durability pragmas it applies are themselves writes,
     /// which read-only media refuses. For an archive with an unfinished
