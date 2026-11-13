@@ -170,7 +170,7 @@ enum Msg {
     },
     /// Rows for the caller's time-keyed store, in order with the ticks
     /// around them and committed on their own. See
-    /// [`CallerRow`](crate::archive::CallerRow).
+    /// [`crate::archive::CallerRow`].
     CallerRows {
         source_id: i64,
         stream: String,
@@ -2469,7 +2469,7 @@ fn adopt_segment(
     // inverted one would set a watermark below its own first row.
     if meta.rows == 0 || meta.first_ts > meta.last_ts {
         return Err(Error::Message(format!(
-            "source {source_id}: the segment offered for `{stream}` claims {} row(s) over              [{}, {}], which is not a segment that can exist",
+            "source {source_id}: the segment offered for `{stream}` claims {} row(s) over [{}, {}], which is not a segment that can exist",
             meta.rows, meta.first_ts, meta.last_ts
         )));
     }
@@ -2493,7 +2493,7 @@ fn adopt_segment(
         // one thing this layer cannot do.
         if meta.first_ts <= w {
             return Err(Error::Message(format!(
-                "source {source_id}: the segment offered for `{stream}` spans [{}, {}], which                  straddles the stream's newest sealed row ({w}); its rows at or below {w}                  could never be read, and splitting it would mean decoding it",
+                "source {source_id}: the segment offered for `{stream}` spans [{}, {}], which straddles the stream's newest sealed row ({w}); its rows at or below {w} could never be read, and splitting it would mean decoding it",
                 meta.first_ts, meta.last_ts
             )));
         }
@@ -2512,7 +2512,7 @@ fn adopt_segment(
     if let Some(first) = live.first_ts {
         if first <= meta.last_ts {
             return Err(Error::Message(format!(
-                "source {source_id}: the segment offered for `{stream}` ends at {}, at or                  after an unsealed row already in the WAL ({first}); adopting it would                  shadow rows no segment holds",
+                "source {source_id}: the segment offered for `{stream}` ends at {}, at or after an unsealed row already in the WAL ({first}); adopting it would shadow rows no segment holds",
                 meta.last_ts
             )));
         }
