@@ -33,6 +33,19 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Fixed
+
+- `read::stream_range` returned nothing from the live tail for an encoder
+  that needs an earlier row of the tail to encode the rest, such as one
+  that states a schema in the first row after a seal. Present since 0.1.0.
+  When the tail holds a row in the range it is now encoded whole, as
+  `read::read_archive` encodes it, so the tail segment can hold rows before
+  `start` and after `end`, as a sealed segment at the edge can; filter by
+  timestamp; a caller that read only the tail and relied on it being cut to
+  the range must now filter. When the tail holds a row in the range, an
+  encoder error on any live row now fails the ranged read, as it fails
+  `read_archive`.
+
 ## [0.7.1] - 2026-11-11
 
 ### Added

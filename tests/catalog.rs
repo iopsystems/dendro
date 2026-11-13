@@ -159,20 +159,97 @@ fn a_probe_is_the_first_sealed_segment_or_the_tail() {
 }
 
 #[test]
-fn a_ranged_read_takes_whole_segments_and_trims_the_tail() {
+fn a_ranged_read_takes_whole_segments_and_the_whole_tail() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.dendro");
     let id = fixture(&path);
     let db = Archive::open(&path).unwrap();
     let got = read::stream_range(&db, id, "a", 3, 5, &Tags).unwrap();
-    assert_eq!(got, vec![b"3,4".to_vec(), b"5".to_vec()]);
-    // A range past everything sealed reads only the tail, trimmed.
+    assert_eq!(got, vec![b"3,4".to_vec(), b"5,6".to_vec()]);
+    // A range past everything sealed reads only the tail, whole.
     let got = read::stream_range(&db, id, "a", 6, 100, &Tags).unwrap();
-    assert_eq!(got, vec![b"6".to_vec()]);
+    assert_eq!(got, vec![b"5,6".to_vec()]);
     // A range before everything: nothing.
     assert!(read::stream_range(&db, id, "a", -10, 0, &Tags)
         .unwrap()
         .is_empty());
+    // A range after the tail: nothing, not the tail.
+    assert!(read::stream_range(&db, id, "a", 7, 100, &Tags)
+        .unwrap()
+        .is_empty());
+    // A range inside the tail: the whole tail.
+    let got = read::stream_range(&db, id, "a", 5, 5, &Tags).unwrap();
+    assert_eq!(got, vec![b"5,6".to_vec()]);
+}
+
+/// Encodes a row only after an anchor (`row == [0]`) has been seen in the
+/// same input, and drops the leading run before the first anchor: the shape
+/// `DESIGN.md` allows for rows that carry a schema once per segment.
+struct Anchored;
+impl SegmentEncoder for Anchored {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        let Some(at) = rows.iter().position(|r| r.row == [0]) else {
+            return Ok(None);
+        };
+        Tags.encode(ctx, &rows[at..])
+    }
+}
+
+/// A range that starts after a live tail's anchor still returns the rows in
+/// it. The tail used to be cut to the range before encoding, which cut the
+/// anchor off and returned nothing.
+#[test]
+fn a_ranged_read_of_the_tail_keeps_the_rows_an_anchored_encoder_needs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db
+        .insert_source(&SourceMeta {
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            clock_anchor_wall_ns: 0,
+        })
+        .unwrap();
+    let mut rows: Vec<WalRow> = (1..=4).map(|ts| row("s", ts)).collect();
+    rows[0].row = vec![0];
+    db.insert_wal_rows(id, &rows).unwrap();
+    drop(db);
+
+    let db = Archive::open(&path).unwrap();
+    let got = read::stream_range(&db, id, "s", 2, 3, &Anchored).unwrap();
+    assert_eq!(got, vec![b"1,2,3,4".to_vec()]);
+}
+
+/// Encodes rows in complete pairs from the first and drops a trailing odd
+/// row: a trailing drop, which `segment::materialize` allows.
+struct Pairs;
+impl SegmentEncoder for Pairs {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        Tags.encode(ctx, &rows[..rows.len() / 2 * 2])
+    }
+}
+
+/// A tail cut at `end` would hand `Pairs` rows 1 to 3 for a range of 2 to 3,
+/// and it would drop row 3. The whole tail is 1 to 4, all of it encoded.
+#[test]
+fn a_ranged_read_of_the_tail_keeps_an_in_range_row_a_trailing_drop_would_lose() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    let id = db
+        .insert_source(&SourceMeta {
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            clock_anchor_wall_ns: 0,
+        })
+        .unwrap();
+    let rows: Vec<WalRow> = (1..=4).map(|ts| row("s", ts)).collect();
+    db.insert_wal_rows(id, &rows).unwrap();
+    drop(db);
+
+    let db = Archive::open(&path).unwrap();
+    let got = read::stream_range(&db, id, "s", 2, 3, &Pairs).unwrap();
+    assert_eq!(got, vec![b"1,2,3,4".to_vec()]);
 }
 
 #[test]
