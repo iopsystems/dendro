@@ -190,14 +190,15 @@ enum Msg {
         name: String,
         reply: SyncSender<Result<Option<RevisionId>>>,
     },
-    /// One source's last clock observation; marks *that* source complete.
+    /// One source's last clock observation, if it has one; marks *that*
+    /// source complete.
     ///
     /// Does not stop the writer: an archive may hold several sources and the
     /// others may still be running. The thread exits when every handle has been
     /// dropped and the channel closes — see `writer_thread`.
     Finalize {
         source_id: i64,
-        clock_offset: (i64, i64),
+        clock_offset: Option<(i64, i64)>,
     },
     /// Stop the writer, whatever else is still holding a sender.
     ///
@@ -1316,7 +1317,17 @@ impl SourceWriter {
     /// "recovery artifact".
     ///
     /// A barrier costs nothing here: this is the last thing a source does.
-    pub fn finalize(mut self, clock_offset: (i64, i64)) -> Result<()> {
+    pub fn finalize(self, clock_offset: (i64, i64)) -> Result<()> {
+        self.finalize_with(Some(clock_offset))
+    }
+
+    /// [`finalize`](Self::finalize) with no final clock observation, for a
+    /// replication subscriber whose publisher sent none.
+    pub(crate) fn finalize_without_offset(self) -> Result<()> {
+        self.finalize_with(None)
+    }
+
+    fn finalize_with(mut self, clock_offset: Option<(i64, i64)>) -> Result<()> {
         self.send(Msg::Finalize {
             source_id: self.source_id,
             clock_offset,
@@ -2241,7 +2252,9 @@ fn writer_loop(
                 // rows, and it grew for the life of the writer.
                 with_retries("finalizing a source", || {
                     db.transaction(|tx| {
-                        tx.insert_clock_offset(source_id, clock_offset.0, clock_offset.1)?;
+                        if let Some((ts, offset)) = clock_offset {
+                            tx.insert_clock_offset(source_id, ts, offset)?;
+                        }
                         tx.mark_complete(source_id)
                     })
                 })?;

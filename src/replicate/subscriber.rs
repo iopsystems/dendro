@@ -22,8 +22,22 @@ use super::frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
 /// asking dendro for it, and match with a wildcard arm.
 #[non_exhaustive]
 pub struct Applied {
-    /// WAL rows written.
+    /// WAL rows handed to the writer. Like [`SourceWriter::wal`], the hand-off
+    /// is not the commit: [`sync`](Subscriber::sync) is the point at which
+    /// they are on disk, and a row the writer drops (one at or below its
+    /// stream's newest sealed row, counted in
+    /// [`dropped_out_of_order`](crate::writer::SourceWriter::dropped_out_of_order),
+    /// or one in a tick the writer gave up on after retries) is counted here
+    /// too.
     pub rows: usize,
+    /// Rows **not** handed over, because this connection already delivered a
+    /// row of their stream at or after their timestamp, or because an earlier
+    /// row of this frame has the same stream and timestamp: a frame delivered
+    /// twice, rows a publisher sent again, or a row sent after a newer one of
+    /// its stream. A repeat written to the WAL would collide with the row
+    /// already there, and a collision costs the writer the whole tick it
+    /// arrived in.
+    pub rows_repeated: usize,
     /// Rows **not** written, because the index state they were built against
     /// is not the one this subscriber has accumulated, or because they name an
     /// index and no [`Full`](IndexKind::Full) entry has arrived yet for their
@@ -78,9 +92,16 @@ struct SourceState {
     /// Whether a gap has already been logged for this source, so a persistently
     /// lossy transport does not produce one line per frame.
     logged_gap: bool,
+    /// Per stream, the newest row timestamp handed to the writer on this
+    /// connection. A row at or below it is a repeat.
+    newest: BTreeMap<String, i64>,
 }
 
 /// Applies replication frames to an archive.
+///
+/// **One `Subscriber` per connection.** After a reconnect, [`finish`](Self::finish)
+/// this one and open a new one: the new connection's ordinals restart at zero,
+/// and a reused subscriber refuses their handshakes.
 ///
 /// Owns a [`Writer`], because the subscriber's archive is written the way every
 /// other archive is: one writer, one file, with the checkpoint thread,
@@ -134,6 +155,17 @@ impl Subscriber {
                 clock_anchor_wall_ns,
                 complete,
             } => {
+                // Checked before the source row is written. Replacing the
+                // state would send every later frame for this ordinal to the
+                // new source, and the first would stop receiving with nothing
+                // said.
+                if self.sources.contains_key(&source) {
+                    return Err(Error::Message(format!(
+                        "replication handshake for ordinal {source}, which an earlier \
+                         handshake on this connection already assigned; an ordinal names \
+                         one source for the life of a connection"
+                    )));
+                }
                 // The subscriber seals this source's rows with its own
                 // encoder, so one that disagrees with the encoder that wrote
                 // them is refused, by the rule every read path applies
@@ -174,6 +206,7 @@ impl Subscriber {
                         complete,
                         last_offset: None,
                         logged_gap: false,
+                        newest: BTreeMap::new(),
                     },
                 );
                 Ok(Applied {
@@ -249,12 +282,30 @@ impl Subscriber {
                     });
                 }
 
-                let n = rows.len();
+                // A repeat is a row at or below what earlier frames delivered
+                // for its stream, or a second row at one `(stream, ts)` in
+                // this frame. Rows of one stream may arrive in any order
+                // within a frame, so the bound is the one before the frame.
+                let offered = rows.len();
+                let before = st.newest.clone();
+                let mut seen: std::collections::BTreeSet<(String, i64)> = Default::default();
+                let mut fresh = Vec::with_capacity(offered);
+                for row in rows {
+                    let delivered = before.get(&row.stream).is_some_and(|n| row.ts <= *n);
+                    if delivered || !seen.insert((row.stream.clone(), row.ts)) {
+                        continue;
+                    }
+                    let newest = st.newest.entry(row.stream.clone()).or_insert(row.ts);
+                    *newest = (*newest).max(row.ts);
+                    fresh.push(row);
+                }
+                let n = fresh.len();
                 if n > 0 {
-                    st.writer.wal(rows)?;
+                    st.writer.wal(fresh)?;
                 }
                 Ok(Applied {
                     rows: n,
+                    rows_repeated: offered - n,
                     gap,
                     ..Applied::default()
                 })
@@ -321,6 +372,7 @@ impl Subscriber {
             let one = self.apply(frame)?;
             total.rows += one.rows;
             total.rows_skipped += one.rows_skipped;
+            total.rows_repeated += one.rows_repeated;
             total.segments += one.segments;
             total.segments_held += one.segments_held;
             total.index_entries += one.index_entries;
@@ -367,7 +419,8 @@ impl Subscriber {
     ///
     /// The finalize observation is the newest [`ClockOffset`](Frame::ClockOffset)
     /// frame seen, so the copy's drift series ends where the publisher's did
-    /// rather than at a timestamp this process invented.
+    /// rather than at a timestamp this process invented. A source that received
+    /// none is finalized with none.
     pub fn finish(mut self) -> Result<()> {
         for (_, st) in std::mem::take(&mut self.sources) {
             let SourceState {
@@ -377,7 +430,10 @@ impl Subscriber {
                 ..
             } = st;
             if complete {
-                writer.finalize(last_offset.unwrap_or((0, 0)))?;
+                match last_offset {
+                    Some(offset) => writer.finalize(offset)?,
+                    None => writer.finalize_without_offset()?,
+                }
             } else {
                 drop(writer);
             }
