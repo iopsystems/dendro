@@ -76,6 +76,24 @@ cannot reach a failed release any other way.
   own version. The handshake is now refused before any source row is
   written; either side reporting no version is not a mismatch, as on every
   read path.
+- `ArchivePublisher::next` put every row of a source since the last poll
+  into one `Rows` frame. Past `MAX_FRAME_BYTES` (64 MiB) that frame could
+  not be encoded, and the publisher's cursor had already moved past its
+  rows, so the next poll shipped none of them. An interval's rows are now
+  split across several `Rows` frames sharing its `seq` (WIRE.md rule 6). A
+  subscriber built on an earlier release applies split frames as it applies
+  any other. Present since 0.2.0.
+- A call to `ArchivePublisher::next` that returned `Err` had already moved
+  the cursors of every source it polled before failing, and of the failing
+  source's index entries and clock offsets, so a later call never sent
+  those frames; a missing index entry made the subscriber skip every later
+  row of its source. A failed call now leaves the publisher as it was.
+  `next` also fails, where it used to return a frame that could not be
+  encoded, when one row or a segment of a stream first seen sealed makes a
+  frame above `MAX_FRAME_BYTES` on its own; that error repeats on every call
+  and holds back every source until the row is discarded or evicted, or the
+  segment evicted.
+  Present since 0.2.0.
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
   source's handle reported `WriterGone` and `Writer::join` returned "the

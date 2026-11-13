@@ -126,14 +126,16 @@ pub enum Frame {
         /// from one.
         ///
         /// It need not start at zero — only the step between consecutive
-        /// frames is ever compared.
+        /// frames is ever compared. An interval whose rows exceed one frame
+        /// ([`MAX_FRAME_BYTES`](crate::replicate::wire::MAX_FRAME_BYTES)) goes
+        /// out as several `Rows` frames carrying the same `seq`.
         ///
         /// Three states, and the second against the third is why this is not
         /// simply a frame counter:
         ///
         /// | the interval | frame | `seq` |
         /// |---|---|---|
-        /// | served, something observed | non-empty | `+1` |
+        /// | served, something observed | non-empty, one or more | `+1`, shared |
         /// | served, nothing observed | **empty** | `+1` |
         /// | **not served** — the publisher would have had to buffer | none | jumps |
         ///

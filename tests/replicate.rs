@@ -853,6 +853,123 @@ fn a_tailing_publisher_ships_only_what_arrives_after_it() {
     );
 }
 
+/// An interval whose rows exceed one frame's limit is shipped as several
+/// `Rows` frames sharing the interval's `seq`, each of which encodes. One
+/// frame used to hold every row, and encoding it failed after the cursor had
+/// moved past them, so the rows were never sent.
+#[test]
+fn an_interval_larger_than_a_frame_is_split_and_every_row_arrives() {
+    use dendro::replicate::wire::{encode, MAX_FRAME_BYTES};
+
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // A little over one frame's worth, in 1 MiB rows.
+    let n = MAX_FRAME_BYTES / (1 << 20) + 6;
+    for ts in 0..n as i64 {
+        w.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![1; 1 << 20],
+        }])
+        .unwrap();
+    }
+    w.sync().unwrap();
+
+    let frames = publisher.next(&db).unwrap();
+    let seqs: Vec<u64> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Rows { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    assert!(seqs.len() > 1, "the interval is split: {seqs:?}");
+    assert!(
+        seqs.windows(2).all(|p| p[0] == p[1]),
+        "one interval, one seq: {seqs:?}"
+    );
+    for frame in &frames {
+        encode(frame).expect("every part fits in a frame");
+    }
+    let applied = sub.apply_all(frames).unwrap();
+    assert_eq!((applied.rows, applied.gap), (n, false));
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+    let dst = Archive::open(&copy).unwrap();
+    assert_eq!(wal_ts(&dst, 1, "s").len(), n);
+}
+
+/// A `next` that fails changes nothing, so the call after the cause is gone
+/// ships everything once: the index entry, the rows that depend on it, and
+/// the sequence without a gap. A failed call used to have moved the index
+/// cursor and the declared state already, so the entry was never sent and
+/// the subscriber skipped every later row.
+#[test]
+fn a_failed_poll_leaves_nothing_shipped_and_the_retry_ships_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("tail.dendro");
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("b", 1_000)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    // In one interval: an index entry and two rows on `a`, and a seal of `b`
+    // past the cursor the opening set on it.
+    w.caller_rows(
+        "a".to_string(),
+        vec![CallerRow {
+            ts: 10_000,
+            blob: b"slot".to_vec(),
+        }],
+    )
+    .unwrap();
+    w.wal(vec![row("a", 10_000), row("a", 11_000), row("b", 2_000)])
+        .unwrap();
+    w.seal(vec!["b".to_string()]).unwrap();
+    w.sync().unwrap();
+    assert!(publisher.next(&db).is_err());
+    assert!(publisher.next(&db).is_err(), "the cause is still there");
+
+    // Remove the cause: `b`'s segment goes, so nothing is past its cursor.
+    w.evict_streams_before(5_000, Box::new(|s: &str| s == "b"))
+        .unwrap();
+    w.sync().unwrap();
+    let frames = publisher.next(&db).unwrap();
+    let applied = sub.apply_all(frames).unwrap();
+    assert_eq!(
+        (
+            applied.index_entries,
+            applied.rows,
+            applied.rows_skipped,
+            applied.gap
+        ),
+        (1, 2, 0, false)
+    );
+    drop(w);
+    archive.join().unwrap();
+    sub.finish().unwrap();
+}
+
 /// A seal carries rows out of the live tail. A publisher polling more slowly
 /// than the source seals says so rather than shipping a stream with a hole in
 /// it — the caller reconnects with a catch-up, which is what the segment

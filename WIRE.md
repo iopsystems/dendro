@@ -48,9 +48,10 @@ so an unknown kind can be skipped rather than misread.
 **A length above `MAX_FRAME_BYTES` (64 MiB) is refused before anything is
 allocated for it.** A four-byte length read off a wire is otherwise an
 allocation request of up to 4 GiB, which is an out-of-memory rather than an
-error. The limit is eight times the default `SealPolicy::max_bytes`, so the
-largest frame a caller on the default seal policy can produce — a `Segment` —
-has ample headroom.
+error. The limit is eight times the default `SealPolicy::max_bytes`. A
+publisher splits an interval's rows across several `Rows` frames to stay under
+it (rule 6). A `Segment` cannot be split, so a segment whose frame exceeds the
+limit cannot be sent; segments compacted by row count can be that large.
 
 **A payload with bytes left over after its fields are read is refused.** The
 sender put something there this build does not read, and applying the fields it
@@ -168,11 +169,13 @@ Each row carries its own stream name, so one frame may span a source's streams.
 `seq` is a **counter over intervals, not over frames.** The producer advances
 it once for every interval it was meant to serve, whether or not a frame went
 out. It is not a timestamp and is not derived from one. It need not start at
-zero — only the step between consecutive frames is ever compared.
+zero — only the step between consecutive frames is ever compared. An interval
+whose rows exceed `MAX_FRAME_BYTES` goes out as several frames with the same
+`seq`; the step between them is zero, which is not a gap.
 
 | the interval | frame | `seq` |
 |---|---|---|
-| served, something observed | non-empty | `+1` |
+| served, something observed | non-empty, one or more | `+1`, shared |
 | served, nothing observed | **empty** | `+1` |
 | **not served** — the publisher would have had to buffer | none | jumps |
 
@@ -270,10 +273,11 @@ read it. A subscriber does not store it.
    is the ordering axis; both carry timestamps and `caller_rows` is already
    time-keyed.
 6. Every interval the publisher **serves** produces a `Rows` frame, empty when
-   nothing was observed; the empty frame is also the keepalive. `seq` counts
-   intervals rather than frames, so an interval the publisher could not serve
-   leaves a gap. A gap means intervals the subscriber did not receive, whether
-   lost in transit or never sent.
+   nothing was observed; the empty frame is also the keepalive. An interval
+   whose rows exceed `MAX_FRAME_BYTES` produces several `Rows` frames with the
+   same `seq`. `seq` counts intervals rather than frames, so an interval the
+   publisher could not serve leaves a gap. A gap means intervals the subscriber
+   did not receive, whether lost in transit or never sent.
 7. `Index` is re-emitted `Full` periodically, so retention cannot orphan it.
    `caller_rows` is evicted on the same cutoff as segments by default, so
    state written once at the start of a recording would be deleted while
