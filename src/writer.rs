@@ -2508,8 +2508,8 @@ fn seal_batch(
             }
             continue;
         }
-        // One contract for the three encode sites — see `segment::materialize`
-        // for what it checks and why counting is the only check that works.
+        // One contract for the three encode sites; see `segment::materialize`
+        // for what it checks.
         // Split into parts of at most `max_rows`, each its own segment; see
         // `split_seal`.
         let ctx = EncodeContext::new(source_id, &stream).with_source_uuid(uuid.as_deref());
@@ -2532,7 +2532,7 @@ fn seal_batch(
             .iter()
             .rev()
             .find(|r| r.ts == tail.last_ts)
-            .expect("the segment's last_ts is one of the rows, by the check above");
+            .expect("the segment's last_ts is one of the rows; `materialize` refuses a segment whose ends are not");
         if observation.is_none_or(|(seen, _)| segment_last.ts >= seen) {
             observation = Some((segment_last.ts, segment_last.wall_offset));
         }

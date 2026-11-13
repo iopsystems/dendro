@@ -166,6 +166,139 @@ fn another_applications_database_is_refused() {
     }
 }
 
+/// Copy `live` and its `-wal` into a fresh directory while `conn` still
+/// holds `live`, so the copy's newest commits are only in its `-wal`: the
+/// state a killed process leaves. Returns the copy's directory (kept alive
+/// by the caller), the copy's path, and its `-wal`'s path.
+fn copy_with_wal(
+    live: &std::path::Path,
+    conn: rusqlite::Connection,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let copies = tempfile::tempdir().unwrap();
+    let path = copies.path().join("crashed.db");
+    let wal = copies.path().join("crashed.db-wal");
+    std::fs::copy(live, &path).unwrap();
+    let mut live_wal = live.as_os_str().to_owned();
+    live_wal.push("-wal");
+    std::fs::copy(&live_wal, &wal).unwrap();
+    drop(conn);
+    (copies, path, wal)
+}
+
+/// Every write open refuses `path`, and the main file and `-wal` are byte
+/// for byte what they were before.
+fn assert_refused_untouched(
+    path: &std::path::Path,
+    wal: &std::path::Path,
+    refused: impl Fn(&Error) -> bool,
+) {
+    let before = (std::fs::read(path).unwrap(), std::fs::read(wal).unwrap());
+    let err = ArchiveMut::open(path).map(drop).unwrap_err();
+    assert!(refused(&err), "{err}");
+    #[cfg(feature = "write")]
+    {
+        let err = dendro::writer::Writer::open(path, Box::new(Never))
+            .map(drop)
+            .unwrap_err();
+        assert!(refused(&err), "{err}");
+    }
+    let after = (
+        std::fs::read(path).unwrap(),
+        std::fs::read(wal).expect("the -wal sidecar is still there"),
+    );
+    assert!(before == after, "the refused open rewrote the files");
+}
+
+/// A refused write open leaves a foreign WAL database's files as they were.
+/// The refused connection is the last one on the file, and SQLite
+/// checkpoints a WAL database when that connection closes, which folded the
+/// foreign `-wal` into the main file and deleted it.
+#[test]
+fn a_refused_write_open_leaves_a_foreign_wal_database_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("live.db");
+    let conn = rusqlite::Connection::open(&live).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE t(x); INSERT INTO t VALUES (1), (2), (3);",
+    )
+    .unwrap();
+    let (_copies, path, wal) = copy_with_wal(&live, conn);
+    assert_refused_untouched(&path, &wal, is_not_an_archive);
+}
+
+/// The same for a finished archive of a newer schema. Every source is
+/// finalized, which is the state in which a read handle's close is allowed
+/// to checkpoint; a refused write open must not take that path.
+#[test]
+fn a_refused_write_open_leaves_a_finished_newer_archive_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("live.dendro");
+    let mut db = ArchiveMut::create(&live).unwrap();
+    let id = db.insert_source(&source("x")).unwrap();
+    db.mark_complete(id).unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&live).unwrap();
+    conn.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA user_version = 6;")
+        .unwrap();
+    let (_copies, path, wal) = copy_with_wal(&live, conn);
+    assert_refused_untouched(&path, &wal, |e| {
+        matches!(e, Error::UnsupportedSchema { found: 6, .. })
+    });
+}
+
+/// A refused write open of a WAL database that was closed cleanly leaves no
+/// sidecar behind, opened directly or through a symlink. The open creates an
+/// empty `-wal` (and `Writer::open` a `-shm`) beside the file SQLite opens;
+/// with nothing in the `-wal` to fold in, the close checkpoint runs and
+/// removes them.
+#[test]
+fn a_refused_write_open_of_a_cleanly_closed_wal_database_leaves_no_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let path = real.join("clean.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    drop(conn);
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(&real)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(listing(), vec!["clean.db"]);
+    let before = std::fs::read(&path).unwrap();
+
+    let mut opened = vec![path.clone()];
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        opened.push(link);
+    }
+    for open in &opened {
+        let err = ArchiveMut::open(open).map(drop).unwrap_err();
+        assert!(is_not_an_archive(&err), "{err}");
+        assert_eq!(listing(), vec!["clean.db"], "ArchiveMut::open of {open:?}");
+        #[cfg(feature = "write")]
+        {
+            let err = dendro::writer::Writer::open(open, Box::new(Never))
+                .map(drop)
+                .unwrap_err();
+            assert!(is_not_an_archive(&err), "{err}");
+            assert_eq!(listing(), vec!["clean.db"], "Writer::open of {open:?}");
+        }
+    }
+    assert!(
+        std::fs::read(&path).unwrap() == before,
+        "the main file is unchanged"
+    );
+}
+
 #[test]
 fn a_file_that_is_not_sqlite_is_refused() {
     let dir = tempfile::tempdir().unwrap();

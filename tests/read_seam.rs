@@ -635,6 +635,69 @@ fn an_encoder_claiming_more_rows_than_its_span_holds_is_refused() {
     );
 }
 
+/// A span whose end is not the timestamp of a row is refused, and the writer
+/// thread survives it.
+///
+/// Rows at 10, 20 and 30 with a segment claiming one row over `[20, 25]`
+/// passes the count: one input row falls inside the span. The seal then looks
+/// up the row at `last_ts` for its clock observation, finds none, and the
+/// writer thread panicked, ending the recording for every source.
+#[test]
+#[cfg(feature = "write")]
+fn a_span_that_does_not_end_on_a_row_is_refused_without_ending_the_writer() {
+    use dendro::writer::Writer;
+
+    struct EndsBetweenRows;
+    impl SegmentEncoder for EndsBetweenRows {
+        fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+            if rows.len() < 3 {
+                return Ok(None);
+            }
+            Ok(Some(Segment {
+                bytes: b"20".to_vec(),
+                rows: 1,
+                first_ts: rows[1].ts,
+                last_ts: rows[1].ts + 5,
+                index: None,
+            }))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Writer::create(&path, Box::new(EndsBetweenRows)).unwrap();
+    let mut src = archive.add_source(source()).unwrap();
+    let mut other = archive.add_source(source()).unwrap();
+    for ts in [10i64, 20, 30] {
+        src.wal(vec![WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![1],
+        }])
+        .unwrap();
+    }
+    src.seal(vec!["s".to_string()]).unwrap();
+
+    let err = src
+        .sync()
+        .expect_err("a span ending between two rows is a breach");
+    assert!(
+        matches!(err.root(), dendro::Error::EncoderContract { .. }),
+        "got: {err:?}"
+    );
+    // An encoder breach ends the writer by design (README, "Known gaps"),
+    // but as an error, not a panic: the thread returns it from `join`.
+    drop(src);
+    drop(other.sync());
+    drop(other);
+    let joined = archive.join();
+    assert!(
+        !format!("{joined:?}").contains("panicked"),
+        "the writer thread panicked: {joined:?}"
+    );
+}
+
 /// A copy catalogs the tail it actually wrote, not the rows it was given.
 ///
 /// `rewrite` kept taking `last_ts` from the raw input after `Segment` gained
