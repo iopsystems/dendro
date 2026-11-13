@@ -295,7 +295,9 @@ lookback).
 ### 3.4 `clock_offsets`
 
 `(ts, offset_ns)` observations: at each seal batch the newest sealed row's
-own `(ts, wall_offset)`, and one at finalize. At most one per `(source, ts)`
+own `(ts, wall_offset)`, and one at finalize when the writer has one (a
+replicated copy whose publisher sent no observation has none). At most one
+per `(source, ts)`
 (`INSERT OR IGNORE`, first wins). Bounded by retention: whole-source eviction
 cuts it at the cutoff, per-stream eviction at the oldest row the source
 still holds. See §5.

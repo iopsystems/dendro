@@ -364,7 +364,8 @@ impl Subscriber {
     ///
     /// The finalize observation is the newest [`ClockOffset`](Frame::ClockOffset)
     /// frame seen, so the copy's drift series ends where the publisher's did
-    /// rather than at a timestamp this process invented.
+    /// rather than at a timestamp this process invented. A source that received
+    /// none is finalized with none.
     pub fn finish(mut self) -> Result<()> {
         for (_, st) in std::mem::take(&mut self.sources) {
             let SourceState {
@@ -374,7 +375,10 @@ impl Subscriber {
                 ..
             } = st;
             if complete {
-                writer.finalize(last_offset.unwrap_or((0, 0)))?;
+                match last_offset {
+                    Some(offset) => writer.finalize(offset)?,
+                    None => writer.finalize_without_offset()?,
+                }
             } else {
                 drop(writer);
             }

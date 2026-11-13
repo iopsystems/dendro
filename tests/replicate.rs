@@ -306,6 +306,26 @@ fn a_handshake_for_an_ordinal_in_use_is_refused() {
     sub.finish().unwrap();
 }
 
+/// A complete source whose publisher sent no clock observation is finalized
+/// with none. `finish` used to record `(0, 0)`, an observation nothing made.
+#[test]
+fn finishing_without_a_clock_observation_records_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nooffset.dendro");
+    let mut sub = subscriber(&path);
+    sub.apply(handshake(true)).unwrap();
+    sub.apply(rows_frame(0, NO_INDEX_STATE, &[1_000])).unwrap();
+    sub.finish().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let src = db.read_sources().unwrap().remove(0);
+    assert!(src.complete, "the publisher's source was complete");
+    assert!(
+        db.read_clock_offsets(src.id).unwrap().is_empty(),
+        "no observation arrived, so none is recorded"
+    );
+}
+
 /// `complete` travels: a copy of a finished source answers "was this
 /// finished" the same way, and a copy of a live one says it may be missing
 /// data after its last row — which it is, because the publisher is still

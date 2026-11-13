@@ -48,7 +48,10 @@ cannot reach a failed release any other way.
   that fed a reconnect's frames to the same `Subscriber` now gets this
   error where it used to get a duplicate source; open a new `Subscriber`
   per connection.
-
+- `Subscriber::finish` finalized a complete source whose publisher had sent
+  no `ClockOffset` frame with the observation `(0, 0)`, so the copy's
+  `clock_offsets` held an entry no publisher made. It now finalizes such a
+  source with no observation. Present since 0.2.0.
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
   source's handle reported `WriterGone` and `Writer::join` returned "the
