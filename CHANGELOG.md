@@ -33,6 +33,18 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- Every writing handle (`Writer`, `ArchiveMut::create`, `ArchiveMut::open`)
+  holds an exclusive advisory lock on `<archive>-lock` for its life, and a
+  second one on the same archive is refused as `Error::InUse`, in the same
+  process or another. A second `Writer::open` on an archive a `Writer` was
+  still writing used to succeed; both writers then took the same `seq`, and
+  the second one's seal failed on the `segments` UNIQUE constraint, ending
+  that writer for all its sources. The `-lock` file is created on first
+  use and left in place; it holds no data and a copy of the archive does
+  not need it. The lock is released when its process ends.
+
 ### Added
 
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`

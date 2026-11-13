@@ -68,8 +68,10 @@ pub enum Error {
     },
 
     /// Another connection holds the file and this open needed it to itself,
-    /// or a [`ArchiveMut::open`](crate::archive::ArchiveMut::open) holds it exclusively and
-    /// this open needed any access at all. `what` names the file.
+    /// a [`ArchiveMut::open`](crate::archive::ArchiveMut::open) holds it exclusively and
+    /// this open needed any access at all, or another writing handle (a
+    /// `Writer` or an `ArchiveMut`) holds the archive's `-lock` file. `what`
+    /// names the file.
     InUse {
         /// The file, as the caller named it.
         what: String,
@@ -218,7 +220,8 @@ impl fmt::Display for Error {
             Error::InUse { what } => write!(
                 f,
                 "{what} is held by another connection: an exclusive open needs the file to \
-                 itself, and nothing can open a file an exclusive handle holds"
+                 itself, nothing can open a file an exclusive handle holds, and one writing \
+                 handle at a time holds its -lock file"
             ),
             Error::NotAnArchive { what, reason } => {
                 write!(f, "{what}: not a dendro archive: {reason}")

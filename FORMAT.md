@@ -93,6 +93,12 @@ creation checkpointed can hold no catalog at all; such a copy is refused as
 least every `CHECKPOINT_INTERVAL` (10 s), so a plain copy is at most that
 stale; `Archive::vacuum_into` is the exact copy.
 
+A writing handle also creates `<path>-lock` beside the file the path resolves
+to: an empty file it holds an exclusive advisory lock on for its life
+(`flock` on unix, `LockFileEx` on Windows), so a second writing handle is
+refused. It holds no data, is not needed to read or copy the archive, and is
+never removed.
+
 ## 3. The catalog
 
 Seven tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`, and `documents` in

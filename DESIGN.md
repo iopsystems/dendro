@@ -201,7 +201,10 @@ a background optimization with no correctness role.
 
 ## How many files an archive is
 
-One, once a finished archive is closed. Three, while anyone has it open.
+One, once a finished archive is closed, plus the empty `-lock` file that any
+write open leaves beside it. Three while anyone has it open, plus `-lock`. The
+table lists SQLite's files; `-lock` is beside an archive in every row once a
+writing handle has opened it.
 
 | state | on disk |
 |---|---|
@@ -218,6 +221,11 @@ into the archive, and `-shm` is the cross-process index that lets readers find
 them. They appear whenever the file is opened, a read-only open included. The
 last read-write connection to close checkpoints and removes them; a read-only
 connection never removes them.
+
+`-lock` is dendro's. A writing handle holds an exclusive advisory lock on it
+for its life (see [One writing connection](#one-writing-connection)). It holds
+no data, so a copy of the archive alone is complete without it, and it is never
+removed, even by a create that fails.
 
 So `Archive::open` picks its connection by whether the archive is finished.
 With at least one source and every source finalized, it reopens the file
@@ -364,21 +372,29 @@ Nothing committed is lost.
 
 The rule is enforced by the types and by a lock. `Archive` is the read handle
 and has no mutators. `ArchiveMut` is the write handle: `ArchiveMut::create`
-for a new archive, and `ArchiveMut::open` for an existing one, which takes
-SQLite's exclusive locking mode and is refused as `Error::InUse` while
-anything else holds the file. The writer thread caches each stream's next
-`seq` and its sealed watermark in memory and seeds them once at startup. It
-re-reads a source's watermarks after each successful retention pass it runs,
-since eviction can remove a stream's last segment. A second connection that
-could evict a stream's segments or insert one behind the writer's back would
-make that cache disagree with the file, and the next seal would collide or the
-next append would be dropped as out of order. `ArchiveMut::open` cannot be
-that connection, because the writer thread holds the file, and a writer thread
-cannot be started on a file a `ArchiveMut` holds, for the same reason. The
-streaming writer opens its own connection privately and without the exclusive
-lock, because its readers must coexist with it. A raw SQLite connection can
-still write behind the writer's back; dendro cannot prevent that and does not
-claim to.
+for a new archive, `ArchiveMut::open` for an existing one, and the connection
+a `Writer` thread opens. Every `ArchiveMut` holds an exclusive advisory lock
+(`flock` on unix, `LockFileEx` on Windows) on `<path>-lock` for its life, and
+a second one on the same archive, in the same process or another, is refused
+as `Error::InUse`. The operating system releases the lock when its process
+ends, so a killed writer leaves nothing to clear. The lock is on a separate
+file rather than the archive because SQLite locks the archive with POSIX
+locks: on macOS `flock` conflicts with them, and on unix closing a descriptor
+on the archive releases every POSIX lock the process holds on it.
+`ArchiveMut::open` also takes SQLite's exclusive locking mode, so it is
+refused while a reader holds the file and holds the file against readers. The
+writer thread caches each stream's next `seq` and its sealed watermark in
+memory and seeds them once at startup. It re-reads a source's watermarks after
+each successful retention pass it runs, since eviction can remove a stream's
+last segment. A second connection that could evict a stream's segments or
+insert one behind the writer's back would make that cache disagree with the
+file, and the next seal would collide or the next append would be dropped as
+out of order. No dendro handle can be that connection: a second `Writer` or an
+`ArchiveMut` is refused by the lock. The streaming writer opens its own
+connection without SQLite's exclusive mode, because its readers must coexist
+with it. A raw SQLite connection, or a process that ignores `-lock`, can still
+write behind the writer's back; dendro cannot prevent that and does not claim
+to.
 
 ## Segment encoding choices
 
