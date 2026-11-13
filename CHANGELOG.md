@@ -40,6 +40,14 @@ cannot reach a failed release any other way.
   length prefix, so a cut that landed there read as the end of the
   recording. It is now an error, as a cut anywhere else in a frame already
   was. Present since 0.2.0.
+- `Subscriber::apply` accepted a `Handshake` for an ordinal an earlier
+  handshake on the connection had already assigned. It created a second
+  source and sent every later frame for that ordinal to it, and the first
+  source stopped receiving with nothing said. Such a handshake is now
+  refused, before any source row is written. Present since 0.2.0. A caller
+  that fed a reconnect's frames to the same `Subscriber` now gets this
+  error where it used to get a duplicate source; open a new `Subscriber`
+  per connection.
 
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
