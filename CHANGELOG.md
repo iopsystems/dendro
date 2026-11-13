@@ -35,6 +35,12 @@ cannot reach a failed release any other way.
 
 ### Fixed
 
+- `FrameReader::next_frame` returned `Ok(None)`, the clean end of a stream,
+  for a stream that stopped one to three bytes into a frame's four-byte
+  length prefix, so a cut that landed there read as the end of the
+  recording. It is now an error, as a cut anywhere else in a frame already
+  was. Present since 0.2.0.
+
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
   source's handle reported `WriterGone` and `Writer::join` returned "the

@@ -25,8 +25,8 @@ The logical split survives as frame kinds that demultiplex to `caller_rows` and
 `wal`.
 
 A stream has no end marker. It ends when the transport ends, and a stream that
-stops *inside* a frame lost that frame; a reader reports that as an error, not
-as the end (`FrameReader::next_frame`).
+stops *inside* a frame, its length prefix included, lost that frame; a reader
+reports that as an error, not as the end (`FrameReader::next_frame`).
 
 ## 2. Framing
 
