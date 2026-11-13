@@ -33,7 +33,29 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Changed
+
+- The writer drops an append at or below its stream's newest live row,
+  as it already dropped one at or below the newest sealed row, and counts it
+  in `SourceWriter::dropped_out_of_order`. Such a row was stored and
+  readable, and a tailing `ArchivePublisher`, which ships the rows after the
+  newest it has sent, never replicated it. A repeat of a stream's newest
+  row, which used to collide and cost the whole tick, is dropped the same
+  way. Within one tick a stream's rows may still arrive in any order. A
+  producer that relied on appending a stream's rows out of order across
+  ticks now loses the late ones; the count says how many. The bound is
+  what the file holds, so after `SourceWriter::discard_live_rows` or a
+  retention pass removes a stream's newest rows, a row below them is taken
+  again, and a running publisher whose cursor is past it does not ship it.
+
 ### Added
+
+- The high bit of a replication frame's `kind`
+  (`wire::KIND_MUST_UNDERSTAND`) marks a kind a reader must understand.
+  `FrameReader::next_frame` returns an error for an unknown kind with the
+  bit set, and still skips one without it. No kind dendro writes sets it,
+  so existing streams read as before. A reader on 0.7.x or earlier skips
+  such a frame (WIRE.md §7).
 
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the

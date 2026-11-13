@@ -175,7 +175,7 @@
 //! SQLite does rewrite, and the distinction matters. A read-write connection
 //! that is the last one open **checkpoints on close**, so [`archive::ArchiveMut::open`]
 //! on a crashed archive folds the sidecar back in and deletes it: measured at
-//! 45 KiB to 61 KiB, with a 3.3 MB sidecar, from nothing but an open and a
+//! 64 KiB to 80 KiB, with a 3.3 MB sidecar, from nothing but an open and a
 //! drop. That is recovery, and it is intentional: `ArchiveMut::open` takes the
 //! file exclusively. A reader must never do it by surprise, so
 //! [`archive::Archive::open`] opens an archive with an unfinished source
@@ -309,7 +309,7 @@ pub mod read;
 /// so it needs `archive`; the subscriber needs `write`, because it needs the
 /// writer's thread.
 pub mod replicate;
-/// Combining, trimming and time-bounding archives without decoding a segment.
+/// Combining, trimming and time-bounding archives, and compacting their segments.
 #[cfg(feature = "archive")]
 pub mod rewrite;
 /// When to seal.

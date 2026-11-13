@@ -59,10 +59,12 @@ fn wal_ts(db: &Archive, id: i64) -> Vec<i64> {
         .collect()
 }
 
-/// A source repeating a `(stream, ts)` it already committed is that source's
-/// bad tick and nobody else's. The batched commit used to turn it into a dead
+/// A source whose tick collides with a row already in the WAL loses that
+/// tick and nobody else's. The batched commit used to turn it into a dead
 /// writer for every source in the archive; now the colliding rows are dropped,
-/// the other source's land, and the writer keeps going.
+/// the other source's land, and the writer keeps going. The writer drops a
+/// repeat of a row it committed before it reaches the WAL, so the colliding
+/// row here is written behind its back by a raw connection.
 #[test]
 fn a_sources_colliding_tick_is_dropped_without_taking_the_archive_down() {
     let dir = tempfile::tempdir().unwrap();
@@ -75,9 +77,17 @@ fn a_sources_colliding_tick_is_dropped_without_taking_the_archive_down() {
     archive
         .wal_tick(vec![(ia, vec![row(1_000)]), (ib, vec![row(1_000)])])
         .unwrap();
-    // Tick 2: A repeats ts 1000 (collides with its own row), B is fine.
+    a.sync().unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.busy_timeout(Duration::from_secs(5)).unwrap();
+    raw.execute(
+            "INSERT INTO wal (source_id, stream, ts, wall_offset, row) VALUES (?1, 's', 2000, 0, x'02')",
+            [ia],
+        )
+        .unwrap();
+    // Tick 2: A's row collides with the one written above; B is fine.
     archive
-        .wal_tick(vec![(ia, vec![row(1_000)]), (ib, vec![row(2_000)])])
+        .wal_tick(vec![(ia, vec![row(2_000)]), (ib, vec![row(2_000)])])
         .unwrap();
     // Tick 3: a normal tick for both. The writer must still be alive.
     archive
@@ -86,12 +96,105 @@ fn a_sources_colliding_tick_is_dropped_without_taking_the_archive_down() {
     a.sync().unwrap();
 
     let db = Archive::open(&path).unwrap();
+    let a_rows: Vec<(i64, Vec<u8>)> = db
+        .read_wal(ia, "s")
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.ts, r.row))
+        .collect();
     assert_eq!(
-        wal_ts(&db, ia),
-        vec![1_000, 3_000],
-        "A lost only its colliding tick"
+        a_rows,
+        vec![(1_000, vec![1]), (2_000, vec![2]), (3_000, vec![1])],
+        "A lost only its colliding tick; the row at 2000 is the raw one"
     );
     assert_eq!(wal_ts(&db, ib), vec![1_000, 2_000, 3_000], "B lost nothing");
+    drop(b);
+    drop(a);
+    archive.join().unwrap();
+}
+
+/// A row at or below a segment the writer adopted (a replication catch-up)
+/// is dropped: the adopted segment raises the stream's bound.
+#[test]
+fn a_row_below_an_adopted_segment_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adopt.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source("a")).unwrap();
+    let meta = SegmentMeta {
+        rows: 2,
+        first_ts: 3_000,
+        last_ts: 4_000,
+    };
+    assert!(w.adopt_segment("s", &meta, b"3000,4000", None).unwrap());
+    w.wal(vec![row(3_500)]).unwrap();
+    w.wal(vec![row(5_000)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        w.dropped_out_of_order(),
+        1,
+        "3500 is below the adopted segment"
+    );
+    let id = w.source_id();
+    let db = Archive::open(&path).unwrap();
+    assert_eq!(wal_ts(&db, id), vec![5_000]);
+    drop(db);
+    drop(w);
+    archive.join().unwrap();
+}
+
+/// The bound is seeded from the file, so a reopened writer handed a raw
+/// source id through `wal_tick`, without a resume and so without a floor,
+/// still drops a row below one the previous session left.
+#[test]
+fn a_reopened_writer_seeds_the_bound_from_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seed.dendro");
+    let id;
+    {
+        let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+        let mut a = archive.add_source(source("a")).unwrap();
+        id = a.source_id();
+        a.wal(vec![row(1_000)]).unwrap();
+        a.sync().unwrap();
+        drop(a);
+        archive.join().unwrap();
+    }
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    archive.wal_tick(vec![(id, vec![row(500)])]).unwrap();
+    let mut b = archive.add_source(source("b")).unwrap();
+    b.sync().unwrap();
+    let db = Archive::open(&path).unwrap();
+    assert_eq!(wal_ts(&db, id), vec![1_000]);
+    drop(db);
+    drop(b);
+    archive.join().unwrap();
+}
+
+/// One source named twice in a tick: a second row at one timestamp across
+/// the two entries is dropped and counted like any other repeat, and the
+/// tick's other rows land.
+#[test]
+fn a_repeat_across_two_entries_of_one_tick_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("twice.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(source("a")).unwrap();
+    let b = archive.add_source(source("b")).unwrap();
+    let (ia, ib) = (a.source_id(), b.source_id());
+    archive
+        .wal_tick(vec![
+            (ia, vec![row(1_000)]),
+            (ia, vec![row(1_000), row(1_500)]),
+            (ib, vec![row(1_000)]),
+        ])
+        .unwrap();
+    a.sync().unwrap();
+    assert_eq!(a.dropped_out_of_order(), 1);
+    let db = Archive::open(&path).unwrap();
+    assert_eq!(wal_ts(&db, ia), vec![1_000, 1_500]);
+    assert_eq!(wal_ts(&db, ib), vec![1_000]);
+    drop(db);
     drop(b);
     drop(a);
     archive.join().unwrap();

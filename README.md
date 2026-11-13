@@ -87,10 +87,13 @@ Read these before you build on it. The first two are behaviors that can
 surprise a caller; the rest are boundaries.
 
 - **Out-of-order appends are dropped, not stored.** A row whose timestamp is
-  at or below its stream's newest sealed segment cannot be read, because the
-  watermark that keeps the seal seam free of duplicates shadows it. The
-  writer drops it, counts it in `SourceWriter::dropped_out_of_order`, and
-  logs once per stream. A resumed source refuses such a row at the call.
+  at or below its stream's newest row, sealed or live, is dropped, counted in
+  `SourceWriter::dropped_out_of_order`, and logged once per stream. Below the
+  newest sealed row it cannot be read, because the watermark that keeps the
+  seal seam free of duplicates shadows it; below the newest live row a
+  tailing replication publisher would never ship it. Within one tick a
+  stream's rows may arrive in any order, and a second row at one timestamp
+  is dropped. A resumed source refuses such a row at the call.
   dendro is for producers that append monotonically **per stream**. The
   restriction is per `(source, stream)`: a sibling stream or another source
   accepts the same timestamp, and backfilling either is not out of order.
@@ -297,8 +300,8 @@ its sidecars stay.
 An unclean kill leaves all three. Creation checkpoints the catalog into the
 archive, so the archive alone always opens; what it lacks is every commit
 since the last checkpoint, which is in the sidecar. Measured on the kill
-fixture in `tests/unclean_kill.rs`, 400 appends with no seal and no
-checkpoint leave a 45 KiB archive and a 3.3 MB sidecar. Opening the set
+fixture `append-until-killed`, 400 appends with no seal and no checkpoint
+leave a 64 KiB archive and a 3.3 MB sidecar. Opening the set
 recovers all 400 rows. Copying only the archive at that moment recovers none
 of them. `CHECKPOINT_INTERVAL` bounds how much can be in the sidecar, and
 `Archive::vacuum_into` takes an exact copy without pausing the writer.
