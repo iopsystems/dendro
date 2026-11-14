@@ -228,8 +228,10 @@ i64          ts
 i64          offset_ns
 ```
 
-One drift observation (`FORMAT.md` §5). Cheap to carry — a handful of rows per
-seal — and part of the source's identity.
+One drift observation (`FORMAT.md` §5). Cheap to carry: one row per seal
+batch, one at finalize, and any the writer's caller records. Part of the
+source's identity. Offsets are not recorded in timestamp order, so a
+subscriber may receive them out of order.
 
 ### 4.6 `SourceUpdate` (kind 6)
 
