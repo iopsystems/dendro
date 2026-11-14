@@ -96,10 +96,13 @@ then read as one frame. A reader refuses:
 - a stream that ends before the join is complete;
 - a joined payload whose kind is `0xfe` or `0xff`.
 
-A reader joins the bytes as they arrive and grows its buffer to `total` at
-most, so a `total` off the wire is not an allocation, and a version 2 reader
-holds at most 1 GiB per frame, built from bytes it received. A reader on a
-32-bit target may fail to allocate a frame near that size.
+A reader joins the bytes as they arrive and grows its buffer to `total` plus
+at most one part, so a `total` off the wire is not an allocation. Decoding
+copies a segment's bytes out of the joined payload, so a reader holds up to
+about twice the frame while decoding one: about 2 GiB at the limit, all of it
+bytes it received. A writer holds the frame and its encoding, also about
+twice the frame. A reader or writer on a 32-bit target may fail to allocate
+a frame near the limit.
 
 A segment's parquet file and its caller index are separate SQLite values, each
 up to SQLite's default limit of 1,000,000,000 bytes. A segment whose two

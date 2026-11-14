@@ -256,6 +256,59 @@ pub fn encode_frame(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// The bytes [`put_payload`] appends for `frame`.
+fn payload_len(frame: &Frame) -> usize {
+    fn bytes(b: &[u8]) -> usize {
+        4 + b.len()
+    }
+    fn map(m: &BTreeMap<String, String>) -> usize {
+        4 + m
+            .iter()
+            .map(|(k, v)| bytes(k.as_bytes()) + bytes(v.as_bytes()))
+            .sum::<usize>()
+    }
+    match frame {
+        Frame::Handshake {
+            uuid,
+            labels,
+            metadata,
+            ..
+        } => {
+            1 + 4
+                + 1
+                + uuid.as_ref().map_or(0, |u| bytes(u.as_bytes()))
+                + map(labels)
+                + map(metadata)
+                + 8
+                + 1
+        }
+        Frame::Index { stream, blob, .. } => {
+            1 + 4 + bytes(stream.as_bytes()) + 8 + 1 + 16 + bytes(blob)
+        }
+        Frame::Rows { rows, .. } => {
+            ROWS_FRAME_HEADER_BYTES + rows.iter().map(rows_frame_row_bytes).sum::<usize>()
+        }
+        Frame::Segment {
+            stream,
+            bytes,
+            caller_index,
+            ..
+        } => segment_frame_bytes(stream, bytes, caller_index.as_deref()),
+        Frame::ClockOffset { .. } => 1 + 4 + 8 + 8,
+        Frame::SourceUpdate {
+            labels, metadata, ..
+        } => 1 + 4 + 8 + map(labels) + map(metadata),
+        Frame::Sync { stream, .. } => 1 + 4 + bytes(stream.as_bytes()) + 8,
+        Frame::SegmentAfter {
+            stream,
+            bytes,
+            caller_index,
+            ..
+        } => segment_frame_bytes(stream, bytes, caller_index.as_deref()) + 8,
+        Frame::Unavailable { stream, .. } => 1 + 4 + bytes(stream.as_bytes()) + 8 + 8,
+    }
+}
+
 /// Append one frame's kind byte and fields to `out`: the payload, which is
 /// the same in both protocol versions.
 fn put_payload(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
@@ -789,9 +842,10 @@ impl<R: Read> FrameReader<R> {
         }
         let total = total as usize;
         let mut joined = self.buf[at + 1 + 8..].to_vec();
-        // Grown to `total` at most, never by doubling past it: doubling would
-        // reserve up to twice the frame, which a 32-bit reader cannot address
-        // for a frame near the limit.
+        // Grown to `total`, or to `total` plus the part that overshoots it,
+        // never by doubling past it: doubling would reserve up to twice the
+        // frame, which a 32-bit reader cannot address for a frame near the
+        // limit.
         while joined.len() < total {
             let Some(at) = self.read_part()? else {
                 return Err(Error::Message(format!(
@@ -986,14 +1040,19 @@ impl<W: Write> FrameWriter<W> {
                 .write_all(&self.buf)
                 .map_err(|e| Error::Message(format!("failed to write a replication frame: {e}")));
         }
-        put_payload(frame, &mut self.buf)?;
-        let total = self.buf.len();
+        // Sized before it is encoded, so a frame too large is refused before
+        // anything is allocated for it, and the buffer is reserved once
+        // rather than grown by doubling past the frame.
+        let total = payload_len(frame);
         if total > MAX_SPLIT_FRAME_BYTES {
             return Err(Error::Message(format!(
                 "a replication frame of {total} bytes exceeds the \
                  {MAX_SPLIT_FRAME_BYTES}-byte limit on a split frame"
             )));
         }
+        self.buf.reserve_exact(total);
+        put_payload(frame, &mut self.buf)?;
+        debug_assert_eq!(self.buf.len(), total, "payload_len is put_payload's size");
         if NUMBER_BYTES + total <= limit {
             return write_part(&mut self.out, &mut self.next_number, &[], &self.buf);
         }
@@ -1755,6 +1814,60 @@ mod tests {
                 assert!(err.contains("only in protocol version 2"), "{err}");
             }
         }
+    }
+
+    /// `payload_len` is the size `put_payload` writes, for every frame.
+    #[test]
+    fn the_payload_size_is_computed_exactly() {
+        let mut frames = version_2_frames();
+        frames.push(Frame::Index {
+            source: 1,
+            stream: "cpu".to_string(),
+            ts: 42,
+            kind: IndexKind::Full,
+            state: (7, 9),
+            blob: vec![1, 2, 3, 4],
+        });
+        frames.push(Frame::SourceUpdate {
+            source: 5,
+            ts: 1,
+            labels: map(&[("host", "a"), ("source", "x")]),
+            metadata: map(&[("k", "v")]),
+        });
+        frames.push(Frame::Rows {
+            source: 2,
+            seq: 99,
+            index_state: (7, 9),
+            rows: vec![WalRow {
+                stream: "cpu".to_string(),
+                ts: 1,
+                wall_offset: -5,
+                row: vec![0xde, 0xad],
+            }],
+        });
+        frames.push(Frame::ClockOffset {
+            source: 0,
+            ts: 1,
+            offset_ns: 2,
+        });
+        frames.push(Frame::Handshake {
+            source: 0,
+            uuid: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            clock_anchor_wall_ns: 0,
+            complete: true,
+        });
+        for frame in &frames {
+            let mut out = Vec::new();
+            put_payload(frame, &mut out).unwrap();
+            assert_eq!(payload_len(frame), out.len(), "{frame:?}");
+        }
+        // And the writer reserves exactly that.
+        let big = segment(1 << 20);
+        let mut w = FrameWriter::new(Vec::new(), PROTOCOL_VERSION_2).unwrap();
+        w.write(&big).unwrap();
+        assert_eq!(w.buf.capacity(), payload_len(&big));
     }
 
     /// Version 1 bytes, written out: the layout WIRE.md §2 and §4.5 give,

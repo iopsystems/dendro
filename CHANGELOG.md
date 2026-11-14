@@ -115,7 +115,8 @@ cannot reach a failed release any other way.
 - Replication protocol version 2 (WIRE.md §2.1). Every frame carries a
   number, so `FrameReader` refuses a stream that lost, repeated or reordered
   a frame, and a frame above `MAX_FRAME_BYTES` travels in parts up to
-  `MAX_SPLIT_FRAME_BYTES` (1 GiB), so a segment above 64 MiB can be sent.
+  `MAX_SPLIT_FRAME_BYTES` (1 GiB), so a segment above 64 MiB can be sent
+  through a `FrameWriter` opened for version 2.
   `wire::FrameWriter` writes either version. `FrameReader` reads both and
   reports which (`FrameReader::version`), so a caller that matches frames
   with a catch-all arm can now receive the version 2 frames from a version 2

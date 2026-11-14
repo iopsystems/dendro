@@ -278,7 +278,7 @@ pub enum Frame {
     /// `(after, before)`, and the copy may lack rows the publisher once held
     /// there, because retention removed them before the copy received them.
     /// Protocol version 2 only (WIRE.md §4.9). Applying it changes nothing in
-    /// the copy, and a version 1 reader skips it.
+    /// the copy, and a reader skips it in a version 1 stream.
     Unavailable {
         /// Which source, by handshake ordinal.
         source: u32,
