@@ -396,7 +396,8 @@ writer thread caches each stream's next `seq`, its sealed watermark and its
 newest row in memory and seeds them once at startup. It re-reads a source's
 watermarks and newest rows after each successful retention pass it runs, since
 eviction can remove a stream's last segment, and its newest rows after a
-discard of live rows. A second connection that could evict a stream's
+discard of live rows. A newest row it re-reads includes the bound the delete
+recorded (FORMAT.md §3.7), so it never moves backwards. A second connection that could evict a stream's
 segments, insert one, or insert WAL rows behind the writer's back would make
 that cache disagree with the file, and the next seal would collide, the next
 append would be dropped as out of order, or a tick would collide and be lost.

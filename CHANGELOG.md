@@ -57,10 +57,21 @@ cannot reach a failed release any other way.
   row, which used to collide and cost the whole tick, is dropped the same
   way. Within one tick a stream's rows may still arrive in any order. A
   producer that relied on appending a stream's rows out of order across
-  ticks now loses the late ones; the count says how many. The bound is
-  what the file holds, so after `SourceWriter::discard_live_rows` or a
-  retention pass removes a stream's newest rows, a row below them is taken
-  again, and a running publisher whose cursor is past it does not ship it.
+  ticks now loses the late ones; the count says how many.
+- A stream's bound survives the deletes that remove its newest rows:
+  `discard_live_rows`, every retention pass (`evict_before`,
+  `evict_streams_before`, with or without a floor), and `prune_wal` past
+  the stream's watermark. A row at or below the removed rows is dropped and
+  counted, in the writer that ran the delete and in any later one on the
+  file. Before, such a row was taken, and a running `ArchivePublisher`
+  whose cursor was past it never shipped it. The bound is kept in a new
+  table, `bounds`, which a file gets at its first such delete; the schema
+  version is unchanged, and a writer from an earlier release ignores the
+  table. `resume_source` refuses an anchor at or below a source's bound
+  and returns it as the floor, so a source evicted to nothing still has
+  one. `rewrite::copy_sources_into` carries each copied stream's bound.
+  Writing corrected rows at the timestamps of discarded ones is no longer
+  possible.
 - Every writing handle (`Writer`, `ArchiveMut::create`, `ArchiveMut::open`)
   holds an exclusive advisory lock on `<archive>-lock` for its life, and a
   second one on the same archive is refused as `Error::InUse`, in the same

@@ -530,8 +530,10 @@ impl Writer {
     /// ([`keys::WRITER_SESSIONS`](crate::keys::WRITER_SESSIONS), plus a
     /// `writer_session` event under [`keys::EVENTS`](crate::keys::EVENTS) at
     /// the new anchor), and the handle refuses any row stamped at or before
-    /// the newest row the previous session left — the returned `last_ts` —
-    /// so a clock that went backwards across the restart is
+    /// the newest row the source has held, the returned `last_ts`. That is
+    /// the newest row it holds, or a newer one that retention or a discard
+    /// removed, since a stream's timestamps strictly increase for the life
+    /// of its source. So a clock that went backwards across the restart is
     /// [`Error::TimelineBackwards`], not a silent collision or a timeline
     /// that runs backwards. The anchor itself is checked the same way.
     ///
@@ -829,8 +831,9 @@ impl Drop for Writer {
 /// What the writer thread answers a `ResumeSource` with.
 struct Resumed {
     labels: BTreeMap<String, String>,
-    /// The newest row timestamp the source holds, segments and WAL together;
-    /// `None` for a source with no rows.
+    /// The newest row timestamp the source has held: what it holds,
+    /// segments and WAL together, or a newer row a delete removed
+    /// (`bounds`). `None` for a source that has held no rows.
     last_ts: Option<i64>,
 }
 
@@ -1260,9 +1263,13 @@ impl SourceWriter {
     /// writer-side spelling of
     /// [`ArchiveMut::discard_live_rows`](crate::archive::ArchiveMut::discard_live_rows).
     ///
-    /// A deferred seal of those streams is dropped. Rows written to them
-    /// afterwards are live rows like any others. The discard is not
-    /// replicated: a subscriber that already received the rows keeps them.
+    /// A deferred seal of those streams is dropped. A row written to them
+    /// afterwards at or below a discarded row is dropped as out of order
+    /// ([`dropped_out_of_order`](Self::dropped_out_of_order)), here and in
+    /// any later writer on the file: the stream's timestamps strictly
+    /// increase for the life of its source (FORMAT.md §3.7). The discard is
+    /// not replicated: a subscriber that already received the rows keeps
+    /// them.
     /// Waits for the writer thread, as eviction does. A failed discard
     /// deletes nothing and does not stop the writer.
     pub fn discard_live_rows(&mut self, discard: StreamFilter) -> Result<usize> {
@@ -1747,7 +1754,10 @@ fn resume_source(
     // stream's later segments will not decode like its earlier ones.
     crate::segment::check_encoder(source_id, &src.meta.metadata, encoder)?;
     let (_, last_ts) = db.source_time_span(source_id)?;
-    if let Some(floor) = last_ts {
+    // A stream's timestamps strictly increase across deletes, so the floor
+    // is the newest row the source has held, not only what it holds now.
+    let floor_ts = last_ts.max(db.newest_bound(source_id)?);
+    if let Some(floor) = floor_ts {
         if clock_anchor_wall_ns <= floor {
             return Err(Error::TimelineBackwards {
                 source_id,
@@ -1760,7 +1770,7 @@ fn resume_source(
     record_session(db, source_id, clock_anchor_wall_ns, Some(last_ts))?;
     Ok(Resumed {
         labels: src.meta.labels,
-        last_ts,
+        last_ts: floor_ts,
     })
 }
 
