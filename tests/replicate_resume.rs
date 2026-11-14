@@ -1150,11 +1150,25 @@ fn several_sources_and_one_created_while_connected_resume_independently() {
     later.seal(vec!["s".to_string()]).unwrap();
     later.wal(vec![row("s", 3)]).unwrap();
     later.sync().unwrap();
-    link.poll(&o);
+    let (_, mut frames) = link.poll(&o);
     later.wal(vec![row("s", 4)]).unwrap();
     later.seal(vec!["s".to_string()]).unwrap();
     later.sync().unwrap();
-    link.poll(&o);
+    frames.extend(link.poll(&o).1);
+    // The new source's catch-up ships its first segment, and its second
+    // seal goes out after it, with no `Sync` and nothing sent twice.
+    let ordinal = 2;
+    assert!(!frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { source, .. } if *source == ordinal)));
+    let after: Vec<i64> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::SegmentAfter { source, after, .. } if *source == ordinal => Some(*after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(after, vec![2]);
     link.close();
 
     let by_source = |path: &Path| {
