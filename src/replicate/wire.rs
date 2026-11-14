@@ -33,7 +33,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// [`Frame::Unavailable`]) exist. A [`FrameWriter`] opened for it writes it.
 pub const PROTOCOL_VERSION_2: u16 = 2;
 
-/// The largest frame this build will read, and the bound that is applied to a
+/// The largest frame or version 2 part this build will read, and the bound
+/// that is applied to a
 /// length **before** anything is allocated for it.
 ///
 /// A corrupt or hostile four-byte length is otherwise an allocation of up to
@@ -45,8 +46,11 @@ pub const PROTOCOL_VERSION_2: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// The largest frame protocol version 2 carries in parts, and the most a
-/// reader joins for one. 1 GiB, above SQLite's default limit of
-/// 1,000,000,000 bytes on one value, so a segment an archive holds fits.
+/// reader joins for one: 1 GiB. A segment's parquet file and its caller index
+/// are separate SQLite values, each up to SQLite's default limit of
+/// 1,000,000,000 bytes, so a segment whose two together exceed 1 GiB exists
+/// and cannot be sent. A reader on a 32-bit target may fail to allocate a
+/// frame near this size.
 pub const MAX_SPLIT_FRAME_BYTES: usize = 1 << 30;
 
 /// The bytes of a version 2 frame's number, between its length and its kind.
@@ -528,17 +532,22 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame> {
 /// `None` rather than an error, so [`FrameReader`] can skip it (WIRE.md §7),
 /// unless the kind has [`KIND_MUST_UNDERSTAND`] set, which is an error.
 /// Only the kind byte of an unknown frame is read: its layout is not known,
-/// and the length prefix already says where it ends. A kind that exists only
-/// in version 2 is refused in a version 1 stream.
+/// and the length prefix already says where it ends. In a version 1 stream,
+/// `Sync` and `SegmentAfter` are refused and `Unavailable` is skipped as an
+/// unknown kind, as a reader on 0.7.1 skips it.
 fn decode_known(payload: &[u8], version: u16) -> Result<Option<Frame>> {
     let mut c = Cursor::new(payload);
     let kind = c.u8()?;
-    if version < PROTOCOL_VERSION_2
-        && matches!(kind, KIND_SYNC | KIND_SEGMENT_AFTER | KIND_UNAVAILABLE)
-    {
-        return Err(malformed(&format!(
-            "kind {kind} exists only in protocol version 2, and this stream is version {version}"
-        )));
+    if version < PROTOCOL_VERSION_2 {
+        if matches!(kind, KIND_SYNC | KIND_SEGMENT_AFTER) {
+            return Err(malformed(&format!(
+                "kind {kind} exists only in protocol version 2, and this stream is version \
+                 {version}"
+            )));
+        }
+        if kind == KIND_UNAVAILABLE {
+            return Ok(None);
+        }
     }
     let frame = match kind {
         KIND_HANDSHAKE => {
@@ -780,6 +789,9 @@ impl<R: Read> FrameReader<R> {
         }
         let total = total as usize;
         let mut joined = self.buf[at + 1 + 8..].to_vec();
+        // Grown to `total` at most, never by doubling past it: doubling would
+        // reserve up to twice the frame, which a 32-bit reader cannot address
+        // for a frame near the limit.
         while joined.len() < total {
             let Some(at) = self.read_part()? else {
                 return Err(Error::Message(format!(
@@ -794,7 +806,15 @@ impl<R: Read> FrameReader<R> {
                      before its last part",
                 ));
             }
-            joined.extend_from_slice(&self.buf[at + 1..]);
+            let part = &self.buf[at + 1..];
+            let need = joined.len() + part.len();
+            if need > joined.capacity() {
+                let want = need
+                    .max(joined.capacity().saturating_mul(2))
+                    .min(total.max(need));
+                joined.reserve_exact(want - joined.len());
+            }
+            joined.extend_from_slice(part);
         }
         if joined.len() != total {
             return Err(malformed(&format!(
@@ -947,7 +967,12 @@ impl<W: Write> FrameWriter<W> {
 
     /// Write one frame.
     pub fn write(&mut self, frame: &Frame) -> Result<()> {
-        self.write_in_parts_of(frame, MAX_FRAME_BYTES)
+        let written = self.write_in_parts_of(frame, MAX_FRAME_BYTES);
+        // A split frame's buffer is not kept for the frames after it.
+        if self.buf.capacity() > MAX_FRAME_BYTES {
+            self.buf = Vec::new();
+        }
+        written
     }
 
     /// [`write`](Self::write), splitting at `limit` bytes per frame or part
@@ -1085,6 +1110,15 @@ impl ResumeRequest {
     /// the version is wrong, when bytes are left over, and when the request
     /// is out of order.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_fields(bytes).map_err(|e| match e {
+            Error::Message(m) if m.starts_with("malformed replication frame: ") => {
+                Error::Message(m.replacen("replication frame", "resume request", 1))
+            }
+            other => other,
+        })
+    }
+
+    fn decode_fields(bytes: &[u8]) -> Result<Self> {
         let bad = |what: &str| Error::Message(format!("malformed resume request: {what}"));
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(bad(&format!(
@@ -1702,7 +1736,9 @@ mod tests {
             assert!(w.write(frame).is_err());
             assert_eq!(w.into_inner().len(), 14, "nothing after the preamble");
 
-            // A version 1 stream that carries one anyway.
+            // A version 1 stream that carries one anyway: `Sync` and
+            // `SegmentAfter` are refused, and `Unavailable` is skipped as a
+            // reader on 0.7.1 skips it.
             let mut payload = Vec::new();
             put_payload(frame, &mut payload).unwrap();
             assert!(decode_payload(&payload).is_err());
@@ -1710,8 +1746,71 @@ mod tests {
             write_preamble(&mut bytes).unwrap();
             put_u32(&mut bytes, payload.len() as u32);
             bytes.extend_from_slice(&payload);
-            let err = read_all(bytes).unwrap_err().to_string();
-            assert!(err.contains("only in protocol version 2"), "{err}");
+            if matches!(frame, Frame::Unavailable { .. }) {
+                let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
+                assert_eq!(reader.next_frame().unwrap(), None);
+                assert_eq!(reader.skipped(), 1);
+            } else {
+                let err = read_all(bytes).unwrap_err().to_string();
+                assert!(err.contains("only in protocol version 2"), "{err}");
+            }
+        }
+    }
+
+    /// Version 1 bytes, written out: the layout WIRE.md §2 and §4.5 give,
+    /// checked against the encoder rather than against itself.
+    #[test]
+    fn a_version_1_frame_has_the_documented_bytes() {
+        let frame = Frame::ClockOffset {
+            source: 1,
+            ts: 2,
+            offset_ns: -1,
+        };
+        let mut want = Vec::new();
+        want.extend_from_slice(b"dendro-repl\0");
+        want.extend_from_slice(&[1, 0]);
+        want.extend_from_slice(&21u32.to_le_bytes());
+        want.push(5);
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.extend_from_slice(&2i64.to_le_bytes());
+        want.extend_from_slice(&(-1i64).to_le_bytes());
+        let mut w = FrameWriter::new(Vec::new(), PROTOCOL_VERSION).unwrap();
+        w.write(&frame).unwrap();
+        assert_eq!(w.into_inner(), want);
+
+        // And version 2: the same payload behind a number.
+        let mut want2 = Vec::new();
+        want2.extend_from_slice(b"dendro-repl\0");
+        want2.extend_from_slice(&[2, 0]);
+        want2.extend_from_slice(&29u32.to_le_bytes());
+        want2.extend_from_slice(&0u64.to_le_bytes());
+        want2.extend_from_slice(&want[18..]);
+        let mut w = FrameWriter::new(Vec::new(), PROTOCOL_VERSION_2).unwrap();
+        w.write(&frame).unwrap();
+        assert_eq!(w.into_inner(), want2);
+    }
+
+    /// A frame whose number and payload fill the limit exactly goes as one
+    /// frame; one byte more and it goes in parts, none above the limit.
+    #[test]
+    fn a_frame_splits_only_above_the_limit() {
+        let limit = 64;
+        let header = segment(0);
+        let mut payload = Vec::new();
+        put_payload(&header, &mut payload).unwrap();
+        let base = payload.len();
+        for (extra, parts) in [
+            (limit - NUMBER_BYTES - base, 1),
+            (limit - NUMBER_BYTES - base + 1, 2),
+        ] {
+            let frame = segment(extra);
+            let (bytes, starts) = split(&frame, limit);
+            assert_eq!(starts.len(), parts, "{extra} bytes of segment");
+            for &at in &starts {
+                let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                assert!(len <= limit, "a {len}-byte part, above {limit}");
+            }
+            assert_eq!(read_all(bytes).unwrap(), vec![frame]);
         }
     }
 
@@ -1800,6 +1899,22 @@ mod tests {
             at += 4 + len;
         }
         (bytes, starts)
+    }
+
+    /// The joined buffer grows to the declared total and no further, so a
+    /// frame near `MAX_SPLIT_FRAME_BYTES` does not reserve twice its size.
+    #[test]
+    fn a_split_frame_is_joined_into_no_more_than_its_total() {
+        let frame = segment(1000);
+        let mut payload = Vec::new();
+        put_payload(&frame, &mut payload).unwrap();
+        let (bytes, _) = split(&frame, 40);
+        let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let at = reader.read_part().unwrap().unwrap();
+        assert_eq!(reader.buf[at], KIND_SPLIT_FIRST);
+        let joined = reader.join_split(at).unwrap();
+        assert_eq!(joined, payload);
+        assert_eq!(joined.capacity(), payload.len());
     }
 
     #[test]
@@ -1908,6 +2023,7 @@ mod tests {
         let mut w = FrameWriter::new(Vec::new(), PROTOCOL_VERSION_2).unwrap();
         w.write(&big).unwrap();
         assert_eq!(w.next_number, 2, "two parts");
+        assert_eq!(w.buf.capacity(), 0, "the split frame's buffer is not kept");
         assert_eq!(read_all(w.into_inner()).unwrap(), vec![big]);
     }
 
@@ -1971,10 +2087,15 @@ mod tests {
         wrong[14] = 1;
         let err = ResumeRequest::decode(&wrong).unwrap_err().to_string();
         assert!(err.contains("protocol version 1"), "{err}");
-        let mut wrong = bytes;
+        let mut wrong = bytes.clone();
         wrong[0] = b'x';
         let err = ResumeRequest::decode(&wrong).unwrap_err().to_string();
         assert!(err.contains("magic"), "{err}");
+        let err = ResumeRequest::decode(&bytes[..20]).unwrap_err().to_string();
+        assert!(
+            err.starts_with("malformed resume request: it ends early"),
+            "{err}"
+        );
     }
 
     /// Each ordering rule is checked on both encode and decode.

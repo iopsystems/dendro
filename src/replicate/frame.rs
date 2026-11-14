@@ -237,7 +237,10 @@ pub enum Frame {
     /// The copy keeps what it holds of the stream at or below `at` and
     /// deletes what it holds above it, which the frames after this one
     /// replace. Its live rows at or below `at` are sealed with its own
-    /// encoder, and the ones that do not seal are deleted and counted.
+    /// encoder, and the ones that do not seal are deleted.
+    ///
+    /// This build's [`Subscriber`](crate::replicate::Subscriber) refuses this
+    /// frame; no release applies it yet.
     Sync {
         /// Which source, by handshake ordinal.
         source: u32,
@@ -252,6 +255,9 @@ pub enum Frame {
     ///
     /// The copy refuses it when it holds a live row of the stream at or below
     /// `after`, or a segment of the stream ending above `after`.
+    ///
+    /// This build's [`Subscriber`](crate::replicate::Subscriber) refuses this
+    /// frame; no release applies it yet.
     SegmentAfter {
         /// Which source, by handshake ordinal.
         source: u32,
@@ -268,10 +274,11 @@ pub enum Frame {
         caller_index: Option<Vec<u8>>,
     },
 
-    /// The origin holds no row of `stream` in the open interval
-    /// `(after, before)`, and the copy may lack rows the origin once held
+    /// The publisher holds no row of `stream` in the open interval
+    /// `(after, before)`, and the copy may lack rows the publisher once held
     /// there, because retention removed them before the copy received them.
-    /// Protocol version 2 only (WIRE.md §4.9).
+    /// Protocol version 2 only (WIRE.md §4.9). Applying it changes nothing in
+    /// the copy, and a version 1 reader skips it.
     Unavailable {
         /// Which source, by handshake ordinal.
         source: u32,
@@ -279,7 +286,7 @@ pub enum Frame {
         stream: String,
         /// The newest timestamp of the stream the copy holds.
         after: i64,
-        /// The origin's oldest held timestamp of the stream.
+        /// The publisher's oldest held timestamp of the stream.
         before: i64,
     },
 }

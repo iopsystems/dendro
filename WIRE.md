@@ -54,8 +54,9 @@ allocated for it.** A four-byte length read off a wire is otherwise an
 allocation request of up to 4 GiB, which is an out-of-memory rather than an
 error. The limit is eight times the default `SealPolicy::max_bytes`. A
 publisher splits an interval's rows across several `Rows` frames to stay under
-it (rule 6). A `Segment` cannot be split, so a segment whose frame exceeds the
-limit cannot be sent; segments compacted by row count can be that large.
+it (rule 6). On version 1 a `Segment` cannot be split, so a segment whose
+frame exceeds the limit cannot be sent; segments compacted by row count can be
+that large. On version 2 the limit applies to each part (§2.1).
 
 **A payload with bytes left over after its fields are read is refused.** The
 sender put something there this build does not read, and applying the fields it
@@ -95,9 +96,14 @@ then read as one frame. A reader refuses:
 - a stream that ends before the join is complete;
 - a joined payload whose kind is `0xfe` or `0xff`.
 
-A reader joins the bytes as they arrive, so a `total` off the wire is not an
-allocation. 1 GiB is above SQLite's default limit of 1,000,000,000 bytes on
-one value, so any segment an archive holds fits in one split frame.
+A reader joins the bytes as they arrive and grows its buffer to `total` at
+most, so a `total` off the wire is not an allocation, and a version 2 reader
+holds at most 1 GiB per frame, built from bytes it received. A reader on a
+32-bit target may fail to allocate a frame near that size.
+
+A segment's parquet file and its caller index are separate SQLite values, each
+up to SQLite's default limit of 1,000,000,000 bytes. A segment whose two
+together exceed 1 GiB cannot be sent, and a `FrameWriter` refuses it.
 
 ## 3. Primitives
 
@@ -130,7 +136,9 @@ only integer type, and the reason a negative value means before 1970.
 One kind per table in the set `rewrite` copies (`src/rewrite.rs`, `COPIED`) —
 `sources`, `caller_rows`, `wal`, `segments`, `clock_offsets` — so the frame set
 has a completeness check rather than a guess, plus `SourceUpdate` for a change
-to a source's row in `sources` after its handshake.
+to a source's row in `sources` after its handshake. Version 2's `Sync`,
+`SegmentAfter` and `Unavailable` act on what a resumed copy holds and are
+outside this mapping.
 
 | `kind` | frame | lands in |
 |---|---|---|
@@ -140,14 +148,15 @@ to a source's row in `sources` after its handshake.
 | 4 | `Segment` | `segments` |
 | 5 | `ClockOffset` | `clock_offsets` |
 | 6 | `SourceUpdate` | `sources` |
+| 9 | `Unavailable` | nothing (version 2) |
 | 135 (`0x87`) | `Sync` | `segments`, `wal` (version 2) |
 | 136 (`0x88`) | `SegmentAfter` | `segments`, `wal` (version 2) |
-| 9 | `Unavailable` | nothing (version 2) |
 
 The high bit of `kind` (`0x80`) marks a kind a reader must understand to apply
 the stream correctly; see §7. `Sync` and `SegmentAfter` set it, and so do the
-parts of a split frame (`0xfe`, `0xff`, §2.1), which are framing rather than
-frames. A version 1 stream that carries a version 2 kind is refused.
+kinds of a split frame's parts (`0xfe`, `0xff`, §2.1). A version 1 stream that
+carries `Sync` or `SegmentAfter` is refused; one that carries `Unavailable`
+has it skipped, as an unknown kind.
 
 ### 4.1 `Handshake` (kind 1)
 
@@ -325,13 +334,13 @@ what it holds above it:
 
 1. The copy seals its live rows of the stream at or below `at` with its own
    encoder.
-2. It deletes the live rows at or below `at` that are still not in a segment,
-   and counts them.
-3. It deletes its segments and live rows of the stream above `at`, and counts
-   the rows.
+2. It deletes the live rows at or below `at` that are still not in a segment.
+3. It deletes its segments and live rows of the stream above `at`.
 
 The publisher picks `at` so that no segment of the copy's or of its own
 contains it, so the copy deletes and the publisher ships whole segments.
+
+This build's `Subscriber` refuses this frame; no release applies it yet.
 
 ### 4.8 `SegmentAfter` (kind 136, version 2)
 
@@ -351,7 +360,9 @@ A sealed segment that replaces the copy's live rows of its stream in
 copy refuses it when it holds a live row of the stream at or below `after`, or
 a segment of the stream whose `last_ts` is above `after`; either means the
 copy is not where the publisher put it. The live rows it deletes below
-`first_ts` are rows the publisher's seal pruned or discarded, and are counted.
+`first_ts` are rows the publisher's seal pruned or discarded.
+
+This build's `Subscriber` refuses this frame; no release applies it yet.
 
 ### 4.9 `Unavailable` (kind 9, version 2)
 
@@ -364,12 +375,10 @@ i64          before                 the publisher's oldest held row of it
 
 The publisher holds no row of the stream in the open interval
 `(after, before)`, and the copy may lack rows the publisher once held there,
-because retention removed them before the copy received them. A report, not a
-change: the kind is skippable, and a subscriber that skips it holds the same
-rows.
-
-This build's `Subscriber` refuses `Sync` and `SegmentAfter`, because it
-resumes no copy, and applies `Unavailable` as nothing.
+because retention removed them before the copy received them. Applying it
+changes nothing in the copy, so the kind is skippable, and a subscriber that
+skips it holds the same rows. This build's `Subscriber` applies it as
+nothing.
 
 ## 5. Protocol rules
 

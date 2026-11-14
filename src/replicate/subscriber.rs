@@ -375,7 +375,7 @@ impl Subscriber {
                 )))
             }
 
-            // A report, not a change: the frame is skippable (WIRE.md §4.9).
+            // Changes nothing in the copy; the kind is skippable (WIRE.md §4.9).
             Frame::Unavailable { source, .. } => {
                 Self::source_mut(&mut self.sources, source)?;
                 Ok(Applied::default())
