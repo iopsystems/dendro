@@ -228,8 +228,12 @@ ordered by `seq`; a reader splices them in `seq` order and tolerates gaps
 (a filtered copy renumbers densely from 0, a resumed writer continues from
 `MAX(seq) + 1`). `first_ts`/`last_ts` are the segment's own row timestamps,
 what the **encoder reported** and never the input's span, and are what
-retention and range reads consult; `rows` is the row count. A segment is
-immutable once inserted.
+retention and range reads consult; `rows` is the row count. Within a
+stream, `seq` order must be time order with no overlap: each segment's
+`first_ts` must be above the `last_ts` of the segment before it. The live-WAL
+watermark (`MAX(last_ts)`, §3.3) and compaction depend on that. dendro's
+writers and rewrites keep it; `insert_segment` does not check it, and neither
+does `verify`. A segment is immutable once inserted.
 
 **The caller's index** is whatever the caller's encoder returned alongside
 the segment, stored verbatim and never interpreted: a name set, a bloom
@@ -259,9 +263,11 @@ original columns may describe columns the copy no longer has, and a wrong
 index is worse than none. A merged segment has none, since an index over
 one input cannot describe two.
 
-`bytes` is one Parquet file the crate never opens, with one exception:
-`rewrite::project_segment_columns`, an opt-in column projection that
-re-encodes with `segment::writer_props`.
+`bytes` is one Parquet file the crate decodes only in two opt-in operations:
+`rewrite::project_segment_columns`, a column projection, and compaction
+(`rewrite::compact`, `rewrite::compact_stream`), which merges segments. Both re-encode with
+`segment::writer_props` unless the caller passes other writer properties. Both
+therefore require `bytes` that Arrow's Parquet reader can open.
 
 ### 3.3 `wal`
 
@@ -284,11 +290,16 @@ sealed segment and live rows is a stream, not an absence.
 
 A row at or below the watermark can never be read, so a writer **drops** it
 rather than storing it, counts it, and logs once per stream; a resumed source
-refuses it at the call instead. Producers must append monotonically **per
-stream**. The watermark is per `(source, stream)`, so the same timestamp is
-accepted on a sibling stream or on another source, and backfilling either is
-not out of order. Late samples *within* one stream remain unsupported; see
-[out-of-order appends](docs/journal/2026-09-11-out-of-order-appends.md).
+refuses it at the call instead. A writer drops a row at or below its stream's
+newest live row the same way: it would be readable, but a reader that tails a
+stream by timestamp has passed it. The bound is the stream's newest row before
+the tick, so a stream's rows may arrive in any order within one tick; a second
+row at one timestamp in the tick is dropped the same way. Producers must
+append monotonically **per stream**. The watermark is per `(source, stream)`,
+so the same timestamp is accepted on a sibling stream or on another source,
+and backfilling either is not out of order. Late samples *within* one stream
+remain unsupported; see [out-of-order
+appends](docs/journal/2026-09-11-out-of-order-appends.md).
 
 **Retention and live rows.** Eviction deletes by timestamp and does not
 know which rows have been sealed. A live row older than the cutoff, one a

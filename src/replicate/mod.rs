@@ -114,7 +114,8 @@
 //! `WIRE.md` specifies the bytes; [`wire`](crate::replicate::wire) implements it. Frames are
 //! length-prefixed, so a reader bounds an allocation before making it
 //! ([`MAX_FRAME_BYTES`](crate::replicate::wire::MAX_FRAME_BYTES)) and a future frame kind can be
-//! skipped rather than misread.
+//! skipped rather than misread, unless its kind sets
+//! [`KIND_MUST_UNDERSTAND`](crate::replicate::wire::KIND_MUST_UNDERSTAND).
 
 mod frame;
 /// Frames as bytes: the codec, its limits, and a reader over a byte stream.

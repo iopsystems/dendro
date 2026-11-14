@@ -97,6 +97,12 @@ const KIND_SEGMENT: u8 = 4;
 const KIND_CLOCK_OFFSET: u8 = 5;
 const KIND_SOURCE_UPDATE: u8 = 6;
 
+/// The high bit of a frame's kind: set on a kind a reader must understand to
+/// apply the stream correctly. A reader that does not know such a kind stops
+/// with an error rather than skipping it (WIRE.md §7). No kind this build
+/// writes sets it.
+pub const KIND_MUST_UNDERSTAND: u8 = 0x80;
+
 const INDEX_FULL: u8 = 0;
 const INDEX_DELTA: u8 = 1;
 
@@ -429,7 +435,8 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame> {
 }
 
 /// [`decode_payload`], with a kind this build does not know returned as
-/// `None` rather than an error, so [`FrameReader`] can skip it (WIRE.md §7).
+/// `None` rather than an error, so [`FrameReader`] can skip it (WIRE.md §7),
+/// unless the kind has [`KIND_MUST_UNDERSTAND`] set, which is an error.
 /// Only the kind byte of an unknown frame is read: its layout is not known,
 /// and the length prefix already says where it ends.
 fn decode_known(payload: &[u8]) -> Result<Option<Frame>> {
@@ -508,6 +515,12 @@ fn decode_known(payload: &[u8]) -> Result<Option<Frame>> {
             labels: c.map()?,
             metadata: c.map()?,
         },
+        unknown if unknown & KIND_MUST_UNDERSTAND != 0 => {
+            return Err(malformed(&format!(
+                "{unknown} is a frame kind this build does not read, and its high bit says a \
+                 reader must understand it to apply the stream; a newer dendro wrote it"
+            )))
+        }
         _ => return Ok(None),
     };
     c.finish()?;
@@ -585,7 +598,11 @@ impl<R: Read> FrameReader<R> {
     /// A frame of a kind this build does not know is skipped and counted in
     /// [`skipped`](Self::skipped), not returned and not an error (WIRE.md
     /// §7): the length prefix says where it ends, and a subscriber older than
-    /// its publisher should lose only what the new kind carries.
+    /// its publisher should lose only what the new kind carries. A kind with
+    /// [`KIND_MUST_UNDERSTAND`] set is the exception: it is an error, because
+    /// applying the frames after it without it would be wrong. After that
+    /// error the reader is past the refused frame, so a caller must stop
+    /// reading the stream rather than call this again.
     pub fn next_frame(&mut self) -> Result<Option<Frame>> {
         loop {
             let Some(()) = self.read_payload()? else {

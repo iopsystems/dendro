@@ -1091,8 +1091,9 @@ fn an_unknown_frame_kind_is_skipped_not_fatal() {
     let mut stream = Vec::new();
     write_preamble(&mut stream).unwrap();
     stream.extend(encode(&before).unwrap());
-    // A kind no build has yet: a length prefix and a payload of kind 200.
-    let unknown = [200u8, 9, 9, 9];
+    // A kind no build has yet, without the must-understand bit: a length
+    // prefix and a payload of kind 100.
+    let unknown = [100u8, 9, 9, 9];
     stream.extend((unknown.len() as u32).to_le_bytes());
     stream.extend(unknown);
     stream.extend(encode(&after).unwrap());
@@ -1102,6 +1103,32 @@ fn an_unknown_frame_kind_is_skipped_not_fatal() {
     assert_eq!(reader.next_frame().unwrap(), Some(after));
     assert_eq!(reader.next_frame().unwrap(), None);
     assert_eq!(reader.skipped(), 1);
+}
+
+/// A kind with the high bit set is one a reader must understand to apply the
+/// stream correctly, so a reader that does not know it stops there rather
+/// than skipping it; the frames before it were read.
+#[test]
+fn an_unknown_must_understand_kind_is_an_error() {
+    use dendro::replicate::wire::{encode, write_preamble, FrameReader};
+
+    let before = Frame::ClockOffset {
+        source: 0,
+        ts: 1,
+        offset_ns: 2,
+    };
+    let mut stream = Vec::new();
+    write_preamble(&mut stream).unwrap();
+    stream.extend(encode(&before).unwrap());
+    let unknown = [0x80u8 | 7, 9, 9, 9];
+    stream.extend((unknown.len() as u32).to_le_bytes());
+    stream.extend(unknown);
+
+    let mut reader = FrameReader::new(stream.as_slice()).unwrap();
+    assert_eq!(reader.next_frame().unwrap(), Some(before));
+    let err = reader.next_frame().unwrap_err().to_string();
+    assert!(err.contains("135") && err.contains("must"), "{err}");
+    assert_eq!(reader.skipped(), 0);
 }
 
 /// The identity the subscriber's copy holds for its one source.
