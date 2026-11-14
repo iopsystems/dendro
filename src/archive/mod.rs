@@ -51,6 +51,8 @@ pub struct WalRow {
 }
 
 #[cfg(feature = "archive")]
+mod lock;
+#[cfg(feature = "archive")]
 mod sqlite;
 #[cfg(feature = "archive")]
 pub use sqlite::*;

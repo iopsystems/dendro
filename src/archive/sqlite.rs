@@ -783,6 +783,10 @@ impl Archive {
     /// Only `create` (and that test) may call this — the page size is not a
     /// caller's choice.
     fn create_with_page_size(path: &Path, page_size: u32) -> Result<ArchiveMut> {
+        // The writer lock first, so a create refused by it has touched
+        // nothing, and the cleanup below never removes files another handle
+        // is using.
+        let lock = super::lock::WriterLock::acquire(path, path)?;
         // Claim the path atomically rather than testing `exists()` — this is
         // also what stops SQLite from silently adopting a file that appeared
         // between the check and the open. A zero-length file is a valid empty
@@ -799,7 +803,10 @@ impl Archive {
         // reads as a bug in the retry rather than fallout from the error that
         // actually happened.
         match Self::init_created(path, page_size) {
-            Ok(db) => Ok(db),
+            Ok(mut db) => {
+                db._writer_lock = Some(lock);
+                Ok(db)
+            }
             Err(e) => {
                 Self::remove_archive(path);
                 Err(e)
@@ -2604,6 +2611,9 @@ pub struct ArchiveMut {
     /// Committed transactions. See [`ArchiveMut::commits`].
     #[cfg(any(test, feature = "test-support"))]
     commits: std::cell::Cell<u64>,
+    /// The file's writer lock, held for the handle's life and released after
+    /// `db` closes. `None` for an in-memory archive. See `archive::lock`.
+    _writer_lock: Option<super::lock::WriterLock>,
 }
 
 impl std::ops::Deref for ArchiveMut {
@@ -2662,7 +2672,20 @@ impl ArchiveMut {
             db,
             #[cfg(any(test, feature = "test-support"))]
             commits: std::cell::Cell::new(0),
+            _writer_lock: None,
         }
+    }
+
+    /// [`wrap`](Self::wrap) holding the writer lock, taken after the open
+    /// succeeded so that a file the open refuses is never locked. The lock
+    /// is named after the file SQLite opened, a symlink's target, so on unix
+    /// every path through a symlink takes the same lock.
+    fn wrap_locked(db: Archive, path: &Path) -> Result<Self> {
+        let opened = db.conn.path().map(Path::new).unwrap_or(path);
+        let lock = super::lock::WriterLock::acquire(opened, path)?;
+        let mut db = Self::wrap(db);
+        db._writer_lock = Some(lock);
+        Ok(db)
     }
 
     /// Open an existing archive to write to it, with SQLite's exclusive
@@ -2676,7 +2699,7 @@ impl ArchiveMut {
     /// they are.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Archive::open_with_cache(path, READER_CACHE_SIZE_KIB, true)?;
-        Ok(ArchiveMut::wrap(db))
+        ArchiveMut::wrap_locked(db, path)
     }
 
     /// Run `f` inside one transaction: it commits when `f` returns `Ok` and
@@ -3329,7 +3352,7 @@ impl ArchiveMut {
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn open_for_write(path: &Path) -> Result<Self> {
         let db = Archive::open_with_cache(path, WRITER_CACHE_SIZE_KIB, false)?;
-        Ok(ArchiveMut::wrap(db))
+        ArchiveMut::wrap_locked(db, path)
     }
 
     /// How many transactions this connection has COMMITTED.

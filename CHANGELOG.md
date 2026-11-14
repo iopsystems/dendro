@@ -47,6 +47,17 @@ cannot reach a failed release any other way.
   what the file holds, so after `SourceWriter::discard_live_rows` or a
   retention pass removes a stream's newest rows, a row below them is taken
   again, and a running publisher whose cursor is past it does not ship it.
+- Every writing handle (`Writer`, `ArchiveMut::create`, `ArchiveMut::open`)
+  holds an exclusive advisory lock on `<archive>-lock` for its life, and a
+  second one on the same archive is refused as `Error::InUse`, in the same
+  process or another. A second `Writer::open` on an archive a `Writer` was
+  still writing used to succeed; both writers then took the same `seq`, and
+  the second one's seal failed on the `segments` UNIQUE constraint, ending
+  that writer for all its sources. The `-lock` file is created on first
+  use and left in place; it holds no data and a copy of the archive does
+  not need it. The lock is released when its handle is dropped or its
+  process ends; a child process forked while it is held keeps it until the
+  child execs or exits.
 
 ### Added
 
@@ -56,7 +67,6 @@ cannot reach a failed release any other way.
   bit set, and still skips one without it. No kind dendro writes sets it,
   so existing streams read as before. A reader on 0.7.x or earlier skips
   such a frame (WIRE.md §7).
-
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a

@@ -288,8 +288,10 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
 
 A finished archive is **one file at rest**. After a clean finalize with
 nothing else open the sidecars are gone, and what is left is the file you
-hand someone. It is **three while open**: SQLite adds `-wal` and `-shm`
-whenever the file is opened, a read included. The last read-write connection
+hand someone, beside the empty `-lock` file any writing handle leaves (a
+writer locks it so a second one is refused); it holds no data and a copy does
+not need it. It is **three while open**, plus `-lock`: SQLite adds `-wal` and
+`-shm` whenever the file is opened, a read included. The last read-write connection
 to close removes them. `Archive::open` reads a finished archive (at least one
 source, every source finalized) on a read-write connection with `query_only`
 set, which refuses writes, so its close removes them too. A reader opened
