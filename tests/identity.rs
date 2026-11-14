@@ -416,7 +416,8 @@ fn an_archive_without_the_uuid_column_reads_unknown_identity() {
     let path = dir.path().join("old.dendro");
     drop(ArchiveMut::create(&path).unwrap());
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE sources DROP COLUMN uuid;")
+    // An archive from before the column has no uuid index either.
+    conn.execute_batch("DROP INDEX sources_by_uuid; ALTER TABLE sources DROP COLUMN uuid;")
         .unwrap();
     conn.execute(
         "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns) \
@@ -436,4 +437,164 @@ fn an_archive_without_the_uuid_column_reads_unknown_identity() {
         .unwrap();
     assert!(dst.read_sources().unwrap()[0].uuid.is_some());
     assert!(shared_sources(&db, &dst).unwrap().is_empty());
+}
+
+/// A uuid names one source, so copying the same archive twice into one
+/// destination is refused, and the refused copy's transaction leaves
+/// nothing behind. It used to succeed with two sources claiming one
+/// identity, and `verify` passed it.
+#[test]
+fn a_second_copy_of_a_source_into_one_archive_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let mut src = ArchiveMut::create(&src_path).unwrap();
+    src.insert_source(&source("a")).unwrap();
+    let uuid = src.read_sources().unwrap()[0].uuid.clone().unwrap();
+    drop(src);
+    let src = Archive::open(&src_path).unwrap();
+
+    let dst_path = dir.path().join("dst.dendro");
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Never))
+        .unwrap();
+    let err = dst
+        .transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Never))
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::DuplicateSource { uuid: u } if *u == uuid),
+        "{err}"
+    );
+    assert_eq!(dst.read_sources().unwrap().len(), 1);
+}
+
+/// An archive created before the uuid index has none, and a build that does
+/// not check can leave two sources with one uuid. Every insert here checks
+/// whether the index is there or not, and `verify` reports a duplicate that
+/// is already in the file.
+#[test]
+fn without_the_index_a_duplicate_is_refused_on_insert_and_reported_by_verify() {
+    use dendro::archive::{Depth, Problem};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    db.insert_source(&source("a")).unwrap();
+    let uuid = db.read_sources().unwrap()[0].uuid.clone().unwrap();
+    drop(db);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP INDEX sources_by_uuid;")
+        .unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let err = db
+        .insert_source_with_uuid(&source("b"), Some(&uuid))
+        .unwrap_err();
+    assert!(matches!(err, Error::DuplicateSource { .. }), "{err}");
+    drop(db);
+
+    // What an older build, which does not check, could have left.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns, uuid) \
+             VALUES ('{}', '{}', 0, 0, ?1)",
+            [&uuid],
+        )
+        .unwrap();
+    let report = Archive::open(&path).unwrap().verify(Depth::Quick).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::DuplicateUuid { uuid: u, source_ids } if *u == uuid && source_ids.len() == 2)),
+        "{:?}",
+        report.problems
+    );
+}
+
+/// Two archives that share a source combine into one destination when the
+/// second copy leaves the shared source out; its other sources come across.
+#[test]
+fn a_combine_leaves_out_the_sources_the_destination_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_path = dir.path().join("a.dendro");
+    let mut a = ArchiveMut::create(&a_path).unwrap();
+    a.insert_source(&source("x")).unwrap();
+    let x_uuid = a.read_sources().unwrap()[0].uuid.clone().unwrap();
+    drop(a);
+
+    // B holds the same x (a copy of A) and a source z of its own.
+    let a = Archive::open(&a_path).unwrap();
+    let b_path = dir.path().join("b.dendro");
+    let mut b = ArchiveMut::create(&b_path).unwrap();
+    b.transaction(|tx| copy_sources_into(&a, tx, &CopySpec::everything(), &Never))
+        .unwrap();
+    b.insert_source(&source("z")).unwrap();
+    drop(b);
+    let b = Archive::open(&b_path).unwrap();
+
+    let dst_path = dir.path().join("dst.dendro");
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&a, tx, &CopySpec::everything(), &Never))
+        .unwrap();
+    let held = shared_sources(&b, &dst).unwrap();
+    assert_eq!(held, vec![x_uuid.clone()]);
+    let leave_out =
+        |s: &dendro::archive::SourceRow| s.uuid.as_ref().is_none_or(|u| !held.contains(u));
+    let spec = CopySpec {
+        keep_sources: Some(&leave_out),
+        ..CopySpec::everything()
+    };
+    dst.transaction(|tx| copy_sources_into(&b, tx, &spec, &Never))
+        .unwrap();
+    let mut names: Vec<String> = dst
+        .read_sources()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.meta.labels["source"].clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["x", "z"]);
+}
+
+/// A file an older build left with two sources per uuid copies with one of
+/// each: the filter keeps the first source it sees for each uuid.
+#[test]
+fn a_file_with_duplicate_uuids_copies_with_one_of_each() {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    db.insert_source(&source("a")).unwrap();
+    let uuid = db.read_sources().unwrap()[0].uuid.clone().unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP INDEX sources_by_uuid;").unwrap();
+    conn.execute(
+        "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns, uuid) \
+         VALUES ('{\"source\":\"a\"}', '{}', 0, 0, ?1)",
+        [&uuid],
+    )
+    .unwrap();
+    drop(conn);
+    let src = Archive::open(&path).unwrap();
+    assert_eq!(src.read_sources().unwrap().len(), 2);
+
+    let seen = RefCell::new(BTreeSet::new());
+    let first_of_each = |s: &dendro::archive::SourceRow| match s.uuid.clone() {
+        Some(u) => seen.borrow_mut().insert(u),
+        None => true,
+    };
+    let spec = CopySpec {
+        keep_sources: Some(&first_of_each),
+        ..CopySpec::everything()
+    };
+    let dst_path = dir.path().join("fixed.dendro");
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &spec, &Never))
+        .unwrap();
+    assert_eq!(dst.read_sources().unwrap().len(), 1);
 }

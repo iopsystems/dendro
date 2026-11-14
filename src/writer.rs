@@ -479,9 +479,10 @@ impl Writer {
     /// existed: a fresh id claims only that two copies are not *known* to
     /// differ, where reusing a `NULL` would claim they are the same.
     ///
-    /// Nothing checks that the uuid is unique in this archive, or that it is a
-    /// UUID at all. It is the caller's identity to assign, and the archive
-    /// stores it the way it stores labels.
+    /// A uuid the archive already holds is refused as [`Error::DuplicateSource`]
+    /// (FORMAT.md §3.1). Nothing checks that it is a UUID at all; it is the
+    /// caller's identity to assign, and the archive stores it the way it
+    /// stores labels.
     pub fn add_source_with_uuid(
         &mut self,
         seed: SourceMeta,

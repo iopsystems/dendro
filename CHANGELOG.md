@@ -35,6 +35,20 @@ cannot reach a failed release any other way.
 
 ### Changed
 
+- An archive holds at most one source per uuid. `ArchiveMut::insert_source_with_uuid`,
+  `Transaction::insert_source_with_uuid`, `rewrite::copy_sources_into` and
+  `Writer::add_source_with_uuid` refuse a uuid the archive already holds as
+  the new `Error::DuplicateSource`; a copy of the same archive twice into
+  one destination used to succeed with two sources claiming one identity.
+  New archives carry a `UNIQUE` index on `sources.uuid`; the schema version
+  is unchanged, and an archive created earlier, which has no index, is
+  checked at each insert instead. `verify` reports a duplicate already in a
+  file as the new `Problem::DuplicateUuid`.
+- A replication `Subscriber` refuses a `Handshake` whose uuid its archive
+  already holds, as `Error::DuplicateSource`. A reconnect, or a restart that
+  opened the same archive, used to copy every source again under the same
+  uuid; catch up into a new archive instead. A source whose handshake has
+  no uuid is still added, as before.
 - The writer drops an append at or below its stream's newest live row,
   as it already dropped one at or below the newest sealed row, and counts it
   in `SourceWriter::dropped_out_of_order`. Such a row was stored and
@@ -61,6 +75,9 @@ cannot reach a failed release any other way.
 
 ### Added
 
+- `CopySpec::keep_sources`, a per-source filter for `copy_sources_into`, so
+  a combine of archives that share a source can leave the shared ones out
+  (`shared_sources` lists them) instead of being refused.
 - The high bit of a replication frame's `kind`
   (`wire::KIND_MUST_UNDERSTAND`) marks a kind a reader must understand.
   `FrameReader::next_frame` returns an error for an unknown kind with the

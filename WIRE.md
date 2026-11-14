@@ -291,7 +291,10 @@ read it. A subscriber does not store it.
    a floor (FORMAT.md §3.5). This crate's `Subscriber` does not record an
    entry's kind and has no retention of its own, so a subscriber archive has
    no retention path yet.
-8. A reconnect is a new handshake and full state. There is no resume token.
+8. A reconnect is a new handshake and full state. There is no resume token,
+   and a `Subscriber` refuses a handshake whose `uuid` its archive already
+   holds (`Error::DuplicateSource`): a reconnect catches up into a new
+   archive.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
 10. A subscriber drops a row at or below the newest timestamp the connection

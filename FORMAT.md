@@ -117,6 +117,7 @@ CREATE TABLE sources(
   heartbeat INTEGER,                   -- absent in archives before it existed
   heartbeat_interval_ns INTEGER        -- absent in archives before it existed
 );
+CREATE UNIQUE INDEX sources_by_uuid ON sources(uuid);  -- absent in archives created before it
 CREATE TABLE segments(
   source_id INTEGER NOT NULL REFERENCES sources(id),
   stream TEXT NOT NULL,
@@ -186,10 +187,17 @@ caused).
   it is not an identity.
 - **`uuid`** is the identity: a random v4 UUID in canonical `8-4-4-4-12`
   lowercase form, minted when the row is inserted and carried verbatim by
-  every copy. Two sources with equal `uuid` are the same source.
-  `NULL` means unknown (the archive predates the column); a copy of such a
-  source mints a fresh uuid, so two copies are not claimed identical, only
-  not known to differ. `rewrite::shared_sources` is the comparison.
+  every copy. Two sources with equal `uuid` are the same source, so an
+  archive holds at most one source per `uuid`: an insert, a copy and a
+  replication subscriber refuse a second (`Error::DuplicateSource`), and
+  `CopySpec::keep_sources` lets a copy leave out the ones the destination
+  holds. An archive created by a release that has the `UNIQUE` index
+  `sources_by_uuid` carries it; one created earlier has none, and a build
+  that did not check could leave a duplicate there, which `verify` reports
+  (`Problem::DuplicateUuid`). `NULL` means unknown (the archive predates the
+  column); a copy of such a source mints a fresh uuid, so two copies are not
+  claimed identical, only not known to differ. `rewrite::shared_sources` is
+  the comparison.
 - **`labels`** is the source's *name*: an open string map for selection and
   display. Labels need not be unique; a tool that must name one source and
   cannot refuses.
@@ -542,7 +550,11 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   drop what they do not know, which degrades to "unknown", never to wrong.
   One exception: a writer older than the heartbeat that resumes a source a
   newer writer left does not bump `heartbeat`, so a newer reader reads that
-  source as stopped while it is being appended to.
+  source as stopped while it is being appended to. A unique index an old
+  reader can ignore does not bump the version either (`sources_by_uuid`, added
+  at creation by the release that added it); an older writer that inserts a duplicate uuid into
+  such an archive gets SQLite's constraint error where a current one gets
+  `Error::DuplicateSource`.
 - **What the format does not version, and whose problem it is.** The row
   payload and the segment's columns are the encoder's: a writer and a reader
   must run the same encoder over the same rows to the same bytes. The file

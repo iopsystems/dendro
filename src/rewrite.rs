@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::archive::{Archive, ArchiveMut, CopiedDocuments, SegmentMeta, Transaction};
+use crate::archive::{Archive, ArchiveMut, CopiedDocuments, SegmentMeta, SourceRow, Transaction};
 use crate::error::{Error, Result};
 use crate::segment::SegmentEncoder;
 
@@ -699,6 +699,18 @@ pub struct CopySpec<'a> {
     /// under a coarser unit than the stream key — one an operator names, that
     /// owns several streams — and dropping that unit has to drop all of them.
     pub keep_streams: Option<&'a dyn Fn(&str) -> bool>,
+    /// Copy only the sources this accepts; `None` copies every source.
+    ///
+    /// A destination holds at most one source per uuid, so a copy of a
+    /// source it already holds is refused as
+    /// [`Error::DuplicateSource`], and the
+    /// caller's transaction with it. A combine of archives that share a
+    /// source leaves the shared ones out here
+    /// ([`shared_sources`] lists them), and a repair of a file an older build
+    /// left with two sources per uuid keeps one of each. The rows of a
+    /// source left out are not copied; nothing merges two sources. The
+    /// archive's documents are copied whatever this leaves out.
+    pub keep_sources: Option<&'a dyn Fn(&SourceRow) -> bool>,
     /// Extra metadata merged into each copied source's own, overwriting on
     /// key collision. A caller that stamps results of its own into a copy
     /// uses this; `None` leaves the metadata as it was.
@@ -741,6 +753,7 @@ impl CopySpec<'_> {
             start: i64::MIN,
             end: i64::MAX,
             keep_streams: None,
+            keep_sources: None,
             metadata_extra: None,
             keep_columns: None,
             writer_props: None,
@@ -751,8 +764,10 @@ impl CopySpec<'_> {
 /// The UUIDs of sources present in both archives — the same source, not two
 /// sources with the same labels. A caller assembling several archives into
 /// one asks this before copying: the same file given twice, or a copy
-/// alongside its original, would otherwise land twice and double every
-/// value it holds. Sources without a uuid (archives from before the column)
+/// alongside its original, holds sources the destination already has, which
+/// [`copy_sources_into`] refuses as
+/// [`Error::DuplicateSource`] unless
+/// [`CopySpec::keep_sources`] leaves them out. Sources without a uuid (archives from before the column)
 /// are never reported; they are not known to be the same.
 pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
     let in_a: std::collections::BTreeSet<String> = a
@@ -786,7 +801,8 @@ pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
 /// did not warn.
 ///
 /// The archive's documents come too, every revision of every one, whatever
-/// the spec's time bound and stream filter: a document belongs to the
+/// the spec's time bound, stream filter and source filter (a copy that leaves
+/// out every source still copies them): a document belongs to the
 /// archive rather than to a source or a time, so no part of the spec
 /// selects it. See [`copy_documents_into`], which this calls in the same
 /// snapshot, for how revisions already in the destination are handled.
@@ -824,6 +840,9 @@ fn copy_sources_snapshotted(
     let sources = src.read_sources()?;
     let mut copied = 0usize;
     for rec in &sources {
+        if spec.keep_sources.is_some_and(|keep| !keep(rec)) {
+            continue;
+        }
         // The tail is re-encoded on the way across; a different encoder
         // would write a segment the source's earlier ones do not match.
         crate::segment::check_encoder(rec.id, &rec.meta.metadata, encoder)?;

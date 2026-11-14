@@ -67,6 +67,15 @@ pub enum Error {
         floor: i64,
     },
 
+    /// A source with this uuid is already in the archive. A uuid is a
+    /// source's identity (FORMAT.md §3.1), so a second source with it would
+    /// claim to be the first: an insert, a copy and a replication subscriber
+    /// refuse one.
+    DuplicateSource {
+        /// The uuid.
+        uuid: String,
+    },
+
     /// Another connection holds the file and this open needed it to itself,
     /// a [`ArchiveMut::open`](crate::archive::ArchiveMut::open) holds it exclusively and
     /// this open needed any access at all, or another writing handle (a
@@ -216,6 +225,10 @@ impl fmt::Display for Error {
                 "source {source_id}: timestamp {ts} is not after the newest row its previous \
                  writer session left ({floor}); the clock went backwards across the restart, \
                  and rows would collide or run backwards"
+            ),
+            Error::DuplicateSource { uuid } => write!(
+                f,
+                "a source with uuid {uuid} is already in the archive; a uuid names one source"
             ),
             Error::InUse { what } => write!(
                 f,
