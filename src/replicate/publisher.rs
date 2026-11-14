@@ -6,6 +6,7 @@ use crate::archive::{Archive, SourceRow};
 use crate::error::{Error, Result};
 
 use super::frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
+use super::resume::{ResumeRequest, SourcePosition};
 
 /// Fold one index entry into the running state.
 ///
@@ -61,6 +62,11 @@ struct StreamCursor {
     /// back in insertion order (FORMAT.md §3.5), so a timestamp alone cannot
     /// say where to resume.
     index_after: Option<(i64, usize)>,
+    /// On a version 2 connection, the copy's segments of the stream as
+    /// `(first_ts, last_ts)`, oldest first: the request's, then every one
+    /// shipped. Where the publisher puts each later segment is judged against
+    /// these (WIRE.md §4.7, §4.8).
+    copy_spans: Vec<(i64, i64)>,
 }
 
 /// One source, and everything the publisher remembers about it between polls.
@@ -117,6 +123,8 @@ struct SourceCursor {
 /// own; shipping the publisher's segment as well would offer the subscriber a
 /// segment covering rows it already holds unsealed, which
 /// [`adopt_segment`](crate::writer::SourceWriter::adopt_segment) refuses.
+/// That is protocol version 1; a [`resuming`](Self::resuming) publisher ships
+/// each later seal as [`SegmentAfter`](Frame::SegmentAfter) frames.
 ///
 /// # Index entries
 ///
@@ -175,12 +183,17 @@ struct SourceCursor {
 /// returns an error** naming the stream rather than shipping a stream with a
 /// hole in it; the caller reconnects with `catching_up`, which is what the
 /// segment frames are for. A stream with no cursor yet (one of those above)
-/// has nothing to have missed; its segments are shipped instead.
+/// has nothing to have missed; its segments are shipped instead. A
+/// [`resuming`](Self::resuming) publisher ships the seal's segments, which
+/// carry the rows, and does not return this error.
 pub struct ArchivePublisher {
     sources: Vec<SourceCursor>,
     /// Where a source created after opening starts: the `since` of
     /// [`catching_up`](Self::catching_up), else its first row.
     since: i64,
+    /// Whether this publisher serves protocol version 2, from
+    /// [`resuming`](Self::resuming).
+    version_2: bool,
 }
 
 impl std::fmt::Debug for ArchivePublisher {
@@ -205,6 +218,41 @@ impl ArchivePublisher {
     /// segment, so it cannot trim one.
     pub fn catching_up(db: &Archive, since: i64) -> Result<(Self, Vec<Frame>)> {
         db.read_snapshot(|db| Self::open(db, Some(since)))
+    }
+
+    /// Answer a copy's [`ResumeRequest`] with a protocol version 2 stream:
+    /// handshake every source, continue each source the request names from
+    /// where the copy and this archive agree, ship every other source from
+    /// the request's `since_for_new_sources`, then tail. Write the frames
+    /// with a [`FrameWriter`](super::wire::FrameWriter) opened for version 2.
+    ///
+    /// For each stream of a named source the copy holds, the publisher picks
+    /// a sync point (WIRE.md §4.7). When this archive has sealed nothing past
+    /// the copy's watermark, the point is the copy's newest row and nothing
+    /// is deleted. Otherwise the stream gets a [`Sync`](Frame::Sync) to the
+    /// largest point at or below the copy's watermark that is inside no
+    /// segment of either side, then this archive's segments above it as
+    /// [`SegmentAfter`](Frame::SegmentAfter) frames, then its live rows. A
+    /// stream this archive's retention has evicted past the copy's newest
+    /// row gets an [`Unavailable`](Frame::Unavailable). A caller-row name
+    /// continues after the request's position, and clock offsets are sent
+    /// again from the smallest sync point.
+    ///
+    /// While tailing, a seal in this archive goes out as `SegmentAfter`
+    /// frames, preceded by a `Sync` when the copy's watermark is not a point
+    /// both sides agree on, so a seal that outruns a poll is not an error as
+    /// it is on version 1.
+    ///
+    /// # Errors
+    ///
+    /// Refused when the request is ahead of this archive: a stream's newest
+    /// row above every row this archive has held of it, or a caller-row
+    /// position past its entries. That is an origin restored from an older
+    /// backup, or a request sent to the wrong archive. Also refused when a
+    /// stream has no sync point, which a copy whose segment boundaries are
+    /// not this archive's can produce (WIRE.md §8.2).
+    pub fn resuming(db: &Archive, request: &ResumeRequest) -> Result<(Self, Vec<Frame>)> {
+        db.read_snapshot(|db| Self::open_resumed(db, request))
     }
 
     /// Everything new since the last call, as frames.
@@ -271,7 +319,7 @@ impl ArchivePublisher {
                         });
                     }
                 }
-                cursor.poll(db, &mut out)?;
+                cursor.poll(db, self.version_2, &mut out)?;
             }
 
             records.retain(|r| !self.sources.iter().any(|c| c.source_id == r.id));
@@ -284,7 +332,10 @@ impl ArchivePublisher {
                     // publisher's own catch-up started.
                     let since = Some(self.since);
                     let mut cursor = open_source(db, &rec, ordinal, since, &watermarks, &mut out)?;
-                    cursor.poll(db, &mut out)?;
+                    if self.version_2 {
+                        cursor.record_shipped_spans(db, self.since)?;
+                    }
+                    cursor.poll(db, self.version_2, &mut out)?;
                     self.sources.push(cursor);
                 }
             }
@@ -321,8 +372,297 @@ impl ArchivePublisher {
         }
 
         let since = since.unwrap_or(i64::MIN);
-        Ok((ArchivePublisher { sources, since }, frames))
+        Ok((
+            ArchivePublisher {
+                sources,
+                since,
+                version_2: false,
+            },
+            frames,
+        ))
     }
+
+    /// [`resuming`](Self::resuming), inside a snapshot.
+    fn open_resumed(db: &Archive, request: &ResumeRequest) -> Result<(Self, Vec<Frame>)> {
+        let mut sources = Vec::new();
+        let mut frames = Vec::new();
+        let watermarks = db.sealed_watermarks()?;
+        let since = request.since_for_new_sources;
+        for (ordinal, rec) in db.read_sources()?.into_iter().enumerate() {
+            let ordinal = next_ordinal(ordinal)?;
+            let named = rec
+                .uuid
+                .as_deref()
+                .and_then(|u| request.sources.iter().find(|p| p.uuid == u));
+            let cursor = match named {
+                Some(position) => open_resumed_source(db, &rec, ordinal, position, &mut frames)?,
+                None => {
+                    let mut cursor =
+                        open_source(db, &rec, ordinal, Some(since), &watermarks, &mut frames)?;
+                    cursor.record_shipped_spans(db, since)?;
+                    cursor
+                }
+            };
+            sources.push(cursor);
+        }
+        Ok((
+            ArchivePublisher {
+                sources,
+                since,
+                version_2: true,
+            },
+            frames,
+        ))
+    }
+}
+
+/// The largest value in `[low, high]` inside none of `spans`, where a value
+/// is inside `(first, last)` when `first <= value < last`; `None` when every
+/// value is.
+fn sync_point(high: i64, low: i64, spans: &[(i64, i64)]) -> Option<i64> {
+    let mut at = high;
+    loop {
+        if at < low {
+            return None;
+        }
+        match spans
+            .iter()
+            .filter(|(first, last)| *first <= at && at < *last)
+            .map(|(first, _)| *first)
+            .min()
+        {
+            None => return Some(at),
+            Some(first) => at = first.checked_sub(1)?,
+        }
+    }
+}
+
+/// One stream's oldest held row, from its segments and its live rows.
+fn oldest_row(segments: &[(i64, i64)], live_first: Option<i64>) -> Option<i64> {
+    segments
+        .iter()
+        .map(|(first, _)| *first)
+        .chain(live_first)
+        .min()
+}
+
+/// A named source's handshake and opening batch on a version 2 connection.
+fn open_resumed_source(
+    db: &Archive,
+    rec: &SourceRow,
+    ordinal: u32,
+    position: &SourcePosition,
+    frames: &mut Vec<Frame>,
+) -> Result<SourceCursor> {
+    let refuse = |what: String| {
+        Err(Error::Message(format!(
+            "source {} ({}): the resume request is ahead of this archive: {what}; it was \
+             made from another archive, or this one was restored from an older copy",
+            rec.id, position.uuid
+        )))
+    };
+    let held = db.newest_rows_of(rec.id)?;
+    for stream in &position.streams {
+        match held.get(&stream.stream) {
+            Some(newest) if stream.newest <= *newest => {}
+            Some(newest) => {
+                return refuse(format!(
+                    "stream `{}` at {}, and this archive's newest is {newest}",
+                    stream.stream, stream.newest
+                ))
+            }
+            None => {
+                return refuse(format!(
+                    "stream `{}`, which this archive has never held",
+                    stream.stream
+                ))
+            }
+        }
+    }
+    for name in &position.caller_rows {
+        let (held_ts, bound) = db.caller_row_floor(rec.id, &name.name)?;
+        let newest = held_ts.max(bound);
+        let count = db.caller_row_position(rec.id, &name.name)?;
+        let ahead = match newest {
+            None => true,
+            Some(n) if name.ts > n => true,
+            // At the newest held `ts`, fewer entries than the copy holds,
+            // unless retention removed some there.
+            Some(_) => count.is_some_and(|(ts, k)| {
+                ts == name.ts && k < name.at_ts && bound.is_none_or(|b| b < ts)
+            }),
+        };
+        if ahead {
+            return refuse(format!(
+                "caller-row name `{}` at ({}, {})",
+                name.name, name.ts, name.at_ts
+            ));
+        }
+    }
+
+    frames.push(Frame::Handshake {
+        source: ordinal,
+        uuid: rec.uuid.clone(),
+        labels: rec.meta.labels.clone(),
+        metadata: rec.meta.metadata.clone(),
+        clock_anchor_wall_ns: rec.meta.clock_anchor_wall_ns,
+        complete: rec.complete,
+    });
+    let mut cursor = SourceCursor {
+        ordinal,
+        source_id: rec.id,
+        streams: BTreeMap::new(),
+        clock_sent: BTreeSet::new(),
+        seq: 0,
+        index_state: NO_INDEX_STATE,
+        // A copy that holds entries has had its `Full` (WIRE.md §8.1).
+        sent_full: !position.caller_rows.is_empty(),
+        labels: rec.meta.labels.clone(),
+        metadata: rec.meta.metadata.clone(),
+    };
+
+    // Index entries first (rule 4), each name after the copy's position.
+    for name in db.caller_row_streams(rec.id)? {
+        let after = position
+            .caller_rows
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| (n.ts, n.at_ts as usize));
+        cursor.streams.entry(name.clone()).or_default().index_after = after;
+        cursor.emit_index(db, &name, i64::MIN, frames)?;
+    }
+
+    let mut lowest_point = i64::MAX;
+    for stream in db.all_streams(rec.id)? {
+        let origin: Vec<(i64, i64)> = db
+            .read_segment_meta(rec.id, &stream)?
+            .into_iter()
+            .map(|(_, m)| (m.first_ts, m.last_ts))
+            .collect();
+        let origin_watermark = origin.iter().map(|(_, last)| *last).max();
+        let oldest = oldest_row(&origin, db.live_wal_span(rec.id, &stream)?.first_ts);
+        let entry = cursor.streams.entry(stream.clone()).or_default();
+        let Some(copy) = position.streams.iter().find(|p| p.stream == stream) else {
+            // A stream the copy does not hold: from its first row.
+            for segment in db.segments_overlapping(rec.id, &stream, i64::MIN, i64::MAX)? {
+                entry
+                    .copy_spans
+                    .push((segment.meta.first_ts, segment.meta.last_ts));
+                frames.push(Frame::Segment {
+                    source: ordinal,
+                    stream: stream.clone(),
+                    meta: segment.meta,
+                    bytes: segment.bytes,
+                    caller_index: segment.caller_index,
+                });
+            }
+            entry.copy_spans.sort_unstable();
+            entry.wal_after = origin_watermark;
+            lowest_point = i64::MIN;
+            continue;
+        };
+        let newest = copy.newest;
+        let watermark = copy.watermark();
+        entry.copy_spans = copy.spans.iter().rev().copied().collect();
+        if oldest.is_some_and(|o| o > newest.saturating_add(1)) {
+            frames.push(Frame::Unavailable {
+                source: ordinal,
+                stream: stream.clone(),
+                after: newest,
+                before: oldest.expect("checked"),
+            });
+        }
+        // The fast path: nothing sealed here past the copy's watermark, so
+        // the copy keeps everything and takes the rows after its newest.
+        if origin_watermark.is_none_or(|wo| watermark.is_some_and(|w| wo <= w)) {
+            entry.wal_after = Some(newest);
+            lowest_point = lowest_point.min(newest);
+            continue;
+        }
+        let at = cursor_sync(&mut cursor, db, &stream, newest, oldest, &origin, frames)?;
+        lowest_point = lowest_point.min(at);
+    }
+
+    // Clock offsets from the smallest sync point; the copy ignores one it
+    // holds (`clock_offsets` is keyed by timestamp).
+    cursor.clock_sent = db
+        .read_clock_offsets(rec.id)?
+        .into_iter()
+        .map(|(ts, _)| ts)
+        .filter(|ts| *ts < lowest_point)
+        .collect();
+    cursor.emit_clock_offsets(db, frames)?;
+    Ok(cursor)
+}
+
+/// Pick a stream's sync point against the copy's spans as `cursor` holds
+/// them and this archive's `origin` spans, and emit the `Sync` and the
+/// `SegmentAfter` frames above it; or, when the point is the copy's
+/// watermark, the `SegmentAfter` frames alone. Moves the stream's row cursor
+/// to the newer of the point and this archive's watermark, and returns the
+/// point.
+fn cursor_sync(
+    cursor: &mut SourceCursor,
+    db: &Archive,
+    stream: &str,
+    copy_newest: i64,
+    oldest: Option<i64>,
+    origin: &[(i64, i64)],
+    frames: &mut Vec<Frame>,
+) -> Result<i64> {
+    let ordinal = cursor.ordinal;
+    let source_id = cursor.source_id;
+    let entry = cursor.streams.entry(stream.to_string()).or_default();
+    let watermark = entry.copy_spans.iter().map(|(_, last)| *last).max();
+    let low = match oldest {
+        Some(o) if o <= copy_newest => o.saturating_sub(1),
+        _ => copy_newest,
+    };
+    let high = watermark.map_or(low, |w| w.max(low));
+    let spans: Vec<(i64, i64)> = entry
+        .copy_spans
+        .iter()
+        .chain(origin.iter())
+        .copied()
+        .collect();
+    let Some(at) = sync_point(high, low, &spans) else {
+        return Err(Error::Message(format!(
+            "source {source_id}: stream `{stream}` has no sync point in [{low}, {high}]: \
+             every value there is inside a segment of the copy's or of this archive's, \
+             which happens when the copy drew its own segment boundaries (WIRE.md §8.2)"
+        )));
+    };
+    if Some(at) != watermark {
+        frames.push(Frame::Sync {
+            source: ordinal,
+            stream: stream.to_string(),
+            at,
+        });
+        entry.copy_spans.retain(|(_, last)| *last <= at);
+    }
+    let mut after = at;
+    let mut above: Vec<_> = db
+        .segments_overlapping(source_id, stream, at.saturating_add(1), i64::MAX)?
+        .into_iter()
+        .filter(|s| s.meta.last_ts > at)
+        .collect();
+    above.sort_by_key(|s| s.meta.first_ts);
+    for segment in above {
+        let last = segment.meta.last_ts;
+        entry.copy_spans.push((segment.meta.first_ts, last));
+        frames.push(Frame::SegmentAfter {
+            source: ordinal,
+            stream: stream.to_string(),
+            after,
+            meta: segment.meta,
+            bytes: segment.bytes,
+            caller_index: segment.caller_index,
+        });
+        after = last;
+    }
+    let origin_watermark = origin.iter().map(|(_, last)| *last).max();
+    entry.wal_after = Some(origin_watermark.map_or(at, |w| w.max(at)));
+    Ok(at)
 }
 
 /// The ordinal for the source at `index` in the order the publisher read them.
@@ -426,6 +766,21 @@ fn open_source(
 }
 
 impl SourceCursor {
+    /// On a version 2 connection, record as the copy's spans the segments a
+    /// catch-up from `since` shipped.
+    fn record_shipped_spans(&mut self, db: &Archive, since: i64) -> Result<()> {
+        for (stream, entry) in &mut self.streams {
+            entry.copy_spans = db
+                .read_segment_meta(self.source_id, stream)?
+                .into_iter()
+                .map(|(_, m)| (m.first_ts, m.last_ts))
+                .filter(|(_, last)| *last >= since)
+                .collect();
+            entry.copy_spans.sort_unstable();
+        }
+        Ok(())
+    }
+
     /// Emit every clock offset not yet in `clock_sent`, and forget the sent
     /// timestamps below the oldest the archive still holds, which retention
     /// removed and nothing can match again.
@@ -519,7 +874,7 @@ impl SourceCursor {
     /// segments of streams first seen sealed, then the interval's `Rows`
     /// frames — one, or several sharing a `seq` when the rows exceed one
     /// frame.
-    fn poll(&mut self, db: &Archive, out: &mut Vec<Frame>) -> Result<()> {
+    fn poll(&mut self, db: &Archive, version_2: bool, out: &mut Vec<Frame>) -> Result<()> {
         for name in db.caller_row_streams(self.source_id)? {
             self.emit_index(db, &name, i64::MIN, out)?;
         }
@@ -558,6 +913,40 @@ impl SourceCursor {
             // of its rows, so its segments are shipped whole and the cursor
             // starts at the watermark.
             let mut after = after;
+            // Version 2: a seal past the copy's watermark goes out as
+            // `SegmentAfter` frames, after a `Sync` when needed, whatever the
+            // row cursor had reached.
+            if version_2 && after.is_some() {
+                let origin: Vec<(i64, i64)> = db
+                    .read_segment_meta(self.source_id, &stream)?
+                    .into_iter()
+                    .map(|(_, m)| (m.first_ts, m.last_ts))
+                    .collect();
+                let copy_watermark = self
+                    .streams
+                    .get(&stream)
+                    .and_then(|e| e.copy_spans.iter().map(|(_, last)| *last).max());
+                if origin
+                    .iter()
+                    .any(|(_, last)| copy_watermark.is_none_or(|w| *last > w))
+                {
+                    let copy_newest = after
+                        .expect("checked")
+                        .max(copy_watermark.unwrap_or(i64::MIN));
+                    let oldest =
+                        oldest_row(&origin, db.live_wal_span(self.source_id, &stream)?.first_ts);
+                    cursor_sync(
+                        self,
+                        db,
+                        &stream,
+                        copy_newest,
+                        oldest,
+                        &origin,
+                        &mut segments,
+                    )?;
+                    after = self.streams.get(&stream).and_then(|e| e.wal_after);
+                }
+            }
             if let (Some(w), None) = (watermark, after) {
                 for segment in
                     db.segments_overlapping(self.source_id, &stream, i64::MIN, i64::MAX)?
@@ -567,7 +956,13 @@ impl SourceCursor {
                         &segment.bytes,
                         segment.caller_index.as_deref(),
                     );
-                    if size > super::wire::MAX_FRAME_BYTES {
+                    if version_2 {
+                        self.streams
+                            .entry(stream.clone())
+                            .or_default()
+                            .copy_spans
+                            .push((segment.meta.first_ts, segment.meta.last_ts));
+                    } else if size > super::wire::MAX_FRAME_BYTES {
                         return Err(Error::Message(format!(
                             "source {}: a segment of stream `{stream}` makes a {size}-byte \
                              replication frame, above the {}-byte limit",
