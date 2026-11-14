@@ -487,6 +487,38 @@ can regenerate forces a bump. The alternatives were:
 - a schema bump to v6, which per §8 means a reader for v5, a copy-forward,
   and refusing v6 in 0.7.x.
 
+## Changes made while building step 2
+
+Step 2 (#78) departs from the design above in two places. Both keep every
+existing `Frame` variant's fields as they are, because external crates
+construct `Frame::Rows` and `Frame::Segment` and a new field breaks them.
+
+- **One frame number per connection, in the framing.** Version 2 frames
+  carry a `u64` number after the length, and `FrameReader` refuses one that
+  is not the next. That replaces the per-stream counters inside `Sync`,
+  `Segment`, `Rows` and `Index`. It detects a lost frame of any kind,
+  including frames a reader skips. It does not detect a frame dropped before
+  `FrameWriter` numbers it, or one dropped by a caller that hands `Frame`
+  values to `Subscriber::apply` directly; step 3 documents that `apply`
+  trusts its caller for completeness. The matrix row for a frame dropped in
+  transit drops bytes between `FrameWriter` and `FrameReader`, and the error
+  comes from the reader.
+- **Large frames split at the framing layer.** A frame above
+  `MAX_FRAME_BYTES` travels as consecutive parts and is joined before it is
+  decoded, up to 1 GiB. That replaces chunk frames in the `Frame` enum. A
+  reader holds the whole frame in memory; the design's chunks could have
+  been written to the stored value as they arrived.
+- **`Index` carries no `(ts, k)`.** On resume the publisher starts each name
+  past the request's `(ts, at_ts)`. Continuity rests on that and on the
+  writer's ordering rule (#77), not on a check by the copy.
+- **New frames.** `Sync` (kind `0x87`), `SegmentAfter` (`0x88`, the
+  connected seal's "`Segment` carrying `X`") and `Unavailable` (9, the
+  reported span). The request's watermark is not a separate field; it is
+  the first span's `last_ts`.
+
+Left for step 3: the cap on spans per stream, and what a request that would
+exceed 64 MiB does.
+
 ## Order of work
 
 1. Origin invariants: strictly increasing timestamps with `bounds`, caller
