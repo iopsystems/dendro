@@ -247,7 +247,16 @@ type ErrorSlot = Arc<Mutex<Option<Arc<Error>>>>;
 /// A map behind one lock rather than an atomic per source: it is touched only
 /// when a row is actually dropped, which for a well-behaved producer is
 /// never, and read only when a caller asks.
-type ShadowCounts = Arc<Mutex<BTreeMap<i64, u64>>>;
+type ShadowCounts = Arc<Mutex<BTreeMap<i64, Dropped>>>;
+
+/// One source's out-of-order drops.
+#[derive(Clone, Copy, Default)]
+struct Dropped {
+    /// WAL rows; [`SourceWriter::dropped_out_of_order`].
+    rows: u64,
+    /// Caller rows; [`SourceWriter::dropped_caller_rows_out_of_order`].
+    caller_rows: u64,
+}
 
 /// Reclaim at most this many pages per retention pass — sized to fit inside a
 /// tick. The point of a cap at all is that a shrunken working set drains back
@@ -957,11 +966,29 @@ impl SourceWriter {
     /// channel exists to avoid. Read it after a [`sync`](Self::sync) for a
     /// count that includes everything handed over so far.
     pub fn dropped_out_of_order(&self) -> u64 {
+        self.dropped().rows
+    }
+
+    /// How many of this source's caller rows ([`caller_rows`](Self::caller_rows))
+    /// have been dropped for a `ts` below their name's newest row, as it
+    /// stood before the call that carried them.
+    ///
+    /// A name's rows append in `ts` order: several may share the newest
+    /// `ts`, and within one call they may arrive in any order, but a row
+    /// below the newest is dropped. After retention removes a name's newest
+    /// rows, the next row must be above them (FORMAT.md §3.7). Counted, not
+    /// returned, for the reason [`dropped_out_of_order`](Self::dropped_out_of_order)
+    /// gives.
+    pub fn dropped_caller_rows_out_of_order(&self) -> u64 {
+        self.dropped().caller_rows
+    }
+
+    fn dropped(&self) -> Dropped {
         self.shadowed
             .lock()
             .ok()
             .and_then(|c| c.get(&self.source_id).copied())
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     /// Hand one seal batch (= one transaction) to the writer, as the streams
@@ -1157,6 +1184,10 @@ impl SourceWriter {
     /// like [`wal`](Self::wal): a transient failure is retried, and a run of
     /// dropped commits stops the writer the way dropped ticks do. See
     /// [`CallerRow`] for what the store is.
+    ///
+    /// A row whose `ts` is below the name's newest is dropped and counted in
+    /// [`dropped_caller_rows_out_of_order`](Self::dropped_caller_rows_out_of_order).
+    /// Rows at the newest `ts` are kept, so several may share one.
     pub fn caller_rows(&mut self, stream: impl Into<String>, rows: Vec<CallerRow>) -> Result<()> {
         if rows.is_empty() {
             return self.check_alive();
@@ -1444,6 +1475,54 @@ struct WriterHealth {
     /// Streams already warned about for an out-of-order append, so a
     /// producer that is late every tick logs once rather than every tick.
     warned_shadowed: BTreeSet<(i64, String)>,
+    /// Likewise for caller rows below their name's floor.
+    warned_caller_rows: BTreeSet<(i64, String)>,
+}
+
+/// The floor a caller-row name's next rows must clear: a row is admitted at
+/// `ts > floor`, or at `ts == floor` while the name still holds rows there.
+#[derive(Clone, Copy)]
+struct CallerFloor {
+    floor: Option<i64>,
+    /// Whether rows at exactly `floor` are admitted: the name holds rows at
+    /// its newest `ts`. Not after retention removed them, when `floor` is
+    /// the removed rows' `ts` from `bounds`.
+    at_floor: bool,
+}
+
+impl CallerFloor {
+    fn read(db: &ArchiveMut, source_id: i64, name: &str) -> Result<Self> {
+        let (held, bound) = db.caller_row_floor(source_id, name)?;
+        Ok(match (held, bound) {
+            (Some(h), Some(b)) if b > h => CallerFloor {
+                floor: Some(b),
+                at_floor: false,
+            },
+            (Some(h), _) => CallerFloor {
+                floor: Some(h),
+                at_floor: true,
+            },
+            (None, b) => CallerFloor {
+                floor: b,
+                at_floor: false,
+            },
+        })
+    }
+
+    fn admits(&self, ts: i64) -> bool {
+        match self.floor {
+            None => true,
+            Some(f) => ts > f || (self.at_floor && ts == f),
+        }
+    }
+
+    /// The floor after rows up to `newest` were committed.
+    fn after(&self, newest: i64) -> Self {
+        CallerFloor {
+            floor: Some(self.floor.map_or(newest, |f| f.max(newest))),
+            at_floor: true,
+        }
+    }
 }
 
 impl WriterHealth {
@@ -1463,7 +1542,7 @@ impl WriterHealth {
         bound: Option<i64>,
     ) {
         if let Ok(mut counts) = shadowed.lock() {
-            *counts.entry(source_id).or_insert(0) += 1;
+            counts.entry(source_id).or_default().rows += 1;
         }
         if self.warned_shadowed.insert((source_id, stream.to_string())) {
             let why = match bound {
@@ -1473,6 +1552,30 @@ impl WriterHealth {
             warn!(
                 "source {source_id}, stream {stream}: dropped an append at {ts}, {why}. Append \
                  in order per stream; later drops on this stream are counted, not logged"
+            );
+        }
+    }
+
+    /// Count caller rows dropped for arriving below their name's floor.
+    /// Logged once per name.
+    fn count_late_caller_rows(
+        &mut self,
+        shadowed: &ShadowCounts,
+        source_id: i64,
+        name: &str,
+        n: u64,
+    ) {
+        if let Ok(mut counts) = shadowed.lock() {
+            counts.entry(source_id).or_default().caller_rows += n;
+        }
+        if self
+            .warned_caller_rows
+            .insert((source_id, name.to_string()))
+        {
+            warn!(
+                "source {source_id}, caller rows {name}: dropped {n} row(s) below the newest \
+                 row the name has held. Append caller rows in ts order per name; later \
+                 drops are counted, not logged"
             );
         }
     }
@@ -1921,6 +2024,10 @@ fn writer_loop(
     // commit, and re-read for a source after anything that deletes its rows
     // (retention, a discard); an adopted segment raises it in place.
     let mut newest: BTreeMap<i64, BTreeMap<String, i64>> = db.newest_rows()?;
+    // Per `(source, caller-row name)`, the floor its next rows must clear.
+    // Filled on a name's first rows and dropped for a source after
+    // retention, which can remove a name's newest rows.
+    let mut caller_floors: BTreeMap<(i64, String), CallerFloor> = BTreeMap::new();
     // Per source, the streams whose last seal was deferred, with the
     // smallest `max_rows` asked for them. Their live rows are in no segment,
     // and the oldest of them is the one a caller's encoder may need to
@@ -2214,6 +2321,7 @@ fn writer_loop(
                     ),
                 }
                 refresh_newest(db, &mut newest, source_id, "retention");
+                caller_floors.retain(|(source, _), _| *source != source_id);
                 // Same rule for the reclaim that follows: the caller was just
                 // told retention succeeded, and it did. Handing pages back is
                 // an optimization; a failure here is the next pass's problem,
@@ -2312,13 +2420,41 @@ fn writer_loop(
                 stream,
                 rows,
             }) => {
+                // A name's rows append in `ts` order, judged against the
+                // floor as it stood before this call (FORMAT.md §3.7).
+                let floor = match caller_floors.get(&(source_id, stream.clone())) {
+                    Some(floor) => *floor,
+                    None => {
+                        let floor = CallerFloor::read(db, source_id, &stream)?;
+                        caller_floors.insert((source_id, stream.clone()), floor);
+                        floor
+                    }
+                };
+                let offered = rows.len();
+                let rows: Vec<CallerRow> =
+                    rows.into_iter().filter(|r| floor.admits(r.ts)).collect();
+                if rows.len() < offered {
+                    health.count_late_caller_rows(
+                        shadowed,
+                        source_id,
+                        &stream,
+                        (offered - rows.len()) as u64,
+                    );
+                }
+                if rows.is_empty() {
+                    continue;
+                }
                 // Data, not metadata: a commit that fails after retries is
                 // counted like a dropped tick, and a run of them stops the
                 // writer.
                 match with_retries("committing caller rows", || {
                     db.insert_caller_rows(source_id, &stream, &rows)
                 }) {
-                    Ok(()) => health.committed(),
+                    Ok(()) => {
+                        health.committed();
+                        let newest = rows.iter().map(|r| r.ts).max().expect("not empty");
+                        caller_floors.insert((source_id, stream), floor.after(newest));
+                    }
                     Err(e) if e.is_retryable() => health.dropped(e)?,
                     Err(e) => return Err(e),
                 }

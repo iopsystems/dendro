@@ -1005,6 +1005,15 @@ fn copy_sources_snapshotted(
             }
             let rows = src.read_caller_rows(rec.id, &name, spec.start, spec.end)?;
             tx.insert_caller_rows(id, &name, &rows)?;
+            // The newest row the name has held, so the copy's writer refuses
+            // what the original's would. A time-bounded copy can leave it
+            // out, and the original's own bound may be newer still.
+            let (held, bound) = src.caller_row_floor(rec.id, &name)?;
+            if let Some(ts) = held.max(bound) {
+                if rows.last().is_none_or(|r| r.ts < ts) {
+                    tx.record_caller_row_bound(id, &name, ts)?;
+                }
+            }
         }
     }
     tx.copy_documents_from(src)?;
