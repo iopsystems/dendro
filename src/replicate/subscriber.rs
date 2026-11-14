@@ -131,12 +131,11 @@ struct SourceState {
 /// more than `limit` bytes. A request above `MAX_FRAME_BYTES` cannot be sent,
 /// and the newest span alone gives each stream's watermark, which is the sync
 /// point whenever the two sides' segment boundaries agree.
+///
+/// A request for more streams than one span each fits in can still exceed
+/// the limit; its `encode` then refuses it.
 fn fit_spans(request: &mut ResumeRequest, limit: usize) {
-    let too_large = match request.encode() {
-        Ok(bytes) => bytes.len() > limit,
-        Err(e) => e.to_string().contains("exceeds the"),
-    };
-    if too_large {
+    if request.encoded_len() > limit {
         for source in &mut request.sources {
             for stream in &mut source.streams {
                 stream.spans.truncate(1);
@@ -729,7 +728,11 @@ impl Subscriber {
     /// writer: the copy has a hole, and finalizing it would say it does not.
     pub fn finish(mut self) -> Result<()> {
         let mut stopped = None;
-        for (ordinal, st) in std::mem::take(&mut self.sources) {
+        for (ordinal, mut st) in std::mem::take(&mut self.sources) {
+            // A write still queued may be the one the writer drops.
+            if st.replica {
+                st.writer.sync()?;
+            }
             if let Err(e) = Self::check_poisoned(ordinal, &st) {
                 stopped.get_or_insert(e);
                 drop(st);

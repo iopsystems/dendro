@@ -640,7 +640,7 @@ fn a_stopped_source_is_not_finalized() {
     let (mut sub, _) = resume(&path);
     sub.apply(handshake(true)).unwrap();
     sub.apply(index(4, IndexKind::Delta, (2, 2))).unwrap();
-    assert!(sub.sync().is_err());
+    // No `sync` first: the dropped entry may still be queued.
     assert!(sub.finish().is_err());
     let db = Archive::open(&path).unwrap();
     assert!(!db.read_sources().unwrap()[0].complete);

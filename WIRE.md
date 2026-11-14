@@ -548,7 +548,8 @@ A caller-row name's entries append in `ts` order (`FORMAT.md` §3.5), so
 `Subscriber::resume` reads the request from the copy's archive, so after a
 kill it describes what the file holds. It lists at most 256 spans per stream,
 newest first, and only the newest when 256 would make the request exceed
-`MAX_FRAME_BYTES`. A source with no uuid is left out, and the publisher's
+`MAX_FRAME_BYTES`. A copy with more streams than that fits is refused by
+`ResumeRequest::encode`. A source with no uuid is left out, and the publisher's
 handshake for it adds a second source.
 
 A handshake for a source the request named continues it without a writer

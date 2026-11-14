@@ -137,9 +137,9 @@ cannot reach a failed release any other way.
   including a `Rows` frame whose index state the copy does not hold, and at
   a write its writer drops: `apply`, `sync` and `finish` return an error,
   `finish` does not finalize it, and the writer writes none of its rows,
-  index entries, segments or syncs after that. A resumed subscriber refuses `seal`. `ArchivePublisher` does not
-  answer a request yet, so nothing in this release resumes a copy end to
-  end.
+  index entries, segments or syncs after that. A resumed subscriber refuses
+  `seal`. `ArchivePublisher` does not answer a request yet, so nothing in
+  this release resumes a copy end to end.
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a

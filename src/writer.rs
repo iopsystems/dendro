@@ -201,9 +201,9 @@ enum Msg {
         clock_offset: Option<(i64, i64)>,
     },
     /// Make a source a replicated copy's (WIRE.md §2.1): its stream bounds
-    /// become the rows it holds, leaving out `bounds`, and a tick or caller
-    /// rows the writer would drop any part of for it poison the source
-    /// instead ([`SourceWriter::poisoned`]). `alive` is `Some` for an existing source
+    /// become the rows it holds, leaving out `bounds`, and the writer poisons
+    /// the source when it would drop any row of a tick or any caller row for
+    /// it ([`SourceWriter::poisoned`]). `alive` is `Some` for an existing source
     /// continued without a writer session, whose handle this opens; the
     /// reply carries its labels. `None` for a source just added.
     Replicate {

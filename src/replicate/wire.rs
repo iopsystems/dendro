@@ -1136,6 +1136,33 @@ impl ResumeRequest {
         Ok(out)
     }
 
+    /// How many bytes [`encode`](Self::encode) writes for this request,
+    /// whether or not it would refuse it.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn encoded_len(&self) -> usize {
+        RESUME_MAGIC.len()
+            + 2
+            + 8
+            + 4
+            + self
+                .sources
+                .iter()
+                .map(|s| {
+                    4 + s.uuid.len()
+                        + 4
+                        + s.streams
+                            .iter()
+                            .map(|t| 4 + t.stream.len() + 8 + 4 + 16 * t.spans.len())
+                            .sum::<usize>()
+                        + 4
+                        + s.caller_rows
+                            .iter()
+                            .map(|n| 4 + n.name.len() + 8 + 8)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
     /// The bytes, unchecked.
     fn encode_fields(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -2179,6 +2206,7 @@ mod tests {
     fn a_resume_request_round_trips() {
         for r in [request(), ResumeRequest::default()] {
             let bytes = r.encode().unwrap();
+            assert_eq!(r.encoded_len(), bytes.len());
             assert_eq!(&bytes[..14], RESUME_MAGIC);
             assert_eq!(ResumeRequest::decode(&bytes).unwrap(), r);
         }
