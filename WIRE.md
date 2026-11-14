@@ -367,8 +367,10 @@ opt<bytes>   caller_index
 A sealed segment that replaces the copy's live rows of its stream in
 `(after, last_ts]`. The fields after `after` are a `Segment`'s (§4.4). The
 copy refuses it when it holds a live row of the stream at or below `after`, or
-a segment of the stream whose `last_ts` is above `after`; either means the
-copy is not where the publisher put it. The live rows it deletes below
+a segment of the stream whose `last_ts` is above `after` or at or above the
+offered `first_ts`; either means the copy is not where the publisher put it.
+It also refuses a segment with no rows, a `first_ts` above its `last_ts`, or
+a `last_ts` at or below `after`. The live rows it deletes below
 `first_ts` are rows the publisher's seal pruned or discarded, counted in
 `Applied::rows_pruned`.
 
@@ -545,7 +547,8 @@ A caller-row name's entries append in `ts` order (`FORMAT.md` §3.5), so
 
 `Subscriber::resume` reads the request from the copy's archive, so after a
 kill it describes what the file holds. It lists at most 256 spans per stream,
-newest first. A source with no uuid is left out, and the publisher's
+newest first, and only the newest when 256 would make the request exceed
+`MAX_FRAME_BYTES`. A source with no uuid is left out, and the publisher's
 handshake for it adds a second source.
 
 A handshake for a source the request named continues it without a writer
@@ -554,16 +557,21 @@ session. Its labels and metadata are replaced with the handshake's, as a
 copy's `complete`. The connection's newest row per stream starts at the
 copy's newest, so a row at or below it is a repeat (rule 10), until a `Sync`
 sets it to the sync point. A copy that holds index entries for the source has
-had its `Full`, so a first `Delta` is applied. A handshake for any other
-source adds it.
+had its `Full`, so a first `Delta` is applied. Its index state starts at
+`NO_INDEX_STATE`, so the publisher's index-state values on the connection
+start there too: rows built against entries the copy already holds carry
+`NO_INDEX_STATE`, and each entry sent changes the state from it. A handshake
+for any other source adds it.
 
-Each source of a resumed subscriber stops at the first write its writer
-drops: a tick dropped after retries, a row at or below its stream's newest,
-or an index entry below its name's newest. The writer drops the source's
-later rows and index entries and refuses its later segments and syncs, so
-the file holds what was written before the drop, and a new request asks for
-the rest. `apply` and `sync` return an error from then
-on. A resumed subscriber does not seal; its segments come from `Sync` and
+Each source of a resumed subscriber stops at the first frame for it that
+fails, and at the first write its writer drops: a tick dropped after
+retries, a row at or below its stream's newest, or an index entry below its
+name's newest. A `Rows` frame whose index state the copy does not hold
+fails, where a subscriber that resumes nothing skips its rows (rule 9). From
+then on `apply`, `sync` and `finish` return an error, `finish` does not
+finalize the source, and the writer writes none of the source's rows, index
+entries, segments or syncs, so a new request asks for what is missing. A
+resumed subscriber does not seal; its segments come from `Sync` and
 `SegmentAfter`.
 
 Frames lost before they reach `apply` are not detected by the subscriber;

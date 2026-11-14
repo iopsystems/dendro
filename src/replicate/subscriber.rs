@@ -122,6 +122,27 @@ struct SourceState {
     /// Whether this source is a resumed connection's, which applies the
     /// version 2 frames and stops when its writer drops a write.
     replica: bool,
+    /// Whether a frame for this replica failed. Its later frames are refused,
+    /// so nothing is written past what the failed frame left out.
+    stopped: bool,
+}
+
+/// Keep each stream's newest span only, when the request would encode to
+/// more than `limit` bytes. A request above `MAX_FRAME_BYTES` cannot be sent,
+/// and the newest span alone gives each stream's watermark, which is the sync
+/// point whenever the two sides' segment boundaries agree.
+fn fit_spans(request: &mut ResumeRequest, limit: usize) {
+    let too_large = match request.encode() {
+        Ok(bytes) => bytes.len() > limit,
+        Err(e) => e.to_string().contains("exceeds the"),
+    };
+    if too_large {
+        for source in &mut request.sources {
+            for stream in &mut source.streams {
+                stream.spans.truncate(1);
+            }
+        }
+    }
 }
 
 /// A source a resumed copy holds, as its resume request described it.
@@ -153,7 +174,8 @@ struct Held {
 /// readable at once, and the caller decides when a stream has accumulated
 /// enough — [`seal`](Self::seal), driven by [`SealPolicy`](crate::seal::SealPolicy)
 /// exactly as a local recording drives it. An archive that is never sealed is
-/// still correct, only slower to read.
+/// still correct, only slower to read. A [`resume`](Self::resume)d subscriber
+/// is the exception: it refuses `seal`, and its segments are the publisher's.
 ///
 /// **It applies what it is handed.** There is no authentication here and no
 /// check that the publisher is entitled to the source it claims; whatever
@@ -193,8 +215,9 @@ impl Subscriber {
     /// copy was made from.
     ///
     /// The request names each source the archive holds by uuid, with each
-    /// stream's newest row and its segment spans (the newest
-    /// 256), and each caller-row name's position. It is read from the file,
+    /// stream's newest row and its segment spans (the newest 256, or only
+    /// the newest when that many would make the request too large to send),
+    /// and each caller-row name's position. It is read from the file,
     /// so after a kill it describes what the file holds. A source with no
     /// uuid is left out, and the publisher's handshake for it adds a second
     /// source.
@@ -206,11 +229,15 @@ impl Subscriber {
     /// says the publisher's source is incomplete clears a finalized copy's
     /// `complete`. Any other source is added, as [`new`](Self::new) adds it.
     ///
-    /// Every source of a resumed subscriber stops at the first write its
-    /// writer drops for it: a tick, a row below its stream's newest, or an
-    /// index entry below its name's newest. [`apply`](Self::apply) and
-    /// [`sync`](Self::sync) then return an error, the file holds what was
-    /// written before the drop, and a new `resume` asks for the rest.
+    /// Every source of a resumed subscriber stops at the first frame for it
+    /// that fails and at the first write its writer drops for it: a tick, a
+    /// row at or below its stream's newest, or an index entry below its
+    /// name's newest. A `Rows` frame whose index state the copy does not hold
+    /// fails, where [`new`](Self::new)'s subscriber skips its rows.
+    /// [`apply`](Self::apply), [`sync`](Self::sync) and
+    /// [`finish`](Self::finish) then return an error; the writer writes none
+    /// of the source's rows, index entries, segments or syncs after the
+    /// drop, and a new `resume` asks for the rest.
     /// Frames lost before they reach `apply` are not detected here; a
     /// version 2 [`FrameReader`](super::wire::FrameReader) refuses a stream
     /// that lost one.
@@ -259,10 +286,11 @@ impl Subscriber {
             });
         }
         sources.sort_by(|a, b| a.uuid.cmp(&b.uuid));
-        let request = ResumeRequest {
+        let mut request = ResumeRequest {
             sources,
             ..ResumeRequest::default()
         };
+        fit_spans(&mut request, super::wire::MAX_FRAME_BYTES);
         Ok((
             Subscriber {
                 writer,
@@ -274,12 +302,28 @@ impl Subscriber {
     }
 
     /// Apply one frame.
+    ///
+    /// On a [`resume`](Self::resume)d subscriber, a frame that fails stops
+    /// its source: every later frame for it is refused, as after a dropped
+    /// write, so the copy holds nothing past the failed frame.
     pub fn apply(&mut self, frame: Frame) -> Result<Applied> {
-        if !matches!(frame, Frame::Handshake { .. }) {
-            if let Some(st) = self.sources.get(&frame.source()) {
-                Self::check_poisoned(frame.source(), st)?;
+        let ordinal = frame.source();
+        let handshake = matches!(frame, Frame::Handshake { .. });
+        if !handshake {
+            if let Some(st) = self.sources.get(&ordinal) {
+                Self::check_poisoned(ordinal, st)?;
             }
         }
+        let applied = self.apply_frame(frame);
+        if applied.is_err() && !handshake {
+            if let Some(st) = self.sources.get_mut(&ordinal) {
+                st.stopped |= st.replica;
+            }
+        }
+        applied
+    }
+
+    fn apply_frame(&mut self, frame: Frame) -> Result<Applied> {
         match frame {
             Frame::Handshake {
                 source,
@@ -364,6 +408,7 @@ impl Subscriber {
                         logged_gap: false,
                         newest,
                         replica,
+                        stopped: false,
                     },
                 );
                 Ok(Applied {
@@ -431,6 +476,16 @@ impl Subscriber {
                 // every row. A publisher that HAS an index must not declare
                 // `NO_INDEX_STATE`; see [`NO_INDEX_STATE`].
                 let unresolvable = index_state != NO_INDEX_STATE && !st.seen_full;
+                if (unresolvable || index_state != st.index_state) && st.replica {
+                    // Skipping would leave a hole below rows committed after
+                    // it, which the next resume request cannot see.
+                    return Err(Error::Message(format!(
+                        "source {source}: a Rows frame was built against index state \
+                         {index_state:?}, and the copy holds {:?}; resume it \
+                         (`Subscriber::resume`) for the publisher to send them again",
+                        st.index_state
+                    )));
+                }
                 if unresolvable || index_state != st.index_state {
                     return Ok(Applied {
                         rows_skipped: rows.len(),
@@ -668,8 +723,18 @@ impl Subscriber {
     /// frame seen, so the copy's drift series ends where the publisher's did
     /// rather than at a timestamp this process invented. A source that received
     /// none is finalized with none.
+    ///
+    /// A resumed source that stopped, on a failed frame or a dropped write,
+    /// is not finalized, and this returns its error after joining the
+    /// writer: the copy has a hole, and finalizing it would say it does not.
     pub fn finish(mut self) -> Result<()> {
-        for (_, st) in std::mem::take(&mut self.sources) {
+        let mut stopped = None;
+        for (ordinal, st) in std::mem::take(&mut self.sources) {
+            if let Err(e) = Self::check_poisoned(ordinal, &st) {
+                stopped.get_or_insert(e);
+                drop(st);
+                continue;
+            }
             let SourceState {
                 writer,
                 complete,
@@ -685,7 +750,8 @@ impl Subscriber {
                 drop(writer);
             }
         }
-        self.writer.join()
+        self.writer.join()?;
+        stopped.map_or(Ok(()), Err)
     }
 
     /// The archive being written.
@@ -694,11 +760,11 @@ impl Subscriber {
     }
 
     fn check_poisoned(ordinal: u32, st: &SourceState) -> Result<()> {
-        if st.replica && st.writer.poisoned() {
+        if st.replica && (st.stopped || st.writer.poisoned()) {
             return Err(Error::Message(format!(
-                "source {ordinal}: the copy's writer dropped a write for it, so the copy has \
-                 a hole after what the file holds; finish this subscriber and resume it \
-                 (`Subscriber::resume`) for the publisher to send the rest"
+                "source {ordinal}: a frame for it failed or its writer dropped a write, so \
+                 the copy may lack rows after what the file holds; finish this subscriber \
+                 and resume it (`Subscriber::resume`) for the publisher to send the rest"
             )));
         }
         Ok(())
@@ -730,5 +796,38 @@ impl Subscriber {
                  every frame names a source by the ordinal its handshake assigned"
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(spans: usize) -> ResumeRequest {
+        ResumeRequest {
+            sources: vec![SourcePosition {
+                uuid: "a".to_string(),
+                streams: vec![StreamPosition {
+                    stream: "s".to_string(),
+                    newest: 1_000,
+                    spans: (0..spans as i64)
+                        .rev()
+                        .map(|i| (i * 10, i * 10 + 5))
+                        .collect(),
+                }],
+                caller_rows: Vec::new(),
+            }],
+            ..ResumeRequest::default()
+        }
+    }
+
+    #[test]
+    fn a_request_too_large_to_send_keeps_only_each_streams_newest_span() {
+        let mut r = request(8);
+        let size = r.encode().unwrap().len();
+        fit_spans(&mut r, size);
+        assert_eq!(r.sources[0].streams[0].spans.len(), 8, "fits as it is");
+        fit_spans(&mut r, size - 1);
+        assert_eq!(r.sources[0].streams[0].spans, vec![(70, 75)]);
     }
 }

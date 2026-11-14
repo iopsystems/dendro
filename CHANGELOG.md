@@ -133,9 +133,11 @@ cannot reach a failed release any other way.
   handshake for a source the request names continues that source, and the
   subscriber applies `Sync`, `SegmentAfter` and `Unavailable` to it, counted
   in the new `Applied::syncs`, `rows_unsealable`, `rows_replaced`,
-  `rows_pruned` and `unavailable`. A source whose writer drops a write
-  stops: `apply` and `sync` return an error, and nothing after the drop is
-  written. A resumed subscriber refuses `seal`. `ArchivePublisher` does not
+  `rows_pruned` and `unavailable`. A source stops at a frame that fails,
+  including a `Rows` frame whose index state the copy does not hold, and at
+  a write its writer drops: `apply`, `sync` and `finish` return an error,
+  `finish` does not finalize it, and the writer writes none of its rows,
+  index entries, segments or syncs after that. A resumed subscriber refuses `seal`. `ArchivePublisher` does not
   answer a request yet, so nothing in this release resumes a copy end to
   end.
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`

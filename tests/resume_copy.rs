@@ -357,7 +357,7 @@ fn a_sync_point_inside_a_segment_is_refused() {
     sub.apply(handshake(false)).unwrap();
     let err = sub.apply(sync(2)).unwrap_err().to_string();
     assert!(err.contains("inside the copy's segment"), "{err}");
-    sub.finish().unwrap();
+    assert!(sub.finish().is_err(), "the refusal stopped the source");
     assert_eq!(held(&path), (vec![(1, 3)], vec![]));
 }
 
@@ -407,20 +407,17 @@ fn a_segment_after_the_wrong_point_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("copy.dendro");
     first_copy(&path, vec![segment(&[1, 2, 3]), rows(0, &[4, 5])]);
-    let (mut sub, _) = resume(&path);
-    sub.apply(handshake(false)).unwrap();
-    let err = sub
-        .apply(segment_after(4, &[5, 6]))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("live row"), "{err}");
-    let err = sub
-        .apply(segment_after(2, &[4, 5]))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("overlap"), "{err}");
-    sub.finish().unwrap();
-    assert_eq!(held(&path), (vec![(1, 3)], vec![4, 5]));
+    for (frame, want) in [
+        (segment_after(4, &[5, 6]), "live row"),
+        (segment_after(2, &[4, 5]), "overlap"),
+    ] {
+        let (mut sub, _) = resume(&path);
+        sub.apply(handshake(false)).unwrap();
+        let err = sub.apply(frame).unwrap_err().to_string();
+        assert!(err.contains(want), "{err}");
+        assert!(sub.finish().is_err(), "the refusal stopped the source");
+        assert_eq!(held(&path), (vec![(1, 3)], vec![4, 5]));
+    }
 }
 
 /// A write the copy's writer drops stops the source: later frames and
@@ -593,4 +590,58 @@ fn a_tick_dropped_after_retries_stops_a_resumed_source() {
     assert!(sub.apply(rows(2, &[3])).is_err());
     drop(sub);
     assert_eq!(held(&path).1, vec![1]);
+}
+
+/// A refused frame stops a resumed source: later rows are refused, so the
+/// copy's newest row stays below what the refused frame left out.
+#[test]
+fn a_refused_frame_stops_a_resumed_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.dendro");
+    first_copy(&path, vec![rows(0, &[4, 5])]);
+    let (mut sub, _) = resume(&path);
+    sub.apply(handshake(false)).unwrap();
+    assert!(sub.apply(segment(&[6, 7, 8])).is_err(), "over live rows");
+    let err = sub.apply(rows(1, &[9])).unwrap_err().to_string();
+    assert!(err.contains("failed or its writer dropped"), "{err}");
+    assert!(sub.finish().is_err());
+    assert_eq!(held(&path).1, vec![4, 5]);
+}
+
+/// Rows against an index state the copy does not hold stop a resumed
+/// source, where a fresh subscriber skips them.
+#[test]
+fn an_unmatched_index_state_stops_a_resumed_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.dendro");
+    first_copy(&path, vec![rows(0, &[1])]);
+    let (mut sub, _) = resume(&path);
+    sub.apply(handshake(false)).unwrap();
+    let mut bad = rows(1, &[2]);
+    if let Frame::Rows { index_state, .. } = &mut bad {
+        *index_state = (9, 9);
+    }
+    assert!(sub.apply(bad).is_err());
+    assert!(sub.apply(rows(2, &[3])).is_err());
+    assert!(sub.finish().is_err());
+    assert_eq!(held(&path).1, vec![1]);
+}
+
+/// A stopped source whose publisher says complete is not finalized: the
+/// copy has a hole.
+#[test]
+fn a_stopped_source_is_not_finalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.dendro");
+    first_copy(
+        &path,
+        vec![rows(0, &[1, 2]), index(5, IndexKind::Full, (1, 1))],
+    );
+    let (mut sub, _) = resume(&path);
+    sub.apply(handshake(true)).unwrap();
+    sub.apply(index(4, IndexKind::Delta, (2, 2))).unwrap();
+    assert!(sub.sync().is_err());
+    assert!(sub.finish().is_err());
+    let db = Archive::open(&path).unwrap();
+    assert!(!db.read_sources().unwrap()[0].complete);
 }
