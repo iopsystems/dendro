@@ -667,7 +667,14 @@ fn a_sync_that_outlasts_its_retries_stops_the_source_and_changes_nothing() {
 
     let lock = rusqlite::Connection::open(&path).unwrap();
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
     let err = sub.apply(sync(2)).unwrap_err().to_string();
+    // The writer's backoff is 10, 50 and 250 ms; a lower bound on sleeps.
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(300),
+        "retried: {:?}",
+        started.elapsed()
+    );
     lock.execute_batch("COMMIT").unwrap();
     assert!(err.contains("locked") || err.contains("busy"), "{err}");
     assert!(sub.apply(rows(1, &[4])).is_err(), "the source stopped");

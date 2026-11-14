@@ -4,10 +4,12 @@
 
 //! A replication copy killed partway through a resume.
 //!
-//! In its own test binary, apart from `replicate_resume.rs`: spawning a
-//! process forks this one, and until the child execs it shares every open
-//! file description, the writer locks of tests running beside it included,
-//! which then fail to reopen their archives as `InUse`.
+//! In its own test binary, apart from `replicate_resume.rs`. Spawning a child
+//! gives it a copy of this process's descriptors until it execs, with
+//! `posix_spawn` as with `fork`. `flock` locks belong to the open file
+//! description, so a writer lock a test running beside the spawn has just
+//! dropped stays held for that window, and the test's reopen fails as
+//! `InUse` (`src/archive/lock.rs`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -159,6 +161,17 @@ fn resume_from(origin: &Path, copy: &Path) {
     sub.finish().unwrap();
 }
 
+/// A child process killed and reaped when dropped, so a failed assertion
+/// does not leave it running.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// When to kill the copy in `a_copy_killed_during_a_sync_resumes_to_the_origin`.
 #[derive(Clone, Copy, Debug)]
 enum Kill {
@@ -176,7 +189,7 @@ enum Kill {
 /// it, and a kill between frames leaves the frames before it applied.
 #[test]
 fn a_copy_killed_during_a_sync_resumes_to_the_origin() {
-    use std::io::{BufRead, BufReader, Write as _};
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
     let mut kills: Vec<Kill> = (0..=44).step_by(4).map(Kill::After).collect();
@@ -209,13 +222,15 @@ fn a_copy_killed_during_a_sync_resumes_to_the_origin() {
         if matches!(kill, Kill::BetweenFrames) {
             cmd.arg("pause");
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut child = Reaped(
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        // Held open until after the kill, so a paused child does not see EOF.
+        let stdin = child.0.stdin.take().unwrap();
+        let mut out = BufReader::new(child.0.stdout.take().unwrap());
         let mut line = String::new();
         out.read_line(&mut line).unwrap();
         assert_eq!(line.trim(), "syncing");
@@ -229,9 +244,9 @@ fn a_copy_killed_during_a_sync_resumes_to_the_origin() {
             Kill::BetweenFrames => expect(&mut out, "synced"),
             Kill::Done => expect(&mut out, "done"),
         }
-        child.kill().unwrap();
-        child.wait().unwrap();
-        drop(stdin.flush());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        drop(stdin);
 
         let db = Archive::open(&c).unwrap();
         let report = db.verify(dendro::archive::Depth::Quick).unwrap();
@@ -251,7 +266,16 @@ fn a_copy_killed_during_a_sync_resumes_to_the_origin() {
             // replaces them has not arrived.
             Kill::BetweenFrames => assert!(held.is_empty(), "{kill:?}: {}", held.len()),
             Kill::Done => assert_eq!(held, readable(&o)["s"]),
-            Kill::After(_) => {}
+            // As it was, with the copy's 20,000 rows; as the `Sync` left it,
+            // with none; or later, with the origin's rows up to a point.
+            Kill::After(_) => {
+                let all = &readable(&o)["s"];
+                assert!(
+                    held.is_empty() || (held.len() >= 20_000 && held[..] == all[..held.len()]),
+                    "{kill:?}: {} rows",
+                    held.len()
+                );
+            }
         }
 
         resume_from(&o, &c);

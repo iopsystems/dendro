@@ -24,8 +24,8 @@ use dendro::replicate::{Frame, Subscriber};
 use dendro::segment::{EncodeContext, EncodeResult, Segment, SegmentEncoder};
 use dendro::writer::Writer;
 
-/// The encoder `tests/replicate_resume.rs` uses: rows as a comma-joined list
-/// of timestamps.
+/// Rows as a comma-joined list of timestamps, as `tests/resume_kill.rs` reads
+/// them; unlike that file's `Tags`, it refuses nothing.
 struct Tags;
 
 impl SegmentEncoder for Tags {

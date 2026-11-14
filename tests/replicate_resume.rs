@@ -250,6 +250,11 @@ fn a_resume_with_nothing_newly_sealed_ships_only_newer_rows() {
     assert!(shipped_rows(&link.frames, "quiet").is_empty());
     assert_eq!(link.opened.rows_replaced, 0);
     link.close();
+    let report = Archive::open(&c)
+        .unwrap()
+        .verify(dendro::archive::Depth::Full)
+        .unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
     assert_eq!(readable(&c), readable(&o));
     origin.close();
 }
@@ -712,7 +717,7 @@ fn a_frame_lost_in_transit_stops_the_stream_and_resume_completes_the_copy() {
         frames.extend(publisher.next(&db).unwrap());
         let err = apply_losing(&frames, &mut sub, lose);
         assert!(err.contains("was next"), "{kind}: {err}");
-        eprintln!("DIAG {kind} finish: {:?}", sub.finish());
+        sub.finish().unwrap();
 
         connect(&o, &c).close();
         assert_eq!(readable(&c), readable(&o), "{kind}");
@@ -727,17 +732,20 @@ fn a_lost_segment_ending_below_the_copys_newest_is_detected() {
     let dir = tempfile::tempdir().unwrap();
     let (o, c) = (dir.path().join("o"), dir.path().join("c"));
     let mut origin = Origin::create(&o);
-    origin.rows("s", 1..=5);
+    origin.rows("s", 1..=7);
+    origin.close();
     let mut link = connect(&o, &c);
-    origin.seal(&["s"]);
-    origin.rows("s", 6..=10);
-    let frames = link.publisher.next(&Archive::open(&o).unwrap()).unwrap();
+    // A segment of 1..=5, while the copy holds 1..=7 live.
+    put(&o, &[], &[(0, 1, 5)]);
+    let db = Archive::open(&o).unwrap();
+    let mut frames = link.publisher.next(&db).unwrap();
+    // The next poll's keepalive, so the loss is seen.
+    frames.extend(link.publisher.next(&db).unwrap());
     let err = apply_losing(&frames, &mut link.sub, is_segment_after);
     assert!(err.contains("was next"), "{err}");
     link.close();
     connect(&o, &c).close();
     assert_eq!(readable(&c), readable(&o));
-    origin.close();
 }
 
 /// A segment above `MAX_FRAME_BYTES` is sent in parts and adopted whole.
@@ -1376,15 +1384,16 @@ fn rows_the_copy_holds_live_that_the_origin_evicted_are_sealed_by_the_copy() {
     origin.close();
 }
 
-/// A `Sync` whose live rows are both ones the origin evicted and ones the
-/// copy's encoder refuses: all of them are deleted and counted, and the span
-/// is reported.
+/// A `Sync` over live rows the origin evicted, some of which the copy's
+/// encoder refuses: the encoder's error covers the batch, so all of them are
+/// deleted and counted unsealable, and the span is reported.
 #[test]
 fn evicted_rows_the_copys_encoder_refuses_are_counted_unsealable() {
     let dir = tempfile::tempdir().unwrap();
     let (o, c) = (dir.path().join("o"), dir.path().join("c"));
     let mut origin = Origin::create(&o);
-    origin.rows("s", 1000..=1002);
+    // 998 and 999 encode on their own; 1000..=1002 do not.
+    origin.rows("s", 998..=1002);
     connect(&o, &c).close();
     origin.rows("s", 2000..=2001);
     origin.w.evict_before(2000).unwrap();
@@ -1394,7 +1403,7 @@ fn evicted_rows_the_copys_encoder_refuses_are_counted_unsealable() {
         .frames
         .iter()
         .any(|f| matches!(f, Frame::Sync { at: 1002, .. })));
-    assert_eq!(link.opened.rows_unsealable, 3);
+    assert_eq!(link.opened.rows_unsealable, 5);
     assert_eq!(link.opened.unavailable, 1);
     link.close();
     assert_eq!(readable(&c), readable(&o));
@@ -1505,8 +1514,8 @@ fn a_chain_whose_middle_stopped_partway_completes_once_it_does() {
     origin.close();
 }
 
-/// Clock offsets the origin records out of timestamp order while the copy is
-/// away all arrive on version 2.
+/// A clock offset the origin records after a newer one the copy already has
+/// arrives on version 2.
 #[test]
 fn clock_offsets_recorded_out_of_order_all_arrive_on_version_2() {
     let dir = tempfile::tempdir().unwrap();
@@ -1519,8 +1528,11 @@ fn clock_offsets_recorded_out_of_order_all_arrive_on_version_2() {
     origin.rows("a", [100]);
     origin.rows("b", [80]);
     origin.seal(&["a"]);
+    // The copy takes 100 before the origin records 80.
+    let mut link = connect(&o, &c);
     origin.seal(&["b"]);
-    connect(&o, &c).close();
+    link.poll(&o);
+    link.close();
     let held = offsets(&c);
     assert_eq!(held, offsets(&o));
     assert!(held.iter().any(|(ts, _)| *ts == 80));
@@ -1548,4 +1560,35 @@ fn an_eviction_on_the_fast_path_is_reported() {
     link.close();
     assert_eq!(readable(&c)["s"], vec![1, 2, 3, 4, 5, 10, 11, 12]);
     origin.close();
+}
+
+/// A connected `Sync` deletes the copy's live rows above the sync point,
+/// and the publisher moves its row cursor back, so the ones the origin still
+/// holds live above its watermark arrive again.
+#[test]
+fn rows_a_connected_sync_deleted_are_shipped_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=2);
+    origin.seal(&["s"]);
+    origin.rows("s", 3..=4);
+    origin.seal(&["s"]);
+    let mut link = connect(&o, &c);
+    // The copy takes 5..=8 live; its watermark stays 4.
+    origin.rows("s", 5..=8);
+    link.poll(&o);
+    origin.close();
+    // The origin merges [3, 4] with a new [5, 6] into [3, 6]: the copy's
+    // watermark is inside it, so the sync point falls to 2, and the `Sync`
+    // deletes the copy's live 5..=8. 7 and 8 stay live on the origin.
+    put(&o, &[3], &[(10, 3, 6)]);
+    let (applied, frames) = link.poll(&o);
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 2, .. })));
+    assert_eq!(applied.rows_replaced, 6, "3..=8");
+    assert_eq!(shipped_rows(&frames, "s"), vec![7, 8]);
+    link.close();
+    assert_eq!(readable(&c)["s"], (1..=8).collect::<Vec<_>>());
 }
