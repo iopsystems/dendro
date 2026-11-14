@@ -364,6 +364,22 @@ impl Subscriber {
                     ..Applied::default()
                 })
             }
+
+            // These act on a copy resumed on protocol version 2, and this
+            // subscriber's sources are new ones it created.
+            Frame::Sync { source, .. } | Frame::SegmentAfter { source, .. } => {
+                Self::source_mut(&mut self.sources, source)?;
+                Err(Error::Message(format!(
+                    "replication frame for source {source} acts on a resumed copy, and this \
+                     subscriber resumes none"
+                )))
+            }
+
+            // Changes nothing in the copy; the kind is skippable (WIRE.md §4.9).
+            Frame::Unavailable { source, .. } => {
+                Self::source_mut(&mut self.sources, source)?;
+                Ok(Applied::default())
+            }
         }
     }
 

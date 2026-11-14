@@ -87,7 +87,8 @@
 //!    are `Full` keeps them with a
 //!    [`CallerRowFloor`](crate::archive::CallerRowFloor). [`Subscriber`](crate::replicate::Subscriber)
 //!    records no entry kinds and has no retention of its own.
-//! 8. A reconnect is a new handshake and full state. There is no resume token.
+//! 8. A reconnect is a new handshake and full state. [`Subscriber`](crate::replicate::Subscriber)
+//!    takes no [`ResumeRequest`](crate::replicate::ResumeRequest).
 //! 9. A row carries the [`IndexState`](crate::replicate::IndexState) it was built against, and a subscriber
 //!    that cannot match it **skips the row**. Misattribution is worse than a
 //!    gap.
@@ -116,12 +117,25 @@
 //! ([`MAX_FRAME_BYTES`](crate::replicate::wire::MAX_FRAME_BYTES)) and a future frame kind can be
 //! skipped rather than misread, unless its kind sets
 //! [`KIND_MUST_UNDERSTAND`](crate::replicate::wire::KIND_MUST_UNDERSTAND).
+//!
+//! Protocol version 2 numbers every frame, so a reader refuses a stream that
+//! lost one, and carries a frame larger than `MAX_FRAME_BYTES` in parts. It
+//! adds [`Sync`](crate::replicate::Frame::Sync),
+//! [`SegmentAfter`](crate::replicate::Frame::SegmentAfter) and
+//! [`Unavailable`](crate::replicate::Frame::Unavailable), which act on a
+//! copy resumed with a [`ResumeRequest`](crate::replicate::ResumeRequest).
+//! [`FrameWriter`](crate::replicate::wire::FrameWriter) writes either
+//! version, and [`FrameReader`](crate::replicate::wire::FrameReader) reads
+//! both.
 
 mod frame;
-/// Frames as bytes: the codec, its limits, and a reader over a byte stream.
+mod resume;
+/// Frames as bytes: the codec, its limits, and a reader and a writer over a
+/// byte stream.
 pub mod wire;
 
 pub use frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
+pub use resume::{CallerRowPosition, ResumeRequest, SourcePosition, StreamPosition};
 
 #[cfg(feature = "archive")]
 mod publisher;

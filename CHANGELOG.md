@@ -109,9 +109,26 @@ cannot reach a failed release any other way.
 - The high bit of a replication frame's `kind`
   (`wire::KIND_MUST_UNDERSTAND`) marks a kind a reader must understand.
   `FrameReader::next_frame` returns an error for an unknown kind with the
-  bit set, and still skips one without it. No kind dendro writes sets it,
-  so existing streams read as before. A reader on 0.7.x or earlier skips
-  such a frame (WIRE.md §7).
+  bit set, and still skips one without it. No version 1 kind sets it, so
+  existing streams read as before. A reader on 0.7.1 or earlier skips such
+  a frame (WIRE.md §7).
+- Replication protocol version 2 (WIRE.md §2.1). Every frame carries a
+  number, so `FrameReader` refuses a stream that lost, repeated or reordered
+  a frame, and a frame above `MAX_FRAME_BYTES` travels in parts up to
+  `MAX_SPLIT_FRAME_BYTES` (1 GiB), so a segment above 64 MiB can be sent
+  through a `FrameWriter` opened for version 2.
+  `wire::FrameWriter` writes either version. `FrameReader` reads both and
+  reports which (`FrameReader::version`), so a caller that matches frames
+  with a catch-all arm can now receive the version 2 frames from a version 2
+  stream. `write_preamble`, `encode_frame` and `encode` still write version 1
+  and refuse the version 2 frames. A reader on 0.7.1 or earlier refuses a
+  version 2 stream at the preamble.
+- Version 2 frames `Frame::Sync`, `Frame::SegmentAfter` and
+  `Frame::Unavailable` (WIRE.md §4.7 to §4.9). This release's `Subscriber`
+  refuses the first two and `ArchivePublisher` sends none of them.
+- `ResumeRequest`, with `encode` and `decode` (WIRE.md §8): what a copy
+  holds of each source, for the publisher it resumes from. This release
+  neither builds nor answers one.
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a

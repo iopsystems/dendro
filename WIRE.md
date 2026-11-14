@@ -10,7 +10,10 @@ this document has a bug.
 the same contents in flight — and the two version independently. A frame
 carries no schema version, and a change here does not bump the archive's.
 
-Protocol version: **1** (`src/replicate/wire.rs`, `PROTOCOL_VERSION`).
+Protocol versions: 1 and 2 (`src/replicate/wire.rs`, `PROTOCOL_VERSION` and
+`PROTOCOL_VERSION_2`). Version 2 differs in its framing (§2.1), adds three
+frames that act on a resumed copy (§4.7 to §4.9), and has a resume request
+(§8). Every frame of version 1 has the same payload in version 2.
 
 ## 1. The model
 
@@ -39,7 +42,8 @@ frame   := u32 len | u8 kind | payload       len covers kind + payload
 
 Detection is by the magic, checked before any frame is read, so a reader
 pointed at the wrong socket says so rather than reporting a malformed frame. A
-version this build does not implement is refused by number.
+version this build does not implement is refused by number. The framing above
+is version 1's; §2.1 is version 2's.
 
 `len` is the byte count of everything after it in the frame, the kind byte
 included. It exists so a reader can bound an allocation before making it and
@@ -50,12 +54,59 @@ allocated for it.** A four-byte length read off a wire is otherwise an
 allocation request of up to 4 GiB, which is an out-of-memory rather than an
 error. The limit is eight times the default `SealPolicy::max_bytes`. A
 publisher splits an interval's rows across several `Rows` frames to stay under
-it (rule 6). A `Segment` cannot be split, so a segment whose frame exceeds the
-limit cannot be sent; segments compacted by row count can be that large.
+it (rule 6). On version 1 a `Segment` cannot be split, so a segment whose
+frame exceeds the limit cannot be sent; segments compacted by row count can be
+that large. On version 2 the limit applies to each part (§2.1).
 
 **A payload with bytes left over after its fields are read is refused.** The
 sender put something there this build does not read, and applying the fields it
 did understand would be acting on a frame whose meaning it has guessed.
+
+### 2.1 Version 2
+
+```
+stream  := magic | version | frame*          version = 2
+frame   := u32 len | u64 number | u8 kind | payload
+                                             len covers number + kind + payload
+```
+
+`number` is 0 for the first frame after the preamble and one more for each
+frame after it. A reader refuses a frame whose number is not the next one, so
+a frame lost, repeated or reordered in transit stops the stream instead of
+being applied around. Frames of a kind the reader skips (§7) count too.
+
+A frame whose payload makes `len` exceed `MAX_FRAME_BYTES` travels as a split
+frame: consecutive parts, each a frame of its own with its own number and
+`len` within the limit.
+
+```
+first   := u32 len | u64 number | u8 0xfe | u64 total | bytes
+later   := u32 len | u64 number | u8 0xff | bytes
+```
+
+`total` is the byte count of the joined payload, kind byte included, from 1
+to `MAX_SPLIT_FRAME_BYTES` (1 GiB). The payload is the first part's bytes
+followed by each later part's, in order, until `total` bytes are joined; it is
+then read as one frame. A reader refuses:
+
+- a `total` outside that range;
+- a frame other than a later part before the join is complete;
+- a later part with no first part before it;
+- parts whose bytes exceed `total`;
+- a stream that ends before the join is complete;
+- a joined payload whose kind is `0xfe` or `0xff`.
+
+A reader joins the bytes as they arrive and grows its buffer to `total` plus
+at most one part, so a `total` off the wire is not an allocation. Decoding
+copies a segment's bytes out of the joined payload, so a reader holds up to
+about twice the frame while decoding one: about 2 GiB at the limit, all of it
+bytes it received. A writer holds the frame and its encoding, also about
+twice the frame. A reader or writer on a 32-bit target may fail to allocate
+a frame near the limit.
+
+A segment's parquet file and its caller index are separate SQLite values, each
+up to SQLite's default limit of 1,000,000,000 bytes. A segment whose two
+together exceed 1 GiB cannot be sent, and a `FrameWriter` refuses it.
 
 ## 3. Primitives
 
@@ -88,7 +139,9 @@ only integer type, and the reason a negative value means before 1970.
 One kind per table in the set `rewrite` copies (`src/rewrite.rs`, `COPIED`) —
 `sources`, `caller_rows`, `wal`, `segments`, `clock_offsets` — so the frame set
 has a completeness check rather than a guess, plus `SourceUpdate` for a change
-to a source's row in `sources` after its handshake.
+to a source's row in `sources` after its handshake. Version 2's `Sync`,
+`SegmentAfter` and `Unavailable` act on what a resumed copy holds and are
+outside this mapping.
 
 | `kind` | frame | lands in |
 |---|---|---|
@@ -98,9 +151,15 @@ to a source's row in `sources` after its handshake.
 | 4 | `Segment` | `segments` |
 | 5 | `ClockOffset` | `clock_offsets` |
 | 6 | `SourceUpdate` | `sources` |
+| 9 | `Unavailable` | nothing (version 2) |
+| 135 (`0x87`) | `Sync` | `segments`, `wal` (version 2) |
+| 136 (`0x88`) | `SegmentAfter` | `segments`, `wal` (version 2) |
 
 The high bit of `kind` (`0x80`) marks a kind a reader must understand to apply
-the stream correctly; see §7. No kind above sets it.
+the stream correctly; see §7. `Sync` and `SegmentAfter` set it, and so do the
+kinds of a split frame's parts (`0xfe`, `0xff`, §2.1). A version 1 stream that
+carries `Sync` or `SegmentAfter` is refused; one that carries `Unavailable`
+has it skipped, as an unknown kind.
 
 ### 4.1 `Handshake` (kind 1)
 
@@ -264,6 +323,66 @@ publisher's. `events` is replaced, so a copy's `events` may include
 metadata change, so an archive publisher sends the wall time of the poll that
 read it. A subscriber does not store it.
 
+### 4.7 `Sync` (kind 135, version 2)
+
+```
+u32          source
+str          stream
+i64          at                     the sync point
+```
+
+Sets one stream of a resumed copy to the sync point `at`. The copy keeps what
+it holds of the stream at or below `at`, and the frames after this one replace
+what it holds above it:
+
+1. The copy seals its live rows of the stream at or below `at` with its own
+   encoder.
+2. It deletes the live rows at or below `at` that are still not in a segment.
+3. It deletes its segments and live rows of the stream above `at`.
+
+The publisher picks `at` so that no segment of the copy's or of its own
+contains it, so the copy deletes and the publisher ships whole segments.
+
+This build's `Subscriber` refuses this frame; no release applies it yet.
+
+### 4.8 `SegmentAfter` (kind 136, version 2)
+
+```
+u32          source
+str          stream
+i64          after
+u64          rows
+i64          first_ts
+i64          last_ts
+bytes        bytes                  one parquet file, byte-identical
+opt<bytes>   caller_index
+```
+
+A sealed segment that replaces the copy's live rows of its stream in
+`(after, last_ts]`. The fields after `after` are a `Segment`'s (§4.4). The
+copy refuses it when it holds a live row of the stream at or below `after`, or
+a segment of the stream whose `last_ts` is above `after`; either means the
+copy is not where the publisher put it. The live rows it deletes below
+`first_ts` are rows the publisher's seal pruned or discarded.
+
+This build's `Subscriber` refuses this frame; no release applies it yet.
+
+### 4.9 `Unavailable` (kind 9, version 2)
+
+```
+u32          source
+str          stream
+i64          after                  the copy's newest row of the stream
+i64          before                 the publisher's oldest held row of it
+```
+
+The publisher holds no row of the stream in the open interval
+`(after, before)`, and the copy may lack rows the publisher once held there,
+because retention removed them before the copy received them. Applying it
+changes nothing in the copy, so the kind is skippable, and a subscriber that
+skips it holds the same rows. This build's `Subscriber` applies it as
+nothing.
+
 ## 5. Protocol rules
 
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
@@ -299,10 +418,10 @@ read it. A subscriber does not store it.
    a floor (FORMAT.md §3.5). This crate's `Subscriber` does not record an
    entry's kind and has no retention of its own, so a subscriber archive has
    no retention path yet.
-8. A reconnect is a new handshake and full state. There is no resume token,
-   and a `Subscriber` refuses a handshake whose `uuid` its archive already
-   holds (`Error::DuplicateSource`): a reconnect catches up into a new
-   archive.
+8. A reconnect is a new handshake and full state. This build's `Subscriber`
+   takes no resume request (§8), and refuses a handshake whose `uuid` its
+   archive already holds (`Error::DuplicateSource`): a reconnect catches up
+   into a new archive.
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
 10. A subscriber drops a row at or below the newest timestamp the connection
@@ -322,10 +441,12 @@ it bounds a mid-stream join to one `Full`.
 Unix socket, or a file is the caller's problem, and keeping it out is what
 leaves dendro storage-shaped.
 
-**Acknowledgement, retry and flow control.** There is no ack, no resume token
-and no negotiation. A subscriber that falls behind reconnects and takes a fresh
-handshake with full state (rule 8), and catch-up is `Segment` frames rather
-than a replayed log.
+**Acknowledgement, retry and flow control.** There is no ack and no
+negotiation: the publisher's side picks the version, and a reader that does not
+implement it refuses the preamble. A subscriber that falls behind reconnects
+and takes a fresh handshake with full state (rule 8), and catch-up is
+`Segment` frames rather than a replayed log. The resume request (§8) is
+carried by the caller's transport, not by the stream.
 
 **Compression and encryption.** A `Segment`'s parquet is already compressed
 (`segment::writer_props`); anything else belongs to the transport.
@@ -350,7 +471,7 @@ is handed, so whatever decides who may hand it anything is the transport's.
   subscriber holds, say) sets the high bit of `kind`. A reader that does not
   know such a kind refuses the stream there instead of skipping it, and the
   frames before it stand. `FrameReader` does this in releases after 0.7.1.
-  Readers on 0.7.x and earlier do not know the bit and skip such a frame like
+  Readers on 0.7.1 and earlier do not know the bit and skip such a frame like
   any other unknown kind, so a producer that sends one to an older subscriber gets that
   subscriber's skip, not its refusal.
 - **What this does not version.** The row payload, the segment's columns and
@@ -359,6 +480,53 @@ is handed, so whatever decides who may hand it anything is the transport's.
   `encoder` differs from the version its own encoder reports, by the rule
   every read path applies (`segment::check_encoder`): either side reporting
   no version is not a mismatch.
+- **Version 2.** Its framing differs from version 1's, so it is a new
+  version rather than new kinds. A reader on 0.7.1 or earlier refuses a
+  version 2 stream at the preamble, before it applies anything. This build
+  reads both versions; `write_preamble` and `encode_frame` write version 1,
+  and a `FrameWriter` writes either.
 - **The archive schema version is separate** and is not carried here. A
   publisher and a subscriber on different archive schema versions can still
-  speak protocol 1; what each can store is decided by its own file.
+  speak the same protocol version; what each can store is decided by its own
+  file.
+
+## 8. The resume request
+
+What a copy holds of each source, sent from the subscriber's side to the
+publisher's by the caller's transport before a version 2 stream starts
+(`ResumeRequest::encode`, `ResumeRequest::decode`).
+
+```
+request  := magic | u16 version | i64 since_for_new_sources | u32 count | source*
+magic    := "dendro-resume\0"                 14 bytes
+version  := 2                                 the protocol version it asks for
+source   := str uuid
+            u32 count | stream*
+            u32 count | name*
+stream   := str stream
+            i64 newest                        the copy's newest row, sealed or live
+            u32 count | (i64 first_ts, i64 last_ts)*
+                                              the copy's segments, newest first
+name     := str name
+            i64 ts                            the copy's newest entry of the name
+            u64 at_ts                         how many entries it holds at ts, >= 1
+```
+
+A source is named by uuid; `since_for_new_sources` is where a source the
+request does not name is shipped from, `i64::MIN` for its first row. A stream
+or caller-row name a source omits is one the copy holds no row of. The
+watermark of a stream is the first span's `last_ts`.
+
+A reader refuses a request that:
+
+- exceeds `MAX_FRAME_BYTES` or has bytes left over;
+- has a wrong magic or a version other than 2;
+- lists sources out of uuid order, or streams or names out of name order, or
+  any of them twice;
+- has a span whose `first_ts` is above its `last_ts`, or spans that overlap or
+  are not newest first;
+- has a `newest` below the watermark, or an `at_ts` of 0.
+
+A caller-row name's entries append in `ts` order (`FORMAT.md` §3.5), so
+`(ts, at_ts)` is a position in the publisher's entries of that name too.
+`ArchivePublisher` in this build takes no request.
