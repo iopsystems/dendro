@@ -525,3 +525,97 @@ fn a_bounded_copy_keeps_the_original_bound() {
         "`t`'s 200 is not carried"
     );
 }
+
+/// A later writer seeds each stream's bound from the file's `bounds` too, so
+/// `Writer::wal_tick` on a source it did not resume drops a row at or below
+/// a discarded one.
+#[test]
+fn a_tick_on_a_source_not_resumed_respects_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    let id = w.source_id();
+    w.wal(vec![row("s", 10)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.wal(vec![row("s", 100)]).unwrap();
+    w.sync().unwrap();
+    w.discard_live_rows(Box::new(|s: &str| s == "s")).unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    archive
+        .wal_tick(vec![(id, vec![row("s", 50), row("s", 150)])])
+        .unwrap();
+    archive.join().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(live, vec![150]);
+}
+
+/// `Transaction::delete_segment` records the bound as well: deleting a
+/// stream's newest segment leaves it as the floor.
+#[test]
+fn deleting_the_newest_segment_keeps_its_bound() {
+    use dendro::archive::ArchiveMut;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    for ts in [10, 100] {
+        w.wal(vec![row("s", ts)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    db.transaction(|tx| tx.delete_segment(id, "s", 1)).unwrap();
+    drop(db);
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    let (w, floor) = archive.resume_source(id, 1_000).unwrap();
+    assert_eq!(floor, Some(100));
+    drop(w);
+    archive.join().unwrap();
+}
+
+/// A stream the original has evicted to nothing exists only in its
+/// `bounds`, and a copy carries that bound too.
+#[test]
+fn a_copy_carries_the_bound_of_a_stream_evicted_to_nothing() {
+    use dendro::archive::ArchiveMut;
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let copy = dir.path().join("c.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    w.wal(vec![row("keep", 10), row("gone", 100)]).unwrap();
+    w.seal(vec!["gone".to_string()]).unwrap();
+    w.sync().unwrap();
+    w.evict_streams_before(1_000, Box::new(|s: &str| s == "gone"))
+        .unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let src = Archive::open(&path).unwrap();
+    let mut dst = ArchiveMut::create(&copy).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Tags))
+        .unwrap();
+    drop(dst);
+    let mut archive = Writer::open(&copy, Box::new(Tags)).unwrap();
+    let id = Archive::open(&copy).unwrap().read_sources().unwrap()[0].id;
+    let (w, floor) = archive.resume_source(id, 1_000).unwrap();
+    assert_eq!(
+        floor,
+        Some(100),
+        "the evicted stream's 100, not `keep`'s 10"
+    );
+    drop(w);
+    archive.join().unwrap();
+}

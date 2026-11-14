@@ -172,7 +172,7 @@ CREATE TABLE documents(                -- schema 5; a v4 archive has none
   CHECK ((schema IS NULL) = (body IS NULL))
 );
 CREATE INDEX documents_by_name ON documents(kind, name, id);
-CREATE TABLE bounds(                   -- absent until a file's first delete that needs it
+CREATE TABLE bounds(                   -- with the file; an older file gets it at its first delete that needs it (§3.7)
   source_id INTEGER NOT NULL REFERENCES sources(id),
   kind INTEGER NOT NULL,               -- 0: `name` is a stream
   name TEXT NOT NULL,
@@ -437,15 +437,18 @@ spans every source. Each row is one **revision** of the document
 ### 3.7 `bounds`
 
 The newest timestamp a stream of this file has held, per `(source_id,
-name)`. A writer's bound for a stream (§3.3) is the larger of this and the
+kind, name)`. A writer's bound for a stream (§3.3) is the larger of this and the
 stream's newest row in `wal` and `segments`. The rules:
 
 - **Who writes it.** Every delete that can remove a stream's newest row
   records that row's timestamp first, in the same transaction:
   - retention, through `evict_before` and `evict_streams_before`, with or
-    without a floor;
+    without a floor, for each stream whose newest row is below the cutoff;
   - `discard_live_rows`;
-  - `prune_wal` past the stream's watermark.
+  - `prune_wal` past the stream's watermark;
+  - `Transaction::delete_segment`, which compaction uses and then replaces
+    with a segment ending at the same row, so for it the record changes
+    nothing.
 
   A later delete never lowers a recorded value. `kind` 0 is the only kind:
   `name` is a stream.
@@ -453,13 +456,17 @@ stream's newest row in `wal` and `segments`. The rules:
   accepts rows at timestamps it has already held. A tailing replication
   publisher whose cursor is past them does not ship them.
 - **Absent.** A file created before the table has none until its first such
-  delete creates it, and a reader treats the absence as no bounds.
+  delete creates it, and a reader treats the absence as no bounds. The
+  table is not versioned: such a delete, or a copy into the file, adds it to
+  a v4 archive as to a v5 one (§8).
 - **Copies.** `rewrite::copy_sources_into` records each carried stream's
   newest row in the copy, counting the original's own bounds, so a
   time-bounded copy keeps the original's bound. Compaction does not touch
   it. Replication does not carry it: it describes this file.
 - **Resume.** A resumed source's floor (§7) is the newest row the source has
-  held, bounds included.
+  held, bounds included. So a source whose rows were stamped in the future
+  cannot be resumed until the clock passes them, even after they are
+  discarded or evicted.
 
 ## 4. Reading
 
@@ -636,7 +643,8 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   what v4 holds, so that a recording made before the upgrade can be resumed
   and annotated in place: a writer resumes its sources, metadata and labels
   are edited, compaction and retention run, and the file stays v4. It never
-  adds a v5 structure to it. A document written into a v4 archive, directly
+  adds a v5 structure to it. `bounds` (§3.7) is not one: it is not
+  versioned, and a v4 reader ignores it. A document written into a v4 archive, directly
   or by a copy, is refused as `Error::SchemaTooOld`, and the archive is
   copied forward instead: `rewrite::copy_sources_into` into a new archive,
   which is v5. The header is never restamped.

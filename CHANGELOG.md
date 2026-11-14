@@ -61,9 +61,11 @@ cannot reach a failed release any other way.
 - A stream's bound survives the deletes that remove its newest rows:
   `discard_live_rows`, every retention pass (`evict_before`,
   `evict_streams_before`, with or without a floor), and `prune_wal` past
-  the stream's watermark. A row at or below the removed rows is dropped and
-  counted, in the writer that ran the delete and in any later one on the
-  file. Before, such a row was taken, and a running `ArchivePublisher`
+  the stream's watermark. In the writer that ran the delete, a row at or
+  below the removed rows is dropped and counted; a later writer that resumes
+  the source refuses it as `Error::TimelineBackwards`, since its floor
+  includes the bound, and `Writer::wal_tick` drops it as out of order.
+  Before, such a row was taken, and a running `ArchivePublisher`
   whose cursor was past it never shipped it. The bound is kept in a new
   table, `bounds`, which a file gets at its first such delete; the schema
   version is unchanged, and a writer from an earlier release ignores the
@@ -71,7 +73,9 @@ cannot reach a failed release any other way.
   and returns it as the floor, so a source evicted to nothing still has
   one. `rewrite::copy_sources_into` carries each copied stream's bound.
   Writing corrected rows at the timestamps of discarded ones is no longer
-  possible.
+  possible, and a source whose rows were stamped in the future cannot be
+  resumed until the clock passes them, even after they are discarded or
+  evicted.
 - Every writing handle (`Writer`, `ArchiveMut::create`, `ArchiveMut::open`)
   holds an exclusive advisory lock on `<archive>-lock` for its life, and a
   second one on the same archive is refused as `Error::InUse`, in the same

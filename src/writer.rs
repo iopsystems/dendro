@@ -911,7 +911,7 @@ impl SourceWriter {
             return self.check_alive();
         }
         // The handle's half of the floor: a resumed source refuses, here and
-        // now, a row at or before its previous session's newest. The writer
+        // now, a row at or before the newest row the source has held. The writer
         // thread enforces the same rule for rows that arrive through
         // `Writer::wal_tick`, which has no handle to ask.
         if let Some(floor) = self.floor_ts {
@@ -928,8 +928,9 @@ impl SourceWriter {
         })
     }
 
-    /// The newest row timestamp a previous writer session left, when this
-    /// handle resumed a source; every row must be stamped after it.
+    /// The newest row timestamp the source has held, including one a
+    /// delete removed (FORMAT.md §3.7), when this handle resumed a source;
+    /// every row must be stamped after it.
     pub fn floor_ts(&self) -> Option<i64> {
         self.floor_ts
     }
@@ -1263,11 +1264,12 @@ impl SourceWriter {
     /// writer-side spelling of
     /// [`ArchiveMut::discard_live_rows`](crate::archive::ArchiveMut::discard_live_rows).
     ///
-    /// A deferred seal of those streams is dropped. A row written to them
-    /// afterwards at or below a discarded row is dropped as out of order
-    /// ([`dropped_out_of_order`](Self::dropped_out_of_order)), here and in
-    /// any later writer on the file: the stream's timestamps strictly
-    /// increase for the life of its source (FORMAT.md §3.7). The discard is
+    /// A deferred seal of those streams is dropped. The stream's timestamps
+    /// strictly increase for the life of its source (FORMAT.md §3.7): a row
+    /// written afterwards at or below a discarded row is dropped and counted
+    /// in [`dropped_out_of_order`](Self::dropped_out_of_order) by this
+    /// writer, and refused as [`Error::TimelineBackwards`] by a later writer
+    /// that resumes the source, whose floor includes it. The discard is
     /// not replicated: a subscriber that already received the rows keeps
     /// them.
     /// Waits for the writer thread, as eviction does. A failed discard
@@ -1512,7 +1514,7 @@ fn commit_tick(
 ) -> Result<()> {
     // The writer's half of the resume floor (the handle checks `wal`; this
     // covers `wal_tick`, which has no handle to ask): a resumed source's rows
-    // at or before its previous session's newest are that source's problem,
+    // at or before the newest row it has held are that source's problem,
     // dropped and warned once, like a collision.
     let mut kept: Vec<(i64, Vec<WalRow>)> = Vec::with_capacity(ticks.len());
     for (source_id, rows) in ticks {
