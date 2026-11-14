@@ -4,7 +4,10 @@
 //! frame set has a completeness check rather than a guess, plus
 //! [`SourceUpdate`](Frame::SourceUpdate) for a change to a row of `sources`
 //! after its handshake. The archive-level
-//! `documents` table has none; see the module docs. No I/O here; [`wire`](super::wire)
+//! `documents` table has none; see the module docs. Protocol version 2 adds
+//! three frames that act on what a resumed copy already holds:
+//! [`Sync`](Frame::Sync), [`SegmentAfter`](Frame::SegmentAfter) and
+//! [`Unavailable`](Frame::Unavailable). No I/O here; [`wire`](super::wire)
 //! turns these into bytes.
 
 use std::collections::BTreeMap;
@@ -227,6 +230,58 @@ pub enum Frame {
         /// The source's metadata, reserved keys included.
         metadata: BTreeMap<String, String>,
     },
+
+    /// Sets a stream of a resumed copy to the sync point `at`. Protocol
+    /// version 2 only (WIRE.md §4.7).
+    ///
+    /// The copy keeps what it holds of the stream at or below `at` and
+    /// deletes what it holds above it, which the frames after this one
+    /// replace. Its live rows at or below `at` are sealed with its own
+    /// encoder, and the ones that do not seal are deleted and counted.
+    Sync {
+        /// Which source, by handshake ordinal.
+        source: u32,
+        /// The stream.
+        stream: String,
+        /// The sync point.
+        at: i64,
+    },
+
+    /// A sealed segment that replaces a copy's live rows of its stream in
+    /// `(after, meta.last_ts]`. Protocol version 2 only (WIRE.md §4.8).
+    ///
+    /// The copy refuses it when it holds a live row of the stream at or below
+    /// `after`, or a segment of the stream ending above `after`.
+    SegmentAfter {
+        /// Which source, by handshake ordinal.
+        source: u32,
+        /// The stream the segment belongs to.
+        stream: String,
+        /// The newest timestamp of the stream the copy keeps below this
+        /// segment.
+        after: i64,
+        /// The segment's catalog entry, as in [`Segment`](Frame::Segment).
+        meta: SegmentMeta,
+        /// One parquet file, passed through byte-identical.
+        bytes: Vec<u8>,
+        /// The caller's index over this segment, or `None`.
+        caller_index: Option<Vec<u8>>,
+    },
+
+    /// The origin holds no row of `stream` in the open interval
+    /// `(after, before)`, and the copy may lack rows the origin once held
+    /// there, because retention removed them before the copy received them.
+    /// Protocol version 2 only (WIRE.md §4.9).
+    Unavailable {
+        /// Which source, by handshake ordinal.
+        source: u32,
+        /// The stream.
+        stream: String,
+        /// The newest timestamp of the stream the copy holds.
+        after: i64,
+        /// The origin's oldest held timestamp of the stream.
+        before: i64,
+    },
 }
 
 impl Frame {
@@ -238,7 +293,10 @@ impl Frame {
             | Frame::Rows { source, .. }
             | Frame::Segment { source, .. }
             | Frame::ClockOffset { source, .. }
-            | Frame::SourceUpdate { source, .. } => *source,
+            | Frame::SourceUpdate { source, .. }
+            | Frame::Sync { source, .. }
+            | Frame::SegmentAfter { source, .. }
+            | Frame::Unavailable { source, .. } => *source,
         }
     }
 }

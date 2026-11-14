@@ -1120,15 +1120,56 @@ fn an_unknown_must_understand_kind_is_an_error() {
     let mut stream = Vec::new();
     write_preamble(&mut stream).unwrap();
     stream.extend(encode(&before).unwrap());
-    let unknown = [0x80u8 | 7, 9, 9, 9];
+    let unknown = [0x80u8 | 100, 9, 9, 9];
     stream.extend((unknown.len() as u32).to_le_bytes());
     stream.extend(unknown);
 
     let mut reader = FrameReader::new(stream.as_slice()).unwrap();
     assert_eq!(reader.next_frame().unwrap(), Some(before));
     let err = reader.next_frame().unwrap_err().to_string();
-    assert!(err.contains("135") && err.contains("must"), "{err}");
+    assert!(err.contains("228") && err.contains("must"), "{err}");
     assert_eq!(reader.skipped(), 0);
+}
+
+/// The frames that act on a resumed copy are refused by a subscriber that
+/// resumes none, and the report of an unavailable span is not a change.
+#[test]
+fn a_subscriber_that_resumes_nothing_refuses_the_resume_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sub = subscriber(&dir.path().join("copy.dendro"));
+    sub.apply(handshake(false)).unwrap();
+    for frame in [
+        Frame::Sync {
+            source: 0,
+            stream: "s".to_string(),
+            at: 5,
+        },
+        Frame::SegmentAfter {
+            source: 0,
+            stream: "s".to_string(),
+            after: 5,
+            meta: SegmentMeta {
+                rows: 1,
+                first_ts: 6,
+                last_ts: 6,
+            },
+            bytes: b"6".to_vec(),
+            caller_index: None,
+        },
+    ] {
+        let err = sub.apply(frame).unwrap_err().to_string();
+        assert!(err.contains("resumes none"), "{err}");
+    }
+    let applied = sub
+        .apply(Frame::Unavailable {
+            source: 0,
+            stream: "s".to_string(),
+            after: 1,
+            before: 9,
+        })
+        .unwrap();
+    assert_eq!(applied, dendro::replicate::Applied::default());
+    sub.finish().unwrap();
 }
 
 /// The identity the subscriber's copy holds for its one source.
