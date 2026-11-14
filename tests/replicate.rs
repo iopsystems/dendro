@@ -1604,3 +1604,145 @@ fn a_reconnect_into_the_same_archive_is_refused_by_uuid() {
         1
     );
 }
+
+/// A seal records its clock observation at the newest row it sealed, so
+/// offsets are not inserted in timestamp order: sealing stream `a` to 100 and
+/// then `b` to 80 inserts 80 after 100. The publisher used to skip every
+/// offset at or below the newest it had shipped, and never shipped the 80.
+#[test]
+fn a_clock_offset_older_than_one_already_shipped_still_ships() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("offsets.dendro");
+    let copy = dir.path().join("offsets-copy.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("a", 100), row("b", 80)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let mut sub = subscriber(&copy);
+    sub.apply_all(opening).unwrap();
+
+    w.seal(vec!["a".to_string()]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        sub.apply_all(publisher.next(&db).unwrap())
+            .unwrap()
+            .clock_offsets,
+        1
+    );
+
+    w.seal(vec!["b".to_string()]).unwrap();
+    w.sync().unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    assert_eq!(
+        db.read_clock_offsets(id)
+            .unwrap()
+            .iter()
+            .map(|o| o.0)
+            .collect::<Vec<_>>(),
+        vec![80, 100],
+        "the origin holds both observations"
+    );
+    assert_eq!(
+        sub.apply_all(publisher.next(&db).unwrap())
+            .unwrap()
+            .clock_offsets,
+        1,
+        "the observation at 80 arrived after the one at 100 and is shipped"
+    );
+    // Shipped once: a later poll sends neither again.
+    assert_eq!(
+        sub.apply_all(publisher.next(&db).unwrap())
+            .unwrap()
+            .clock_offsets,
+        0
+    );
+
+    drop(w);
+    archive.join().unwrap();
+    sub.sync().unwrap();
+    sub.finish().unwrap();
+    let dst = Archive::open(&copy).unwrap();
+    let dst_id = dst.read_sources().unwrap()[0].id;
+    assert_eq!(
+        dst.read_clock_offsets(dst_id)
+            .unwrap()
+            .iter()
+            .map(|o| o.0)
+            .collect::<Vec<_>>(),
+        vec![80, 100]
+    );
+}
+
+/// A tailing publisher starts at the archive's present, clock offsets
+/// included: an observation the archive already held is not shipped.
+#[test]
+fn a_tailing_publisher_does_not_ship_the_clock_offsets_already_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("held.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("a", 100)]).unwrap();
+    w.seal(vec!["a".to_string()]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, opening) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
+    let offsets = |frames: &[Frame]| {
+        frames
+            .iter()
+            .filter(|f| matches!(f, Frame::ClockOffset { .. }))
+            .count()
+    };
+    assert_eq!(offsets(&opening), 0);
+    assert_eq!(
+        offsets(&publisher.next(&db).unwrap()),
+        0,
+        "the held offset is the archive's past"
+    );
+
+    drop(w);
+    archive.join().unwrap();
+}
+
+/// A catch-up from `since` ships the clock offsets at or after it, and an
+/// observation below it that the archive records later is not shipped
+/// either.
+#[test]
+fn a_catch_up_ships_no_clock_offset_below_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("since.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("a", 100), row("b", 50)]).unwrap();
+    w.sync().unwrap();
+
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, _) = dendro::replicate::ArchivePublisher::catching_up(&db, 90).unwrap();
+    let offsets = |frames: Vec<Frame>| -> Vec<i64> {
+        frames
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::ClockOffset { ts, .. } => Some(ts),
+                _ => None,
+            })
+            .collect()
+    };
+
+    w.seal(vec!["b".to_string()]).unwrap();
+    w.seal(vec!["a".to_string()]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        offsets(publisher.next(&db).unwrap()),
+        vec![100],
+        "50 is below since"
+    );
+
+    drop(w);
+    archive.join().unwrap();
+}

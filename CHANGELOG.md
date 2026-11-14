@@ -92,6 +92,14 @@ cannot reach a failed release any other way.
 
 ### Fixed
 
+- `ArchivePublisher` never shipped a clock offset whose timestamp was at or
+  below one it had already shipped. Offsets are not recorded in timestamp
+  order: a seal records its observation at the newest row it sealed, so
+  sealing one stream to 100 and then another to 80 records 80 after 100,
+  and the copy never received the 80. `SourceWriter::clock_offset` with an
+  earlier timestamp did the same. Every offset at or after the catch-up's
+  `since` (any offset, for a tailing publisher, that arrives after it
+  opened) is now shipped once. Present since 0.2.0.
 - `FrameReader::next_frame` returned `Ok(None)`, the clean end of a stream,
   for a stream that stopped one to three bytes into a frame's four-byte
   length prefix, so a cut that landed there read as the end of the

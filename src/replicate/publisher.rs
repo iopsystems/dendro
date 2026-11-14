@@ -1,6 +1,6 @@
 //! Tailing an archive as frames.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::archive::{Archive, SourceRow};
 use crate::error::{Error, Result};
@@ -69,8 +69,16 @@ struct SourceCursor {
     ordinal: u32,
     source_id: i64,
     streams: BTreeMap<String, StreamCursor>,
-    /// Newest `clock_offsets` timestamp emitted.
-    clock_after: Option<i64>,
+    /// The `clock_offsets` timestamps already emitted, or already in the
+    /// archive's past when the publisher started tailing. A set rather than
+    /// the newest timestamp sent, because offsets are not inserted in
+    /// timestamp order: a seal records its observation at the newest row it
+    /// sealed, so sealing one stream to 100 and then another to 80 inserts
+    /// 80 after 100. One `i64` per observation, and a recording makes a
+    /// handful per seal.
+    clock_sent: BTreeSet<i64>,
+    /// Offsets below this are not shipped: the `since` of a catch-up.
+    clock_from: i64,
     seq: u64,
     index_state: IndexState,
     /// Whether the opening batch has sent its `Full`. Only the first index
@@ -349,7 +357,8 @@ fn open_source(
         ordinal,
         source_id: rec.id,
         streams: BTreeMap::new(),
-        clock_after: None,
+        clock_sent: BTreeSet::new(),
+        clock_from: since.unwrap_or(i64::MIN),
         seq: 0,
         index_state: NO_INDEX_STATE,
         sent_full: false,
@@ -405,29 +414,38 @@ fn open_source(
         }
     }
 
-    // Clock offsets, bounded the same way.
-    for (ts, offset) in db.read_clock_offsets(rec.id)? {
-        match since {
-            Some(since) if ts < since => continue,
-            _ => {}
-        }
-        if since.is_none() {
-            // Tailing: these are already in the archive's past.
-            cursor.clock_after = Some(ts);
-            continue;
-        }
-        frames.push(Frame::ClockOffset {
-            source: ordinal,
-            ts,
-            offset_ns: offset,
-        });
-        cursor.clock_after = Some(ts);
+    // Clock offsets, bounded the same way. Tailing: these are already in the
+    // archive's past, so they count as sent.
+    if since.is_none() {
+        cursor.clock_sent = db
+            .read_clock_offsets(rec.id)?
+            .into_iter()
+            .map(|(ts, _)| ts)
+            .collect();
+    } else {
+        cursor.emit_clock_offsets(db, frames)?;
     }
 
     Ok(cursor)
 }
 
 impl SourceCursor {
+    /// Emit every clock offset at or after `clock_from` that has not been
+    /// sent.
+    fn emit_clock_offsets(&mut self, db: &Archive, out: &mut Vec<Frame>) -> Result<()> {
+        for (ts, offset) in db.read_clock_offsets(self.source_id)? {
+            if ts < self.clock_from || !self.clock_sent.insert(ts) {
+                continue;
+            }
+            out.push(Frame::ClockOffset {
+                source: self.ordinal,
+                ts,
+                offset_ns: offset,
+            });
+        }
+        Ok(())
+    }
+
     /// Emit every index entry at or after `from` that has not been sent,
     /// advancing both the cursor and the declared state.
     fn emit_index(
@@ -504,17 +522,7 @@ impl SourceCursor {
             self.emit_index(db, &name, i64::MIN, out)?;
         }
 
-        for (ts, offset) in db.read_clock_offsets(self.source_id)? {
-            if self.clock_after.is_some_and(|after| ts <= after) {
-                continue;
-            }
-            out.push(Frame::ClockOffset {
-                source: self.ordinal,
-                ts,
-                offset_ns: offset,
-            });
-            self.clock_after = Some(ts);
-        }
+        self.emit_clock_offsets(db, out)?;
 
         // The row cursors move only once the frames are built. `next` also
         // restores every cursor when a poll fails; this keeps the poll itself
