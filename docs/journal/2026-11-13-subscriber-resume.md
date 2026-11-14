@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 opened: 2026-11-13
 updated: 2026-11-14
 ---
@@ -30,8 +30,15 @@ do not count toward that limit.
 
 ## Where this stands
 
-A handshake whose uuid the subscriber's archive already holds is refused as
-`Error::DuplicateSource`, and a reconnect catches up into a new archive.
+Built. Step 1 landed as #75, #76 and #77, step 2 as #78, and step 3 as #79
+(the copy's side) and #80 (the publisher's side). `Subscriber::resume` and
+`ArchivePublisher::resuming` resume a copy on protocol version 2, and
+`tests/replicate_resume.rs` runs the matrix below. WIRE.md §8.1 and §8.2
+are the reference for what was built; where they differ from this entry,
+they are right.
+
+Not covered by a test: a kill during a copy's `Sync`, a request cut at the
+256-span cap, and multi-part `Rows` frames on version 2.
 
 ## What was tried
 
