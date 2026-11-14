@@ -77,11 +77,9 @@ review found ordinary cases where that decision was wrong:
 - A stream evicted to nothing on the origin caused a permanent refusal.
 
 **Third: positions, predecessor links, and four segment cases on the copy.**
-This entry is the version after it, in which the publisher decides; its
-review is answered under "Review of the publisher-decides version".
-This added a resume request and protocol version 2, and fixed most of the
-above. A second design review found that the copy still decided what to
-delete from the segment spans it was sent:
+The third design added a resume request and protocol version 2, and fixed
+most of the above. A second design review found that the copy still
+decided what to delete from the segment spans it was sent:
 
 - A segment with no predecessor came from eviction, from a stream's first
   seal, or from a discard before the first seal. Nothing in the frames
@@ -94,6 +92,9 @@ delete from the segment spans it was sent:
   had pruned.
 - A `Rows` predecessor defined as the origin's previous row made every
   discard a permanent refusal.
+
+This entry is the version after it, in which the publisher decides; its
+review is answered under "Review of the publisher-decides version".
 
 All three missed that a reconnect re-sends index entries, and that
 `caller_rows` has no primary key (`src/archive/sqlite.rs:4005`). A resumed
@@ -278,9 +279,8 @@ Version 1 and the existing constructors are unchanged, byte for byte:
 The publisher refuses a source whose requested position is ahead of the
 origin: a `P` above the stream's newest row and its bound, a stream the
 origin has never held, or a caller-row position past what the origin
-holds. That catches an origin restored from an
-older backup, and a request sent to the wrong archive when that archive is
-behind the copy.
+holds. That catches an origin restored from an older backup, and a request
+sent to the wrong archive when that archive is behind the copy.
 
 ### The sync point
 
@@ -368,8 +368,8 @@ lies at or below `X`, as `adopt_segment` refuses today
 (`src/writer.rs:2580-2594`). Otherwise it deletes its live rows in
 `(X, l]` and inserts the segment. The deleted rows below `f` are a leading
 run the origin pruned or rows the origin discarded, and are counted as
-`rows_pruned`. Any
-other `X` is sent as a `Sync` followed by the segments, which covers:
+`rows_pruned`. Any other `X` is sent as a `Sync` followed by the segments,
+which covers:
 
 - a merge on the origin that crosses the copy's watermark;
 - retention on the origin that evicted past it (`O - 1 > W`), where a
@@ -413,8 +413,8 @@ from the file, so it sits below the hole, and resume ships it again.
 
 **Segments in chunks.** (Built differently: large frames split at the
 framing layer; see Changes made while building.) A `Segment` is a header
-frame followed by chunk
-frames with offsets, so no segment exceeds `MAX_FRAME_BYTES`. A kill leaves
+frame followed by chunk frames with offsets, so no segment exceeds
+`MAX_FRAME_BYTES`. A kill leaves
 the copy as it was before the frame being applied. A catch-up spans many
 frames, so a kill partway leaves it partway, and resume continues from what
 the file holds.
@@ -559,8 +559,8 @@ does not fit (WIRE.md §8.1).
   `Rows` frame whose index state the copy does not hold (skipped on a
   subscriber that resumes nothing) all stop it. The rule applies to every
   source of a subscriber opened with `Subscriber::resume`; the subscriber
-  has no notion of the protocol version. `finish` syncs a stopped source and
-  does not finalize it.
+  has no notion of the protocol version. `finish` syncs a stopped source,
+  does not finalize it, and returns its error.
 - **The publisher tracks the copy's newest row** per stream, as well as its
   spans, and uses it as `P` while tailing, so live rows the copy kept at
   open are not deleted by a later seal. `Unavailable` is sent while tailing
@@ -595,7 +595,7 @@ the note says untested.
 
 | case | expected | test |
 |---|---|---|
-| resume, neither side sealed since the copy's watermark | fast path; ships only rows past `P`; no row twice; `verify` clean | `replicate_resume::a_resume_with_nothing_newly_sealed_ships_only_newer_rows` |
+| resume, neither side sealed since the copy's watermark | fast path; ships only rows past `P`; no row twice; `verify` clean | `replicate_resume::a_resume_with_nothing_newly_sealed_ships_only_newer_rows` (runs a full `verify`) |
 | resume, one quiet stream and one busy one | the quiet stream ships nothing | same |
 | origin seals rows the copy holds live, connected | `Segment` carrying `X = W`; rows past `l` stay live | `replicate_resume::a_connected_seal_arrives_as_a_segment_after_the_copys_watermark` |
 | origin seals rows the publisher had not polled | the segment carries them; no error | `replicate_resume::a_seal_the_publisher_had_not_polled_is_carried_by_its_segment` |
@@ -606,7 +606,7 @@ the note says untested.
 | origin evicts past the copy's newest while disconnected | `L = P`; span reported; the copy's rows stay readable | `replicate_resume::eviction_past_the_copys_newest_is_reported_and_the_copy_keeps_its_rows`, `an_eviction_on_the_fast_path_is_reported` |
 | origin evicts past the copy's watermark while connected, then seals | `Sync`, not `Segment`; the copy's rows stay readable | `replicate_resume::connected_eviction_past_the_copys_watermark_syncs_and_keeps_its_rows`, `a_connected_seal_and_eviction_between_polls_is_reported` |
 | origin evicts a stream to nothing | no refusal | `replicate_resume::a_stream_evicted_to_nothing_is_not_refused`, `a_stream_evicted_to_nothing_past_the_copy_is_reported_and_continues` |
-| a step-1 batch mixing evicted rows and rows the encoder refuses | all deleted and counted unsealable | `replicate_resume::evicted_rows_the_copys_encoder_refuses_are_counted_unsealable` |
+| a step-1 batch mixing evicted rows and rows the encoder refuses | all deleted and counted unsealable | `replicate_resume::evicted_rows_the_copys_encoder_refuses_are_counted_unsealable` (998 and 999 encode alone, 1000 to 1002 do not) |
 | a retryable failure during step 1 | retried, then the source fails; nothing deferred | `resume_copy::a_sync_that_outlasts_its_retries_stops_the_source_and_changes_nothing` |
 | origin discards, then writes; connected and resumed | rows at or below the discarded newest dropped and counted on the origin; links hold | `out_of_order::a_discard_keeps_the_newest_row_bound_across_a_restart`, `replicate_resume::a_discard_before_the_first_seal_does_not_stop_the_copy`; partly covered: not while connected |
 | caller row older than its name's newest, on the origin | dropped and counted | `caller_rows_order::a_caller_row_below_its_names_newest_is_dropped_and_counted` |
@@ -626,13 +626,13 @@ the note says untested.
 | index entries on resume | none written twice; entries past the position arrive | `replicate_resume::index_entries_continue_after_the_copys_position` |
 | clock offsets inserted out of `ts` order | all shipped, v1 and v2; `finish` uses the newest | `replicate_resume::clock_offsets_recorded_out_of_order_all_arrive_on_version_2`; the v1 cases and `finish` in `replicate` (#75) |
 | a lost `Segment` that ends below the copy's newest row | detected by the counter; resume completes | `replicate_resume::a_lost_segment_ending_below_the_copys_newest_is_detected` (by the frame number) |
-| connected `Sync` after origin eviction with trailing rows live | the rows above `max(X, W_o)` shipped again | `replicate_resume::connected_eviction_past_the_copys_watermark_syncs_and_keeps_its_rows` |
+| connected `Sync` after origin eviction with trailing rows live | the rows above `max(X, W_o)` shipped again | `replicate_resume::rows_a_connected_sync_deleted_are_shipped_again` (after a merge rather than an eviction) |
 | caller-row name and stream with the same name, discard on the stream | caller rows at the stream's old newest still accepted | `caller_rows_order::a_discard_on_a_stream_leaves_a_caller_row_name_of_the_same_name_alone` |
 | `update_source_metadata` after a discard | the bound survives | `out_of_order::replacing_the_metadata_after_a_discard_keeps_the_bound` |
 | replicated source reopened after a `Sync` recorded a bound | rows re-shipped below the bound accepted | `resume_copy::a_reopened_copy_takes_rows_below_its_recorded_bound` |
 | origin restored behind the copy | the source refused as ahead of the origin | `replicate_resume::a_request_ahead_of_the_origin_is_refused`, `a_caller_row_position_ahead_of_the_origin_is_refused` |
 | stream created on the origin while disconnected | shipped from its first row | `replicate_resume::a_stream_created_while_disconnected_ships_from_its_first_row` |
-| kill during a `Sync` or a replacement | old state or new state; resume completes | `resume_kill::a_copy_killed_during_a_sync_resumes_to_the_origin`; kills before the `Sync`, after it commits and at the end are deterministic, and a delay sweep may or may not land inside a transaction |
+| kill during a `Sync` or a replacement | old state or new state; resume completes | `resume_kill::a_copy_killed_during_a_sync_resumes_to_the_origin`; the kills after the `Sync` commits and after the last frame are deterministic, and twelve kills 0 to 44 ms after the copy starts the `Sync` must leave it as it was, as the `Sync` left it, or holding the origin's rows up to a point; the test does not record whether a kill landed inside the transaction |
 | `Subscriber::seal` on v2 | refused | `resume_copy::a_resumed_subscriber_does_not_seal` |
 | v2 stream into a v1-only reader | refused at the preamble | not run: read from v0.7.1's `FrameReader::new`, which refuses any version but 1 |
 | v1 publisher, any subscriber | today's frames, plus the clock offsets the old cursor missed | `replicate` (unchanged v1 tests, and #75's clock-offset tests) |
