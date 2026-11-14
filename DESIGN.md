@@ -386,17 +386,17 @@ a `Writer` thread opens. Every `ArchiveMut` holds an exclusive advisory lock
 a second one on the same archive, in the same process or another, is refused
 as `Error::InUse`. The operating system releases the lock when its process
 ends, so a killed writer leaves nothing to clear; a child process forked while
-the lock is held shares it until the child execs or exits. The lock is on a separate
-file rather than the archive because SQLite locks the archive with POSIX
-locks: on macOS `flock` conflicts with them, and on unix closing a descriptor
-on the archive releases every POSIX lock the process holds on it.
+the lock is held shares it until the child execs or exits. The lock is on a
+separate file rather than the archive because SQLite locks the archive with
+POSIX locks: on macOS `flock` conflicts with them, and on unix closing a
+descriptor on the archive releases every POSIX lock the process holds on it.
 `ArchiveMut::open` also takes SQLite's exclusive locking mode, so it is
 refused while a reader holds the file and holds the file against readers. The
 writer thread caches each stream's next `seq`, its sealed watermark and its
 newest row in memory and seeds them once at startup. It re-reads a source's
-watermarks and newest rows after each successful retention pass it runs,
-since eviction can remove a stream's last segment, and its newest rows after
-a discard of live rows. A second connection that could evict a stream's
+watermarks and newest rows after each successful retention pass it runs, since
+eviction can remove a stream's last segment, and its newest rows after a
+discard of live rows. A second connection that could evict a stream's
 segments, insert one, or insert WAL rows behind the writer's back would make
 that cache disagree with the file, and the next seal would collide, the next
 append would be dropped as out of order, or a tick would collide and be lost.
