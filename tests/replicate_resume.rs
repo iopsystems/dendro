@@ -1081,3 +1081,101 @@ fn spans_a_sync_deleted_do_not_block_a_later_sync() {
     link.close();
     assert_eq!(readable(&c)["s"], (1..=45).collect::<Vec<_>>());
 }
+
+/// A caller-row position past the origin's entries at the same `ts` is
+/// ahead of it, and refused.
+#[test]
+fn a_caller_row_position_ahead_of_the_origin_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    let entry = |ts: i64| dendro::archive::CallerRow {
+        ts,
+        blob: ts.to_le_bytes().to_vec(),
+    };
+    origin.w.caller_rows("idx", vec![entry(1)]).unwrap();
+    origin.rows("s", [1]);
+    let backup = dir.path().join("backup");
+    origin.w.sync().unwrap();
+    origin.close();
+    std::fs::copy(&o, &backup).unwrap();
+    let mut origin = Writer::open(&o, Box::new(Tags)).unwrap();
+    let id = Archive::open(&o).unwrap().read_sources().unwrap()[0].id;
+    let (mut w, _) = origin.resume_source(id, 1_000).unwrap();
+    w.caller_rows("idx", vec![entry(1)]).unwrap();
+    w.sync().unwrap();
+    drop(w);
+    origin.join().unwrap();
+    connect(&o, &c).close();
+
+    // The copy holds two entries at 1; the backup holds one.
+    let (sub, request) = resume_copy(&c);
+    assert_eq!(request.sources[0].caller_rows[0].at_ts, 2);
+    let err = ArchivePublisher::resuming(&Archive::open(&backup).unwrap(), &request)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("caller-row name `idx`"), "{err}");
+    sub.finish().unwrap();
+}
+
+/// Several sources on one connection resume independently, and a source
+/// created on the origin while connected is caught up and tailed.
+#[test]
+fn several_sources_and_one_created_while_connected_resume_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let meta = |name: &str| SourceMeta {
+        labels: BTreeMap::from([("source".to_string(), name.to_string())]),
+        metadata: BTreeMap::new(),
+        clock_anchor_wall_ns: 0,
+    };
+    let mut archive = Writer::create(&o, Box::new(Tags)).unwrap();
+    let mut a = archive.add_source(meta("a")).unwrap();
+    let mut b = archive.add_source(meta("b")).unwrap();
+    a.wal((1..=3).map(|t| row("s", t)).collect()).unwrap();
+    a.seal(vec!["s".to_string()]).unwrap();
+    b.wal((1..=2).map(|t| row("s", t)).collect()).unwrap();
+    b.sync().unwrap();
+    a.sync().unwrap();
+    connect(&o, &c).close();
+
+    a.wal((4..=5).map(|t| row("s", t)).collect()).unwrap();
+    a.seal(vec!["s".to_string()]).unwrap();
+    b.wal((3..=4).map(|t| row("s", t)).collect()).unwrap();
+    b.sync().unwrap();
+    a.sync().unwrap();
+    let mut link = connect(&o, &c);
+    let mut later = archive.add_source(meta("later")).unwrap();
+    later.wal((1..=2).map(|t| row("s", t)).collect()).unwrap();
+    later.seal(vec!["s".to_string()]).unwrap();
+    later.wal(vec![row("s", 3)]).unwrap();
+    later.sync().unwrap();
+    link.poll(&o);
+    later.wal(vec![row("s", 4)]).unwrap();
+    later.seal(vec!["s".to_string()]).unwrap();
+    later.sync().unwrap();
+    link.poll(&o);
+    link.close();
+
+    let by_source = |path: &Path| {
+        let db = Archive::open(path).unwrap();
+        let mut out = BTreeMap::new();
+        for rec in db.read_sources().unwrap() {
+            let mut ts: Vec<i64> = Vec::new();
+            for seg in db
+                .segments_overlapping(rec.id, "s", i64::MIN, i64::MAX)
+                .unwrap()
+            {
+                let text = String::from_utf8(seg.bytes).unwrap();
+                ts.extend(text.split(',').map(|t| t.parse::<i64>().unwrap()));
+            }
+            ts.extend(db.live_wal(rec.id, "s").unwrap().iter().map(|r| r.ts));
+            out.insert(rec.uuid.unwrap(), ts);
+        }
+        out
+    };
+    assert_eq!(by_source(&c).len(), 3);
+    assert_eq!(by_source(&c), by_source(&o));
+    drop((a, b, later));
+    archive.join().unwrap();
+}

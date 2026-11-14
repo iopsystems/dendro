@@ -602,10 +602,9 @@ handled by what the copy holds of it:
   the copy's watermark, inside no segment of the copy's spans and no segment
   of the archive's, where a value is inside `(first, last)` when
   `first <= X < last`. The stream gets a `Sync` to `X` unless `X` is `W`,
-  then the archive's
-  segments with `last_ts` above `X`, oldest first, as `SegmentAfter` frames,
-  each `after` the previous one's `last_ts`, then the live rows past the
-  newer of `X` and the archive's watermark.
+  then the archive's segments with `last_ts` above `X`, oldest first, as
+  `SegmentAfter` frames, each `after` the previous one's `last_ts`, then
+  the live rows past what the copy then holds.
 
 A stream whose `O` is more than one past `P` also gets an `Unavailable` from
 `P` to `O`. A stream the copy holds and the archive holds no row of gets one

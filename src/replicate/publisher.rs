@@ -247,9 +247,9 @@ impl ArchivePublisher {
     ///
     /// While tailing, a seal in this archive goes out as `SegmentAfter`
     /// frames, preceded by a `Sync` when the sync point is not the copy's
-    /// watermark and by an `Unavailable` when retention removed rows past the
-    /// copy's newest, so a seal that outruns a poll is not an error as it is
-    /// on version 1.
+    /// watermark and by an `Unavailable` when this archive's oldest row is
+    /// more than one past the copy's newest, so a seal that outruns a poll is
+    /// not an error as it is on version 1.
     ///
     /// # Errors
     ///
