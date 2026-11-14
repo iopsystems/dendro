@@ -996,15 +996,28 @@ fn copy_sources_snapshotted(
         // The caller's time-keyed store, verbatim and within the range. By
         // its own names rather than the streams', because a series kept
         // under a name no stream uses is still the caller's to keep; the
-        // stream filter applies to those names the same way.
-        for name in src.caller_row_streams(rec.id)? {
+        // stream filter applies to those names the same way. A name whose
+        // rows retention removed has only its bound, and the copy carries
+        // that too.
+        for name in src.caller_row_names_held_or_bounded(rec.id)? {
             if let Some(keep) = spec.keep_streams {
                 if !keep(name.as_str()) {
                     continue;
                 }
             }
             let rows = src.read_caller_rows(rec.id, &name, spec.start, spec.end)?;
-            tx.insert_caller_rows(id, &name, &rows)?;
+            if !rows.is_empty() {
+                tx.insert_caller_rows(id, &name, &rows)?;
+            }
+            // The newest row the name has held, so the copy's writer refuses
+            // what the original's would. A time-bounded copy can leave it
+            // out, and the original's own bound may be newer still.
+            let (held, bound) = src.caller_row_floor(rec.id, &name)?;
+            if let Some(ts) = held.max(bound) {
+                if rows.last().is_none_or(|r| r.ts < ts) {
+                    tx.record_caller_row_bound(id, &name, ts)?;
+                }
+            }
         }
     }
     tx.copy_documents_from(src)?;

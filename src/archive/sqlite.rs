@@ -433,6 +433,7 @@ fn evict_caller_rows(
         Some(floor) => floor(stream, oldest_row(tx, source_id, stream)?).min(cutoff_ts),
         None => cutoff_ts,
     };
+    record_caller_row_bounds(tx, source_id, Some(stream), cut)?;
     tx.execute(
         "DELETE FROM caller_rows WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
         rusqlite::params![source_id, stream, cut],
@@ -2398,6 +2399,39 @@ impl Archive {
         Ok(out)
     }
 
+    /// The newest `ts` a caller-row name holds, and the newest its `bounds`
+    /// entry records, each `None` when absent.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn caller_row_floor(
+        &self,
+        source_id: i64,
+        name: &str,
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        let held = self
+            .conn
+            .query_row(
+                "SELECT MAX(ts) FROM caller_rows WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, name],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to read {name}'s newest caller row"
+            )))?;
+        let bound =
+            if has_table(&self.conn, "bounds")? {
+                self.conn
+                .query_row(
+                    "SELECT MAX(ts) FROM bounds WHERE source_id = ?1 AND kind = ?2 AND name = ?3",
+                    rusqlite::params![source_id, BOUND_CALLER_ROWS, name],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(Error::sqlite(format!("failed to read {name}'s caller-row bound")))?
+            } else {
+                None
+            };
+        Ok((held, bound))
+    }
+
     /// The newest timestamp `bounds` records for any of `source_id`'s
     /// streams, or `None`.
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
@@ -2636,6 +2670,29 @@ impl Archive {
             .map_err(Error::sqlite("failed to query caller row streams"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::sqlite("failed to read a caller row stream name"))
+    }
+
+    /// [`caller_row_streams`](Self::caller_row_streams), plus the names that
+    /// hold no rows any more and have a bound (FORMAT.md §3.7), in name
+    /// order: every name a copy must carry a floor for.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn caller_row_names_held_or_bounded(&self, source_id: i64) -> Result<Vec<String>> {
+        let bounded = if has_table(&self.conn, "bounds")? {
+            "UNION SELECT name FROM bounds WHERE source_id = ?1 AND kind = 1"
+        } else {
+            ""
+        };
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT DISTINCT stream FROM caller_rows WHERE source_id = ?1 {bounded} ORDER BY 1"
+            ))
+            .map_err(Error::sqlite("failed to query caller row names"))?;
+        let rows = stmt
+            .query_map([source_id], |row| row.get::<_, String>(0))
+            .map_err(Error::sqlite("failed to query caller row names"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::sqlite("failed to read a caller row name"))
     }
 
     #[cfg(test)]
@@ -3213,13 +3270,15 @@ impl ArchiveMut {
             // supplied a floor: it is keyed by time and nothing else, which
             // is what lets retention touch it without knowing what a row says.
             let caller_rows = match floor {
-                None => tx
-                    .tx
-                    .execute(
-                        "DELETE FROM caller_rows WHERE source_id = ?1 AND ts < ?2",
-                        params,
-                    )
-                    .map_err(Error::sqlite("failed to evict caller rows"))?,
+                None => {
+                    record_caller_row_bounds(&tx.tx, source_id, None, cutoff_ts)?;
+                    tx.tx
+                        .execute(
+                            "DELETE FROM caller_rows WHERE source_id = ?1 AND ts < ?2",
+                            params,
+                        )
+                        .map_err(Error::sqlite("failed to evict caller rows"))?
+                }
                 Some(_) => {
                     let mut deleted = 0;
                     for name in &names {
@@ -3608,6 +3667,26 @@ impl Transaction<'_> {
                 r.stream
             )))?;
         }
+        Ok(())
+    }
+
+    /// Record that caller-row name `name` of `source_id` has held a row at
+    /// `ts`, so a writer on this file drops a row below it, and one at it
+    /// unless the name still holds rows there (FORMAT.md §3.7). Keeps the
+    /// larger of `ts` and any bound already recorded.
+    pub fn record_caller_row_bound(&self, source_id: i64, name: &str, ts: i64) -> Result<()> {
+        self.tx
+            .execute_batch(BOUNDS_SQL)
+            .map_err(Error::sqlite("failed to create the bounds table"))?;
+        self.tx
+            .execute(
+                "INSERT INTO bounds(source_id, kind, name, ts) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(source_id, kind, name) DO UPDATE SET ts = MAX(ts, excluded.ts)",
+                rusqlite::params![source_id, BOUND_CALLER_ROWS, name, ts],
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to record {name}'s caller-row bound for source {source_id}"
+            )))?;
         Ok(())
     }
 
@@ -4110,7 +4189,7 @@ CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
 pub(crate) const BOUNDS_SQL: &str = "
 CREATE TABLE IF NOT EXISTS bounds(
   source_id INTEGER NOT NULL REFERENCES sources(id),
-  -- 0: `name` is a stream.
+  -- 0: `name` is a stream. 1: `name` is a caller-row name.
   kind INTEGER NOT NULL,
   name TEXT NOT NULL,
   ts INTEGER NOT NULL,
@@ -4120,6 +4199,39 @@ CREATE TABLE IF NOT EXISTS bounds(
 
 /// `bounds.kind` for a stream.
 const BOUND_STREAM: i64 = 0;
+
+/// `bounds.kind` for a caller-row name.
+const BOUND_CALLER_ROWS: i64 = 1;
+
+/// Record, in `bounds`, the newest `caller_rows` timestamp of `source_id`'s
+/// names whose newest row is below `below`: every name, or only `name`.
+/// Called inside a retention pass's transaction, before its delete.
+fn record_caller_row_bounds(
+    conn: &Connection,
+    source_id: i64,
+    name: Option<&str>,
+    below: i64,
+) -> Result<()> {
+    conn.execute_batch(BOUNDS_SQL)
+        .map_err(Error::sqlite("failed to create the bounds table"))?;
+    let filter = match name {
+        Some(_) => "source_id = ?1 AND stream = ?2",
+        None => "source_id = ?1",
+    };
+    conn.execute(
+        &format!(
+            "INSERT INTO bounds(source_id, kind, name, ts) \
+             SELECT ?1, ?3, stream, MAX(ts) FROM caller_rows WHERE {filter} \
+             GROUP BY stream HAVING MAX(ts) < ?4 \
+             ON CONFLICT(source_id, kind, name) DO UPDATE SET ts = MAX(ts, excluded.ts)"
+        ),
+        rusqlite::params![source_id, name.unwrap_or(""), BOUND_CALLER_ROWS, below],
+    )
+    .map_err(Error::sqlite(format!(
+        "failed to record source {source_id}'s caller-row bounds"
+    )))?;
+    Ok(())
+}
 
 /// Record, in `bounds`, the newest timestamp `source_id`'s streams hold now:
 /// every stream, or only `stream`, and only the streams whose newest row is

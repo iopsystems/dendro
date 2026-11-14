@@ -174,7 +174,7 @@ CREATE TABLE documents(                -- schema 5; a v4 archive has none
 CREATE INDEX documents_by_name ON documents(kind, name, id);
 CREATE TABLE bounds(                   -- with the file; an older file gets it at its first delete that needs it (§3.7)
   source_id INTEGER NOT NULL REFERENCES sources(id),
-  kind INTEGER NOT NULL,               -- 0: `name` is a stream
+  kind INTEGER NOT NULL,               -- 0: a stream; 1: a caller-row name
   name TEXT NOT NULL,
   ts INTEGER NOT NULL,
   PRIMARY KEY (source_id, kind, name)
@@ -348,6 +348,15 @@ cannot destroy. The rules:
 
 - No primary key. Several rows may share a timestamp, and `rowid` is their
   insertion order; a ranged read returns `ORDER BY ts, rowid`.
+- A name's rows append in `ts` order. A writer drops, and counts, a row
+  whose `ts` is below the name's newest
+  (`SourceWriter::dropped_caller_rows_out_of_order`); rows at the newest
+  `ts` are kept, and within one call rows may arrive in any order. After
+  retention removes a name's newest rows, the next row must be above them
+  (§3.7). So a row's position is its `ts` and its ordinal among the rows at
+  that `ts`; an `ArchivePublisher`'s cursor resumes a name from that pair
+  between polls. `Transaction::insert_caller_rows`, which runs without a
+  writer, does not check the order; a copy inserts in order.
 - `stream` is a name the caller chooses, normally a stream this source has.
   A row here does not make a stream exist: the set of streams is still
   `segments ∪ wal`. A series kept under a name no stream uses appears in no
@@ -436,8 +445,8 @@ spans every source. Each row is one **revision** of the document
 
 ### 3.7 `bounds`
 
-The newest timestamp a stream of this file has held, per `(source_id,
-kind, name)`. A writer's bound for a stream (§3.3) is the larger of this and the
+The newest timestamp a stream, or a caller-row name, of this file has
+held, per `(source_id, kind, name)`. A writer's bound for a stream (§3.3) is the larger of this and the
 stream's newest row in `wal` and `segments`. The rules:
 
 - **Who writes it.** Every delete that can remove a stream's newest row
@@ -450,8 +459,12 @@ stream's newest row in `wal` and `segments`. The rules:
     with a segment ending at the same row, so for it the record changes
     nothing.
 
-  A later delete never lowers a recorded value. `kind` 0 is the only kind:
-  `name` is a stream.
+  A later delete never lowers a recorded value. `kind` 0 names a stream.
+- **Caller rows.** `kind` 1 names a caller-row name (§3.5), and its `ts` is
+  the newest `caller_rows` row a retention pass removed, recorded for each
+  name whose newest row the pass's cut (the cutoff, or the caller's floor)
+  removes. A writer then takes only rows above it. A copy records each
+  carried name's newest row when its time bound leaves that row out.
 - **Why.** Without it, a stream whose newest rows were discarded or evicted
   accepts rows at timestamps it has already held. A tailing replication
   publisher whose cursor is past them does not ship them.
