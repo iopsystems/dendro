@@ -4,9 +4,9 @@
 ///
 /// The caller's transport carries it from the subscriber's side to the
 /// publisher's, as it carries the frames the other way.
-/// [`encode`](Self::encode) and [`decode`](Self::decode) are its bytes. This
-/// build has no constructor that reads an archive; [`Default`] and
-/// [`decode`](Self::decode) are the ways to obtain one.
+/// [`encode`](Self::encode) and [`decode`](Self::decode) are its bytes.
+/// [`Subscriber::resume`](crate::replicate::Subscriber::resume) builds one from
+/// the copy's archive.
 ///
 /// Sources are in `uuid` order, and each source's streams and caller-row
 /// names in name order, each name once; [`encode`](Self::encode) and

@@ -2432,6 +2432,30 @@ impl Archive {
         Ok((held, bound))
     }
 
+    /// The position of a caller-row name's newest entry: its `ts` and how
+    /// many entries the name holds at that `ts`, or `None` when it holds
+    /// none (WIRE.md §8).
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn caller_row_position(
+        &self,
+        source_id: i64,
+        name: &str,
+    ) -> Result<Option<(i64, u64)>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT ts, COUNT(*) FROM caller_rows WHERE source_id = ?1 AND stream = ?2 \
+                 AND ts = (SELECT MAX(ts) FROM caller_rows WHERE source_id = ?1 AND stream = ?2) \
+                 GROUP BY ts",
+                rusqlite::params![source_id, name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()
+            .map_err(Error::sqlite(format!(
+                "failed to read {name}'s caller-row position"
+            )))
+    }
+
     /// The newest timestamp `bounds` records for any of `source_id`'s
     /// streams, or `None`.
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
@@ -2453,7 +2477,23 @@ impl Archive {
     /// [`newest_rows`](Self::newest_rows) for one source.
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn newest_rows_of(&self, source_id: i64) -> Result<BTreeMap<String, i64>> {
-        let bounds = if has_table(&self.conn, "bounds")? {
+        self.newest_rows_of_with(source_id, true)
+    }
+
+    /// Each stream's newest row the file holds for one source, sealed or
+    /// live, leaving out `bounds`: a replicated copy's own rows, whose bound
+    /// the protocol sets (WIRE.md §4.7).
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn held_newest_rows_of(&self, source_id: i64) -> Result<BTreeMap<String, i64>> {
+        self.newest_rows_of_with(source_id, false)
+    }
+
+    fn newest_rows_of_with(
+        &self,
+        source_id: i64,
+        with_bounds: bool,
+    ) -> Result<BTreeMap<String, i64>> {
+        let bounds = if with_bounds && has_table(&self.conn, "bounds")? {
             "UNION ALL SELECT name, ts FROM bounds WHERE source_id = ?1 AND kind = 0"
         } else {
             ""
@@ -3643,6 +3683,29 @@ impl Transaction<'_> {
             bytes,
             caller_index,
         )
+    }
+
+    /// Delete `stream`'s WAL rows with `ts` above `above` and at or below
+    /// `upto`, each bound absent for no bound, and return how many went.
+    /// Records nothing in `bounds`; a caller that removes the stream's newest
+    /// rows records them itself.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn delete_wal_range(
+        &self,
+        source_id: i64,
+        stream: &str,
+        above: Option<i64>,
+        upto: Option<i64>,
+    ) -> Result<usize> {
+        self.tx
+            .execute(
+                "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 \
+                 AND (?3 IS NULL OR ts > ?3) AND (?4 IS NULL OR ts <= ?4)",
+                rusqlite::params![source_id, stream, above, upto],
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to delete WAL rows of {stream}"
+            )))
     }
 
     /// Insert every WAL row for one tick — one stream each, typically.

@@ -87,8 +87,10 @@
 //!    are `Full` keeps them with a
 //!    [`CallerRowFloor`](crate::archive::CallerRowFloor). [`Subscriber`](crate::replicate::Subscriber)
 //!    records no entry kinds and has no retention of its own.
-//! 8. A reconnect is a new handshake and full state. [`Subscriber`](crate::replicate::Subscriber)
-//!    takes no [`ResumeRequest`](crate::replicate::ResumeRequest).
+//! 8. A reconnect is a new handshake and full state, on protocol version 1.
+//!    On version 2 a copy resumes instead: [`Subscriber::resume`](crate::replicate::Subscriber::resume)
+//!    builds the [`ResumeRequest`](crate::replicate::ResumeRequest) the
+//!    publisher answers.
 //! 9. A row carries the [`IndexState`](crate::replicate::IndexState) it was built against, and a subscriber
 //!    that cannot match it **skips the row**. Misattribution is worse than a
 //!    gap.

@@ -1132,7 +1132,7 @@ fn an_unknown_must_understand_kind_is_an_error() {
 }
 
 /// The frames that act on a resumed copy are refused by a subscriber that
-/// resumes none, and the report of an unavailable span is not a change.
+/// resumes none, and the report of an unavailable span changes nothing.
 #[test]
 fn a_subscriber_that_resumes_nothing_refuses_the_resume_frames() {
     let dir = tempfile::tempdir().unwrap();
@@ -1168,7 +1168,7 @@ fn a_subscriber_that_resumes_nothing_refuses_the_resume_frames() {
             before: 9,
         })
         .unwrap();
-    assert_eq!(applied, dendro::replicate::Applied::default());
+    assert_eq!((applied.unavailable, applied.rows), (1, 0));
     sub.finish().unwrap();
 }
 

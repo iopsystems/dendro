@@ -343,7 +343,13 @@ what it holds above it:
 The publisher picks `at` so that no segment of the copy's or of its own
 contains it, so the copy deletes and the publisher ships whole segments.
 
-This build's `Subscriber` refuses this frame; no release applies it yet.
+A `Subscriber` applies it to a source of a resumed copy
+(`Subscriber::resume`) and refuses it otherwise. Step 2's deletes are counted
+in `Applied::rows_unsealable`, step 3's in `Applied::rows_replaced`, and the
+newest row deleted is recorded in the copy's `bounds` (`FORMAT.md` §3.7). An
+encoder error in step 1 does not fail the frame: the rows it covered are
+deleted under step 2. A `Sync` whose `at` is inside one of the copy's
+segments is refused.
 
 ### 4.8 `SegmentAfter` (kind 136, version 2)
 
@@ -363,9 +369,11 @@ A sealed segment that replaces the copy's live rows of its stream in
 copy refuses it when it holds a live row of the stream at or below `after`, or
 a segment of the stream whose `last_ts` is above `after`; either means the
 copy is not where the publisher put it. The live rows it deletes below
-`first_ts` are rows the publisher's seal pruned or discarded.
+`first_ts` are rows the publisher's seal pruned or discarded, counted in
+`Applied::rows_pruned`.
 
-This build's `Subscriber` refuses this frame; no release applies it yet.
+A `Subscriber` applies it to a source of a resumed copy and refuses it
+otherwise.
 
 ### 4.9 `Unavailable` (kind 9, version 2)
 
@@ -380,8 +388,8 @@ The publisher holds no row of the stream in the open interval
 `(after, before)`, and the copy may lack rows the publisher once held there,
 because retention removed them before the copy received them. Applying it
 changes nothing in the copy, so the kind is skippable, and a subscriber that
-skips it holds the same rows. This build's `Subscriber` applies it as
-nothing.
+skips it holds the same rows. A `Subscriber` counts it in
+`Applied::unavailable`.
 
 ## 5. Protocol rules
 
@@ -418,10 +426,12 @@ nothing.
    a floor (FORMAT.md §3.5). This crate's `Subscriber` does not record an
    entry's kind and has no retention of its own, so a subscriber archive has
    no retention path yet.
-8. A reconnect is a new handshake and full state. This build's `Subscriber`
-   takes no resume request (§8), and refuses a handshake whose `uuid` its
-   archive already holds (`Error::DuplicateSource`): a reconnect catches up
-   into a new archive.
+8. On version 1 a reconnect is a new handshake and full state, and a
+   `Subscriber` refuses a handshake whose `uuid` its archive already holds
+   (`Error::DuplicateSource`): a reconnect catches up into a new archive. On
+   version 2 a copy resumes: `Subscriber::resume` builds the request of §8
+   from the copy's archive, and a handshake for a source it names continues
+   that source (§8.1).
 9. A row carries the `index_state` it was built against, and a subscriber that
    cannot match it **skips the row**. Misattribution is worse than a gap.
 10. A subscriber drops a row at or below the newest timestamp the connection
@@ -530,3 +540,31 @@ A reader refuses a request that:
 A caller-row name's entries append in `ts` order (`FORMAT.md` §3.5), so
 `(ts, at_ts)` is a position in the publisher's entries of that name too.
 `ArchivePublisher` in this build takes no request.
+
+### 8.1 The copy's side
+
+`Subscriber::resume` reads the request from the copy's archive, so after a
+kill it describes what the file holds. It lists at most 256 spans per stream,
+newest first. A source with no uuid is left out, and the publisher's
+handshake for it adds a second source.
+
+A handshake for a source the request named continues it without a writer
+session. Its labels and metadata are replaced with the handshake's, as a
+`SourceUpdate` replaces them. A handshake that says incomplete clears the
+copy's `complete`. The connection's newest row per stream starts at the
+copy's newest, so a row at or below it is a repeat (rule 10), until a `Sync`
+sets it to the sync point. A copy that holds index entries for the source has
+had its `Full`, so a first `Delta` is applied. A handshake for any other
+source adds it.
+
+Each source of a resumed subscriber stops at the first write its writer
+drops: a tick dropped after retries, a row at or below its stream's newest,
+or an index entry below its name's newest. The writer drops the source's
+later rows and index entries and refuses its later segments and syncs, so
+the file holds what was written before the drop, and a new request asks for
+the rest. `apply` and `sync` return an error from then
+on. A resumed subscriber does not seal; its segments come from `Sync` and
+`SegmentAfter`.
+
+Frames lost before they reach `apply` are not detected by the subscriber;
+a version 2 `FrameReader` refuses a stream that lost one (§2.1).
