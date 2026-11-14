@@ -151,6 +151,11 @@ slots collides often enough to matter when a mismatch silently drops rows.
 `Full` carries every live slot; `Delta` carries what changed, and is
 meaningless without the `Full` before it.
 
+A stream's `Index` frames carry non-decreasing `ts`. A `Subscriber` writes
+them through its writer, which drops an entry below the stream's newest
+and counts it (`SourceWriter::dropped_caller_rows_out_of_order`).
+`ArchivePublisher` sends them in that order.
+
 ### 4.3 `Rows` (kind 3)
 
 ```

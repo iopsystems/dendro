@@ -76,17 +76,19 @@ cannot reach a failed release any other way.
   table. `resume_source` refuses an anchor at or below a source's bound
   and returns it as the floor, so a source evicted to nothing still has
   one. `rewrite::copy_sources_into` carries each copied stream's bound.
-  The same holds for the caller's time-keyed store: `SourceWriter::caller_rows`
-  drops, and counts in the new `SourceWriter::dropped_caller_rows_out_of_order`,
-  a row whose `ts` is below its name's newest, or at or below the newest
-  rows a retention pass removed. Rows at a name's newest `ts` are still
-  kept, so several may share one, and within one call rows may arrive in
-  any order. A caller that wrote caller rows out of order across calls now
-  loses the late ones; the count says how many.
   Writing corrected rows at the timestamps of discarded ones is no longer
   possible, and a source whose rows were stamped in the future cannot be
   resumed until the clock passes them, even after they are discarded or
   evicted.
+- `SourceWriter::caller_rows` drops, and counts in the new
+  `SourceWriter::dropped_caller_rows_out_of_order`, a row whose `ts` is
+  below its name's newest, or at or below the newest rows a retention pass
+  removed or a time-bounded `copy_sources_into` left out. Rows at a name's
+  newest `ts` are kept, so several may share one, and within one call rows
+  may arrive in any order. A caller that wrote caller rows out of order
+  across calls now loses the late ones; the count says how many. A
+  `Subscriber` writes `Index` frames the same way, so a producer must send a
+  stream's entries in `ts` order, as `ArchivePublisher` does.
 - Every writing handle (`Writer`, `ArchiveMut::create`, `ArchiveMut::open`)
   holds an exclusive advisory lock on `<archive>-lock` for its life, and a
   second one on the same archive is refused as `Error::InUse`, in the same

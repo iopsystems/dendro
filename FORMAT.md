@@ -353,8 +353,8 @@ cannot destroy. The rules:
   rows at the newest `ts` are kept, and within one call rows may arrive in
   any order. After retention removes a name's newest rows, the next row
   must be above them (§3.7). So a row's position is its `ts` and its
-  ordinal among the rows at that `ts`, which is what replication resumes
-  from. `Transaction::insert_caller_rows`, which runs without a writer, does
+  ordinal among the rows at that `ts`; an `ArchivePublisher`'s cursor
+  resumes a name from that pair between polls. `Transaction::insert_caller_rows`, which runs without a writer, does
   not check the order; a copy inserts in order.
 - `stream` is a name the caller chooses, normally a stream this source has.
   A row here does not make a stream exist: the set of streams is still

@@ -970,13 +970,14 @@ impl SourceWriter {
     }
 
     /// How many of this source's caller rows ([`caller_rows`](Self::caller_rows))
-    /// have been dropped for a `ts` below their name's newest row, as it
-    /// stood before the call that carried them.
+    /// have been dropped for arriving below their name's floor, as it stood
+    /// before the call that carried them.
     ///
     /// A name's rows append in `ts` order: several may share the newest
     /// `ts`, and within one call they may arrive in any order, but a row
-    /// below the newest is dropped. After retention removes a name's newest
-    /// rows, the next row must be above them (FORMAT.md §3.7). Counted, not
+    /// below the newest is dropped. When the name's newest rows are not in
+    /// the file, because retention removed them or a time-bounded copy left
+    /// them out, the next row must be above them (FORMAT.md §3.7). Counted, not
     /// returned, for the reason [`dropped_out_of_order`](Self::dropped_out_of_order)
     /// gives.
     pub fn dropped_caller_rows_out_of_order(&self) -> u64 {
@@ -1485,8 +1486,8 @@ struct WriterHealth {
 struct CallerFloor {
     floor: Option<i64>,
     /// Whether rows at exactly `floor` are admitted: the name holds rows at
-    /// its newest `ts`. Not after retention removed them, when `floor` is
-    /// the removed rows' `ts` from `bounds`.
+    /// its newest `ts`. Not when retention removed them or a copy left them
+    /// out, and `floor` is their `ts` from `bounds`.
     at_floor: bool,
 }
 
@@ -2424,11 +2425,21 @@ fn writer_loop(
                 // floor as it stood before this call (FORMAT.md §3.7).
                 let floor = match caller_floors.get(&(source_id, stream.clone())) {
                     Some(floor) => *floor,
-                    None => {
-                        let floor = CallerFloor::read(db, source_id, &stream)?;
-                        caller_floors.insert((source_id, stream.clone()), floor);
-                        floor
-                    }
+                    None => match with_retries("reading a caller-row floor", || {
+                        CallerFloor::read(db, source_id, &stream)
+                    }) {
+                        Ok(floor) => {
+                            caller_floors.insert((source_id, stream.clone()), floor);
+                            floor
+                        }
+                        // Lost like a dropped commit: the rows are not
+                        // written, and a run of these stops the writer.
+                        Err(e) if e.is_retryable() => {
+                            health.dropped(e)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    },
                 };
                 let offered = rows.len();
                 let rows: Vec<CallerRow> =
@@ -2463,6 +2474,7 @@ fn writer_loop(
                 source_id,
                 clock_offset,
             }) => {
+                caller_floors.retain(|(source, _), _| *source != source_id);
                 // The loop's final tick observation joins the series only when
                 // it adds a timestamp no sealed row already covers — otherwise
                 // the series would carry two conflicting offsets at one

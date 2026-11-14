@@ -2672,6 +2672,29 @@ impl Archive {
             .map_err(Error::sqlite("failed to read a caller row stream name"))
     }
 
+    /// [`caller_row_streams`](Self::caller_row_streams), plus the names that
+    /// hold no rows any more and have a bound (FORMAT.md §3.7), in name
+    /// order: every name a copy must carry a floor for.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn caller_row_names_held_or_bounded(&self, source_id: i64) -> Result<Vec<String>> {
+        let bounded = if has_table(&self.conn, "bounds")? {
+            "UNION SELECT name FROM bounds WHERE source_id = ?1 AND kind = 1"
+        } else {
+            ""
+        };
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT stream FROM caller_rows WHERE source_id = ?1 {bounded} ORDER BY 1"
+            ))
+            .map_err(Error::sqlite("failed to query caller row names"))?;
+        let rows = stmt
+            .query_map([source_id], |row| row.get::<_, String>(0))
+            .map_err(Error::sqlite("failed to query caller row names"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::sqlite("failed to read a caller row name"))
+    }
+
     #[cfg(test)]
     fn pragma_string(&self, name: &str) -> Result<String> {
         self.conn

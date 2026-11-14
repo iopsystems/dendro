@@ -4,9 +4,9 @@
 //! A caller-row name's rows append in `ts` order. Several may share the
 //! newest `ts`, and within one call they may arrive in any order, but a row
 //! below the newest is dropped and counted. After retention removes a
-//! name's newest rows, the next row must be above them. That order is what
-//! gives a caller row a position a replication subscriber can resume from:
-//! its `ts` and its ordinal among the rows at that `ts`.
+//! name's newest rows, the next row must be above them. That order gives a
+//! caller row a position: its `ts` and its ordinal among the rows at that
+//! `ts`.
 
 use std::collections::BTreeMap;
 
@@ -208,4 +208,36 @@ fn whole_source_retention_keeps_each_names_floor() {
     drop(w);
     archive.join().unwrap();
     assert_eq!(held(&path, "idx"), vec![60]);
+}
+
+/// A name whose rows retention removed holds only its bound, and a copy
+/// carries that bound too.
+#[test]
+fn a_copy_carries_the_floor_of_a_name_evicted_to_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let copy = dir.path().join("copy.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta()).unwrap();
+    w.caller_rows("gone", vec![entry(10), entry(50)]).unwrap();
+    w.sync().unwrap();
+    w.evict_before(100).unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let src = Archive::open(&path).unwrap();
+    let mut dst = ArchiveMut::create(&copy).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Tags))
+        .unwrap();
+    drop(dst);
+
+    let mut archive = Writer::open(&copy, Box::new(Tags)).unwrap();
+    let id = Archive::open(&copy).unwrap().read_sources().unwrap()[0].id;
+    let (mut w, _) = archive.resume_source(id, 1_000).unwrap();
+    w.caller_rows("gone", vec![entry(40), entry(60)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_caller_rows_out_of_order(), 1, "the 40");
+    drop(w);
+    archive.join().unwrap();
+    assert_eq!(held(&copy, "gone"), vec![60]);
 }
