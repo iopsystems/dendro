@@ -619,3 +619,33 @@ fn a_copy_carries_the_bound_of_a_stream_evicted_to_nothing() {
     drop(w);
     archive.join().unwrap();
 }
+
+/// The bound a discard records is not in the source's metadata, so replacing
+/// the metadata leaves it: a later writer still drops rows at or below it.
+#[test]
+fn replacing_the_metadata_after_a_discard_keeps_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    let id = w.source_id();
+    w.wal(vec![row("s", 1), row("s", 2), row("s", 3)]).unwrap();
+    w.discard_live_rows(Box::new(|_: &str| true)).unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut db = dendro::archive::ArchiveMut::open(&path).unwrap();
+    db.update_source_metadata(id, &BTreeMap::new()).unwrap();
+    drop(db);
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    let (mut w, floor) = archive.resume_source(id, 1_000).unwrap();
+    assert_eq!(floor, Some(3));
+    let err = w.wal(vec![row("s", 3)]).unwrap_err();
+    assert!(
+        matches!(err, dendro::Error::TimelineBackwards { floor: 3, .. }),
+        "{err}"
+    );
+    drop(w);
+    archive.join().unwrap();
+}

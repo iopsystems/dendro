@@ -83,6 +83,14 @@ name = "append-until-killed"
 path = "src/bin/append-until-killed.rs"
 required-features = ["test-support"]
 
+# A resumed replication copy in its own process, applying a recorded version
+# 2 stream, so a test can SIGKILL it partway through a `Sync`. Behind
+# `test-support` because nothing ships it.
+[[bin]]
+name = "resume-until-killed"
+path = "src/bin/resume-until-killed.rs"
+required-features = ["test-support"]
+
 # The compaction gate's measurement: does read cost track segment count?
 # Behind `test-support` for `Archive::single`, and because nothing ships it.
 [[bin]]
