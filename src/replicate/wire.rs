@@ -1053,6 +1053,8 @@ impl<W: Write> FrameWriter<W> {
         self.buf.reserve_exact(total);
         put_payload(frame, &mut self.buf)?;
         debug_assert_eq!(self.buf.len(), total, "payload_len is put_payload's size");
+        // The split and the declared total use what was written.
+        let total = self.buf.len();
         if NUMBER_BYTES + total <= limit {
             return write_part(&mut self.out, &mut self.next_number, &[], &self.buf);
         }
