@@ -1565,3 +1565,42 @@ fn a_live_only_stream_sealed_before_the_first_poll_is_caught_up() {
     sub.finish().unwrap();
     assert_eq!(readable(&copy), readable(&origin));
 }
+
+/// A handshake for a source the subscriber's archive already holds is
+/// refused by uuid, and the archive keeps its one copy. Each handshake used
+/// to insert a new source row, so a reconnect into the same archive copied
+/// every source again under the same uuid.
+#[test]
+fn a_reconnect_into_the_same_archive_is_refused_by_uuid() {
+    use dendro::replicate::ArchivePublisher;
+
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("live.dendro");
+    let copy = dir.path().join("copy.dendro");
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("s", 1_000)]).unwrap();
+    w.sync().unwrap();
+    let db = Archive::open(&origin).unwrap();
+
+    let (_, opening) = ArchivePublisher::catching_up(&db, i64::MIN).unwrap();
+    let mut sub = Subscriber::new(Writer::create(&copy, Box::new(Tags)).unwrap());
+    sub.apply_all(opening).unwrap();
+    sub.finish().unwrap();
+
+    let (_, opening) = ArchivePublisher::catching_up(&db, i64::MIN).unwrap();
+    let mut sub = Subscriber::new(Writer::open(&copy, Box::new(Tags)).unwrap());
+    let err = sub.apply_all(opening).unwrap_err();
+    assert!(
+        matches!(err, dendro::Error::DuplicateSource { .. }),
+        "{err}"
+    );
+    sub.finish().unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    assert_eq!(
+        Archive::open(&copy).unwrap().read_sources().unwrap().len(),
+        1
+    );
+}

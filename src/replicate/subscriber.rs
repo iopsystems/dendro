@@ -101,7 +101,9 @@ struct SourceState {
 ///
 /// **One `Subscriber` per connection.** After a reconnect, [`finish`](Self::finish)
 /// this one and open a new one: the new connection's ordinals restart at zero,
-/// and a reused subscriber refuses their handshakes.
+/// and a reused subscriber refuses their handshakes. Open it on a new archive:
+/// an archive holds one source per uuid, so a handshake for a source the
+/// archive already holds is refused as [`Error::DuplicateSource`].
 ///
 /// Owns a [`Writer`], because the subscriber's archive is written the way every
 /// other archive is: one writer, one file, with the checkpoint thread,

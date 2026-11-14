@@ -596,6 +596,15 @@ pub enum Problem {
         /// How many.
         rows: usize,
     },
+    /// Several sources carry one uuid, so they claim to be one source. Only
+    /// reachable in an archive created before the uuid index, written by a
+    /// build that did not check (FORMAT.md §3.1).
+    DuplicateUuid {
+        /// The uuid.
+        uuid: String,
+        /// The sources carrying it.
+        source_ids: Vec<i64>,
+    },
 }
 
 impl std::fmt::Display for Problem {
@@ -620,6 +629,10 @@ impl std::fmt::Display for Problem {
                 f,
                 "source {source_id}, stream {stream}: {rows} WAL row(s) at or below the \
                  sealed watermark, which no read path can reach"
+            ),
+            Problem::DuplicateUuid { uuid, source_ids } => write!(
+                f,
+                "sources {source_ids:?} all carry uuid {uuid}, so they claim to be one source"
             ),
         }
     }
@@ -2171,6 +2184,20 @@ impl Archive {
         // findings describe the same instant.
         let walked = self.read_snapshot(|db| {
             let rows = db.read_sources()?;
+            let mut by_uuid: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+            for src in &rows {
+                if let Some(uuid) = src.uuid.as_deref() {
+                    by_uuid.entry(uuid).or_default().push(src.id);
+                }
+            }
+            for (uuid, source_ids) in by_uuid {
+                if source_ids.len() > 1 {
+                    problems.push(Problem::DuplicateUuid {
+                        uuid: uuid.to_string(),
+                        source_ids,
+                    });
+                }
+            }
             let mut streams = 0usize;
             let mut segments = 0usize;
             let mut wal_rows = 0usize;
@@ -3669,6 +3696,19 @@ fn insert_source_sql(conn: &Connection, meta: &SourceMeta, uuid: Option<&str>) -
         Some(u) => u.to_string(),
         None => mint_uuid(conn)?,
     };
+    // Checked here, not only by the index: an archive created before the
+    // index has none, and a second source with one uuid there would be
+    // indistinguishable from the first.
+    let held: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE uuid = ?1)",
+            [&uuid],
+            |row| row.get(0),
+        )
+        .map_err(Error::sqlite("failed to look up a source uuid"))?;
+    if held {
+        return Err(Error::DuplicateSource { uuid });
+    }
     conn.execute(
         "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns, uuid) \
          VALUES (?1, ?2, 0, ?3, ?4)",
@@ -3899,6 +3939,9 @@ CREATE TABLE sources(
   heartbeat INTEGER,
   heartbeat_interval_ns INTEGER
 );
+-- At most one source per uuid. Created with the archive; an archive created
+-- before it has no index, and every insert checks instead (FORMAT.md §3.1).
+CREATE UNIQUE INDEX sources_by_uuid ON sources(uuid);
 CREATE TABLE segments(
   source_id INTEGER NOT NULL REFERENCES sources(id),
   stream TEXT NOT NULL,

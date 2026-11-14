@@ -456,7 +456,8 @@ what makes "is this file mine" a header comparison rather than a guess.
 Every source carries a `uuid`, minted at insert from SQLite's own
 `randomblob` (so the reader build needs no random source) and carried
 verbatim by every copy. Labels are a source's *name*; the uuid is its
-identity, and `rewrite::shared_sources` is how an assembly tells "the same
-source again" from "another source with the same labels". `NULL` in archives
+identity, and an archive holds at most one source per uuid: a copy of a
+source the destination holds is refused, and `rewrite::shared_sources` is how
+an assembly finds them first, to leave them out with `CopySpec::keep_sources`. `NULL` in archives
 from before the column means unknown, never the same.
 
