@@ -241,3 +241,28 @@ fn a_copy_carries_the_floor_of_a_name_evicted_to_nothing() {
     archive.join().unwrap();
     assert_eq!(held(&copy, "gone"), vec![60]);
 }
+
+/// A file from before the `bounds` table copies each caller row once.
+#[test]
+fn a_file_without_bounds_copies_each_caller_row_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let copy = dir.path().join("copy.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta()).unwrap();
+    w.caller_rows("idx", vec![entry(10), entry(20), entry(30)])
+        .unwrap();
+    drop(w);
+    archive.join().unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE bounds")
+        .unwrap();
+
+    let src = Archive::open(&path).unwrap();
+    let mut dst = ArchiveMut::create(&copy).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Tags))
+        .unwrap();
+    drop(dst);
+    assert_eq!(held(&copy, "idx"), vec![10, 20, 30]);
+}

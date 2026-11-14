@@ -349,13 +349,14 @@ cannot destroy. The rules:
 - No primary key. Several rows may share a timestamp, and `rowid` is their
   insertion order; a ranged read returns `ORDER BY ts, rowid`.
 - A name's rows append in `ts` order. A writer drops, and counts, a row
-  whose `ts` is below the name's newest (`SourceWriter::dropped_caller_rows_out_of_order`);
-  rows at the newest `ts` are kept, and within one call rows may arrive in
-  any order. After retention removes a name's newest rows, the next row
-  must be above them (§3.7). So a row's position is its `ts` and its
-  ordinal among the rows at that `ts`; an `ArchivePublisher`'s cursor
-  resumes a name from that pair between polls. `Transaction::insert_caller_rows`, which runs without a writer, does
-  not check the order; a copy inserts in order.
+  whose `ts` is below the name's newest
+  (`SourceWriter::dropped_caller_rows_out_of_order`); rows at the newest
+  `ts` are kept, and within one call rows may arrive in any order. After
+  retention removes a name's newest rows, the next row must be above them
+  (§3.7). So a row's position is its `ts` and its ordinal among the rows at
+  that `ts`; an `ArchivePublisher`'s cursor resumes a name from that pair
+  between polls. `Transaction::insert_caller_rows`, which runs without a
+  writer, does not check the order; a copy inserts in order.
 - `stream` is a name the caller chooses, normally a stream this source has.
   A row here does not make a stream exist: the set of streams is still
   `segments ∪ wal`. A series kept under a name no stream uses appears in no

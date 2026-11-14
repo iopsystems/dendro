@@ -2685,7 +2685,7 @@ impl Archive {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT stream FROM caller_rows WHERE source_id = ?1 {bounded} ORDER BY 1"
+                "SELECT DISTINCT stream FROM caller_rows WHERE source_id = ?1 {bounded} ORDER BY 1"
             ))
             .map_err(Error::sqlite("failed to query caller row names"))?;
         let rows = stmt
