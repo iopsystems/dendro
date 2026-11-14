@@ -461,8 +461,9 @@ stream's newest row in `wal` and `segments`. The rules:
   a v4 archive as to a v5 one (§8).
 - **Copies.** `rewrite::copy_sources_into` records each carried stream's
   newest row in the copy, counting the original's own bounds, so a
-  time-bounded copy keeps the original's bound. Compaction does not touch
-  it. Replication does not carry it: it describes this file.
+  time-bounded copy keeps the original's bound. Compaction records each
+  merged stream's newest row, which it keeps, so the bound does not change.
+  Replication does not carry it: it describes this file.
 - **Resume.** A resumed source's floor (§7) is the newest row the source has
   held, bounds included. So a source whose rows were stamped in the future
   cannot be resumed until the clock passes them, even after they are

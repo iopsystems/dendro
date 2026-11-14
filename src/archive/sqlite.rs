@@ -2359,8 +2359,9 @@ impl Archive {
             .map_err(Error::sqlite("failed to read a sealed watermark"))
     }
 
-    /// Every stream's newest row timestamp, sealed or live: the larger of its
-    /// newest segment's `last_ts` and its newest WAL row's `ts`. The writer
+    /// Every stream's newest row timestamp, sealed or live: the largest of
+    /// its newest segment's `last_ts`, its newest WAL row's `ts` and its
+    /// `bounds` row (FORMAT.md §3.7). The writer
     /// refuses a row at or below it (see `SourceWriter::dropped_out_of_order`).
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn newest_rows(&self) -> Result<BTreeMap<i64, BTreeMap<String, i64>>> {
