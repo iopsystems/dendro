@@ -74,8 +74,8 @@ struct SourceCursor {
     /// publisher, the offsets below `since` for a catch-up. Offsets are not
     /// inserted in timestamp order: a seal records its observation at the
     /// newest row it sealed, so sealing one stream to 100 and then another
-    /// to 80 inserts 80 after 100. One entry per seal batch, pruned below the
-    /// oldest offset the archive holds.
+    /// to 80 inserts 80 after 100. One entry per `clock_offsets` row, pruned
+    /// below the oldest the archive holds.
     clock_sent: BTreeSet<i64>,
     seq: u64,
     index_state: IndexState,
