@@ -895,3 +895,189 @@ fn a_copy_with_its_own_segment_boundaries_resyncs_below_them() {
     link.close();
     assert_eq!(readable(&c), readable(&o));
 }
+
+fn unavailable(frames: &[Frame]) -> Vec<(String, i64, i64)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Unavailable {
+                stream,
+                after,
+                before,
+                ..
+            } => Some((stream.clone(), *after, *before)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rewrite the origin's or copy's segments of `s` in one transaction:
+/// delete those whose `first_ts` is listed, insert `(seq, first, last)`.
+fn put(path: &Path, delete: &[i64], insert: &[(u64, i64, i64)]) {
+    let mut db = ArchiveMut::open(path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    let metas = db.read_segment_meta(id, "s").unwrap();
+    db.transaction(|tx| {
+        for (seq, m) in &metas {
+            if delete.contains(&m.first_ts) {
+                tx.delete_segment(id, "s", *seq)?;
+            }
+        }
+        for (seq, a, b) in insert {
+            tx.insert_segment(
+                id,
+                "s",
+                *seq,
+                &SegmentMeta {
+                    rows: (b - a + 1) as u64,
+                    first_ts: *a,
+                    last_ts: *b,
+                },
+                &tags(*a..=*b),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// While connected, the origin seals and evicts past the copy's newest row
+/// between two polls: the span is reported, as on resume.
+#[test]
+fn a_connected_seal_and_eviction_between_polls_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=3);
+    origin.seal(&["s"]);
+    let mut link = connect(&o, &c);
+    origin.rows("s", 4..=6);
+    origin.seal(&["s"]);
+    origin.rows("s", 7..=9);
+    origin.seal(&["s"]);
+    origin.w.evict_before(7).unwrap();
+    origin.rows("s", [10]);
+    let (applied, frames) = link.poll(&o);
+    assert_eq!(unavailable(&frames), vec![("s".to_string(), 3, 7)]);
+    assert_eq!(applied.unavailable, 1);
+    link.close();
+    assert_eq!(readable(&c)["s"], vec![1, 2, 3, 7, 8, 9, 10]);
+    origin.close();
+}
+
+/// A stream the origin evicted to nothing after rows the copy never had:
+/// the span is reported, and a later seal of the stream reaches the copy
+/// through a sync point instead of stopping it.
+#[test]
+fn a_stream_evicted_to_nothing_past_the_copy_is_reported_and_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("gone", 1..=3);
+    origin.rows("s", 1..=3);
+    connect(&o, &c).close();
+    origin.rows("gone", 4..=6);
+    origin.seal(&["gone"]);
+    origin
+        .w
+        .evict_streams_before(100, Box::new(|s: &str| s == "gone"))
+        .unwrap();
+    origin.rows("s", 4..=5);
+    let mut link = connect(&o, &c);
+    assert_eq!(unavailable(&link.frames), vec![("gone".to_string(), 3, 7)]);
+    origin.rows("gone", 200..=201);
+    origin.seal(&["gone"]);
+    link.poll(&o);
+    link.close();
+    assert_eq!(readable(&c)["gone"], vec![1, 2, 3, 200, 201]);
+    assert_eq!(readable(&c)["s"], readable(&o)["s"]);
+    origin.close();
+}
+
+/// The opening batch ends with the copy holding live rows past what this
+/// publisher shipped; a seal and an eviction before the first poll must not
+/// delete them.
+#[test]
+fn live_rows_the_copy_kept_at_open_survive_a_seal_before_the_first_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=10);
+    origin.seal(&["s"]);
+    origin.rows("s", 11..=20);
+    connect(&o, &c).close();
+    origin.close();
+    put(&o, &[], &[(1, 11, 15)]);
+
+    let (mut sub, request) = resume_copy(&c);
+    let (mut publisher, frames) =
+        ArchivePublisher::resuming(&Archive::open(&o).unwrap(), &request).unwrap();
+    pump(frames, &mut sub);
+    {
+        let mut db = ArchiveMut::open(&o).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        let rows: Vec<WalRow> = (21..=25).map(|t| row("s", t)).collect();
+        db.transaction(|tx| tx.insert_wal_rows(id, &rows)).unwrap();
+        drop(db);
+        put(&o, &[], &[(2, 16, 20), (3, 21, 25)]);
+        let mut db = ArchiveMut::open(&o).unwrap();
+        db.evict_before(id, 21).unwrap();
+    }
+    let frames = publisher.next(&Archive::open(&o).unwrap()).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 20, .. })));
+    let applied = pump(frames, &mut sub);
+    assert_eq!(applied.rows_pruned, 0);
+    sub.finish().unwrap();
+    assert_eq!(readable(&c)["s"], (1..=25).collect::<Vec<_>>());
+}
+
+/// A source the request does not name ships from `since_for_new_sources`,
+/// as `catching_up` from it would.
+#[test]
+fn a_new_source_ships_from_since_for_new_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=10);
+    origin.seal(&["s"]);
+    origin.rows("s", 101..=105);
+    origin.close();
+    let db = Archive::open(&o).unwrap();
+    let (mut sub, mut request) = resume_copy(&c);
+    request.since_for_new_sources = 100;
+    let (mut publisher, mut frames) = ArchivePublisher::resuming(&db, &request).unwrap();
+    frames.extend(publisher.next(&db).unwrap());
+    assert_eq!(count(&frames, is_sync), 0);
+    pump(frames, &mut sub);
+    sub.finish().unwrap();
+    assert_eq!(readable(&c)["s"], (101..=105).collect::<Vec<_>>());
+}
+
+/// The copy's spans a `Sync` deleted are forgotten: a stale span would
+/// contain the next sync point and refuse the stream.
+#[test]
+fn spans_a_sync_deleted_do_not_block_a_later_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    Origin::create(&o).close();
+    put(&o, &[], &[(0, 1, 10), (1, 11, 20), (2, 21, 25)]);
+    connect(&o, &c).close();
+    // The copy merges [11, 20] and [21, 25] into [11, 25].
+    put(&c, &[11, 21], &[(100, 11, 25)]);
+    let mut link = connect(&o, &c);
+    // The origin merges [21, 25] with new rows into [21, 35].
+    put(&o, &[21], &[(3, 21, 35)]);
+    link.poll(&o);
+    // And again across the copy's watermark, then evicts below 21.
+    put(&o, &[21], &[(4, 21, 40), (5, 41, 45)]);
+    {
+        let mut db = ArchiveMut::open(&o).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        db.evict_before(id, 21).unwrap();
+    }
+    link.poll(&o);
+    link.close();
+    assert_eq!(readable(&c)["s"], (1..=45).collect::<Vec<_>>());
+}

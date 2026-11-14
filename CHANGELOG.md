@@ -143,11 +143,12 @@ cannot reach a failed release any other way.
   restart instead of catching up into a new archive. Each stream the copy
   holds continues from a sync point the publisher picks: the copy's newest
   row when the publisher has sealed nothing past the copy's watermark,
-  otherwise a `Sync` to a point inside no segment of either side, then the
-  publisher's segments above it as `SegmentAfter` frames. A stream evicted
-  past the copy's newest row is reported as `Unavailable`. While tailing,
-  a seal is shipped as `SegmentAfter` frames, so a seal that outruns a poll
-  is not an error as on version 1. A request ahead of the publisher's
+  otherwise a point inside no segment of either side, picked as WIRE.md
+  §8.2 gives, with a `Sync` to it unless it is the copy's watermark, then
+  the publisher's segments above it as `SegmentAfter` frames. A span retention removed past the copy's newest
+  row is reported as `Unavailable`, on resume and while tailing. While
+  tailing, a seal is shipped as `SegmentAfter` frames, so a seal that
+  outruns a poll is not an error as on version 1. A request ahead of the publisher's
   archive, or a stream with no sync point, is refused.
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the

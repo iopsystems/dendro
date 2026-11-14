@@ -601,20 +601,28 @@ handled by what the copy holds of it:
   and `O - 1` otherwise. `X` is the largest value in `[L, max(L, W)]`, `W`
   the copy's watermark, inside no segment of the copy's spans and no segment
   of the archive's, where a value is inside `(first, last)` when
-  `first <= X < last`. The stream gets a `Sync` to `X`, then the archive's
+  `first <= X < last`. The stream gets a `Sync` to `X` unless `X` is `W`,
+  then the archive's
   segments with `last_ts` above `X`, oldest first, as `SegmentAfter` frames,
   each `after` the previous one's `last_ts`, then the live rows past the
   newer of `X` and the archive's watermark.
 
 A stream whose `O` is more than one past `P` also gets an `Unavailable` from
-`P` to `O`. Clock offsets are sent again from the smallest point a stream
+`P` to `O`. A stream the copy holds and the archive holds no row of gets one
+from `P` to one past the archive's `bounds` entry for it, when that entry is
+above `P`; a later row of the stream reaches the copy through a sync point
+as above. Clock offsets are sent again from the smallest point a stream
 continues from; the copy ignores one it holds.
 
-While tailing, the publisher keeps the copy's spans: the request's, then
-every segment it ships. A poll that finds a segment ending past the copy's
-watermark runs the same procedure with the copy's newest row as `P`. When
-`X` is the copy's watermark, the segments go out as `SegmentAfter` frames
-alone; otherwise a `Sync` precedes them.
+While tailing, the publisher keeps the copy's spans (the request's, then
+every segment it ships, less those a `Sync` deleted) and the copy's newest
+row of each stream. A poll that finds a segment ending past the copy's
+watermark runs the same procedure, with that newest row as `P`, the
+`Unavailable` included. When `X` is the copy's watermark, the segments go
+out as `SegmentAfter` frames alone; otherwise a `Sync` precedes them. A
+source created after the publisher opened, and a source the request did not
+name, are caught up from `since_for_new_sources`; the copy's spans for them
+start as every segment the archive holds.
 
 Limits:
 
