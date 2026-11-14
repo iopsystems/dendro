@@ -9,6 +9,7 @@ as ours or not ours, and links the entries that own each one.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
+| 2026-11-13 | [Subscriber resume: continuing a copy across a reconnect](2026-11-13-subscriber-resume.md) | open — design for review; reconnects are refused until it lands |
 | 2026-10-19 | [Segment indexes out of the segment row, and the encoder told its source](2026-10-19-segment-index-table.md) | implemented (cold N=64 open 2.1-2.2 s to 1.4-1.5 s) |
 | 2026-10-19 | [Archive documents: a place for what belongs to the whole archive](2026-10-19-archive-documents.md) | implemented |
 | 2026-10-01 | [Writer heartbeat: telling a source being written from one whose writer stopped](2026-10-01-writer-heartbeat.md) | implemented |
