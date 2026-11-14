@@ -385,7 +385,8 @@ a `Writer` thread opens. Every `ArchiveMut` holds an exclusive advisory lock
 (`flock` on unix, `LockFileEx` on Windows) on `<path>-lock` for its life, and
 a second one on the same archive, in the same process or another, is refused
 as `Error::InUse`. The operating system releases the lock when its process
-ends, so a killed writer leaves nothing to clear. The lock is on a separate
+ends, so a killed writer leaves nothing to clear; a child process forked while
+the lock is held shares it until the child execs or exits. The lock is on a separate
 file rather than the archive because SQLite locks the archive with POSIX
 locks: on macOS `flock` conflicts with them, and on unix closing a descriptor
 on the archive releases every POSIX lock the process holds on it.

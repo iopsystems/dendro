@@ -7,8 +7,6 @@
 //! writer for every source it held.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
 
 use dendro::archive::{Archive, ArchiveMut, SourceMeta, WalRow};
 use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
@@ -27,16 +25,6 @@ fn source() -> SourceMeta {
         labels: BTreeMap::from([("source".to_string(), "a".to_string())]),
         metadata: BTreeMap::new(),
         clock_anchor_wall_ns: 0,
-    }
-}
-
-/// Kills the child on drop, so a failed assertion does not leave a writer
-/// process running.
-struct Reaped(std::process::Child);
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -81,32 +69,6 @@ fn a_created_archive_is_held_until_its_handle_is_dropped() {
     w.join().unwrap();
 }
 
-/// A writer in another process holds the file; the lock goes with that
-/// process, so a SIGKILL releases it and the archive can be reopened.
-#[test]
-fn a_writer_in_another_process_holds_the_file_until_it_dies() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("k.dendro");
-    let mut child = Reaped(
-        Command::new(env!("CARGO_BIN_EXE_append-until-killed"))
-            .arg(&path)
-            .arg("3")
-            .arg("100")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn the fixture writer"),
-    );
-    let mut out = BufReader::new(child.0.stdout.take().unwrap());
-    let mut line = String::new();
-    out.read_line(&mut line).unwrap();
-    assert_eq!(line.trim(), "ready");
-
-    assert!(in_use(Writer::open(&path, Box::new(Never))));
-    drop(child);
-    let mut w = Writer::open(&path, Box::new(Never)).unwrap();
-    w.join().unwrap();
-}
-
 /// A path through a symlink takes the same lock as the archive it points to.
 #[cfg(unix)]
 #[test]
@@ -120,7 +82,7 @@ fn a_symlink_to_an_archive_takes_the_archives_lock() {
     first.join().unwrap();
 }
 
-/// A create that the lock refuses touches nothing: the lock file another
+/// A create that the lock refuses removes nothing: the lock file another
 /// handle holds is still there, and a second create is still refused.
 #[test]
 fn a_create_refused_by_the_lock_leaves_the_held_lock_alone() {

@@ -155,7 +155,9 @@
 //! # One file, or three
 //!
 //! An archive is three files while anyone has it open: SQLite adds a `-wal`
-//! and a `-shm` whenever the file is opened, a read included. The last
+//! and a `-shm` whenever the file is opened, a read included. Any writing
+//! handle also leaves an empty `-lock` file beside it, which holds no data and
+//! which a copy does not need. The last
 //! read-write connection to close removes them; a read-only one leaves them.
 //! [`archive::Archive::open`] reads a finished archive (at least one source,
 //! every source finalized) on a read-write connection with `query_only` set,

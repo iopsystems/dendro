@@ -8,7 +8,9 @@
 //! same archive is refused as [`Error::InUse`], whether it is in this process
 //! or another: each lock is taken through its own descriptor, and the
 //! operating system refuses the second. The lock goes when its process does,
-//! so a killed writer leaves nothing to clear.
+//! so a killed writer leaves nothing to clear. A child process forked while
+//! the lock is held shares it until the child execs or exits, so a drop in
+//! that window does not release it.
 //!
 //! A separate file, not the archive, because on unix SQLite locks the archive
 //! with POSIX (`fcntl`) locks. On macOS `flock` conflicts with those, so a
@@ -16,8 +18,9 @@
 //! a descriptor on the archive releases every POSIX lock the process holds on
 //! it, SQLite connections' included.
 //!
-//! The file sits beside the archive SQLite opened, so a path through a
-//! symlink takes the target's lock. It is created on first use and never
+//! The file sits beside the archive SQLite opened, so on unix a path through
+//! a symlink takes the target's lock; a hard link does not, as SQLite's own
+//! `-wal` does not. It is created on first use and never
 //! removed, not even by a create that fails: removing it would let a writer
 //! that opened the old file and one that created a new one both hold a lock.
 
@@ -42,7 +45,10 @@ pub(crate) fn lock_path(path: &Path) -> PathBuf {
 impl WriterLock {
     /// Lock the archive at `path` for writing, or refuse as [`Error::InUse`]
     /// while another handle holds it.
-    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+    ///
+    /// `path` locates the lock; `named` is the archive as the caller named
+    /// it, for the error.
+    pub(crate) fn acquire(path: &Path, named: &Path) -> Result<Self> {
         let lock = lock_path(path);
         let io =
             |e: std::io::Error| Error::Message(format!("failed to lock {}: {e}", lock.display()));
@@ -65,7 +71,7 @@ impl WriterLock {
         match file.try_lock() {
             Ok(()) => Ok(WriterLock { _file: file }),
             Err(TryLockError::WouldBlock) => Err(Error::InUse {
-                what: path.display().to_string(),
+                what: named.display().to_string(),
             }),
             Err(TryLockError::Error(e)) => Err(io(e)),
         }

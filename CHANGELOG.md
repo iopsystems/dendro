@@ -55,7 +55,8 @@ cannot reach a failed release any other way.
   the second one's seal failed on the `segments` UNIQUE constraint, ending
   that writer for all its sources. The `-lock` file is created on first
   use and left in place; it holds no data and a copy of the archive does
-  not need it. The lock is released when its process ends.
+  not need it. The lock is released when its process ends, or when a
+  child forked while it was held execs or exits.
 
 ### Added
 

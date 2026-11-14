@@ -786,7 +786,7 @@ impl Archive {
         // The writer lock first, so a create refused by it has touched
         // nothing, and the cleanup below never removes files another handle
         // is using.
-        let lock = super::lock::WriterLock::acquire(path)?;
+        let lock = super::lock::WriterLock::acquire(path, path)?;
         // Claim the path atomically rather than testing `exists()` — this is
         // also what stops SQLite from silently adopting a file that appeared
         // between the check and the open. A zero-length file is a valid empty
@@ -2678,11 +2678,11 @@ impl ArchiveMut {
 
     /// [`wrap`](Self::wrap) holding the writer lock, taken after the open
     /// succeeded so that a file the open refuses is never locked. The lock
-    /// is named after the file SQLite opened, a symlink's target, so every
-    /// path to one archive takes the same lock.
+    /// is named after the file SQLite opened, a symlink's target, so on unix
+    /// every path through a symlink takes the same lock.
     fn wrap_locked(db: Archive, path: &Path) -> Result<Self> {
         let opened = db.conn.path().map(Path::new).unwrap_or(path);
-        let lock = super::lock::WriterLock::acquire(opened)?;
+        let lock = super::lock::WriterLock::acquire(opened, path)?;
         let mut db = Self::wrap(db);
         db._writer_lock = Some(lock);
         Ok(db)
