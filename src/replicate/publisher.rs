@@ -69,16 +69,14 @@ struct SourceCursor {
     ordinal: u32,
     source_id: i64,
     streams: BTreeMap<String, StreamCursor>,
-    /// The `clock_offsets` timestamps already emitted, or already in the
-    /// archive's past when the publisher started tailing. A set rather than
-    /// the newest timestamp sent, because offsets are not inserted in
-    /// timestamp order: a seal records its observation at the newest row it
-    /// sealed, so sealing one stream to 100 and then another to 80 inserts
-    /// 80 after 100. One `i64` per observation, and a recording makes a
-    /// handful per seal.
+    /// The `clock_offsets` timestamps already emitted, or held before the
+    /// publisher's start point when it opened: every offset for a tailing
+    /// publisher, the offsets below `since` for a catch-up. Offsets are not
+    /// inserted in timestamp order: a seal records its observation at the
+    /// newest row it sealed, so sealing one stream to 100 and then another
+    /// to 80 inserts 80 after 100. One entry per seal batch, pruned below the
+    /// oldest offset the archive holds.
     clock_sent: BTreeSet<i64>,
-    /// Offsets below this are not shipped: the `since` of a catch-up.
-    clock_from: i64,
     seq: u64,
     index_state: IndexState,
     /// Whether the opening batch has sent its `Full`. Only the first index
@@ -358,7 +356,6 @@ fn open_source(
         source_id: rec.id,
         streams: BTreeMap::new(),
         clock_sent: BTreeSet::new(),
-        clock_from: since.unwrap_or(i64::MIN),
         seq: 0,
         index_state: NO_INDEX_STATE,
         sent_full: false,
@@ -414,27 +411,32 @@ fn open_source(
         }
     }
 
-    // Clock offsets, bounded the same way. Tailing: these are already in the
-    // archive's past, so they count as sent.
-    if since.is_none() {
-        cursor.clock_sent = db
-            .read_clock_offsets(rec.id)?
-            .into_iter()
-            .map(|(ts, _)| ts)
-            .collect();
-    } else {
-        cursor.emit_clock_offsets(db, frames)?;
-    }
+    // Clock offsets, bounded the same way, at open only: an offset recorded
+    // later ships whatever its timestamp, as a segment sealed later does.
+    // Held offsets before the start point count as sent.
+    cursor.clock_sent = db
+        .read_clock_offsets(rec.id)?
+        .into_iter()
+        .map(|(ts, _)| ts)
+        .filter(|ts| since.is_none_or(|since| *ts < since))
+        .collect();
+    cursor.emit_clock_offsets(db, frames)?;
 
     Ok(cursor)
 }
 
 impl SourceCursor {
-    /// Emit every clock offset at or after `clock_from` that has not been
-    /// sent.
+    /// Emit every clock offset not yet in `clock_sent`, and forget the sent
+    /// timestamps below the oldest the archive still holds, which retention
+    /// removed and nothing can match again.
     fn emit_clock_offsets(&mut self, db: &Archive, out: &mut Vec<Frame>) -> Result<()> {
-        for (ts, offset) in db.read_clock_offsets(self.source_id)? {
-            if ts < self.clock_from || !self.clock_sent.insert(ts) {
+        let offsets = db.read_clock_offsets(self.source_id)?;
+        match offsets.first() {
+            Some((oldest, _)) => self.clock_sent = self.clock_sent.split_off(oldest),
+            None => self.clock_sent.clear(),
+        }
+        for (ts, offset) in offsets {
+            if !self.clock_sent.insert(ts) {
                 continue;
             }
             out.push(Frame::ClockOffset {

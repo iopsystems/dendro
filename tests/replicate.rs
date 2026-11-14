@@ -1607,8 +1607,8 @@ fn a_reconnect_into_the_same_archive_is_refused_by_uuid() {
 
 /// A seal records its clock observation at the newest row it sealed, so
 /// offsets are not inserted in timestamp order: sealing stream `a` to 100 and
-/// then `b` to 80 inserts 80 after 100. The publisher used to skip every
-/// offset at or below the newest it had shipped, and never shipped the 80.
+/// then `b` to 80 inserts 80 after 100, and the publisher ships the 80
+/// although it has already shipped the 100.
 #[test]
 fn a_clock_offset_older_than_one_already_shipped_still_ships() {
     let dir = tempfile::tempdir().unwrap();
@@ -1709,21 +1709,77 @@ fn a_tailing_publisher_does_not_ship_the_clock_offsets_already_held() {
     archive.join().unwrap();
 }
 
-/// A catch-up from `since` ships the clock offsets at or after it, and an
-/// observation below it that the archive records later is not shipped
-/// either.
+/// A catch-up from `since` ships the clock offsets held at or after it, and
+/// not those held below it. An offset recorded after it opened ships
+/// whatever its timestamp, as the segment its seal made does.
 #[test]
-fn a_catch_up_ships_no_clock_offset_below_since() {
+fn a_catch_up_ships_the_offsets_from_since_and_every_later_one() {
     let dir = tempfile::tempdir().unwrap();
     let origin = dir.path().join("since.dendro");
 
     let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
     let mut w = archive.add_source(source_meta("a")).unwrap();
-    w.wal(vec![row("a", 100), row("b", 50)]).unwrap();
+    w.wal(vec![
+        row("old", 40),
+        row("held", 95),
+        row("a", 100),
+        row("b", 50),
+    ])
+    .unwrap();
+    w.seal(vec!["old".to_string()]).unwrap();
+    w.seal(vec!["held".to_string()]).unwrap();
     w.sync().unwrap();
 
     let db = Archive::open(&origin).unwrap();
-    let (mut publisher, _) = dendro::replicate::ArchivePublisher::catching_up(&db, 90).unwrap();
+    let offsets = |frames: &[Frame]| -> Vec<i64> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ClockOffset { ts, .. } => Some(*ts),
+                _ => None,
+            })
+            .collect()
+    };
+    let (mut publisher, opening) =
+        dendro::replicate::ArchivePublisher::catching_up(&db, 90).unwrap();
+    assert_eq!(offsets(&opening), vec![95], "40 is below since");
+
+    w.seal(vec!["b".to_string()]).unwrap();
+    w.seal(vec!["a".to_string()]).unwrap();
+    w.sync().unwrap();
+    let polled = publisher.next(&db).unwrap();
+    assert!(
+        polled
+            .iter()
+            .any(|f| matches!(f, Frame::Segment { stream, .. } if stream == "b")),
+        "the segment of `b` ships"
+    );
+    assert_eq!(
+        offsets(&polled),
+        vec![50, 100],
+        "and so does the offset its seal recorded"
+    );
+    assert_eq!(offsets(&publisher.next(&db).unwrap()), Vec::<i64>::new());
+
+    drop(w);
+    archive.join().unwrap();
+}
+
+/// The publisher forgets the offsets retention removed, once a poll has
+/// seen them gone, so an observation recorded again at one of their
+/// timestamps is shipped. A removal and a new observation at the same
+/// timestamp between two polls read as the offset already sent.
+#[test]
+fn an_offset_recorded_again_after_retention_removed_it_ships() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("evicted.dendro");
+
+    let mut archive = Writer::create(&origin, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(source_meta("a")).unwrap();
+    w.wal(vec![row("a", 100)]).unwrap();
+    w.sync().unwrap();
+    let db = Archive::open(&origin).unwrap();
+    let (mut publisher, _) = dendro::replicate::ArchivePublisher::tailing(&db).unwrap();
     let offsets = |frames: Vec<Frame>| -> Vec<i64> {
         frames
             .into_iter()
@@ -1734,13 +1790,18 @@ fn a_catch_up_ships_no_clock_offset_below_since() {
             .collect()
     };
 
-    w.seal(vec!["b".to_string()]).unwrap();
-    w.seal(vec!["a".to_string()]).unwrap();
+    w.clock_offset(10, 1).unwrap();
+    w.sync().unwrap();
+    assert_eq!(offsets(publisher.next(&db).unwrap()), vec![10]);
+
+    w.evict_before(50).unwrap();
+    assert!(offsets(publisher.next(&db).unwrap()).is_empty());
+    w.clock_offset(10, 2).unwrap();
     w.sync().unwrap();
     assert_eq!(
         offsets(publisher.next(&db).unwrap()),
-        vec![100],
-        "50 is below since"
+        vec![10],
+        "the new observation at 10"
     );
 
     drop(w);

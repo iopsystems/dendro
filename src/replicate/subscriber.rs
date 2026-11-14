@@ -338,7 +338,11 @@ impl Subscriber {
             } => {
                 let st = Self::source_mut(&mut self.sources, source)?;
                 st.writer.clock_offset(ts, offset_ns)?;
-                st.last_offset = Some((ts, offset_ns));
+                // The newest by timestamp, not the last to arrive: offsets
+                // are not recorded, and so not shipped, in timestamp order.
+                if st.last_offset.is_none_or(|(newest, _)| ts >= newest) {
+                    st.last_offset = Some((ts, offset_ns));
+                }
                 Ok(Applied {
                     clock_offsets: 1,
                     ..Applied::default()
