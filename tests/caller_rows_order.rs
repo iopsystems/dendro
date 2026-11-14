@@ -266,3 +266,43 @@ fn a_file_without_bounds_copies_each_caller_row_once() {
     drop(dst);
     assert_eq!(held(&copy, "idx"), vec![10, 20, 30]);
 }
+
+/// A stream and a caller-row name may share a name; the stream's bound after
+/// a discard is the stream's alone, so a caller row above the name's newest
+/// and below the stream's old newest is still taken.
+#[test]
+fn a_discard_on_a_stream_leaves_a_caller_row_name_of_the_same_name_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta()).unwrap();
+    w.wal(
+        (5..=7)
+            .map(|ts| WalRow {
+                stream: "cpu".to_string(),
+                ts,
+                wall_offset: 0,
+                row: vec![1],
+            })
+            .collect(),
+    )
+    .unwrap();
+    w.caller_rows("cpu", vec![entry(5)]).unwrap();
+    w.discard_live_rows(Box::new(|s: &str| s == "cpu")).unwrap();
+    w.caller_rows("cpu", vec![entry(6)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_caller_rows_out_of_order(), 0);
+    drop(w);
+    archive.join().unwrap();
+    assert_eq!(held(&path, "cpu"), vec![5, 6]);
+
+    // And a later writer reads the name's floor, not the stream's bound.
+    let id = Archive::open(&path).unwrap().read_sources().unwrap()[0].id;
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    let (mut w, _) = archive.resume_source(id, 1_000).unwrap();
+    w.caller_rows("cpu", vec![entry(6)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_caller_rows_out_of_order(), 0);
+    drop(w);
+    archive.join().unwrap();
+}

@@ -645,35 +645,22 @@ fn a_chained_copy_resumes_from_the_copy() {
     origin.close();
 }
 
-/// A frame lost between the writer and the reader stops the stream at the
-/// reader, and a resume afterwards completes the copy.
-#[test]
-fn a_frame_lost_in_transit_stops_the_stream_and_resume_completes_the_copy() {
-    let dir = tempfile::tempdir().unwrap();
-    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
-    let mut origin = Origin::create(&o);
-    origin.rows("s", 1..=2);
-    origin.seal(&["s"]);
-    origin.rows("s", 3..=4);
-
-    let (mut sub, request) = resume_copy(&c);
-    let (_, frames) = ArchivePublisher::resuming(&Archive::open(&o).unwrap(), &request).unwrap();
+/// Write `frames` through the version 2 codec with the first one `lose`
+/// picks left out of the bytes, and apply what the reader returns until it
+/// fails; the reader's error.
+fn apply_losing(frames: &[Frame], sub: &mut Subscriber, lose: impl Fn(&Frame) -> bool) -> String {
     let mut w = FrameWriter::new(Vec::new(), PROTOCOL_VERSION_2).unwrap();
     let mut ends = vec![w.get_ref().len()];
-    for f in &frames {
+    for f in frames {
         w.write(f).unwrap();
         ends.push(w.get_ref().len());
     }
     let bytes = w.into_inner();
-    // Drop the segment's frame.
-    let lost = frames
-        .iter()
-        .position(|f| matches!(f, Frame::Segment { .. }))
-        .unwrap();
+    let lost = frames.iter().position(lose).expect("a frame to lose");
     let mut cut = bytes[..ends[lost]].to_vec();
     cut.extend_from_slice(&bytes[ends[lost + 1]..]);
     let mut reader = FrameReader::new(std::io::Cursor::new(cut)).unwrap();
-    let err = loop {
+    loop {
         match reader.next_frame() {
             Ok(Some(f)) => {
                 sub.apply(f).unwrap();
@@ -681,10 +668,73 @@ fn a_frame_lost_in_transit_stops_the_stream_and_resume_completes_the_copy() {
             Ok(None) => panic!("the loss was not detected"),
             Err(e) => break e.to_string(),
         }
-    };
-    assert!(err.contains("was next"), "{err}");
-    sub.finish().unwrap();
+    }
+}
 
+/// A `Segment`, `Rows` or `Index` frame lost between the writer and the
+/// reader stops the stream at the reader when the next frame arrives, and a
+/// resume afterwards completes the copy.
+#[test]
+fn a_frame_lost_in_transit_stops_the_stream_and_resume_completes_the_copy() {
+    type Pick = fn(&Frame) -> bool;
+    let kinds: [(&str, Pick); 3] = [
+        ("Segment", |f| matches!(f, Frame::Segment { .. })),
+        (
+            "Rows",
+            |f| matches!(f, Frame::Rows { rows, .. } if !rows.is_empty()),
+        ),
+        ("Index", |f| matches!(f, Frame::Index { .. })),
+    ];
+    for (kind, lose) in kinds {
+        let dir = tempfile::tempdir().unwrap();
+        let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+        let mut origin = Origin::create(&o);
+        origin
+            .w
+            .caller_rows(
+                "idx",
+                vec![dendro::archive::CallerRow {
+                    ts: 1,
+                    blob: vec![1],
+                }],
+            )
+            .unwrap();
+        origin.rows("s", 1..=2);
+        origin.seal(&["s"]);
+        origin.rows("s", 3..=4);
+
+        let (mut sub, request) = resume_copy(&c);
+        let db = Archive::open(&o).unwrap();
+        let (mut publisher, mut frames) = ArchivePublisher::resuming(&db, &request).unwrap();
+        frames.extend(publisher.next(&db).unwrap());
+        // The next poll's keepalive: a stream that ends just after a lost
+        // frame reads as a clean end until the next frame arrives.
+        frames.extend(publisher.next(&db).unwrap());
+        let err = apply_losing(&frames, &mut sub, lose);
+        assert!(err.contains("was next"), "{kind}: {err}");
+        eprintln!("DIAG {kind} finish: {:?}", sub.finish());
+
+        connect(&o, &c).close();
+        assert_eq!(readable(&c), readable(&o), "{kind}");
+        origin.close();
+    }
+}
+
+/// A lost `SegmentAfter` that ends below the copy's newest row moves no
+/// timestamp the copy could compare; the frame number detects it.
+#[test]
+fn a_lost_segment_ending_below_the_copys_newest_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=5);
+    let mut link = connect(&o, &c);
+    origin.seal(&["s"]);
+    origin.rows("s", 6..=10);
+    let frames = link.publisher.next(&Archive::open(&o).unwrap()).unwrap();
+    let err = apply_losing(&frames, &mut link.sub, is_segment_after);
+    assert!(err.contains("was next"), "{err}");
+    link.close();
     connect(&o, &c).close();
     assert_eq!(readable(&c), readable(&o));
     origin.close();
@@ -1192,4 +1242,310 @@ fn several_sources_and_one_created_while_connected_resume_independently() {
     assert_eq!(by_source(&c), by_source(&o));
     drop((a, b, later));
     archive.join().unwrap();
+}
+
+/// A stream with more segments than a request lists still resumes: the
+/// request carries the newest 256 spans, and the sync point is the copy's
+/// watermark.
+#[test]
+fn a_copy_with_more_segments_than_a_request_lists_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    Origin::create(&o).close();
+    let spans: Vec<(u64, i64, i64)> = (0..300)
+        .map(|i| (i as u64, i * 10 + 1, i * 10 + 10))
+        .collect();
+    put(&o, &[], &spans);
+    connect(&o, &c).close();
+    put(&o, &[], &[(300, 3001, 3010)]);
+    let (sub, request) = resume_copy(&c);
+    assert_eq!(request.sources[0].streams[0].spans.len(), 256);
+    assert_eq!(request.sources[0].streams[0].watermark(), Some(3000));
+    sub.finish().unwrap();
+    let link = connect(&o, &c);
+    assert_eq!(count(&link.frames, is_sync), 0);
+    link.close();
+    assert_eq!(readable(&c), readable(&o));
+}
+
+/// The limit WIRE.md §8.2 states: a sync point below the listed spans can be
+/// inside a segment the request left out. The copy refuses that `Sync`, the
+/// source stops, and the copy loses nothing.
+#[test]
+fn a_sync_point_inside_an_unlisted_segment_is_refused_by_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    Origin::create(&o).close();
+    let spans: Vec<(u64, i64, i64)> = (0..300)
+        .map(|i| (i as u64, i * 10 + 1, i * 10 + 10))
+        .collect();
+    put(&o, &[], &spans);
+    connect(&o, &c).close();
+    let before = readable(&c);
+    // The origin's segments become one with other boundaries: [5, 3005]
+    // contains the copy's watermark, so the point falls to 4, inside the
+    // copy's oldest segment [1, 10], which the request does not list.
+    let firsts: Vec<i64> = spans.iter().map(|(_, a, _)| *a).collect();
+    put(&o, &firsts, &[(400, 5, 3005)]);
+    let (mut sub, request) = resume_copy(&c);
+    let (_, frames) = ArchivePublisher::resuming(&Archive::open(&o).unwrap(), &request).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 4, .. })));
+    let mut w = FrameWriter::new(Vec::new(), PROTOCOL_VERSION_2).unwrap();
+    for f in &frames {
+        w.write(f).unwrap();
+    }
+    let mut reader = FrameReader::new(std::io::Cursor::new(w.into_inner())).unwrap();
+    let mut refused = None;
+    while let Some(f) = reader.next_frame().unwrap() {
+        if let Err(e) = sub.apply(f) {
+            refused.get_or_insert(e.to_string());
+        }
+    }
+    let refused = refused.expect("the copy refuses the sync point");
+    assert!(refused.contains("inside the copy's segment"), "{refused}");
+    assert!(sub.finish().is_err());
+    assert_eq!(readable(&c), before);
+}
+
+/// An interval whose rows exceed one frame goes out as several `Rows` frames
+/// with one `seq` on version 2 too, and every row arrives.
+#[test]
+fn an_interval_larger_than_a_frame_arrives_whole_on_version_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", [1]);
+    let mut link = connect(&o, &c);
+    let n = dendro::replicate::wire::MAX_FRAME_BYTES / (1 << 20) + 6;
+    let rows: Vec<WalRow> = (2..2 + n as i64)
+        .map(|ts| WalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![7; 1 << 20],
+        })
+        .collect();
+    origin.w.wal(rows).unwrap();
+    origin.w.sync().unwrap();
+    let (applied, frames) = link.poll(&o);
+    let parts: Vec<u64> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Rows { seq, rows, .. } if !rows.is_empty() => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    assert!(parts.len() >= 2, "{} parts", parts.len());
+    assert!(parts.windows(2).all(|p| p[0] == p[1]), "one seq: {parts:?}");
+    assert_eq!(applied.rows, n);
+    assert!(!applied.gap);
+    link.close();
+    assert_eq!(readable(&c), readable(&o));
+    origin.close();
+}
+
+/// The copy holds live rows the origin has since sealed and evicted, with
+/// newer rows after them: the sync point is the copy's newest row, above its
+/// watermark, and the copy seals those rows itself, so they stay readable.
+#[test]
+fn rows_the_copy_holds_live_that_the_origin_evicted_are_sealed_by_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=3);
+    origin.seal(&["s"]);
+    origin.rows("s", 4..=6);
+    connect(&o, &c).close();
+    origin.seal(&["s"]);
+    origin.rows("s", 7..=9);
+    origin.seal(&["s"]);
+    origin.w.evict_before(7).unwrap();
+    let link = connect(&o, &c);
+    assert!(link
+        .frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 6, .. })));
+    assert_eq!(link.opened.rows_unsealable, 0);
+    link.close();
+    assert_eq!(readable(&c)["s"], (1..=9).collect::<Vec<_>>());
+    let db = Archive::open(&c).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    assert!(db.live_wal(id, "s").unwrap().is_empty(), "4..=6 sealed");
+    origin.close();
+}
+
+/// A `Sync` whose live rows are both ones the origin evicted and ones the
+/// copy's encoder refuses: all of them are deleted and counted, and the span
+/// is reported.
+#[test]
+fn evicted_rows_the_copys_encoder_refuses_are_counted_unsealable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1000..=1002);
+    connect(&o, &c).close();
+    origin.rows("s", 2000..=2001);
+    origin.w.evict_before(2000).unwrap();
+    origin.seal(&["s"]);
+    let link = connect(&o, &c);
+    assert!(link
+        .frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 1002, .. })));
+    assert_eq!(link.opened.rows_unsealable, 3);
+    assert_eq!(link.opened.unavailable, 1);
+    link.close();
+    assert_eq!(readable(&c), readable(&o));
+    origin.close();
+}
+
+/// The origin merges its oldest segments, all at or below the copy's
+/// watermark: nothing is shipped again and no row is held twice.
+#[test]
+fn a_merge_of_the_origins_oldest_segments_ships_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    Origin::create(&o).close();
+    put(&o, &[], &[(0, 1, 2), (1, 3, 4), (2, 5, 6)]);
+    let mut link = connect(&o, &c);
+    put(&o, &[1, 3], &[(3, 1, 4)]);
+    let (applied, frames) = link.poll(&o);
+    assert_eq!(
+        count(&frames, is_sync) + count(&frames, is_segment_after),
+        0
+    );
+    assert_eq!(applied.segments, 0);
+    link.close();
+    let link = connect(&o, &c);
+    assert_eq!(link.opened.segments, 0);
+    link.close();
+    assert_eq!(readable(&c)["s"], (1..=6).collect::<Vec<_>>());
+}
+
+/// The origin seals part of what the copy holds live and leaves the rest
+/// live: the sync point is the copy's watermark, the rows past the segment
+/// stay on the copy, and nothing is dropped as late or repeated.
+#[test]
+fn rows_the_origin_left_live_below_the_copys_newest_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=3);
+    origin.seal(&["s"]);
+    origin.rows("s", 4..=5);
+    connect(&o, &c).close();
+    origin.close();
+    // A segment of 4 alone; 5 stays live on the origin.
+    put(&o, &[], &[(1, 4, 4)]);
+    let link = connect(&o, &c);
+    assert_eq!(count(&link.frames, is_sync), 0);
+    assert_eq!(link.opened.rows_repeated, 0);
+    assert_eq!(link.opened.rows_pruned, 0);
+    link.close();
+    assert_eq!(readable(&c), readable(&o));
+}
+
+/// A stream with no sync point is refused, naming why.
+#[test]
+fn a_stream_with_no_sync_point_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    Origin::create(&o).close();
+    put(&o, &[], &[(0, 1, 10)]);
+    connect(&o, &c).close();
+    // The origin's boundaries are not the copy's: [5, 20] after 1..=4 were
+    // evicted. Every value from O - 1 = 4 to the copy's watermark 10 is
+    // inside [1, 10] or [5, 20].
+    put(&o, &[1], &[(1, 5, 20)]);
+    let (sub, request) = resume_copy(&c);
+    let err = ArchivePublisher::resuming(&Archive::open(&o).unwrap(), &request)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no sync point in [4, 10]"), "{err}");
+    sub.finish().unwrap();
+}
+
+/// A chain A to B to C where B stopped partway through its catch-up: C is
+/// not refused by B, and once B completes, C does too.
+#[test]
+fn a_chain_whose_middle_stopped_partway_completes_once_it_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a"),
+        dir.path().join("b"),
+        dir.path().join("c"),
+    );
+    let mut origin = Origin::create(&a);
+    origin.rows("s", 1..=3);
+    origin.seal(&["s"]);
+    origin.rows("s", 4..=6);
+    origin.seal(&["s"]);
+    origin.rows("s", 7..=8);
+
+    // B applies its catch-up up to its first segment and stops.
+    let (mut sub, request) = resume_copy(&b);
+    let db = Archive::open(&a).unwrap();
+    let (mut publisher, mut frames) = ArchivePublisher::resuming(&db, &request).unwrap();
+    frames.extend(publisher.next(&db).unwrap());
+    let first = frames
+        .iter()
+        .position(|f| matches!(f, Frame::Segment { .. }))
+        .unwrap();
+    sub.apply_all(frames.into_iter().take(first + 1)).unwrap();
+    sub.finish().unwrap();
+    assert_eq!(readable(&b)["s"], vec![1, 2, 3]);
+
+    connect(&b, &c).close();
+    assert_eq!(readable(&c), readable(&b));
+    connect(&a, &b).close();
+    connect(&b, &c).close();
+    assert_eq!(readable(&c), readable(&a));
+    origin.close();
+}
+
+/// Clock offsets the origin records out of timestamp order while the copy is
+/// away all arrive on version 2.
+#[test]
+fn clock_offsets_recorded_out_of_order_all_arrive_on_version_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("a", [1]);
+    origin.rows("b", [1]);
+    connect(&o, &c).close();
+    // Sealing `a` to 100 and then `b` to 80 records 80 after 100.
+    origin.rows("a", [100]);
+    origin.rows("b", [80]);
+    origin.seal(&["a"]);
+    origin.seal(&["b"]);
+    connect(&o, &c).close();
+    let held = offsets(&c);
+    assert_eq!(held, offsets(&o));
+    assert!(held.iter().any(|(ts, _)| *ts == 80));
+    assert!(held.iter().any(|(ts, _)| *ts == 100));
+    origin.close();
+}
+
+/// The origin evicts past the copy's newest row without sealing anything
+/// past the copy's watermark: the fast path keeps what the copy holds and
+/// still reports the span.
+#[test]
+fn an_eviction_on_the_fast_path_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=3);
+    origin.seal(&["s"]);
+    origin.rows("s", 4..=5);
+    connect(&o, &c).close();
+    origin.rows("s", 10..=12);
+    origin.w.evict_before(10).unwrap();
+    let link = connect(&o, &c);
+    assert_eq!(count(&link.frames, is_sync), 0);
+    assert_eq!(unavailable(&link.frames), vec![("s".to_string(), 5, 10)]);
+    link.close();
+    assert_eq!(readable(&c)["s"], vec![1, 2, 3, 4, 5, 10, 11, 12]);
+    origin.close();
 }

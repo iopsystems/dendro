@@ -645,3 +645,32 @@ fn a_stopped_source_is_not_finalized() {
     let db = Archive::open(&path).unwrap();
     assert!(!db.read_sources().unwrap()[0].complete);
 }
+
+/// A `Sync` whose transaction cannot get the write lock is retried, then
+/// fails: the source stops, and the copy is as it was.
+#[cfg(feature = "test-support")]
+#[test]
+fn a_sync_that_outlasts_its_retries_stops_the_source_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.dendro");
+    let writer = Writer::create_with_busy_timeout(
+        &path,
+        Box::new(Tags),
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_millis(1),
+    )
+    .unwrap();
+    let (mut sub, _) = Subscriber::resume(writer).unwrap();
+    sub.apply(handshake(false)).unwrap();
+    sub.apply(rows(0, &[1, 2, 3])).unwrap();
+    sub.sync().unwrap();
+
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let err = sub.apply(sync(2)).unwrap_err().to_string();
+    lock.execute_batch("COMMIT").unwrap();
+    assert!(err.contains("locked") || err.contains("busy"), "{err}");
+    assert!(sub.apply(rows(1, &[4])).is_err(), "the source stopped");
+    drop(sub);
+    assert_eq!(held(&path), (vec![], vec![1, 2, 3]));
+}
