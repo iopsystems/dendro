@@ -6,7 +6,7 @@
 //!
 //! In its own test binary, apart from `replicate_resume.rs`. Spawning a child
 //! gives it a copy of this process's descriptors until it execs, with
-//! `posix_spawn` as with `fork`. `flock` locks belong to the open file
+//! `posix_spawn` as with `fork` (measured on macOS). `flock` locks belong to the open file
 //! description, so a writer lock a test running beside the spawn has just
 //! dropped stays held for that window, and the test's reopen fails as
 //! `InUse` (`src/archive/lock.rs`).

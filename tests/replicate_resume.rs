@@ -1581,7 +1581,8 @@ fn rows_a_connected_sync_deleted_are_shipped_again() {
     origin.close();
     // The origin merges [3, 4] with a new [5, 6] into [3, 6]: the copy's
     // watermark is inside it, so the sync point falls to 2, and the `Sync`
-    // deletes the copy's live 5..=8. 7 and 8 stay live on the origin.
+    // deletes the copy's segment [3, 4] and its live 5..=8. 7 and 8 stay
+    // live on the origin.
     put(&o, &[3], &[(10, 3, 6)]);
     let (applied, frames) = link.poll(&o);
     assert!(frames
