@@ -124,8 +124,7 @@ cannot reach a failed release any other way.
   and refuse the version 2 frames. A reader on 0.7.1 or earlier refuses a
   version 2 stream at the preamble.
 - Version 2 frames `Frame::Sync`, `Frame::SegmentAfter` and
-  `Frame::Unavailable` (WIRE.md §4.7 to §4.9). `ArchivePublisher` sends none
-  of them.
+  `Frame::Unavailable` (WIRE.md §4.7 to §4.9).
 - `ResumeRequest`, with `encode` and `decode` (WIRE.md §8): what a copy
   holds of each source, for the publisher it resumes from.
 - `Subscriber::resume` opens a subscriber on an archive that already holds
@@ -138,8 +137,20 @@ cannot reach a failed release any other way.
   a write its writer drops: `apply`, `sync` and `finish` return an error,
   `finish` does not finalize it, and the writer writes none of its rows,
   index entries, segments or syncs after that. A resumed subscriber refuses
-  `seal`. `ArchivePublisher` does not answer a request yet, so nothing in
-  this release resumes a copy end to end.
+  `seal`.
+- `ArchivePublisher::resuming` answers a `ResumeRequest` with a version 2
+  stream (WIRE.md §8.2), so a copy continues across a reconnect or a
+  restart instead of catching up into a new archive. Each stream the copy
+  holds continues from a sync point the publisher picks: the copy's newest
+  row when the publisher has sealed nothing past the copy's watermark,
+  otherwise a point inside no segment of either side, picked as WIRE.md
+  §8.2 gives, with a `Sync` to it unless it is the copy's watermark, then
+  the publisher's segments above it as `SegmentAfter` frames. A span
+  retention removed past the copy's newest row is reported as
+  `Unavailable`, on resume and while tailing. While tailing, a seal is
+  shipped as `SegmentAfter` frames, so a seal that outruns a poll is not an
+  error as on version 1. A request ahead of the publisher's archive, or a
+  stream with no sync point, is refused.
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a

@@ -541,7 +541,7 @@ A reader refuses a request that:
 
 A caller-row name's entries append in `ts` order (`FORMAT.md` §3.5), so
 `(ts, at_ts)` is a position in the publisher's entries of that name too.
-`ArchivePublisher` in this build takes no request.
+`ArchivePublisher::resuming` answers a request (§8.2).
 
 ### 8.1 The copy's side
 
@@ -577,3 +577,58 @@ resumed subscriber does not seal; its segments come from `Sync` and
 
 Frames lost before they reach `apply` are not detected by the subscriber;
 a version 2 `FrameReader` refuses a stream that lost one (§2.1).
+
+### 8.2 The publisher's side
+
+`ArchivePublisher::resuming` refuses a request that is ahead of its archive:
+a stream whose `newest` is above every row the archive has held of it, its
+`bounds` included, or a stream it has never held; a caller-row position past
+its entries. That is an origin restored from an older backup, or a request
+sent to the wrong archive.
+
+It handshakes every source. A source the request does not name is shipped
+from `since_for_new_sources`, as a catch-up. For a named source, each
+caller-row name continues after the request's position, and each stream is
+handled by what the copy holds of it:
+
+- A stream the copy does not hold ships from its first row, as `Segment`
+  frames and then its live rows.
+- When the archive holds no segment ending past the copy's watermark (an
+  absent watermark is below every value), the copy keeps everything and the
+  publisher ships the live rows past the copy's newest row, `P`.
+- Otherwise the publisher picks a sync point `X`. With `O` the archive's
+  oldest held row of the stream, `L` is `P` when `O` is absent or above `P`,
+  and `O - 1` otherwise. `X` is the largest value in `[L, max(L, W)]`, `W`
+  the copy's watermark, inside no segment of the copy's spans and no segment
+  of the archive's, where a value is inside `(first, last)` when
+  `first <= X < last`. The stream gets a `Sync` to `X` unless `X` is `W`,
+  then the archive's segments with `last_ts` above `X`, oldest first, as
+  `SegmentAfter` frames, each `after` the previous one's `last_ts`, then
+  the live rows past what the copy then holds.
+
+A stream whose `O` is more than one past `P` also gets an `Unavailable` from
+`P` to `O`. A stream the copy holds and the archive holds no row of gets one
+from `P` to one past the archive's `bounds` entry for it, when that entry is
+above `P`; a later row of the stream reaches the copy through a sync point
+as above. Clock offsets are sent again from the smallest point a stream
+continues from; the copy ignores one it holds.
+
+While tailing, the publisher keeps the copy's spans (the request's, then
+every segment it ships, less those a `Sync` deleted) and the copy's newest
+row of each stream. A poll that finds a segment ending past the copy's
+watermark runs the same procedure, with that newest row as `P`, the
+`Unavailable` included. When `X` is the copy's watermark, the segments go
+out as `SegmentAfter` frames alone; otherwise a `Sync` precedes them. A
+source created after the publisher opened, and a source the request did not
+name, are caught up from `since_for_new_sources`; the copy's spans for them
+start as every segment the archive holds.
+
+Limits:
+
+- A copy whose segment boundaries are not the archive's, because a version 1
+  subscriber sealed it or it was compacted, can leave no value in
+  `[L, max(L, W)]` outside every span. The stream is then refused. A sync
+  point below the oldest span the request lists may lie inside a segment
+  the request left out, which the copy refuses (§4.7).
+- Resuming from an archive other than the one the copy was made from, such as
+  a rewritten copy of it, is refused only where the checks above detect it.
