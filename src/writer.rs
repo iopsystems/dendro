@@ -200,6 +200,38 @@ enum Msg {
         source_id: i64,
         clock_offset: Option<(i64, i64)>,
     },
+    /// Make a source a replicated copy's (WIRE.md §2.1): its stream bounds
+    /// become the rows it holds, leaving out `bounds`, and the writer poisons
+    /// the source when it would drop any row of a tick or any caller row for
+    /// it ([`SourceWriter::poisoned`]). `alive` is `Some` for an existing source
+    /// continued without a writer session, whose handle this opens; the
+    /// reply carries its labels. `None` for a source just added.
+    Replicate {
+        source_id: i64,
+        alive: Option<Weak<()>>,
+        reply: SyncSender<Result<BTreeMap<String, String>>>,
+    },
+    /// Set one stream of a replicated copy to a sync point (WIRE.md §4.7).
+    SyncStream {
+        source_id: i64,
+        stream: String,
+        at: i64,
+        reply: SyncSender<Result<Synced>>,
+    },
+    /// Insert a segment that replaces a replicated copy's live rows above
+    /// `after` (WIRE.md §4.8). Replies with the rows deleted below the
+    /// segment's `first_ts`.
+    AdoptAfter {
+        source_id: i64,
+        after: i64,
+        segment: Box<Adopted>,
+        reply: SyncSender<Result<u64>>,
+    },
+    /// Clear one source's `complete` flag.
+    MarkIncomplete {
+        source_id: i64,
+        reply: SyncSender<Result<()>>,
+    },
     /// Stop the writer, whatever else is still holding a sender.
     ///
     /// The exit signal is explicit rather than "the channel closed" because a
@@ -256,6 +288,43 @@ struct Dropped {
     rows: u64,
     /// Caller rows; [`SourceWriter::dropped_caller_rows_out_of_order`].
     caller_rows: u64,
+    /// A replicated copy's source the writer dropped something for, and
+    /// whose later writes it refuses; [`SourceWriter::poisoned`].
+    poisoned: bool,
+}
+
+/// What a [`Msg::SyncStream`] did, in rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Synced {
+    /// Live rows at or below the sync point sealed into a segment.
+    pub(crate) sealed: u64,
+    /// Live rows at or below the sync point in no segment afterwards, and
+    /// deleted: the encoder refused them or left them out.
+    pub(crate) unsealable: u64,
+    /// Rows above the sync point deleted, live or in a segment.
+    pub(crate) replaced: u64,
+}
+
+/// Mark a replicated source poisoned.
+fn poison(shadowed: &ShadowCounts, source_id: i64) {
+    if let Ok(mut counts) = shadowed.lock() {
+        counts.entry(source_id).or_default().poisoned = true;
+    }
+}
+
+fn is_poisoned(shadowed: &ShadowCounts, source_id: i64) -> bool {
+    shadowed
+        .lock()
+        .map(|c| c.get(&source_id).is_some_and(|d| d.poisoned))
+        .unwrap_or(true)
+}
+
+/// The refusal of a write to a poisoned replicated source.
+fn poisoned_error(source_id: i64) -> Error {
+    Error::Message(format!(
+        "source {source_id} is a replicated copy whose writer dropped rows; it takes no \
+         more writes until it is resumed"
+    ))
 }
 
 /// Reclaim at most this many pages per retention pass — sized to fit inside a
@@ -589,6 +658,44 @@ impl Writer {
             },
             resumed.last_ts,
         ))
+    }
+
+    /// Continue an existing source as a replicated copy (WIRE.md §2.1),
+    /// without a writer session: no `writer_sessions` entry, no event, no
+    /// floor, and `complete` left as it is. The source's stream bounds are
+    /// the rows it holds, leaving out `bounds`, because the protocol sets
+    /// them from here on. Any write the writer would drop for it poisons it
+    /// instead (`SourceWriter::poisoned`).
+    pub(crate) fn continue_replica(&mut self, source_id: i64) -> Result<SourceWriter> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(Error::WriterGone);
+        };
+        let (reply_tx, reply_rx) = sync_channel(0);
+        let alive = Arc::new(());
+        if tx
+            .send(Msg::Replicate {
+                source_id,
+                alive: Some(Arc::downgrade(&alive)),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(self.take_error());
+        }
+        let labels = match reply_rx.recv() {
+            Ok(labels) => labels?,
+            Err(_) => return Err(self.take_error()),
+        };
+        Ok(SourceWriter {
+            tx: tx.clone(),
+            source_id,
+            stagger_key: crate::seal::source_stagger_key(&labels),
+            err: Arc::clone(&self.err),
+            path: self.path.clone(),
+            floor_ts: None,
+            shadowed: Arc::clone(&self.shadowed),
+            _alive: alive,
+        })
     }
 
     /// The archive being written — valid and readable while it is written.
@@ -1113,6 +1220,83 @@ impl SourceWriter {
         }
     }
 
+    /// Make this source, just added, a replicated copy's (WIRE.md §2.1). See
+    /// [`Writer::continue_replica`].
+    pub(crate) fn replicate(&mut self) -> Result<()> {
+        let source_id = self.source_id;
+        self.request(|reply| Msg::Replicate {
+            source_id,
+            alive: None,
+            reply,
+        })
+        .map(|_| ())
+    }
+
+    /// Whether this replicated copy's source has been poisoned: the writer
+    /// dropped a tick, a row or an entry for it, and refuses its later
+    /// writes. The file holds what was written before the drop, so a resume
+    /// request built from it lies below the hole.
+    pub(crate) fn poisoned(&self) -> bool {
+        is_poisoned(&self.shadowed, self.source_id)
+    }
+
+    /// Set `stream` to the sync point `at` (WIRE.md §4.7), waiting for the
+    /// writer. Only on a replicated copy.
+    pub(crate) fn sync_to(&mut self, stream: &str, at: i64) -> Result<Synced> {
+        let stream = stream.to_string();
+        let source_id = self.source_id;
+        self.request(|reply| Msg::SyncStream {
+            source_id,
+            stream,
+            at,
+            reply,
+        })
+    }
+
+    /// Insert a segment that replaces this copy's live rows of `stream` in
+    /// `(after, meta.last_ts]` (WIRE.md §4.8), waiting for the writer, and
+    /// return the live rows it deleted below `meta.first_ts`.
+    pub(crate) fn adopt_segment_after(
+        &mut self,
+        stream: &str,
+        after: i64,
+        meta: &SegmentMeta,
+        bytes: &[u8],
+        caller_index: Option<&[u8]>,
+    ) -> Result<u64> {
+        let segment = Box::new(Adopted {
+            stream: stream.to_string(),
+            meta: *meta,
+            bytes: bytes.to_vec(),
+            caller_index: caller_index.map(<[u8]>::to_vec),
+        });
+        let source_id = self.source_id;
+        self.request(|reply| Msg::AdoptAfter {
+            source_id,
+            after,
+            segment,
+            reply,
+        })
+    }
+
+    /// Clear this source's `complete` flag, waiting for the writer.
+    pub(crate) fn mark_incomplete(&mut self) -> Result<()> {
+        let source_id = self.source_id;
+        self.request(|reply| Msg::MarkIncomplete { source_id, reply })
+    }
+
+    /// Send a message that replies, and wait for the reply.
+    fn request<T>(&self, msg: impl FnOnce(SyncSender<Result<T>>) -> Msg) -> Result<T> {
+        let (reply_tx, reply_rx) = sync_channel(0);
+        if self.tx.send(msg(reply_tx)).is_err() {
+            return Err(take_writer_error(&self.err));
+        }
+        match reply_rx.recv() {
+            Ok(answer) => answer,
+            Err(_) => Err(take_writer_error(&self.err)),
+        }
+    }
+
     /// Merge `patch` into this source's metadata, ordered with the ticks
     /// around it and committed on its own. Fire-and-forget like `wal`.
     ///
@@ -1608,14 +1792,61 @@ impl WriterHealth {
 /// source loses its rows. Before this, the batched commit meant one source's
 /// bad tick failed every source in the archive, permanently, and told the
 /// culprit `Ok`.
+#[allow(clippy::too_many_arguments)]
 fn commit_tick(
     db: &mut ArchiveMut,
     ticks: &[(i64, Vec<WalRow>)],
     floors: &BTreeMap<i64, i64>,
     newest: &mut BTreeMap<i64, BTreeMap<String, i64>>,
     shadowed: &ShadowCounts,
+    replicas: &BTreeSet<i64>,
     health: &mut WriterHealth,
 ) -> Result<()> {
+    // A replicated copy's rows are all or nothing per source and tick. A row
+    // the checks below would drop means the copy and its publisher disagree,
+    // so the source's whole entry is dropped and the source poisoned: a later
+    // row committed past the hole would put the copy's newest row, and so its
+    // resume request, above rows it never received.
+    let screened: Vec<(i64, Vec<WalRow>)>;
+    let ticks: &[(i64, Vec<WalRow>)] = if ticks.iter().any(|(id, _)| replicas.contains(id)) {
+        let mut keep = Vec::with_capacity(ticks.len());
+        for (source_id, rows) in ticks {
+            if replicas.contains(source_id) {
+                if is_poisoned(shadowed, *source_id) {
+                    continue;
+                }
+                let bound = newest.get(source_id);
+                let mut seen = BTreeSet::new();
+                let refused = rows.iter().any(|r| {
+                    bound
+                        .and_then(|b| b.get(&r.stream))
+                        .is_some_and(|n| r.ts <= *n)
+                        || !seen.insert((r.stream.as_str(), r.ts))
+                });
+                if refused {
+                    poison(shadowed, *source_id);
+                    warn!(
+                        "source {source_id}: a replicated copy's tick held a row at or below \
+                         its stream's newest; the tick was dropped and the source takes no \
+                         more writes until it is resumed"
+                    );
+                    continue;
+                }
+            }
+            keep.push((*source_id, rows.clone()));
+        }
+        screened = keep;
+        &screened
+    } else {
+        ticks
+    };
+    let poison_replicas = |ticks: &[(i64, Vec<WalRow>)]| {
+        for (source_id, _) in ticks {
+            if replicas.contains(source_id) {
+                poison(shadowed, *source_id);
+            }
+        }
+    };
     // The writer's half of the resume floor (the handle checks `wal`; this
     // covers `wal_tick`, which has no handle to ask): a resumed source's rows
     // at or before the newest row it has held are that source's problem,
@@ -1744,6 +1975,9 @@ fn commit_tick(
                         advance(newest, std::slice::from_ref(&(*source_id, rows.clone())));
                     }
                     Err(e) if e.is_constraint() => {
+                        if replicas.contains(source_id) {
+                            poison(shadowed, *source_id);
+                        }
                         if health.warned_collisions.insert(*source_id) {
                             warn!(
                                 "source {source_id}: a tick was dropped because its rows \
@@ -1752,7 +1986,10 @@ fn commit_tick(
                             );
                         }
                     }
-                    Err(e) if e.is_retryable() => health.dropped(e)?,
+                    Err(e) if e.is_retryable() => {
+                        poison_replicas(std::slice::from_ref(&(*source_id, Vec::new())));
+                        health.dropped(e)?
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -1761,7 +1998,10 @@ fn commit_tick(
             }
             Ok(())
         }
-        Err(e) if e.is_retryable() => health.dropped(e),
+        Err(e) if e.is_retryable() => {
+            poison_replicas(ticks);
+            health.dropped(e)
+        }
         Err(e) => Err(e),
     }
 }
@@ -2047,6 +2287,8 @@ fn writer_loop(
     // elapsed time, not about arriving messages.
     let mut last_checkpoint = Instant::now();
     let mut health = WriterHealth::default();
+    // Sources that are replicated copies (`Msg::Replicate`).
+    let mut replicas: BTreeSet<i64> = BTreeSet::new();
 
     loop {
         // `recv_timeout`, not `recv`: a writer with nothing to do still has to
@@ -2149,9 +2391,15 @@ fn writer_loop(
                 }
                 let _ = reply.send(resumed);
             }
-            Ok(Msg::Wal { ticks }) => {
-                commit_tick(db, &ticks, &floors, &mut newest, shadowed, &mut health)?
-            }
+            Ok(Msg::Wal { ticks }) => commit_tick(
+                db,
+                &ticks,
+                &floors,
+                &mut newest,
+                shadowed,
+                &replicas,
+                &mut health,
+            )?,
             #[cfg(any(test, feature = "test-support"))]
             Ok(Msg::Commits(reply)) => {
                 let _ = reply.send(db.commits());
@@ -2213,9 +2461,13 @@ fn writer_loop(
                 // later attempt, the bytes are in this message — so a failure
                 // that outlasts the retries goes back to the sender, which is
                 // applying a stream and can stop.
-                let adopted = with_retries("adopting a segment", || {
-                    adopt_segment(db, source_id, &mut next_seq, &mut watermarks, &segment)
-                });
+                let adopted = if replicas.contains(&source_id) && is_poisoned(shadowed, source_id) {
+                    Err(poisoned_error(source_id))
+                } else {
+                    with_retries("adopting a segment", || {
+                        adopt_segment(db, source_id, &mut next_seq, &mut watermarks, &segment)
+                    })
+                };
                 // `adopt_segment` only inserts, and refuses a segment at or
                 // below a live row, so the bound becomes the segment's end.
                 if matches!(adopted, Ok(true)) {
@@ -2227,6 +2479,110 @@ fn writer_loop(
                     *n = (*n).max(segment.meta.last_ts);
                 }
                 let _ = reply.send(adopted);
+            }
+            Ok(Msg::Replicate {
+                source_id,
+                alive,
+                reply,
+            }) => {
+                let labels = with_retries("opening a replicated source", || {
+                    let Some(src) = db.read_sources()?.into_iter().find(|s| s.id == source_id)
+                    else {
+                        return Err(Error::Message(format!(
+                            "no source with id {source_id} to replicate into"
+                        )));
+                    };
+                    Ok((src.meta.labels, db.held_newest_rows_of(source_id)?))
+                });
+                let labels = labels.map(|(labels, held)| {
+                    // The protocol sets this source's bounds from here on:
+                    // its own rows, not `bounds`, and no session floor.
+                    newest.insert(source_id, held);
+                    floors.remove(&source_id);
+                    caller_floors.retain(|(source, _), _| *source != source_id);
+                    replicas.insert(source_id);
+                    if let Some(alive) = alive {
+                        start_heartbeat(db, source_id, heartbeat_every);
+                        added += 1;
+                        beating.entry(source_id).or_default().push(alive);
+                    }
+                    labels
+                });
+                let _ = reply.send(labels);
+            }
+            Ok(Msg::SyncStream {
+                source_id,
+                stream,
+                at,
+                reply,
+            }) => {
+                let synced = if !replicas.contains(&source_id) {
+                    Err(Error::Message(format!(
+                        "source {source_id} is not a replicated copy, and only a copy is \
+                         synced"
+                    )))
+                } else if is_poisoned(shadowed, source_id) {
+                    Err(poisoned_error(source_id))
+                } else {
+                    sync_stream(
+                        db,
+                        source_id,
+                        &stream,
+                        at,
+                        &mut next_seq,
+                        &mut watermarks,
+                        encoder,
+                    )
+                };
+                match &synced {
+                    Ok(_) => {
+                        // Rows above `at` arrive again, so the bound is `at`.
+                        newest.entry(source_id).or_default().insert(stream, at);
+                    }
+                    Err(e) if e.is_retryable() => poison(shadowed, source_id),
+                    Err(_) => {}
+                }
+                let _ = reply.send(synced);
+            }
+            Ok(Msg::AdoptAfter {
+                source_id,
+                after,
+                segment,
+                reply,
+            }) => {
+                let adopted = if !replicas.contains(&source_id) {
+                    Err(Error::Message(format!(
+                        "source {source_id} is not a replicated copy, and only a copy adopts \
+                         a segment after a point"
+                    )))
+                } else if is_poisoned(shadowed, source_id) {
+                    Err(poisoned_error(source_id))
+                } else {
+                    with_retries("adopting a segment", || {
+                        adopt_segment_after(
+                            db,
+                            source_id,
+                            after,
+                            &mut next_seq,
+                            &mut watermarks,
+                            &segment,
+                        )
+                    })
+                };
+                if adopted.is_ok() {
+                    let n = newest
+                        .entry(source_id)
+                        .or_default()
+                        .entry(segment.stream.clone())
+                        .or_insert(segment.meta.last_ts);
+                    *n = (*n).max(segment.meta.last_ts);
+                }
+                let _ = reply.send(adopted);
+            }
+            Ok(Msg::MarkIncomplete { source_id, reply }) => {
+                let _ = reply.send(with_retries("reopening a source", || {
+                    db.transaction(|tx| tx.mark_incomplete(source_id))
+                }));
             }
             Ok(Msg::Evict {
                 source_id,
@@ -2435,6 +2791,9 @@ fn writer_loop(
                         // Lost like a dropped commit: the rows are not
                         // written, and a run of these stops the writer.
                         Err(e) if e.is_retryable() => {
+                            if replicas.contains(&source_id) {
+                                poison(shadowed, source_id);
+                            }
                             health.dropped(e)?;
                             continue;
                         }
@@ -2442,6 +2801,17 @@ fn writer_loop(
                     },
                 };
                 let offered = rows.len();
+                if replicas.contains(&source_id) {
+                    // All or nothing, as for a replicated copy's WAL rows.
+                    if is_poisoned(shadowed, source_id) {
+                        continue;
+                    }
+                    if rows.iter().any(|r| !floor.admits(r.ts)) {
+                        poison(shadowed, source_id);
+                        health.count_late_caller_rows(shadowed, source_id, &stream, offered as u64);
+                        continue;
+                    }
+                }
                 let rows: Vec<CallerRow> =
                     rows.into_iter().filter(|r| floor.admits(r.ts)).collect();
                 if rows.len() < offered {
@@ -2466,7 +2836,12 @@ fn writer_loop(
                         let newest = rows.iter().map(|r| r.ts).max().expect("not empty");
                         caller_floors.insert((source_id, stream), floor.after(newest));
                     }
-                    Err(e) if e.is_retryable() => health.dropped(e)?,
+                    Err(e) if e.is_retryable() => {
+                        if replicas.contains(&source_id) {
+                            poison(shadowed, source_id);
+                        }
+                        health.dropped(e)?
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -2769,6 +3144,201 @@ fn adopt_segment(
         .or_default()
         .insert(stream.to_string(), meta.last_ts);
     Ok(true)
+}
+
+/// The writer-thread half of [`SourceWriter::sync_to`] (WIRE.md §4.7).
+///
+/// Reads and encodes outside the transaction, then makes every change in
+/// one: a kill leaves the stream as it was or as the sync left it. An
+/// encoder error does not fail the sync; the rows it covered are deleted and
+/// counted in `unsealable`.
+#[allow(clippy::too_many_arguments)]
+fn sync_stream(
+    db: &mut ArchiveMut,
+    source_id: i64,
+    stream: &str,
+    at: i64,
+    next_seq: &mut BTreeMap<(i64, String), u64>,
+    watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
+    encoder: &(dyn SegmentEncoder + Send),
+) -> Result<Synced> {
+    let (segments, wal, uuid) = with_retries("reading a stream to sync", || {
+        Ok((
+            db.read_segment_meta(source_id, stream)?,
+            db.read_wal(source_id, stream)?,
+            db.source_uuid(source_id)?,
+        ))
+    })?;
+    if let Some((_, m)) = segments
+        .iter()
+        .find(|(_, m)| m.first_ts <= at && at < m.last_ts)
+    {
+        return Err(Error::Message(format!(
+            "source {source_id}: the sync point {at} of `{stream}` is inside the copy's \
+             segment [{}, {}], and a sync deletes whole segments",
+            m.first_ts, m.last_ts
+        )));
+    }
+    let w0 = segments.iter().map(|(_, m)| m.last_ts).max();
+    let held_newest = wal
+        .iter()
+        .map(|r| r.ts)
+        .chain(segments.iter().map(|(_, m)| m.last_ts))
+        .max();
+    let live = |r: &&WalRow| w0.is_none_or(|w| r.ts > w);
+
+    // 1. Seal the live rows at or below `at`.
+    let to_seal: Vec<WalRow> = wal
+        .iter()
+        .filter(live)
+        .filter(|r| r.ts <= at)
+        .cloned()
+        .collect();
+    let sealed = if to_seal.is_empty() {
+        None
+    } else {
+        let ctx = EncodeContext::new(source_id, stream).with_source_uuid(uuid.as_deref());
+        match crate::segment::materialize(encoder, &ctx, &to_seal) {
+            Ok(segment) => segment,
+            Err(e) => {
+                warn!(
+                    "source {source_id}: sealing {} live row(s) of `{stream}` at or below the \
+                     sync point {at} failed ({e}); they are deleted and counted as unsealable",
+                    to_seal.len()
+                );
+                None
+            }
+        }
+    };
+    let removed: Vec<(u64, SegmentMeta)> = segments
+        .iter()
+        .filter(|(_, m)| m.first_ts > at)
+        .copied()
+        .collect();
+    let w1 = segments
+        .iter()
+        .filter(|(_, m)| m.last_ts <= at)
+        .map(|(_, m)| m.last_ts)
+        .chain(sealed.as_ref().map(|s| s.last_ts))
+        .max();
+    let synced = Synced {
+        sealed: sealed.as_ref().map_or(0, |s| s.rows),
+        unsealable: to_seal.len() as u64 - sealed.as_ref().map_or(0, |s| s.rows),
+        replaced: removed.iter().map(|(_, m)| m.rows).sum::<u64>()
+            + wal.iter().filter(live).filter(|r| r.ts > at).count() as u64,
+    };
+    let seq = next_seq
+        .get(&(source_id, stream.to_string()))
+        .copied()
+        .unwrap_or(0);
+
+    with_retries("syncing a stream", || {
+        db.transaction(|tx| {
+            if let Some(newest) = held_newest.filter(|n| *n > at) {
+                tx.record_stream_bound(source_id, stream, newest)?;
+            }
+            for (seq, _) in &removed {
+                tx.delete_segment(source_id, stream, *seq)?;
+            }
+            tx.delete_wal_range(source_id, stream, Some(at), None)?;
+            // 2. What is still live at or below `at` is in no segment.
+            tx.delete_wal_range(source_id, stream, w1, Some(at))?;
+            if let Some(segment) = &sealed {
+                tx.insert_segment_with_index(
+                    source_id,
+                    stream,
+                    seq,
+                    &SegmentMeta {
+                        rows: segment.rows,
+                        first_ts: segment.first_ts,
+                        last_ts: segment.last_ts,
+                    },
+                    &segment.bytes,
+                    segment.index.as_deref(),
+                )?;
+            }
+            Ok(())
+        })
+    })?;
+    if sealed.is_some() {
+        next_seq.insert((source_id, stream.to_string()), seq + 1);
+    }
+    let marks = watermarks.entry(source_id).or_default();
+    match w1 {
+        Some(w) => marks.insert(stream.to_string(), w),
+        None => marks.remove(stream),
+    };
+    // Rows at or below the new watermark are shadowed; deleting them is the
+    // prune a seal makes, outside the transaction for the same reason.
+    if let Some(w) = w1 {
+        if let Err(e) = db.prune_wal(source_id, stream, w) {
+            warn!("source {source_id}: pruning `{stream}` after a sync failed ({e})");
+        }
+    }
+    Ok(synced)
+}
+
+/// The writer-thread half of [`SourceWriter::adopt_segment_after`] (WIRE.md
+/// §4.8). Returns the live rows deleted below the segment's `first_ts`.
+fn adopt_segment_after(
+    db: &mut ArchiveMut,
+    source_id: i64,
+    after: i64,
+    next_seq: &mut BTreeMap<(i64, String), u64>,
+    watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
+    segment: &Adopted,
+) -> Result<u64> {
+    let Adopted {
+        stream,
+        meta,
+        bytes,
+        caller_index,
+    } = segment;
+    let stream = stream.as_str();
+    if meta.rows == 0 || meta.first_ts > meta.last_ts || meta.last_ts <= after {
+        return Err(Error::Message(format!(
+            "source {source_id}: the segment offered for `{stream}` after {after} claims {} \
+             row(s) over [{}, {}], which is not a segment that can follow it",
+            meta.rows, meta.first_ts, meta.last_ts
+        )));
+    }
+    let w0 = watermarks
+        .get(&source_id)
+        .and_then(|m| m.get(stream))
+        .copied();
+    if let Some(w) = w0.filter(|w| *w > after || meta.first_ts <= *w) {
+        return Err(Error::Message(format!(
+            "source {source_id}: the copy holds `{stream}` sealed to {w}, and the segment \
+             offered over [{}, {}] after {after} would overlap it",
+            meta.first_ts, meta.last_ts
+        )));
+    }
+    let live = db.live_wal(source_id, stream)?;
+    if let Some(r) = live.iter().find(|r| r.ts <= after) {
+        return Err(Error::Message(format!(
+            "source {source_id}: the copy holds a live row of `{stream}` at {}, at or below \
+             {after}, where the segment offered after {after} says it holds none",
+            r.ts
+        )));
+    }
+    let pruned = live
+        .iter()
+        .filter(|r| r.ts > after && r.ts < meta.first_ts)
+        .count() as u64;
+    let seq = next_seq
+        .get(&(source_id, stream.to_string()))
+        .copied()
+        .unwrap_or(0);
+    db.transaction(|tx| {
+        tx.delete_wal_range(source_id, stream, Some(after), Some(meta.last_ts))?;
+        tx.insert_segment_with_index(source_id, stream, seq, meta, bytes, caller_index.as_deref())
+    })?;
+    next_seq.insert((source_id, stream.to_string()), seq + 1);
+    watermarks
+        .entry(source_id)
+        .or_default()
+        .insert(stream.to_string(), meta.last_ts);
+    Ok(pruned)
 }
 
 fn seal_batch(

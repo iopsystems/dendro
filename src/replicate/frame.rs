@@ -239,8 +239,9 @@ pub enum Frame {
     /// replace. Its live rows at or below `at` are sealed with its own
     /// encoder, and the ones that do not seal are deleted.
     ///
-    /// This build's [`Subscriber`](crate::replicate::Subscriber) refuses this
-    /// frame; no release applies it yet.
+    /// A [`Subscriber`](crate::replicate::Subscriber) applies it to a source
+    /// of a resumed copy ([`Subscriber::resume`](crate::replicate::Subscriber::resume))
+    /// and refuses it otherwise.
     Sync {
         /// Which source, by handshake ordinal.
         source: u32,
@@ -256,8 +257,8 @@ pub enum Frame {
     /// The copy refuses it when it holds a live row of the stream at or below
     /// `after`, or a segment of the stream ending above `after`.
     ///
-    /// This build's [`Subscriber`](crate::replicate::Subscriber) refuses this
-    /// frame; no release applies it yet.
+    /// A [`Subscriber`](crate::replicate::Subscriber) applies it to a source
+    /// of a resumed copy and refuses it otherwise.
     SegmentAfter {
         /// Which source, by handshake ordinal.
         source: u32,

@@ -124,11 +124,22 @@ cannot reach a failed release any other way.
   and refuse the version 2 frames. A reader on 0.7.1 or earlier refuses a
   version 2 stream at the preamble.
 - Version 2 frames `Frame::Sync`, `Frame::SegmentAfter` and
-  `Frame::Unavailable` (WIRE.md §4.7 to §4.9). This release's `Subscriber`
-  refuses the first two and `ArchivePublisher` sends none of them.
+  `Frame::Unavailable` (WIRE.md §4.7 to §4.9). `ArchivePublisher` sends none
+  of them.
 - `ResumeRequest`, with `encode` and `decode` (WIRE.md §8): what a copy
-  holds of each source, for the publisher it resumes from. This release
-  neither builds nor answers one.
+  holds of each source, for the publisher it resumes from.
+- `Subscriber::resume` opens a subscriber on an archive that already holds
+  a copy and returns the `ResumeRequest` describing it (WIRE.md §8.1). A
+  handshake for a source the request names continues that source, and the
+  subscriber applies `Sync`, `SegmentAfter` and `Unavailable` to it, counted
+  in the new `Applied::syncs`, `rows_unsealable`, `rows_replaced`,
+  `rows_pruned` and `unavailable`. A source stops at a frame that fails,
+  including a `Rows` frame whose index state the copy does not hold, and at
+  a write its writer drops: `apply`, `sync` and `finish` return an error,
+  `finish` does not finalize it, and the writer writes none of its rows,
+  index entries, segments or syncs after that. A resumed subscriber refuses
+  `seal`. `ArchivePublisher` does not answer a request yet, so nothing in
+  this release resumes a copy end to end.
 - `Applied::rows_repeated` counts the rows of a `Rows` frame a `Subscriber`
   did not write because they were at or below the newest timestamp the
   connection had already delivered for their stream, or repeated a
