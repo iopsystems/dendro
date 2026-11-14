@@ -283,11 +283,13 @@ fn rows_out_of_order_within_one_tick_are_kept() {
 }
 
 /// A writer's own retention pass that evicts every segment of a stream
-/// leaves it with no watermark, so a row below the old one is readable and
-/// is taken. The writer kept the old watermark in its cache and dropped the
-/// row as out of order.
+/// leaves its bound where it was: a row at or below the stream's old newest
+/// row is dropped and counted, and one above it is taken and readable. The
+/// bound used to be what the file held, so after the pass a row below the
+/// evicted ones was taken, and a tailing publisher whose cursor was past it
+/// never shipped it.
 #[test]
-fn an_eviction_of_every_segment_lifts_the_stream_watermark() {
+fn an_eviction_of_every_segment_keeps_the_stream_bound() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
     let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
@@ -302,18 +304,17 @@ fn an_eviction_of_every_segment_lifts_the_stream_watermark() {
     w.evict_streams_before(100, only_s).unwrap();
     w.wal(vec![row("s", 15), row("t", 15)]).unwrap();
     w.sync().unwrap();
-    assert_eq!(
-        w.dropped_out_of_order(),
-        1,
-        "only `t`, whose watermark of 20 still stands, drops its row"
-    );
+    assert_eq!(w.dropped_out_of_order(), 2, "both are at or below 20");
+    w.wal(vec![row("s", 25)]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.dropped_out_of_order(), 2);
 
     let db = Archive::open(&path).unwrap();
     let id = db.read_sources().unwrap()[0].id;
     let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
-    assert_eq!(live, vec![15]);
+    assert_eq!(live, vec![25]);
     drop(db);
-    archive.finalize_single(w, (15, 0)).unwrap();
+    archive.finalize_single(w, (25, 0)).unwrap();
 }
 
 /// A row at or below its stream's newest LIVE row is dropped and counted,
@@ -359,22 +360,262 @@ fn a_row_at_or_below_the_newest_live_row_is_dropped_and_counted() {
     archive.finalize_single(w, (300, 0)).unwrap();
 }
 
-/// The newest-row bound is what the file holds, so a stream whose live rows
-/// are discarded accepts rows below them again.
+/// A discard keeps its stream's bound: a row at or below the discarded rows
+/// is dropped and counted. The bound used to be what the file held, so such
+/// a row was taken, and a tailing publisher whose cursor was past it never
+/// shipped it. The next session's floor includes the bound, so the resumed
+/// handle refuses such a row outright.
 #[test]
-fn a_discard_lifts_the_newest_row_bound() {
+fn a_discard_keeps_the_newest_row_bound_across_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("o.dendro");
-    let (archive, mut w) = Writer::single(&path, Box::new(Tags), meta("a")).unwrap();
-    w.wal(vec![row("s", 100)]).unwrap();
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    w.wal(vec![row("s", 10), row("s", 100)]).unwrap();
     w.sync().unwrap();
     w.discard_live_rows(Box::new(|s: &str| s == "s")).unwrap();
     w.wal(vec![row("s", 10)]).unwrap();
+    w.wal(vec![row("s", 100)]).unwrap();
     w.sync().unwrap();
     assert_eq!(
         w.dropped_out_of_order(),
-        0,
-        "the discarded row bounds nothing"
+        2,
+        "10 and 100 are at or below the discarded 100"
     );
-    archive.finalize_single(w, (10, 0)).unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    let id = Archive::open(&path).unwrap().read_sources().unwrap()[0].id;
+    let (mut w, floor) = archive.resume_source(id, 1_000).unwrap();
+    assert_eq!(
+        floor,
+        Some(100),
+        "the floor was read back from the file's bounds"
+    );
+    assert!(matches!(
+        w.wal(vec![row("s", 50)]),
+        Err(dendro::Error::TimelineBackwards { floor: 100, .. })
+    ));
+    w.wal(vec![row("s", 101)]).unwrap();
+    w.sync().unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(live, vec![101]);
+}
+
+/// The offline delete paths, which run without a writer, record the bound
+/// too: `ArchiveMut::discard_live_rows`, `ArchiveMut::evict_streams_before`
+/// and a `prune_wal` past the stream's watermark. Each stream here is the
+/// only one holding the 100, so the next session's floor shows each.
+#[test]
+fn an_offline_delete_records_the_bound_for_the_next_writer() {
+    use dendro::archive::ArchiveMut;
+    for (stream, delete) in [("d", 0), ("e", 1), ("p", 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.dendro");
+        let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+        let mut w = archive.add_source(meta("a")).unwrap();
+        w.wal(vec![row("keep", 10), row(stream, 100)]).unwrap();
+        w.sync().unwrap();
+        drop(w);
+        archive.join().unwrap();
+
+        let mut db = ArchiveMut::open(&path).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        match delete {
+            0 => drop(db.discard_live_rows(id, &|s: &str| s == stream).unwrap()),
+            1 => drop(
+                db.evict_streams_before(id, 1_000, &|s: &str| s == stream)
+                    .unwrap(),
+            ),
+            _ => drop(db.prune_wal(id, stream, 1_000).unwrap()),
+        }
+        drop(db);
+
+        let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+        let (w, floor) = archive.resume_source(id, 1_000).unwrap();
+        assert_eq!(floor, Some(100), "{stream}: the deleted 100 is the floor");
+        drop(w);
+        archive.join().unwrap();
+    }
+}
+
+/// `resume_source` refuses an anchor at or below the newest row the source
+/// has held, not only below what it holds now. A source evicted to nothing
+/// used to have no floor at all, and a writer whose clock went backwards
+/// then had every row dropped one at a time instead of being refused once.
+#[test]
+fn a_resume_below_an_evicted_source_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    w.wal(vec![row("s", 1_000)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.sync().unwrap();
+    w.evict_before(10_000).unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    let id = Archive::open(&path).unwrap().read_sources().unwrap()[0].id;
+    let refused = archive.resume_source(id, 500).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            dendro::Error::TimelineBackwards { floor: 1_000, .. }
+        ),
+        "{refused:?}"
+    );
+    archive.resume_source(id, 1_001).unwrap();
+    archive.join().unwrap();
+}
+
+/// A copy carries each stream's bound: a time-bounded copy that left a
+/// stream's newest rows out still has them as its floor, as its original
+/// would. A stream the copy filters out carries no bound.
+#[test]
+fn a_bounded_copy_keeps_the_original_bound() {
+    use dendro::archive::ArchiveMut;
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    w.wal(vec![row("s", 10), row("t", 10)]).unwrap();
+    w.seal(vec!["s".to_string(), "t".to_string()]).unwrap();
+    // Live tails wholly past the copy's `end`, so the copy leaves them out.
+    w.wal(vec![row("s", 100), row("t", 200)]).unwrap();
+    w.sync().unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let src = Archive::open(&path).unwrap();
+    let copy_with = |keep: &dyn Fn(&str) -> bool| -> Option<i64> {
+        let copy = dir.path().join("c.dendro");
+        let _ = std::fs::remove_file(&copy);
+        let mut dst = ArchiveMut::create(&copy).unwrap();
+        let spec = CopySpec {
+            end: 50,
+            keep_streams: Some(keep),
+            ..CopySpec::everything()
+        };
+        dst.transaction(|tx| copy_sources_into(&src, tx, &spec, &Tags))
+            .unwrap();
+        drop(dst);
+        let mut archive = Writer::open(&copy, Box::new(Tags)).unwrap();
+        let id = Archive::open(&copy).unwrap().read_sources().unwrap()[0].id;
+        let (w, floor) = archive.resume_source(id, 1_000).unwrap();
+        drop(w);
+        archive.join().unwrap();
+        floor
+    };
+    assert_eq!(
+        copy_with(&|s: &str| s == "s"),
+        Some(100),
+        "`s` carries 100, not 10"
+    );
+    assert_eq!(
+        copy_with(&|s: &str| s != "t"),
+        Some(100),
+        "`t`'s 200 is not carried"
+    );
+}
+
+/// A later writer seeds each stream's bound from the file's `bounds` too, so
+/// `Writer::wal_tick` on a source it did not resume drops a row at or below
+/// a discarded one.
+#[test]
+fn a_tick_on_a_source_not_resumed_respects_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    let id = w.source_id();
+    w.wal(vec![row("s", 10)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.wal(vec![row("s", 100)]).unwrap();
+    w.sync().unwrap();
+    w.discard_live_rows(Box::new(|s: &str| s == "s")).unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    archive
+        .wal_tick(vec![(id, vec![row("s", 50), row("s", 150)])])
+        .unwrap();
+    archive.join().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(live, vec![150]);
+}
+
+/// `Transaction::delete_segment` records the bound as well: deleting a
+/// stream's newest segment leaves it as the floor.
+#[test]
+fn deleting_the_newest_segment_keeps_its_bound() {
+    use dendro::archive::ArchiveMut;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    for ts in [10, 100] {
+        w.wal(vec![row("s", ts)]).unwrap();
+        w.seal(vec!["s".to_string()]).unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    db.transaction(|tx| tx.delete_segment(id, "s", 1)).unwrap();
+    drop(db);
+
+    let mut archive = Writer::open(&path, Box::new(Tags)).unwrap();
+    let (w, floor) = archive.resume_source(id, 1_000).unwrap();
+    assert_eq!(floor, Some(100));
+    drop(w);
+    archive.join().unwrap();
+}
+
+/// A stream the original has evicted to nothing exists only in its
+/// `bounds`, and a copy carries that bound too.
+#[test]
+fn a_copy_carries_the_bound_of_a_stream_evicted_to_nothing() {
+    use dendro::archive::ArchiveMut;
+    use dendro::rewrite::{copy_sources_into, CopySpec};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.dendro");
+    let copy = dir.path().join("c.dendro");
+    let mut archive = Writer::create(&path, Box::new(Tags)).unwrap();
+    let mut w = archive.add_source(meta("a")).unwrap();
+    w.wal(vec![row("keep", 10), row("gone", 100)]).unwrap();
+    w.seal(vec!["gone".to_string()]).unwrap();
+    w.sync().unwrap();
+    w.evict_streams_before(1_000, Box::new(|s: &str| s == "gone"))
+        .unwrap();
+    drop(w);
+    archive.join().unwrap();
+
+    let src = Archive::open(&path).unwrap();
+    let mut dst = ArchiveMut::create(&copy).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Tags))
+        .unwrap();
+    drop(dst);
+    let mut archive = Writer::open(&copy, Box::new(Tags)).unwrap();
+    let id = Archive::open(&copy).unwrap().read_sources().unwrap()[0].id;
+    let (w, floor) = archive.resume_source(id, 1_000).unwrap();
+    assert_eq!(
+        floor,
+        Some(100),
+        "the evicted stream's 100, not `keep`'s 10"
+    );
+    drop(w);
+    archive.join().unwrap();
 }

@@ -101,8 +101,8 @@ never removed.
 
 ## 3. The catalog
 
-Seven tables (`src/archive/sqlite.rs`, `SCHEMA_SQL`, and `documents` in
-`src/archive/sqlite/documents.rs`, `DOCUMENTS_SQL`). SQLite is a transactional allocator
+Eight tables (`src/archive/sqlite.rs`, `SCHEMA_SQL` and `BOUNDS_SQL`, and
+`documents` in `src/archive/sqlite/documents.rs`, `DOCUMENTS_SQL`). SQLite is a transactional allocator
 with a queryable catalog here, not a query engine: nothing below ever looks
 inside a segment.
 
@@ -172,6 +172,13 @@ CREATE TABLE documents(                -- schema 5; a v4 archive has none
   CHECK ((schema IS NULL) = (body IS NULL))
 );
 CREATE INDEX documents_by_name ON documents(kind, name, id);
+CREATE TABLE bounds(                   -- with the file; an older file gets it at its first delete that needs it (§3.7)
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  kind INTEGER NOT NULL,               -- 0: `name` is a stream
+  name TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  PRIMARY KEY (source_id, kind, name)
+);
 ```
 
 Every table but `documents` is per source: its rows carry a `source_id`.
@@ -301,7 +308,9 @@ rather than storing it, counts it, and logs once per stream; a resumed source
 refuses it at the call instead. A writer drops a row at or below its stream's
 newest live row the same way: it would be readable, but a reader that tails a
 stream by timestamp has passed it. The bound is the stream's newest row before
-the tick, so a stream's rows may arrive in any order within one tick; a second
+the tick, or a newer one a delete removed (§3.7), so a stream's timestamps
+strictly increase for the life of its source. A stream's rows may still
+arrive in any order within one tick; a second
 row at one timestamp in the tick is dropped the same way. Producers must
 append monotonically **per stream**. The watermark is per `(source, stream)`,
 so the same timestamp is accepted on a sibling stream or on another source,
@@ -425,6 +434,41 @@ spans every source. Each row is one **revision** of the document
   `Error::SchemaTooOld`, and the archive is copied forward into a new (v5)
   archive instead (§8).
 
+### 3.7 `bounds`
+
+The newest timestamp a stream of this file has held, per `(source_id,
+kind, name)`. A writer's bound for a stream (§3.3) is the larger of this and the
+stream's newest row in `wal` and `segments`. The rules:
+
+- **Who writes it.** Every delete that can remove a stream's newest row
+  records that row's timestamp first, in the same transaction:
+  - retention, through `evict_before` and `evict_streams_before`, with or
+    without a floor, for each stream whose newest row is below the cutoff;
+  - `discard_live_rows`;
+  - `prune_wal` past the stream's watermark;
+  - `Transaction::delete_segment`, which compaction uses and then replaces
+    with a segment ending at the same row, so for it the record changes
+    nothing.
+
+  A later delete never lowers a recorded value. `kind` 0 is the only kind:
+  `name` is a stream.
+- **Why.** Without it, a stream whose newest rows were discarded or evicted
+  accepts rows at timestamps it has already held. A tailing replication
+  publisher whose cursor is past them does not ship them.
+- **Absent.** A file created before the table has none until its first such
+  delete creates it, and a reader treats the absence as no bounds. The
+  table is not versioned: such a delete, or a copy into the file, adds it to
+  a v4 archive as to a v5 one (§8).
+- **Copies.** `rewrite::copy_sources_into` records each carried stream's
+  newest row in the copy, counting the original's own bounds, so a
+  time-bounded copy keeps the original's bound. Compaction records each
+  merged stream's newest row, which it keeps, so the bound does not change.
+  Replication does not carry it: it describes this file.
+- **Resume.** A resumed source's floor (§7) is the newest row the source has
+  held, bounds included. So a source whose rows were stamped in the future
+  cannot be resumed until the clock passes them, even after they are
+  discarded or evicted.
+
 ## 4. Reading
 
 The rules a reader must follow; `src/read.rs` is the reference.
@@ -515,9 +559,9 @@ the rows changes shape; five things are guaranteed:
 - Segment numbering continues from `MAX(seq) + 1` per stream; the
   clock-offset series keeps what it had and cannot gain a second offset at
   an old timestamp.
-- The session's anchor must be later than the source's newest row
-  (segments and WAL together), and every row the session commits must be
-  later still. A clock that went backwards across a restart is refused at
+- The session's anchor must be later than the newest row the source has
+  held (segments, WAL and `bounds` together, §3.7), and every row the
+  session commits must be later still. A clock that went backwards across a restart is refused at
   resume and per row (`Error::TimelineBackwards`), never written.
 - The session is recorded under `writer_sessions` and as a
   `writer_session` event at its anchor. A later `set_source_identity`
@@ -554,7 +598,11 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   reader can ignore does not bump the version either (`sources_by_uuid`, added
   at creation by the release that added it); an older writer that inserts a duplicate uuid into
   such an archive gets SQLite's constraint error where a current one gets
-  `Error::DuplicateSource`.
+  `Error::DuplicateSource`. Nor does `bounds` (§3.7), a table an old reader
+  ignores and an old copier drops. That copy's writer, and an old writer
+  on any file, uses the file's newest row as its bound, so it can again
+  accept a row at a timestamp a delete removed. That is the behaviour
+  before the table.
 - **What the format does not version, and whose problem it is.** The row
   payload and the segment's columns are the encoder's: a writer and a reader
   must run the same encoder over the same rows to the same bytes. The file
@@ -596,7 +644,8 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   what v4 holds, so that a recording made before the upgrade can be resumed
   and annotated in place: a writer resumes its sources, metadata and labels
   are edited, compaction and retention run, and the file stays v4. It never
-  adds a v5 structure to it. A document written into a v4 archive, directly
+  adds a v5 structure to it. `bounds` (§3.7) is not one: it is not
+  versioned, and a v4 reader ignores it. A document written into a v4 archive, directly
   or by a copy, is refused as `Error::SchemaTooOld`, and the archive is
   copied forward instead: `rewrite::copy_sources_into` into a new archive,
   which is v5. The header is never restamped.

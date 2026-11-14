@@ -871,6 +871,7 @@ impl Archive {
         db.conn
             .execute_batch(SCHEMA_SQL)
             .and_then(|()| db.conn.execute_batch(documents::DOCUMENTS_SQL))
+            .and_then(|()| db.conn.execute_batch(BOUNDS_SQL))
             .map_err(Error::sqlite("failed to create archive schema"))?;
         db.stamp_header()?;
         // Fold the stamp into the archive itself, now. In WAL mode every
@@ -2358,19 +2359,26 @@ impl Archive {
             .map_err(Error::sqlite("failed to read a sealed watermark"))
     }
 
-    /// Every stream's newest row timestamp, sealed or live: the larger of its
-    /// newest segment's `last_ts` and its newest WAL row's `ts`. The writer
+    /// Every stream's newest row timestamp, sealed or live: the largest of
+    /// its newest segment's `last_ts`, its newest WAL row's `ts` and its
+    /// `bounds` row (FORMAT.md §3.7). The writer
     /// refuses a row at or below it (see `SourceWriter::dropped_out_of_order`).
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn newest_rows(&self) -> Result<BTreeMap<i64, BTreeMap<String, i64>>> {
+        let bounds = if has_table(&self.conn, "bounds")? {
+            "UNION ALL SELECT source_id, name, ts FROM bounds WHERE kind = 0"
+        } else {
+            ""
+        };
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT source_id, stream, MAX(ts) FROM ( \
                    SELECT source_id, stream, ts FROM wal \
                    UNION ALL SELECT source_id, stream, last_ts FROM segments \
-                 ) GROUP BY source_id, stream",
-            )
+                   {bounds} \
+                 ) GROUP BY source_id, stream"
+            ))
             .map_err(Error::sqlite("failed to query newest rows"))?;
         let rows = stmt
             .query_map([], |row| {
@@ -2390,17 +2398,41 @@ impl Archive {
         Ok(out)
     }
 
+    /// The newest timestamp `bounds` records for any of `source_id`'s
+    /// streams, or `None`.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn newest_bound(&self, source_id: i64) -> Result<Option<i64>> {
+        if !has_table(&self.conn, "bounds")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT MAX(ts) FROM bounds WHERE source_id = ?1 AND kind = 0",
+                [source_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to read source {source_id}'s bounds"
+            )))
+    }
+
     /// [`newest_rows`](Self::newest_rows) for one source.
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn newest_rows_of(&self, source_id: i64) -> Result<BTreeMap<String, i64>> {
+        let bounds = if has_table(&self.conn, "bounds")? {
+            "UNION ALL SELECT name, ts FROM bounds WHERE source_id = ?1 AND kind = 0"
+        } else {
+            ""
+        };
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT stream, MAX(ts) FROM ( \
                    SELECT stream, ts FROM wal WHERE source_id = ?1 \
                    UNION ALL SELECT stream, last_ts FROM segments WHERE source_id = ?1 \
-                 ) GROUP BY stream",
-            )
+                   {bounds} \
+                 ) GROUP BY stream"
+            ))
             .map_err(Error::sqlite("failed to query newest rows"))?;
         let rows = stmt
             .query_map([source_id], |row| {
@@ -2877,14 +2909,38 @@ impl ArchiveMut {
     /// that is why WAL rows are per-stream rather than whole snapshots — a
     /// slow-sealing table's prune must not touch, or be blocked by, any other
     /// stream's tail.
+    ///
+    /// A prune past the stream's watermark deletes rows no segment holds, so
+    /// it records the stream's newest row in `bounds` first, in the same
+    /// transaction. The writer's prune after a seal is at the watermark and
+    /// does not.
     pub fn prune_wal(&mut self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
-        self.db
+        const SQL: &str = "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3";
+        let params = rusqlite::params![source_id, stream, upto_ts];
+        let watermark: Option<i64> = self
+            .db
             .conn
-            .execute(
-                "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3",
-                rusqlite::params![source_id, stream, upto_ts],
+            .query_row(
+                "SELECT MAX(last_ts) FROM segments WHERE source_id = ?1 AND stream = ?2",
+                rusqlite::params![source_id, stream],
+                |row| row.get(0),
             )
-            .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")))
+            .map_err(Error::sqlite(format!(
+                "failed to read {stream}'s watermark"
+            )))?;
+        if watermark.is_some_and(|w| upto_ts <= w) {
+            return self
+                .db
+                .conn
+                .execute(SQL, params)
+                .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")));
+        }
+        self.transaction(|tx| {
+            record_stream_bounds(&tx.tx, source_id, Some(stream), None)?;
+            tx.tx
+                .execute(SQL, params)
+                .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")))
+        })
     }
 
     /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
@@ -2995,7 +3051,9 @@ impl ArchiveMut {
     ///
     /// Use it for a stream whose live rows the encoder cannot seal: its
     /// earlier segments stay readable, and a read no longer materializes
-    /// those rows. The discard is not replicated: a subscriber that already
+    /// those rows. Each stream's newest row is recorded in `bounds` first
+    /// (FORMAT.md §3.7), so a writer on this file drops a later row at or
+    /// below it. The discard is not replicated: a subscriber that already
     /// received the rows keeps them.
     pub fn discard_live_rows(
         &mut self,
@@ -3011,6 +3069,7 @@ impl ArchiveMut {
         self.transaction(|tx| {
             let mut deleted = 0;
             for stream in &streams {
+                record_stream_bounds(&tx.tx, source_id, Some(stream), None)?;
                 deleted += tx
                     .tx
                     .execute(
@@ -3045,6 +3104,7 @@ impl ArchiveMut {
             let mut total = Evicted::default();
             for stream in &streams {
                 let params = rusqlite::params![source_id, stream, cutoff_ts];
+                record_stream_bounds(&tx.tx, source_id, Some(stream), Some(cutoff_ts))?;
                 // Before the segment delete, for the reason `evict` gives.
                 total.live_rows += tx
                     .tx
@@ -3114,6 +3174,7 @@ impl ArchiveMut {
         };
         self.transaction(|tx| {
             let params = rusqlite::params![source_id, cutoff_ts];
+            record_stream_bounds(&tx.tx, source_id, None, Some(cutoff_ts))?;
             // Counted BEFORE the segment delete: removing a stream's segments
             // lowers its watermark, and rows those segments already covered
             // would count as live afterwards when they were not.
@@ -3366,6 +3427,7 @@ impl ArchiveMut {
         db.conn
             .execute_batch(SCHEMA_SQL)
             .and_then(|()| db.conn.execute_batch(documents::DOCUMENTS_SQL))
+            .and_then(|()| db.conn.execute_batch(BOUNDS_SQL))
             .map_err(Error::sqlite("failed to create archive schema"))?;
         db.stamp_header()?;
         Ok(ArchiveMut::wrap(db))
@@ -3485,7 +3547,12 @@ impl Transaction<'_> {
     /// transaction**. Apart is not an option: between them the stream's
     /// watermark would dip, and `live_wal` would hand a reader rows that are
     /// already sealed.
+    ///
+    /// Records the stream's newest row in `bounds` first (FORMAT.md §3.7).
+    /// Compaction deletes segments it then replaces with one ending at the
+    /// same row, so for it the record changes nothing.
     pub fn delete_segment(&self, source_id: i64, stream: &str, seq: u64) -> Result<()> {
+        record_stream_bounds(&self.tx, source_id, Some(stream), None)?;
         self.tx
             .execute(
                 "DELETE FROM segments WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
@@ -3541,6 +3608,27 @@ impl Transaction<'_> {
                 r.stream
             )))?;
         }
+        Ok(())
+    }
+
+    /// Record that `stream` of `source_id` has held a row at `ts`, so a
+    /// writer on this file drops rows at or below it (FORMAT.md §3.7). Keeps
+    /// the larger of `ts` and any bound already recorded. A copy calls this
+    /// with its original's newest row, which a time-bounded copy may have
+    /// left out.
+    pub fn record_stream_bound(&self, source_id: i64, stream: &str, ts: i64) -> Result<()> {
+        self.tx
+            .execute_batch(BOUNDS_SQL)
+            .map_err(Error::sqlite("failed to create the bounds table"))?;
+        self.tx
+            .execute(
+                "INSERT INTO bounds(source_id, kind, name, ts) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(source_id, kind, name) DO UPDATE SET ts = MAX(ts, excluded.ts)",
+                rusqlite::params![source_id, BOUND_STREAM, stream, ts],
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to record {stream}'s bound for source {source_id}"
+            )))?;
         Ok(())
     }
 
@@ -4010,6 +4098,69 @@ CREATE TABLE caller_rows(
 );
 CREATE INDEX caller_rows_by_time ON caller_rows(source_id, stream, ts);
 ";
+
+/// The newest timestamp a stream of this file has held, recorded by a delete
+/// that could remove it (FORMAT.md §3.7). A writer's out-of-order bound is
+/// the larger of this and what the file still holds, so a stream's
+/// timestamps strictly increase across retention and discards.
+///
+/// `IF NOT EXISTS` because it is also run inside the first such delete on a
+/// file created before the table: a new table an older build ignores, which
+/// does not change the schema version (FORMAT.md §8).
+pub(crate) const BOUNDS_SQL: &str = "
+CREATE TABLE IF NOT EXISTS bounds(
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  -- 0: `name` is a stream.
+  kind INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  PRIMARY KEY (source_id, kind, name)
+);
+";
+
+/// `bounds.kind` for a stream.
+const BOUND_STREAM: i64 = 0;
+
+/// Record, in `bounds`, the newest timestamp `source_id`'s streams hold now:
+/// every stream, or only `stream`, and only the streams whose newest row is
+/// below `below` when it is given (the streams a retention cutoff empties of
+/// their newest row). Called inside a delete's transaction, before the
+/// delete, so the bound and the delete commit together.
+fn record_stream_bounds(
+    conn: &Connection,
+    source_id: i64,
+    stream: Option<&str>,
+    below: Option<i64>,
+) -> Result<()> {
+    conn.execute_batch(BOUNDS_SQL)
+        .map_err(Error::sqlite("failed to create the bounds table"))?;
+    // Two spellings, so the one-stream form is answered from the
+    // `(source_id, stream, ...)` keys rather than by reading every row of
+    // the source. `WHERE true` before `GROUP BY` is SQLite's documented way
+    // to keep an `INSERT ... SELECT` with an upsert clause from parsing
+    // `ON` as a join.
+    let filter = match stream {
+        Some(_) => "source_id = ?1 AND stream = ?2",
+        None => "source_id = ?1",
+    };
+    let sql = format!(
+        "INSERT INTO bounds(source_id, kind, name, ts) \
+         SELECT ?1, ?3, stream, MAX(ts) FROM ( \
+           SELECT stream, ts FROM wal WHERE {filter} \
+           UNION ALL \
+           SELECT stream, last_ts FROM segments WHERE {filter} \
+         ) WHERE true GROUP BY stream HAVING ?4 IS NULL OR MAX(ts) < ?4 \
+         ON CONFLICT(source_id, kind, name) DO UPDATE SET ts = MAX(ts, excluded.ts)"
+    );
+    conn.execute(
+        &sql,
+        rusqlite::params![source_id, stream.unwrap_or(""), BOUND_STREAM, below],
+    )
+    .map_err(Error::sqlite(format!(
+        "failed to record source {source_id}'s stream bounds"
+    )))?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -5150,6 +5301,80 @@ mod tests {
         let span = db.live_wal_span(rid, "drivehealth").unwrap();
         assert_eq!(span.rows, 1);
         assert_eq!((span.first_ts, span.last_ts), (Some(5), Some(5)));
+    }
+
+    /// A file from before the `bounds` table reads as before, and its first
+    /// delete that can lower a stream's newest row creates the table.
+    #[test]
+    fn a_file_without_the_bounds_table_reads_and_gets_it_at_its_first_delete() {
+        let (_dir, mut db, rid) = wal_test_db();
+        db.conn.execute_batch("DROP TABLE bounds").unwrap();
+        db.insert_wal_rows(rid, &[wal_row("cpu_usage", 10), wal_row("cpu_usage", 20)])
+            .unwrap();
+        assert_eq!(db.newest_rows_of(rid).unwrap()["cpu_usage"], 20);
+        assert_eq!(db.newest_bound(rid).unwrap(), None);
+
+        db.discard_live_rows(rid, &|_: &str| true).unwrap();
+        assert!(has_table(&db.conn, "bounds").unwrap());
+        assert_eq!(db.newest_rows_of(rid).unwrap()["cpu_usage"], 20);
+        assert_eq!(db.newest_bound(rid).unwrap(), Some(20));
+    }
+
+    /// Retention records only the streams whose newest row it removes.
+    #[test]
+    fn retention_records_only_the_streams_it_empties() {
+        let (_dir, mut db, rid) = wal_test_db();
+        db.insert_wal_rows(rid, &[wal_row("cpu_usage", 10), wal_row("blockio", 30)])
+            .unwrap();
+        db.evict_before(rid, 5).unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), None, "nothing removed");
+        db.evict_before(rid, 20).unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), Some(10), "only cpu_usage's");
+        db.evict_streams_before(rid, 40, &|s: &str| s == "blockio")
+            .unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), Some(30));
+    }
+
+    /// A later delete never lowers a recorded bound, though the file then
+    /// holds only older rows.
+    #[test]
+    fn a_later_delete_keeps_the_larger_bound() {
+        let (_dir, mut db, rid) = wal_test_db();
+        let meta = SegmentMeta {
+            rows: 1,
+            first_ts: 10,
+            last_ts: 10,
+        };
+        db.transaction(|tx| tx.insert_segment(rid, "cpu_usage", 0, &meta, b"x"))
+            .unwrap();
+        db.insert_wal_rows(rid, &[wal_row("cpu_usage", 20)])
+            .unwrap();
+        db.discard_live_rows(rid, &|_: &str| true).unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), Some(20));
+        // Deletes nothing, and records the file's newest, 10.
+        db.discard_live_rows(rid, &|_: &str| true).unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), Some(20));
+    }
+
+    /// A prune at or below the stream's watermark, which the writer makes
+    /// after every seal, deletes only rows a segment holds and records no
+    /// bound. One past it records one.
+    #[test]
+    fn only_a_prune_past_the_watermark_records_a_bound() {
+        let (_dir, mut db, rid) = wal_test_db();
+        db.insert_wal_rows(rid, &[wal_row("cpu_usage", 10), wal_row("cpu_usage", 20)])
+            .unwrap();
+        let meta = SegmentMeta {
+            rows: 1,
+            first_ts: 10,
+            last_ts: 10,
+        };
+        db.transaction(|tx| tx.insert_segment(rid, "cpu_usage", 0, &meta, b"x"))
+            .unwrap();
+        db.prune_wal(rid, "cpu_usage", 10).unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), None);
+        db.prune_wal(rid, "cpu_usage", 20).unwrap();
+        assert_eq!(db.newest_bound(rid).unwrap(), Some(20));
     }
 
     #[test]

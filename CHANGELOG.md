@@ -57,10 +57,29 @@ cannot reach a failed release any other way.
   row, which used to collide and cost the whole tick, is dropped the same
   way. Within one tick a stream's rows may still arrive in any order. A
   producer that relied on appending a stream's rows out of order across
-  ticks now loses the late ones; the count says how many. The bound is
-  what the file holds, so after `SourceWriter::discard_live_rows` or a
-  retention pass removes a stream's newest rows, a row below them is taken
-  again, and a running publisher whose cursor is past it does not ship it.
+  ticks now loses the late ones; the count says how many.
+- A stream's bound survives the deletes that remove its newest rows:
+  `discard_live_rows`, every retention pass (`evict_before`,
+  `evict_streams_before`, with or without a floor), `prune_wal` past the
+  stream's watermark, and `Transaction::delete_segment`. In the writer that
+  ran the delete, a row at or below the removed rows is dropped and
+  counted. A later writer that resumes the source refuses it, since its
+  floor includes the bound: `SourceWriter::wal` returns
+  `Error::TimelineBackwards`, and `Writer::wal_tick` drops that source's
+  whole tick and logs it. On a source a later writer did not resume,
+  `wal_tick` drops and counts the row.
+  Before, such a row was taken, and a running `ArchivePublisher`
+  whose cursor was past it never shipped it. The bound is kept in a new
+  table, `bounds`, which a new file has from creation and an existing file
+  gets at its first such delete; the schema
+  version is unchanged, and a writer from an earlier release ignores the
+  table. `resume_source` refuses an anchor at or below a source's bound
+  and returns it as the floor, so a source evicted to nothing still has
+  one. `rewrite::copy_sources_into` carries each copied stream's bound.
+  Writing corrected rows at the timestamps of discarded ones is no longer
+  possible, and a source whose rows were stamped in the future cannot be
+  resumed until the clock passes them, even after they are discarded or
+  evicted.
 - Every writing handle (`Writer`, `ArchiveMut::create`, `ArchiveMut::open`)
   holds an exclusive advisory lock on `<archive>-lock` for its life, and a
   second one on the same archive is refused as `Error::InUse`, in the same

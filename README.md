@@ -87,7 +87,8 @@ Read these before you build on it. The first two are behaviors that can
 surprise a caller; the rest are boundaries.
 
 - **Out-of-order appends are dropped, not stored.** A row whose timestamp is
-  at or below its stream's newest row, sealed or live, is dropped, counted in
+  at or below its stream's newest row, sealed or live, or at or below a
+  newer row retention or a discard removed, is dropped, counted in
   `SourceWriter::dropped_out_of_order`, and logged once per stream. Below the
   newest sealed row it cannot be read, because the watermark that keeps the
   seal seam free of duplicates shadows it; below the newest live row a
@@ -213,7 +214,8 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
   supplies the mechanism and applies no policy of its own.
   `discard_live_rows` deletes only a stream's live rows, the rows after its
   newest segment or every row of a stream with no segment, for a stream
-  whose rows cannot be sealed.
+  whose rows cannot be sealed. Rows written to the stream afterwards must
+  still be newer than the discarded ones.
 - **A lazy read.** `read::catalog` answers what sources and streams exist and
   what each spans, in one snapshot, without touching a segment;
   `read::probe` fetches the one segment a schema needs; `read::stream_range`

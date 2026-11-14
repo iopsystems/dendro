@@ -53,8 +53,8 @@ pub enum Error {
         reading: String,
     },
 
-    /// A resumed source was handed rows at or before the newest row its
-    /// previous writer session left, or a resume anchor at or before it: the
+    /// A resumed source was handed rows at or before the newest row the
+    /// source has held, or a resume anchor at or before it: the
     /// wall clock went backwards across the restart, and writing would make
     /// a timeline that runs backwards or collides with itself.
     TimelineBackwards {
@@ -62,8 +62,9 @@ pub enum Error {
         source_id: i64,
         /// The timestamp that was refused.
         ts: i64,
-        /// The newest row the previous writer session left. Every row this
-        /// session commits must be stamped after it.
+        /// The newest row the source has held, including one a delete
+        /// removed (FORMAT.md §3.7). Every row this session commits must be
+        /// stamped after it.
         floor: i64,
     },
 

@@ -975,6 +975,18 @@ fn copy_sources_snapshotted(
             }
         }
 
+        // The newest row each carried stream has held, counting the
+        // original's own bounds, so the copy's writer refuses what the
+        // original's would. A time-bounded copy leaves the newest rows out,
+        // and without this the copy would take rows at timestamps the
+        // original has already published.
+        for (stream, ts) in src.newest_rows_of(rec.id)? {
+            if spec.keep_streams.is_some_and(|keep| !keep(stream.as_str())) {
+                continue;
+            }
+            tx.record_stream_bound(id, &stream, ts)?;
+        }
+
         // Drift observations are part of the source's identity and cost
         // nothing to carry; they are already only a handful of rows per seal.
         for (ts, offset) in src.read_clock_offsets(rec.id)? {
@@ -1221,6 +1233,8 @@ mod tests {
             "documents",
             // With its segment: `SegmentRow::caller_index`.
             "segment_indexes",
+            // As each carried stream's newest row, original bounds included.
+            "bounds",
         ];
         /// Not carried, and correct not to be. Empty today: the schema version
         /// lives in the header stamp, not in a table.
