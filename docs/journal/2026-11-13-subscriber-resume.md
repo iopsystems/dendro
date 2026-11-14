@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-13
-updated: 2026-11-13
+updated: 2026-11-14
 ---
 
 # Subscriber resume: continuing a copy across a reconnect
@@ -479,9 +479,9 @@ The second found no case where `X` is wrong, and ten problems around it:
 
 ## Owner decision before step 1
 
-The `bounds` table is a format change. It adds a table to v5 files without
-a schema bump, by the §8 rule that only data nobody can regenerate forces
-one. The alternatives:
+Decided 2026-11-14: the `bounds` table, added to v5 files without a schema
+bump. It is a format change, justified by the §8 rule that only data nobody
+can regenerate forces a bump. The alternatives were:
 - a reserved metadata key, which callers can overwrite and which replicates
   to copies;
 - a schema bump to v6, which per §8 means a reader for v5, a copy-forward,
