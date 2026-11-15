@@ -323,10 +323,10 @@ fn read_archive_snapshotted(
         let mut streams = Vec::new();
         for stream in db.all_streams(src.id)? {
             let segments = stream_segments_snapshotted(db, src.id, &stream, encoder)?;
-            // Only reachable if a stream's every WAL row was pruned without its
-            // segment landing — which the seal ordering rules out. A stream
-            // with no bytes has nothing to open, so skip rather than hand the
-            // caller an empty segment list.
+            // Reachable when a stream has WAL rows but no segment and the
+            // encoder returns `Ok(None)` for them; a stream with neither is
+            // not in `all_streams`. A stream with no bytes has nothing to
+            // open, so skip rather than hand the caller an empty segment list.
             if segments.is_empty() {
                 continue;
             }
@@ -345,11 +345,11 @@ fn read_archive_snapshotted(
 /// One stream's parquet segments, oldest first: its sealed segments in `seq`
 /// order, then its live WAL tail materialized as the newest segment.
 ///
-/// [`Archive::live_wal`], not [`Archive::read_wal`]: the watermark (`ts > MAX(last_ts)`
-/// over that stream's own segments) is the only thing keeping the seam free of
-/// duplicates. The prune runs outside the seal transaction, so `wal` routinely
-/// still holds rows a sealed segment already covers; replaying the raw table
-/// would splice those rows in a second time.
+/// [`Archive::live_wal`], not [`Archive::read_wal`]. An archive written before
+/// 0.8.0, or one assembled with `ArchiveMut::insert_segment` and
+/// `insert_wal_rows`, may hold WAL rows a sealed segment covers. The watermark
+/// (`ts > MAX(last_ts)` over that stream's own segments) keeps them out;
+/// replaying the raw table would splice them in a second time.
 pub fn stream_segments(
     db: &Archive,
     source_id: i64,

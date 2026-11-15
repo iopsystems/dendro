@@ -159,6 +159,16 @@ cannot reach a failed release any other way.
 
 ### Fixed
 
+- A seal deletes the WAL rows its segments cover in the same transaction as
+  the segments. The writer used to delete them in a separate commit after the
+  seal, so a crash between the two, or a failed delete, left the segments
+  committed and the covered rows in the `wal` table. Reads never returned
+  those rows, but they took space until the stream sealed again or retention
+  evicted them. A failed delete also skipped the deletes of the streams after
+  it in the batch, and a retry of the seal did not make them. Now a failed
+  delete undoes the whole seal: a retryable error defers it, and any other
+  error stops the writer, as before. Archives written by earlier versions may
+  still hold covered rows, and reads still skip them. Present since 0.1.0.
 - `ArchivePublisher` never shipped a clock offset whose timestamp was at or
   below one it had already shipped. Offsets are not recorded in timestamp
   order: a seal records its observation at the newest row it sealed, so

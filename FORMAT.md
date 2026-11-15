@@ -296,9 +296,10 @@ source_id = ?1 AND stream = ?2
         OR NOT EXISTS (SELECT 1 FROM segments WHERE source_id = ?1 AND stream = ?2) )
 ```
 
-(`src/archive/sqlite.rs`, `LIVE_WAL_PREDICATE`.) This is the recovery rule and the
-reason the prune that follows a seal can run outside the seal transaction: a
+(`src/archive/sqlite.rs`, `LIVE_WAL_PREDICATE`.) This is the recovery rule: a
 row a segment already covers is shadowed whether or not it has been deleted.
+A writer deletes the rows a seal covers in the seal's transaction, but an
+archive written before 0.8.0 may still hold them.
 A reader materializes a stream's live rows through the encoder into one
 in-memory segment and appends it after the sealed ones. A stream with no
 sealed segment and live rows is a stream, not an absence.

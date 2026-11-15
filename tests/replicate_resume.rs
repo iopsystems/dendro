@@ -589,6 +589,93 @@ fn a_merge_across_the_copys_watermark_syncs_below_it() {
     }
 }
 
+/// A `Sync` whose delete of the copy's covered WAL rows fails changes
+/// nothing: the segments it would remove stay and the rows stay. The copy
+/// holds covered rows at 1 and 2, below its segment [1, 2], as an archive
+/// written before a seal deleted its rows in its own transaction can, and a
+/// trigger refuses deleting them.
+#[test]
+fn a_sync_whose_covered_row_delete_fails_changes_nothing_and_a_retry_deletes_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create(&o);
+    origin.rows("s", 1..=2);
+    origin.seal(&["s"]);
+    origin.rows("s", 3..=4);
+    origin.seal(&["s"]);
+    origin.rows("s", 5..=6);
+    connect(&o, &c).close();
+    origin.seal(&["s"]);
+    origin.close();
+    // Merge [3, 4] and [5, 6] into [3, 6] across the copy's watermark 4, and
+    // add rows past it, so the resume ships a `Sync` at 2.
+    put(&o, &[3, 5], &[(100, 3, 6)]);
+    {
+        let mut db = ArchiveMut::open(&o).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        let rows: Vec<WalRow> = (7..=8).map(|t| row("s", t)).collect();
+        db.transaction(|tx| tx.insert_wal_rows(id, &rows)).unwrap();
+    }
+    {
+        let mut db = ArchiveMut::open(&c).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        let rows: Vec<WalRow> = (1..=2).map(|t| row("s", t)).collect();
+        db.transaction(|tx| tx.insert_wal_rows(id, &rows)).unwrap();
+    }
+    let raw = rusqlite::Connection::open(&c).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_covered_delete BEFORE DELETE ON wal WHEN OLD.ts <= 2 \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    drop(raw);
+    let segments = |p: &Path| -> Vec<(i64, i64)> {
+        let db = Archive::open(p).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        db.read_segment_meta(id, "s")
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| (m.first_ts, m.last_ts))
+            .collect()
+    };
+    let wal = |p: &Path| -> Vec<i64> {
+        let db = Archive::open(p).unwrap();
+        let id = db.read_sources().unwrap()[0].id;
+        db.read_wal(id, "s").unwrap().iter().map(|r| r.ts).collect()
+    };
+    assert_eq!(segments(&c), vec![(1, 2), (3, 4)]);
+    assert_eq!(wal(&c), vec![1, 2, 5, 6]);
+
+    let (mut sub, request) = resume_copy(&c);
+    let db = Archive::open(&o).unwrap();
+    let (mut publisher, mut frames) = ArchivePublisher::resuming(&db, &request).unwrap();
+    frames.extend(publisher.next(&db).unwrap());
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, Frame::Sync { at: 2, .. })),
+        "{frames:?}"
+    );
+    assert!(
+        sub.apply_all(frames).is_err(),
+        "the refused delete fails the sync"
+    );
+    drop(sub);
+
+    assert_eq!(segments(&c), vec![(1, 2), (3, 4)], "a segment went");
+    assert_eq!(wal(&c), vec![1, 2, 5, 6], "a row went");
+
+    // Without the fault, the same resume deletes the covered rows with the
+    // rest of the stream's WAL, and the copy holds what the origin holds.
+    rusqlite::Connection::open(&c)
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_covered_delete;")
+        .unwrap();
+    connect(&o, &c).close();
+    assert_eq!(readable(&c), readable(&o));
+    assert_eq!(wal(&c), vec![7, 8]);
+}
+
 /// The origin resumes a source the copy had finalized: the copy is
 /// un-finalized and the new rows arrive.
 #[test]

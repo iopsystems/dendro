@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-14
-updated: 2026-11-14
+updated: 2026-11-15
 ---
 
 # The live tail: liveness from a watermark, and rows anchored to seals
@@ -24,9 +24,10 @@ the delete inside is no slower, by median of at least 15 interleaved trials,
 than today's seal plus its prunes, beyond the difference between the medians
 of two arms of today's seal at the same size. Measured on macOS below, for one
 stream and for a batch of 12: met, and faster for the batch of small streams.
-Still to measure on Linux. The prediction there is that IN beats SEP for 12
-streams of 100 rows by about 12 commit times. IN no faster than SEP beyond the
-floor refutes the mechanism; IN slower beyond the floor fails the criterion.
+Not measured on Linux; GO was taken without it (see Outcome). The prediction
+there is that IN beats SEP for 12 streams of 100 rows by about 12 commit
+times. IN no faster than SEP beyond the floor refutes the mechanism; IN
+slower beyond the floor fails the criterion.
 
 **B. Make a WAL row decodable from its own bytes plus state that retention
 does not delete.** GO when a design moves the anchors out of the rows with
@@ -262,7 +263,9 @@ retryable has its live rows evicted (`src/writer.rs:2590-2640`).
 ## Plan
 
 1. Measure A on Linux with both tests, for one stream and for a batch of 12.
-2. Decide A's reader story: a schema version, or prune-on-open.
+   Skipped; see Outcome.
+2. Decide A's reader story: a schema version, or prune-on-open. Decided:
+   neither; see Outcome.
 3. Decide C.
 4. Design B with metriken-storage, starting from the question above.
 5. Decide D.
@@ -369,5 +372,28 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A is measured on one host and meets its criterion there, for one
-stream and for a batch of 12; B, C and D are not started.
+Open. A is done; B, C and D are not started.
+
+A, decided 2026-11-15 and implemented in the change that adds
+`tests/seal_atomic.rs`:
+
+- `seal_batch` deletes each sealed stream's WAL rows up to its newest
+  segment's `last_ts` inside the seal's transaction, and `sync_stream`
+  deletes the stream's whole WAL inside its transaction. Neither calls
+  `prune_wal` any more.
+- Readers keep `LIVE_WAL_PREDICATE`. Archives written before the change can
+  hold covered rows, and so can one assembled through `ArchiveMut`'s
+  low-level writes, so no schema version and no prune-on-open.
+- Not measured on Linux (plan step 1). The change removes one autocommit per
+  sealed stream and adds no statement to the transaction beyond the deletes
+  those autocommits ran, so I expect it to cost no more there than on macOS;
+  that is inferred, not measured.
+- `a_seal_whose_wal_delete_fails_commits_no_segment` makes the delete fail
+  with a trigger and checks that no segment lands. Run against the previous
+  `src/writer.rs` it fails: the error is `failed to prune WAL for a:
+  refused`, from the prune after the commit. Against the change it passes.
+- `a_sync_whose_covered_row_delete_fails_changes_nothing_and_a_retry_deletes_them`
+  (`tests/replicate_resume.rs`) does the same for a `Sync`: the copy holds
+  covered rows, a trigger refuses deleting them, and the sync must fail with
+  the copy unchanged. Against the previous `src/writer.rs` the sync succeeds,
+  because the failed prune after its commit only logged a warning.
