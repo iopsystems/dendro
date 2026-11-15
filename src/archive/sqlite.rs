@@ -458,22 +458,12 @@ pub struct Evicted {
     /// Live WAL rows (FORMAT.md §3.3) stamped before the cutoff, which the
     /// pass kept. Retention never deletes a row no segment holds: such a row
     /// stays until a seal puts it in a segment and a later pass evicts that
-    /// segment. A stream whose seal cadence is slower than the retention
-    /// lookback keeps its live rows this way, so the archive holds more than
-    /// the lookback until it seals. To delete live rows, call
-    /// [`ArchiveMut::discard_live_rows`].
+    /// segment. A stream that goes longer without sealing than the retention
+    /// window keeps rows older than the cutoff this way until it seals. To
+    /// delete live rows, call [`ArchiveMut::discard_live_rows`].
     pub kept_live_rows: usize,
     /// Rows of the caller's time-keyed store deleted; see [`CallerRow`].
     pub caller_rows: usize,
-    /// Streams the pass left alone because a seal of theirs was deferred
-    /// and still could not commit when the pass ran, counting only streams
-    /// the pass's own filter would have evicted. Only the writer
-    /// ([`SourceWriter::evict_before`](crate::writer::SourceWriter::evict_before)
-    /// and its variants) holds a stream back; an `ArchiveMut` pass has no
-    /// seals to wait for and reports 0. A held stream keeps everything this
-    /// pass would have removed, and the next pass after its seal commits
-    /// removes it.
-    pub held_streams: usize,
 }
 
 /// How many rows a table holds and what time span they cover, answered from
@@ -2866,12 +2856,34 @@ impl ArchiveMut {
     /// in a seal batch*. The writer also deletes a seal's covered WAL rows in
     /// the same transaction, through a crate-private method.
     pub fn transaction<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        self.transaction_with(rusqlite::TransactionBehavior::Deferred, f)
+    }
+
+    /// [`transaction`](Self::transaction), taking the write lock at BEGIN
+    /// through the busy handler. For a caller whose first statement reads
+    /// and which always writes: a deferred transaction holds a read snapshot
+    /// when its first write asks for the lock, and SQLite answers that with
+    /// SQLITE_BUSY at once instead of waiting out the busy timeout. Not the
+    /// default, because an IMMEDIATE transaction waits for the lock even
+    /// when it ends up writing nothing.
+    pub(crate) fn transaction_immediate<T>(
+        &mut self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.transaction_with(rusqlite::TransactionBehavior::Immediate, f)
+    }
+
+    fn transaction_with<T>(
+        &mut self,
+        behavior: rusqlite::TransactionBehavior,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let layout = self.db.layout;
         let tx = Transaction {
             tx: self
                 .db
                 .conn
-                .transaction()
+                .transaction_with_behavior(behavior)
                 .map_err(Error::sqlite("failed to begin transaction"))?,
             layout,
         };
@@ -3023,7 +3035,7 @@ impl ArchiveMut {
                 .execute(SQL, params)
                 .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")));
         }
-        self.transaction(|tx| {
+        self.transaction_immediate(|tx| {
             record_stream_bounds(&tx.tx, source_id, Some(stream), None)?;
             tx.tx
                 .execute(SQL, params)
@@ -3138,7 +3150,7 @@ impl ArchiveMut {
     /// `last_ts`, or every row of a stream with no segment. Rows at or
     /// before that `last_ts`, the streams' segments, caller rows and the
     /// source's clock offsets are kept. Returns the number of rows deleted.
-    /// One transaction.
+    /// One transaction, or none when `discard` accepts no stream.
     ///
     /// Use it for a stream whose live rows the encoder cannot seal: its
     /// earlier segments stay readable, and a read no longer materializes
@@ -3157,7 +3169,10 @@ impl ArchiveMut {
             .into_iter()
             .filter(|s| discard(s))
             .collect();
-        self.transaction(|tx| {
+        if streams.is_empty() {
+            return Ok(0);
+        }
+        self.transaction_immediate(|tx| {
             let mut deleted = 0;
             for stream in &streams {
                 record_stream_bounds(&tx.tx, source_id, Some(stream), None)?;
@@ -3191,7 +3206,7 @@ impl ArchiveMut {
             }
         }
         let streams: Vec<String> = streams.into_iter().filter(|s| evict(s)).collect();
-        self.transaction(|tx| {
+        self.transaction_immediate(|tx| {
             let mut total = Evicted::default();
             for stream in &streams {
                 let params = rusqlite::params![source_id, stream, cutoff_ts];
@@ -3266,7 +3281,7 @@ impl ArchiveMut {
             Some(_) => self.db.caller_row_streams(source_id)?,
             None => Vec::new(),
         };
-        self.transaction(|tx| {
+        self.transaction_immediate(|tx| {
             let params = rusqlite::params![source_id, cutoff_ts];
             record_stream_bounds(&tx.tx, source_id, None, Some(cutoff_ts))?;
             // Counted, and the covered rows deleted, BEFORE the segment
@@ -3335,7 +3350,6 @@ impl ArchiveMut {
                 wal_rows,
                 kept_live_rows: kept_live_rows as usize,
                 caller_rows,
-                held_streams: 0,
             })
         })
     }

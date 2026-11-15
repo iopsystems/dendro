@@ -1,10 +1,10 @@
 // Drives the writer and its test-only constructor, so it needs both features.
 #![cfg(all(feature = "write", feature = "test-support"))]
 
-//! Retention after a deferred seal: the writer seals the deferred streams
-//! before it evicts, and leaves out any it still cannot seal, so a pass never
-//! deletes live rows whose seal is pending. Those rows can include the one
-//! the rest need to decode (a schema stated at a segment's start).
+//! Retention and deferred seals: the writer seals the deferred streams
+//! before it evicts, and a pass keeps every live row, so rows whose seal is
+//! pending are never deleted. Those rows can include the one the rest need
+//! to decode (a schema stated at a segment's start).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -177,7 +177,6 @@ fn eviction_seals_a_deferred_stream_first() {
 
     let evicted = w.evict_before(2_500).unwrap();
     assert_eq!(evicted.kept_live_rows, 0, "{evicted:?}");
-    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
     assert_eq!(
         segments(&path, id),
         (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
@@ -220,10 +219,11 @@ fn eviction_keeps_an_unsealed_streams_anchor() {
 }
 
 /// The retry before the pass fails in the encoder, which no retry fixes:
-/// the stream is not held, the pass keeps its live rows as it keeps any
-/// stream's, and the writer stays up.
+/// the stream is no longer deferred, so the next pass does not retry it,
+/// the pass keeps its live rows as it keeps any stream's, and the writer
+/// stays up.
 #[test]
-fn an_encoder_failure_in_the_retry_is_not_held() {
+fn an_encoder_failure_in_the_retry_is_not_retried_at_the_next_pass() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("encoder.dendro");
     let mut encoder = Anchored::new(None);
@@ -251,13 +251,12 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
     holder.join().unwrap();
 
     let evicted = w.evict_before(2_500).unwrap();
-    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
     assert_eq!(evicted.kept_live_rows, 2, "{evicted:?}");
     assert_eq!(wal_rows(&path), 3);
 
     assert_eq!(calls.load(Ordering::SeqCst), 5);
     let evicted = w.evict_before(2_500).unwrap();
-    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
+    assert_eq!(evicted.kept_live_rows, 2, "{evicted:?}");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         5,
@@ -272,7 +271,7 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
 
 /// Two streams deferred in one seal, and the retry fails in the encoder for
 /// `s` only, which is retried first: `t` is still tried and seals, `s`
-/// keeps its live rows, and neither is held. Calls 1 to 8 are the
+/// keeps its live rows, and neither stays deferred. Calls 1 to 8 are the
 /// deferred seal's four attempts at both streams; 9 is the retry of `s`
 /// and 10 the retry of `t`.
 #[test]
@@ -305,7 +304,6 @@ fn an_encoder_failure_in_one_stream_does_not_hold_another() {
     holder.join().unwrap();
 
     let evicted = w.evict_before(2_500).unwrap();
-    assert_eq!(evicted.held_streams, 0, "{evicted:?}");
     assert_eq!(
         evicted.kept_live_rows, 2,
         "s's rows at 1000 and 2000: {evicted:?}"
@@ -321,51 +319,52 @@ fn an_encoder_failure_in_one_stream_does_not_hold_another() {
 }
 
 /// The retry before the pass also fails, and the lock clears only after
-/// it: the pass runs and leaves the stream out, so all three rows stay in
-/// the WAL and seal whole with the next seal.
+/// it: the pass still evicts the stream's segment before the cutoff and
+/// keeps its live rows, which seal whole with the next seal.
 ///
 /// The lock is released between the retry's last attempt and the pass. The
 /// encoder runs once per attempt, before the attempt's transaction, so the
-/// eighth call (four attempts for the seal, four for the retry) starts the
-/// last attempt; it waits out the 400 ms busy timeout and fails, and the
-/// pass that follows waits up to another 400 ms. Releasing 600 ms after the
-/// eighth call lands in the middle of the pass's wait.
+/// ninth call (one for the first seal, four attempts for the deferred seal,
+/// four for the retry) starts the last attempt; it waits out the 400 ms
+/// busy timeout and fails, and the pass that follows waits up to another
+/// 400 ms. Releasing 600 ms after the ninth call lands in the middle of the
+/// pass's wait.
 #[test]
-fn eviction_leaves_out_a_stream_whose_seal_still_cannot_commit() {
-    held(|w, cutoff| w.evict_before(cutoff).unwrap(), 1);
+fn eviction_keeps_the_live_rows_of_a_stream_whose_seal_still_cannot_commit() {
+    still_deferred(|w, cutoff| w.evict_before(cutoff).unwrap(), true);
 }
 
-/// The same with a caller's filter that names the stream: the hold-back
-/// applies on top of it.
+/// The same with a caller's filter that names the stream.
 #[test]
-fn a_filtered_eviction_leaves_out_a_held_stream() {
-    held(
+fn a_filtered_eviction_of_a_still_deferred_stream_keeps_its_live_rows() {
+    still_deferred(
         |w, cutoff| {
             w.evict_streams_before(cutoff, Box::new(|s: &str| s == "s"))
                 .unwrap()
         },
-        1,
+        true,
     );
 }
 
-/// A caller's filter that does not name the stream: nothing was held back
-/// that the caller asked to evict, so `held_streams` is 0.
+/// A caller's filter that does not name the stream leaves it alone.
 #[test]
-fn a_held_stream_the_filter_skips_is_not_counted() {
-    held(
+fn a_still_deferred_stream_the_filter_skips_is_left_alone() {
+    still_deferred(
         |w, cutoff| {
             w.evict_streams_before(cutoff, Box::new(|s: &str| s != "s"))
                 .unwrap()
         },
-        0,
+        false,
     );
 }
 
-/// A seal deferred, its retry at the start of `evict` failing too, and the
-/// pass that follows; `held_streams` is expected to be `count`.
-fn held(evict: fn(&mut SourceWriter, i64) -> Evicted, count: usize) {
+/// A sealed segment [100, 200], then rows 1000 (an anchor), 2000 and 3000
+/// whose seal is deferred, its retry at the start of `evict` failing too,
+/// and the pass at 2500 that follows. `named` is whether the pass's filter
+/// names the stream.
+fn still_deferred(evict: fn(&mut SourceWriter, i64) -> Evicted, named: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("held.dendro");
+    let path = dir.path().join("deferred.dendro");
     let (calls_tx, calls_rx): (Sender<usize>, Receiver<usize>) = channel();
     let mut archive = Writer::create_with_busy_timeout(
         &path,
@@ -376,42 +375,49 @@ fn held(evict: fn(&mut SourceWriter, i64) -> Evicted, count: usize) {
     .unwrap();
     let mut w = archive.add_source(source()).unwrap();
     let id = w.source_id();
+    w.wal(vec![row(100, true)]).unwrap();
+    w.wal(vec![row(200, false)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
     for ts in 1..=3 {
         w.wal(vec![row(ts * 1_000, ts == 1)]).unwrap();
     }
     w.sync().unwrap();
+    assert_eq!(segments(&path, id).0, [(100, 200)]);
 
     let holder = hold_lock(&path, move || {
-        while calls_rx.recv().unwrap() < 8 {}
+        while calls_rx.recv().unwrap() < 9 {}
         std::thread::sleep(Duration::from_millis(600));
     });
     w.seal(vec!["s".to_string()]).unwrap();
     let evicted = evict(&mut w, 2_500);
     holder.join().unwrap();
-    assert_eq!(evicted.held_streams, count, "{evicted:?}");
-    assert_eq!(evicted.wal_rows, 0, "{evicted:?}");
-    assert_eq!(evicted.kept_live_rows, 0, "{evicted:?}");
-    assert_eq!(wal_rows(&path), 3, "the held stream kept its rows");
+    let (segments_gone, kept) = if named { (1, 2) } else { (0, 0) };
+    assert_eq!(evicted.segments, segments_gone, "{evicted:?}");
+    assert_eq!(evicted.kept_live_rows, kept, "{evicted:?}");
+    assert_eq!(wal_rows(&path), 3, "the live rows are kept");
 
     w.seal(vec!["s".to_string()]).unwrap();
-    let evicted = w.evict_before(2_500).unwrap();
-    assert_eq!(evicted.held_streams, 0, "the seal committed: {evicted:?}");
+    w.sync().unwrap();
     drop(w);
     archive.join().unwrap();
-    assert_eq!(
-        segments(&path, id),
-        (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
-    );
+    let sealed = segments(&path, id);
+    let last = (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()]);
+    if named {
+        assert_eq!(sealed, last);
+    } else {
+        assert_eq!(sealed.0, [(100, 200), (1_000, 3_000)]);
+        assert_eq!(sealed.1[1], last.1[0]);
+    }
 }
 
 /// Two streams deferred, and the retry of the first fails on the lock:
-/// the second is held without being tried, so a pass costs one retry
+/// the second is not tried, so a pass costs one retry
 /// schedule however many streams are deferred. Calls 1 to 8 are the
 /// deferred seal's four attempts at both streams and 9 to 12 the retry of
 /// `s`; the lock is released 600 ms after call 12, inside the pass's wait,
-/// as in [`held`].
+/// as in [`still_deferred`].
 #[test]
-fn after_one_retry_fails_the_rest_are_held_untried() {
+fn after_one_retry_fails_the_rest_are_not_tried() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("untried.dendro");
     let (calls_tx, calls_rx): (Sender<usize>, Receiver<usize>) = channel();
@@ -441,7 +447,7 @@ fn after_one_retry_fails_the_rest_are_held_untried() {
     w.seal(vec!["s".to_string(), "t".to_string()]).unwrap();
     let evicted = w.evict_before(2_500).unwrap();
     holder.join().unwrap();
-    assert_eq!(evicted.held_streams, 2, "{evicted:?}");
+    assert_eq!(evicted.kept_live_rows, 4, "{evicted:?}");
     assert_eq!(calls.load(Ordering::SeqCst), 12, "t was not tried");
     assert_eq!(wal_rows_of(&path, "s"), 3);
     assert_eq!(wal_rows_of(&path, "t"), 3);

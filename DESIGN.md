@@ -183,11 +183,12 @@ Two constraints follow from it, and both are required:
   schemas, names and metadata, once per segment rather than holding it in a
   cache the reader cannot see.
 - **An encoder may drop a leading or a trailing run.** If your rows reference
-  an anchor that retention has since evicted, the rows before the next anchor
-  cannot be decoded; a record still incomplete at the end of the input cannot
-  be encoded yet. So `Segment` reports its own row count and first and last
-  timestamps rather than letting the catalog assume the input's; otherwise the
-  catalog would claim a span the bytes do not contain. A trailing run the
+  an anchor that is no longer in the WAL (for example, deleted by
+  `ArchiveMut::prune_wal` past the watermark), the rows before the next
+  anchor cannot be decoded; a record still incomplete at the end of the
+  input cannot be encoded yet. So `Segment` reports its own row count and
+  first and last timestamps rather than letting the catalog assume the
+  input's; otherwise the catalog would claim a span the bytes do not contain. A trailing run the
   encoder drops stays live and is sealed by a later batch. An encoder may not
   drop rows from the middle (`segment::materialize` refuses it).
 
@@ -345,8 +346,12 @@ and 73% to 80% of the apparent large-page gain came from those knobs alone.
 
 ## Retention
 
-`evict_before` drops everything wholly older than a cutoff. Two details make a
-rolling buffer of bounded size work:
+`evict_before` drops the segments wholly older than a cutoff and the WAL rows
+before it that a segment covers, and keeps live rows (FORMAT.md §3.3). A
+stream that goes longer without sealing than the retention window (the span
+from the cutoff to the stream's newest row) keeps rows older than the cutoff;
+sealing each stream at least once per window, in row time, avoids that. Two
+details make a rolling buffer of bounded size work:
 
 - **`auto_vacuum = INCREMENTAL`**, set at creation and impossible to enable
   later without a full `VACUUM`. Eviction reuses freed pages, so the file's

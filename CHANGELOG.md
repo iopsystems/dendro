@@ -35,20 +35,30 @@ cannot reach a failed release any other way.
 
 ### Changed
 
-- Eviction never deletes a live WAL row, one past its stream's newest
-  sealed segment. `ArchiveMut::evict_before`, `evict_streams_before`, their
-  `_with_floor` forms and the matching `SourceWriter` methods delete
-  segments wholly before the cutoff and the WAL rows before it that a
-  segment covers, and keep live rows whatever their timestamp. Before, a
-  live row older than the cutoff was deleted though no segment held it, and
-  for an encoder that states a schema once per segment, deleting a stream's
-  oldest live rows could leave the rest undecodable. An archive whose
-  streams seal less often than it evicts now holds more than the lookback
-  until they seal. `Evicted::live_rows`, the count of live rows deleted, is
-  replaced by `Evicted::kept_live_rows`, the count of live rows before the
-  cutoff that the pass kept. A caller that evicts at `i64::MAX` to remove
-  a stream entirely must call `discard_live_rows` for it as well, or its
-  live rows stay.
+- Eviction never deletes a live WAL row (one stamped after its stream's
+  newest segment, or any row of a stream with no segment).
+  `ArchiveMut::evict_before`, `evict_streams_before`, their `_with_floor`
+  forms and the matching `SourceWriter` methods delete segments wholly
+  before the cutoff and the WAL rows before it that a segment covers, and
+  keep live rows whatever their timestamp. Before, a live row older than the
+  cutoff was deleted though no segment held it, and for an encoder that
+  states a schema once per segment, deleting a stream's oldest live rows
+  could leave the rest undecodable. A stream that goes longer without
+  sealing than the retention window (the span from the cutoff to the
+  stream's newest row) now keeps rows older than the cutoff until it seals.
+  `Evicted::live_rows`, the count of live rows deleted, is replaced by
+  `Evicted::kept_live_rows`, the count of live rows before the cutoff that
+  the pass kept. A caller that evicts at `i64::MAX` to remove a stream
+  entirely must call `discard_live_rows` for it as well, or its live rows
+  stay. A stream whose rows the encoder refuses keeps them through retention
+  too, so its next seal fails until `discard_live_rows` deletes them.
+- A writer retention pass no longer leaves out a stream whose deferred seal
+  still cannot commit: it evicts that stream's segments and caller rows and
+  keeps its live rows, as for any stream, and the seal is retried before the
+  next pass. A whole-source pass stays whole-source while a seal is
+  deferred, so clock offsets are cut at the cutoff as in any whole-source
+  pass. `Evicted::held_streams`, which counted the streams left out, is
+  removed.
 - An archive holds at most one source per uuid. `ArchiveMut::insert_source_with_uuid`,
   `Transaction::insert_source_with_uuid`, `rewrite::copy_sources_into` and
   `Writer::add_source_with_uuid` refuse a uuid the archive already holds as
@@ -173,6 +183,12 @@ cannot reach a failed release any other way.
 
 ### Fixed
 
+- A retention pass failed with `SQLITE_BUSY` at once when another
+  connection held the write lock, instead of waiting for the busy timeout.
+  Its transaction's first statement reads, and SQLite does not wait when a
+  deferred transaction that has read asks for the write lock. Retention now
+  begins `IMMEDIATE`, taking the lock at `BEGIN` through the busy handler.
+  Present since 0.1.0.
 - A seal deletes the WAL rows its segments cover in the same transaction as
   the segments. The writer used to delete them in a separate commit after the
   seal, so a crash between the two, or a failed delete, left the segments

@@ -321,14 +321,15 @@ appends](docs/journal/2026-09-11-out-of-order-appends.md).
 
 **Retention and live rows.** Eviction deletes segments wholly before the
 cutoff and the WAL rows before it that a segment covers. It never deletes a
-live row. A live row older than the cutoff, one a stream has not sealed yet
-because its seal cadence is slower than the lookback, stays until a seal
-puts it in a segment and a later pass evicts that segment.
-`Evicted::kept_live_rows` counts them, and the writer logs it. An archive
-whose streams seal less often than it evicts holds more than the lookback;
-`SealPolicy::max_age` no longer than the lookback bounds it. Live rows are
-deleted only by `ArchiveMut::discard_live_rows` (or
-`SourceWriter::discard_live_rows`).
+live row: a live row older than the cutoff stays until a seal puts it in a
+segment and a later pass evicts that segment. `Evicted::kept_live_rows`
+counts them, and the writer logs it. A stream that goes longer without
+sealing than the retention window (the span from the cutoff to its newest
+row) therefore keeps rows older than the cutoff. Sealing each stream at
+least once per retention window, measured in row time, avoids that.
+`discard_live_rows` (on `ArchiveMut` or `SourceWriter`) deletes a stream's
+live rows, and `ArchiveMut::prune_wal` past the stream's watermark deletes
+those at or below its `upto_ts`.
 
 ### 3.4 `clock_offsets`
 
