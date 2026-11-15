@@ -3043,9 +3043,6 @@ fn retry_deferred_seals(
     streams
 }
 
-/// Encode one batch's segments, insert them — with the batch's clock
-/// observation in one transaction, then prune the sealed streams' WAL
-/// outside it. Returns the timestamp of the observation recorded, if any.
 /// Insert a segment built elsewhere at this stream's next `seq`.
 ///
 /// The other entrance to the seal path. `seal_batch` encodes what is in the
@@ -3240,9 +3237,11 @@ fn sync_stream(
             for (seq, _) in &removed {
                 tx.delete_segment(source_id, stream, *seq)?;
             }
-            tx.delete_wal_range(source_id, stream, Some(at), None)?;
-            // 2. What is still live at or below `at` is in no segment.
-            tx.delete_wal_range(source_id, stream, w1, Some(at))?;
+            // 2. Delete every WAL row of the stream: the rows above `at` are
+            // replaced, the live rows at or below it are sealed above or
+            // counted unsealable, and the rest are at or below `w1`, where a
+            // segment covers them.
+            tx.delete_wal_range(source_id, stream, None, None)?;
             if let Some(segment) = &sealed {
                 tx.insert_segment_with_index(
                     source_id,
@@ -3268,13 +3267,6 @@ fn sync_stream(
         Some(w) => marks.insert(stream.to_string(), w),
         None => marks.remove(stream),
     };
-    // Rows at or below the new watermark are shadowed; deleting them is the
-    // prune a seal makes, outside the transaction for the same reason.
-    if let Some(w) = w1 {
-        if let Err(e) = db.prune_wal(source_id, stream, w) {
-            warn!("source {source_id}: pruning `{stream}` after a sync failed ({e})");
-        }
-    }
     Ok(synced)
 }
 
@@ -3341,6 +3333,8 @@ fn adopt_segment_after(
     Ok(pruned)
 }
 
+/// Encode one batch's segments, then insert them, record the batch's clock
+/// observation and delete the WAL rows they cover, all in one transaction.
 fn seal_batch(
     db: &mut ArchiveMut,
     source_id: i64,
@@ -3438,6 +3432,17 @@ fn seal_batch(
     // to dig out of a segment, which is what keeps drift readable from the
     // catalog alone — including on a source that is killed before it ever
     // finalizes, where these are the only observations there will be.
+    //
+    // The WAL rows the segments cover are deleted in the same transaction,
+    // so a committed seal leaves no row at or below its watermark and a
+    // failed one leaves the stream as it was. Each stream is deleted only up
+    // to its OWN newest segment's `last_ts`: rows it ingested after the
+    // sealed span, and every other stream's rows, stay live. A split
+    // stream's parts are consecutive in `encoded`, oldest first, so its last
+    // part carries the newest `last_ts`. Measured on macOS, the delete here
+    // was no slower than in a commit of its own after the seal, and faster
+    // for 12 streams of 100 rows; Linux is not measured
+    // (docs/journal/2026-11-14-the-live-tail.md).
     db.transaction(|tx| {
         for e in &encoded {
             tx.insert_segment_with_index(
@@ -3452,6 +3457,14 @@ fn seal_batch(
         if let Some((ts, offset)) = observation {
             tx.insert_clock_offset(source_id, ts, offset)?;
         }
+        for (i, e) in encoded.iter().enumerate() {
+            if encoded
+                .get(i + 1)
+                .is_none_or(|next| next.stream != e.stream)
+            {
+                tx.delete_wal_range(source_id, &e.stream, None, Some(e.meta.last_ts))?;
+            }
+        }
         Ok(())
     })?;
     for e in &encoded {
@@ -3463,27 +3476,6 @@ fn seal_batch(
             .entry(source_id)
             .or_default()
             .insert(e.stream.clone(), e.meta.last_ts);
-    }
-
-    // OUTSIDE the transaction, deliberately: a quiet stream accumulates
-    // thousands of rows before it seals, so pruning inside the seal commit puts
-    // a large delete on the tick path. `live_wal`'s watermark filter makes a
-    // crash between the commit above and the delete below harmless — a
-    // straddling row is not live — which leaves the prune a pure
-    // background optimization. `Transaction` does not expose `prune_wal`, so this
-    // ordering is enforced by the type, not by this comment.
-    //
-    // Each stream is pruned only up to its OWN newest segment's `last_ts`:
-    // rows a stream ingested after the sealed span, and every other stream's
-    // rows, stay live. A split stream's parts are consecutive in `encoded`,
-    // oldest first, so its last part carries the newest `last_ts`.
-    for (i, e) in encoded.iter().enumerate() {
-        if encoded
-            .get(i + 1)
-            .is_none_or(|next| next.stream != e.stream)
-        {
-            db.prune_wal(source_id, &e.stream, e.meta.last_ts)?;
-        }
     }
     Ok(())
 }

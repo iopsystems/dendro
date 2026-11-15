@@ -1767,15 +1767,12 @@ impl Archive {
     /// `MAX(last_ts)` over that stream's own segments, or when that stream has
     /// no segments at all.**
     ///
-    /// The prune (`prune_wal`) deliberately runs OUTSIDE the seal transaction,
-    /// because a quiet stream accumulates thousands of rows before it seals
-    /// and deleting them in the seal's own commit puts tens of megabytes of
-    /// delete on the tick path. That means a crash between "segment committed"
-    /// and "prune ran" can leave WAL rows whose `ts` is already covered by a
-    /// sealed segment. Rather than prevent that straddle, recovery tolerates
-    /// it: a row is live iff its `ts` is past the watermark of the sealed
-    /// segments for its own stream, full stop — one idempotent rule that needs
-    /// no ordering guarantee between sealing and pruning.
+    /// The writer deletes the rows a seal covers in the seal's own
+    /// transaction, so an archive it wrote holds no row at or below a
+    /// stream's watermark. The rule still decides liveness, because an archive
+    /// written before 0.8.0 may hold such rows, and so may one assembled with
+    /// `insert_segment` and `insert_wal_rows` directly. A row at or below
+    /// the watermark is shadowed whether or not it has been deleted.
     ///
     /// **`NOT EXISTS`, rather than a sentinel.** The rule was
     /// `ts > COALESCE(MAX(last_ts), 0)`, which made a row at ts=0 invisible for
@@ -1789,9 +1786,6 @@ impl Archive {
     /// WHOLE history live. That is the property a segment-only container
     /// cannot offer: with kill-safety per segment, a stream that had not
     /// sealed one yet recovers nothing at all.
-    ///
-    /// This turns the prune into a pure background optimization with no
-    /// correctness role.
     pub fn live_wal(&self, source_id: i64, stream: &str) -> Result<Vec<WalRow>> {
         let mut stmt = self
             .conn
@@ -2869,10 +2863,8 @@ impl ArchiveMut {
     ///
     /// `f` receives a `Transaction`, not the connection: SQL stays inside this
     /// module, and `Transaction` deliberately exposes only the *writes that belong
-    /// in a seal batch*. `prune_wal` is not among them, which is how "the
-    /// prune runs outside the seal transaction" is made unrepresentable rather
-    /// than merely documented — inside it, a quiet stream's accumulated rows
-    /// make the delete long enough to threaten the tick.
+    /// in a seal batch*. The writer also deletes a seal's covered WAL rows in
+    /// the same transaction, through a crate-private method.
     pub fn transaction<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let layout = self.db.layout;
         let tx = Transaction {
@@ -2996,11 +2988,11 @@ impl ArchiveMut {
         })
     }
 
-    /// Delete WAL rows at or below `upto_ts` for `(source_id, stream)`.
-    /// Runs OUTSIDE the seal transaction — see `live_wal` for why that is
-    /// safe and has no correctness role. Returns the number of rows deleted,
-    /// so callers/tests can assert idempotency (a second prune of the same
-    /// watermark deletes 0).
+    /// Delete WAL rows at or below `upto_ts` for `(source_id, stream)`, in a
+    /// commit of its own. The writer does not call it: a seal deletes the
+    /// rows it covers in its own transaction. Returns the number of rows
+    /// deleted, so callers/tests can assert idempotency (a second prune of
+    /// the same watermark deletes 0).
     ///
     /// Bounded to one stream by construction (the `stream = ?2` filter):
     /// that is why WAL rows are per-stream rather than whole snapshots — a
@@ -3009,8 +3001,7 @@ impl ArchiveMut {
     ///
     /// A prune past the stream's watermark deletes rows no segment holds, so
     /// it records the stream's newest row in `bounds` first, in the same
-    /// transaction. The writer's prune after a seal is at the watermark and
-    /// does not.
+    /// transaction. A prune at or below the watermark does not.
     pub fn prune_wal(&mut self, source_id: i64, stream: &str, upto_ts: i64) -> Result<usize> {
         const SQL: &str = "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts <= ?3";
         let params = rusqlite::params![source_id, stream, upto_ts];
@@ -3584,10 +3575,8 @@ impl ArchiveMut {
 /// The writes that may share one transaction, handed to `ArchiveMut::transaction`'s
 /// closure. Everything here lands or nothing does.
 ///
-/// What is absent is as deliberate as what is present: there is no `prune_wal`
-/// and no read accessor. The prune belongs OUTSIDE the seal transaction, where
-/// its cost cannot land on a tick, and `live_wal`'s watermark filter is what
-/// makes a crash between the two harmless — see `live_wal`.
+/// There is no read accessor. The writer also deletes a seal's covered WAL
+/// rows in the same transaction, through a crate-private method.
 pub struct Transaction<'a> {
     tx: rusqlite::Transaction<'a>,
     layout: IndexLayout,
@@ -3640,12 +3629,11 @@ impl Transaction<'_> {
 
     /// Remove one sealed segment.
     ///
-    /// Exposed on `Transaction` — unlike the WAL prune, which is deliberately not —
-    /// because the one operation that needs it, compaction, must delete the
-    /// segments it replaced and insert the replacement **in the same
-    /// transaction**. Apart is not an option: between them the stream's
-    /// watermark would dip, and `live_wal` would hand a reader rows that are
-    /// already sealed.
+    /// Exposed on `Transaction` because the crate's two callers, compaction
+    /// and `sync_stream` (a replicated `Sync`, WIRE.md §4.7), delete segments
+    /// in the same transaction as their other writes. Committed apart, a
+    /// reader between the commits could see the stream in a state that is
+    /// neither the one before the operation nor the one after it.
     ///
     /// Records the stream's newest row in `bounds` first (FORMAT.md §3.7).
     /// Compaction deletes segments it then replaces with one ending at the
@@ -5027,8 +5015,8 @@ mod tests {
             b"sealed",
         )
         .unwrap();
-        // ts=20 straddles: sealed into the segment, still present in the WAL
-        // because the prune runs outside the seal transaction.
+        // ts=20 straddles: sealed into the segment and still present in the
+        // WAL, as in an archive written before the seal deleted its rows.
         for ts in [10i64, 20, 30] {
             db.insert_wal_rows(
                 id,
@@ -5235,10 +5223,11 @@ mod tests {
     #[test]
     fn live_wal_excludes_rows_already_covered_by_a_sealed_segment() {
         // THE recovery rule. Seal a segment covering ts<=30, then insert WAL
-        // rows at 10/20/30/40 WITHOUT pruning — simulating a crash between
-        // "segment committed" and "prune ran". live_wal must return only the
-        // row past the watermark (ts=40); read_wal must still return all
-        // four, because the raw table is untouched.
+        // rows at 10/20/30/40 without deleting the covered ones, as an
+        // archive written before 0.8.0, or one assembled with `insert_segment`
+        // and `insert_wal_rows` directly, can hold them. live_wal must return
+        // only the row past the watermark (ts=40); read_wal must still return
+        // all four, because the raw table is untouched.
         let (_dir, mut db, rid) = wal_test_db();
         db.insert_segment(
             rid,
@@ -5434,8 +5423,9 @@ mod tests {
         // The depth a status readout reports is "how many unsealed rows are
         // recoverable", which is exactly what the reader will materialize —
         // so it must apply the SAME watermark `live_wal` does, not count the
-        // raw table. Sealed-but-not-yet-pruned rows (the straddle the deferred
-        // prune deliberately allows) are the case that tells the two apart.
+        // raw table. Rows a segment covers that are still in the WAL (an
+        // archive written before the seal deleted its rows) are the case
+        // that tells the two apart.
         let (_dir, mut db, rid) = wal_test_db();
         db.insert_segment(
             rid,
@@ -5531,9 +5521,8 @@ mod tests {
         assert_eq!(db.newest_bound(rid).unwrap(), Some(20));
     }
 
-    /// A prune at or below the stream's watermark, which the writer makes
-    /// after every seal, deletes only rows a segment holds and records no
-    /// bound. One past it records one.
+    /// A prune at or below the stream's watermark deletes only rows a
+    /// segment holds and records no bound. One past it records one.
     #[test]
     fn only_a_prune_past_the_watermark_records_a_bound() {
         let (_dir, mut db, rid) = wal_test_db();

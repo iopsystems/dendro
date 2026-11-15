@@ -120,10 +120,10 @@ stream still inside its first seal period is not invisible.
 
 The container needs three things that a directory or a tar does not give you:
 
-1. **Transactions.** A seal inserts its segments and records a clock
-   observation in one transaction: either all of that lands or none does. The
-   WAL prune that follows is a transaction of its own, and the watermark makes
-   a crash between the two harmless (see [the seal seam](#the-seal-seam)). In
+1. **Transactions.** A seal inserts its segments, records a clock
+   observation and deletes the WAL rows the segments cover in one
+   transaction: either all of that lands or none does
+   (see [the seal seam](#the-seal-seam)). In
    a tar-shaped container the same guarantee costs a `.partial` file, a rename, a
    rename-aside, checkpoint manifests, and a two-sync ordering protocol, and
    every one of those is a state that can be left half-written and must be
@@ -198,10 +198,9 @@ WAL tail. Nothing de-duplicates that seam, and nothing needs to, because of one
 rule: reads use `live_wal`, which selects `ts > MAX(last_ts)` over that
 stream's *own* segments.
 
-The prune that follows a seal runs **outside** the seal transaction, so the
-`wal` table routinely still holds rows a sealed segment already covers. The
-watermark is what makes that harmless, which in turn is what lets the prune be
-a background optimization with no correctness role.
+A seal deletes the WAL rows it covers in its own transaction, so the writer
+leaves no row at or below a stream's watermark. An archive written before
+0.8.0 can still hold such rows, and the watermark keeps them out of reads.
 
 ## How many files an archive is
 
@@ -326,7 +325,7 @@ through the sidecar without pausing the writer.
 
 Measured in the page-size sweep, on the mixed workload the container was tuned
 for: 26 streams, 1,925 bytes per row, one commit per tick, seals staggered,
-prunes deferred, averaged over 2,500 ticks.
+each prune in a commit of its own after its seal, averaged over 2,500 ticks.
 
 | page size | sidecar bytes written per tick | per byte of row payload |
 |---|---|---|

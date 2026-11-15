@@ -9,7 +9,7 @@ as ours or not ours, and links the entries that own each one.
 
 | Opened | Effort | Status |
 | --- | --- | --- |
-| 2026-11-14 | [The live tail: liveness from a watermark, and rows anchored to seals](2026-11-14-the-live-tail.md) | open (the prune inside the seal measured no slower on macOS, 45% less time for a batch of 12 streams of 100 rows) |
+| 2026-11-14 | [The live tail: liveness from a watermark, and rows anchored to seals](2026-11-14-the-live-tail.md) | open (A done: a seal deletes its WAL rows in its own transaction, measured no slower on macOS and 45% less time for a batch of 12 streams of 100 rows; B, C, D open) |
 | 2026-11-13 | [Subscriber resume: continuing a copy across a reconnect](2026-11-13-subscriber-resume.md) | implemented (#75–#80; resume on protocol version 2) |
 | 2026-10-19 | [Segment indexes out of the segment row, and the encoder told its source](2026-10-19-segment-index-table.md) | implemented (cold N=64 open 2.1-2.2 s to 1.4-1.5 s) |
 | 2026-10-19 | [Archive documents: a place for what belongs to the whole archive](2026-10-19-archive-documents.md) | implemented |

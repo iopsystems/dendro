@@ -192,13 +192,13 @@ fn the_archive_spelling_discards_the_same_rows() {
     assert!(wal(&path, "bad").is_empty());
 }
 
-/// Rows at or before the stream's newest segment that a prune has not yet
-/// removed (a crash between a seal's commit and its prune leaves them) are
-/// not live, and are kept.
+/// Rows at or before the stream's newest segment that are still in the WAL
+/// (an archive written before 0.8.0, or one assembled with `insert_segment`
+/// and `insert_wal_rows` directly, can hold them) are not live, and are kept.
 #[test]
-fn rows_a_segment_covers_but_the_prune_left_are_kept() {
+fn rows_a_segment_covers_that_are_still_in_the_wal_are_kept() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("unpruned.dendro");
+    let path = dir.path().join("covered.dendro");
     let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&source()).unwrap();
     db.insert_segment(
