@@ -600,7 +600,10 @@ fn the_writer_keeps_a_full_statement_a_retained_delta_depends_on() {
         )
         .unwrap();
     assert_eq!(evicted.segments, 1, "the segment holding 1 and 2");
-    assert_eq!(evicted.live_rows, 0, "everything evicted was sealed");
+    assert_eq!(
+        evicted.kept_live_rows, 0,
+        "everything before the cutoff was sealed"
+    );
     assert_eq!(evicted.caller_rows, 0, "delta@4 still depends on full@1");
     w.sync().unwrap();
     let db = Archive::open(&path).unwrap();

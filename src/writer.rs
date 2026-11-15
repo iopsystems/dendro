@@ -1395,17 +1395,21 @@ impl SourceWriter {
     /// Not fire-and-forget, unlike `wal` and `seal`: it waits for the writer
     /// thread to run the pass and returns what it removed, or its error.
     ///
+    /// The pass keeps every live row, whatever its timestamp, and counts the
+    /// ones before the cutoff in [`Evicted::kept_live_rows`]; see
+    /// [`ArchiveMut::evict_before`](crate::archive::ArchiveMut::evict_before).
+    ///
     /// A stream whose last [`seal`](Self::seal) was deferred is sealed first,
-    /// with that seal's retries, because its live rows are in no segment and
-    /// the oldest of them may be one the rest need to decode. A stream still
+    /// with that seal's retries. A stream still
     /// unsealed after that is left out of the pass and counted in
     /// [`Evicted::held_streams`]; the first pass after its seal commits
     /// evicts it. After the first deferred stream whose retry fails with a
     /// retryable error, the remaining ones are held without being tried, so
     /// a pass waits for at most one retry schedule. A stream whose retried
     /// seal fails with an error that is not retryable, such as an encoder
-    /// error, is not held: it is logged and its live rows are evicted. This
-    /// applies to every eviction spelling.
+    /// error, is not held: it is logged, its segments are evicted as any
+    /// other stream's, and its live rows are kept. This applies to every
+    /// eviction spelling.
     pub fn evict_before(&mut self, cutoff_ts: i64) -> Result<Evicted> {
         self.evict(cutoff_ts, None, None)
     }
@@ -2592,8 +2596,7 @@ fn writer_loop(
                 reply,
             }) => {
                 // A stream whose seal was deferred is sealed now, before
-                // anything is cut. Its rows are in no segment, and deleting
-                // the oldest of them can leave the rest undecodable. A
+                // anything is cut, so the rows it seals can be evicted. A
                 // stream still unsealed after a retryable failure is left
                 // out of the pass, its sealed segments included.
                 let held = retry_deferred_seals(
@@ -2646,12 +2649,12 @@ fn writer_loop(
                     e
                 });
                 if let Ok(e) = &evicted {
-                    if e.live_rows > 0 {
+                    if e.kept_live_rows > 0 {
                         warn!(
-                            "retention on source {source_id} deleted {} row(s) no segment \
-                             held: the stream's seal cadence is slower than the lookback. \
-                             Seal at least as often as you evict",
-                            e.live_rows
+                            "retention on source {source_id} kept {} row(s) before the cutoff \
+                             that no segment holds: a stream's seal cadence is slower than \
+                             the lookback, and the archive holds them until they are sealed",
+                            e.kept_live_rows
                         );
                     }
                 }
@@ -2995,9 +2998,9 @@ fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
 /// returned, because retention failing must not stop the writer, and it is
 /// not held: an encoder that fails on these rows fails on them at every
 /// pass, so holding them would keep the stream out of retention for good
-/// and re-encode its growing backlog each time. The pass then treats its
-/// live rows as it treated them before deferrals were tracked, and a
-/// `Seal` of the stream that fails the same way stops the writer.
+/// and re-encode its growing backlog each time. The pass then evicts its
+/// segments and keeps its live rows, as for any stream, and a `Seal` of the
+/// stream that fails the same way stops the writer.
 fn retry_deferred_seals(
     db: &mut ArchiveMut,
     source_id: i64,
@@ -3032,7 +3035,7 @@ fn retry_deferred_seals(
             }
             Err(e) => warn!(
                 "sealing deferred stream `{stream}` of source {source_id} before retention \
-                 failed ({e}); its live rows are evicted as unsealed rows"
+                 failed ({e}); its segments are evicted and its live rows are kept"
             ),
         }
     }

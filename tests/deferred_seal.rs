@@ -176,7 +176,7 @@ fn eviction_seals_a_deferred_stream_first() {
     assert_eq!(segments(&path, id).0, [], "the seal was deferred");
 
     let evicted = w.evict_before(2_500).unwrap();
-    assert_eq!(evicted.live_rows, 0, "{evicted:?}");
+    assert_eq!(evicted.kept_live_rows, 0, "{evicted:?}");
     assert_eq!(evicted.held_streams, 0, "{evicted:?}");
     assert_eq!(
         segments(&path, id),
@@ -187,9 +187,41 @@ fn eviction_seals_a_deferred_stream_first() {
     archive.join().unwrap();
 }
 
+/// A stream nobody has sealed keeps its live rows through a pass whose
+/// cutoff is past them, so the anchor at 1000 is still there when the stream
+/// seals and every row decodes. When eviction deleted live rows, the pass
+/// took 1000 and 2000, and the seal of 3000 decoded nothing.
+#[test]
+fn eviction_keeps_an_unsealed_streams_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("anchor.dendro");
+    let mut archive = Writer::create(&path, Box::new(Anchored::new(None))).unwrap();
+    let mut w = archive.add_source(source()).unwrap();
+    let id = w.source_id();
+    for ts in 1..=3 {
+        w.wal(vec![row(ts * 1_000, ts == 1)]).unwrap();
+    }
+    w.sync().unwrap();
+
+    let evicted = w.evict_before(2_500).unwrap();
+    assert_eq!(
+        (evicted.wal_rows, evicted.kept_live_rows),
+        (0, 2),
+        "{evicted:?}"
+    );
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.sync().unwrap();
+    assert_eq!(
+        segments(&path, id),
+        (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
+    );
+    drop(w);
+    archive.join().unwrap();
+}
+
 /// The retry before the pass fails in the encoder, which no retry fixes:
-/// the stream is not held, the pass evicts its live rows as it would have
-/// without the deferral, and the writer stays up.
+/// the stream is not held, the pass keeps its live rows as it keeps any
+/// stream's, and the writer stays up.
 #[test]
 fn an_encoder_failure_in_the_retry_is_not_held() {
     let dir = tempfile::tempdir().unwrap();
@@ -220,8 +252,8 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
 
     let evicted = w.evict_before(2_500).unwrap();
     assert_eq!(evicted.held_streams, 0, "{evicted:?}");
-    assert_eq!(evicted.live_rows, 2, "{evicted:?}");
-    assert_eq!(wal_rows(&path), 1);
+    assert_eq!(evicted.kept_live_rows, 2, "{evicted:?}");
+    assert_eq!(wal_rows(&path), 3);
 
     assert_eq!(calls.load(Ordering::SeqCst), 5);
     let evicted = w.evict_before(2_500).unwrap();
@@ -235,12 +267,12 @@ fn an_encoder_failure_in_the_retry_is_not_held() {
     w.sync().unwrap();
     drop(w);
     archive.join().unwrap();
-    assert_eq!(wal_rows(&path), 2, "the writer still commits");
+    assert_eq!(wal_rows(&path), 4, "the writer still commits");
 }
 
 /// Two streams deferred in one seal, and the retry fails in the encoder for
-/// `s` only, which is retried first: `t` is still tried and seals, `s` is
-/// evicted as unsealed rows, and neither is held. Calls 1 to 8 are the
+/// `s` only, which is retried first: `t` is still tried and seals, `s`
+/// keeps its live rows, and neither is held. Calls 1 to 8 are the
 /// deferred seal's four attempts at both streams; 9 is the retry of `s`
 /// and 10 the retry of `t`.
 #[test]
@@ -275,7 +307,7 @@ fn an_encoder_failure_in_one_stream_does_not_hold_another() {
     let evicted = w.evict_before(2_500).unwrap();
     assert_eq!(evicted.held_streams, 0, "{evicted:?}");
     assert_eq!(
-        evicted.live_rows, 2,
+        evicted.kept_live_rows, 2,
         "s's rows at 1000 and 2000: {evicted:?}"
     );
     assert_eq!(
@@ -283,7 +315,7 @@ fn an_encoder_failure_in_one_stream_does_not_hold_another() {
         (vec![(1_000, 3_000)], vec!["1000,2000,3000".to_string()])
     );
     assert_eq!(segments_of(&path, id, "s").0, []);
-    assert_eq!(wal_rows_of(&path, "s"), 1);
+    assert_eq!(wal_rows_of(&path, "s"), 3);
     drop(w);
     archive.join().unwrap();
 }
@@ -358,7 +390,7 @@ fn held(evict: fn(&mut SourceWriter, i64) -> Evicted, count: usize) {
     holder.join().unwrap();
     assert_eq!(evicted.held_streams, count, "{evicted:?}");
     assert_eq!(evicted.wal_rows, 0, "{evicted:?}");
-    assert_eq!(evicted.live_rows, 0, "{evicted:?}");
+    assert_eq!(evicted.kept_live_rows, 0, "{evicted:?}");
     assert_eq!(wal_rows(&path), 3, "the held stream kept its rows");
 
     w.seal(vec!["s".to_string()]).unwrap();

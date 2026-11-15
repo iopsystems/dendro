@@ -1471,19 +1471,22 @@ fn rows_the_copy_holds_live_that_the_origin_evicted_are_sealed_by_the_copy() {
     origin.close();
 }
 
-/// A `Sync` over live rows the origin evicted, some of which the copy's
+/// A `Sync` over live rows the origin discarded, some of which the copy's
 /// encoder refuses: the encoder's error covers the batch, so all of them are
 /// deleted and counted unsealable, and the span is reported.
 #[test]
-fn evicted_rows_the_copys_encoder_refuses_are_counted_unsealable() {
+fn discarded_rows_the_copys_encoder_refuses_are_counted_unsealable() {
     let dir = tempfile::tempdir().unwrap();
     let (o, c) = (dir.path().join("o"), dir.path().join("c"));
     let mut origin = Origin::create(&o);
     // 998 and 999 encode on their own; 1000..=1002 do not.
     origin.rows("s", 998..=1002);
     connect(&o, &c).close();
+    origin
+        .w
+        .discard_live_rows(Box::new(|_: &str| true))
+        .unwrap();
     origin.rows("s", 2000..=2001);
-    origin.w.evict_before(2000).unwrap();
     origin.seal(&["s"]);
     let link = connect(&o, &c);
     assert!(link
@@ -1629,7 +1632,8 @@ fn clock_offsets_recorded_out_of_order_all_arrive_on_version_2() {
 
 /// The origin evicts past the copy's newest row without sealing anything
 /// past the copy's watermark: the fast path keeps what the copy holds and
-/// still reports the span.
+/// still reports the span. Eviction keeps live rows, so the origin's live
+/// rows 4 and 5 are discarded first.
 #[test]
 fn an_eviction_on_the_fast_path_is_reported() {
     let dir = tempfile::tempdir().unwrap();
@@ -1639,6 +1643,10 @@ fn an_eviction_on_the_fast_path_is_reported() {
     origin.seal(&["s"]);
     origin.rows("s", 4..=5);
     connect(&o, &c).close();
+    origin
+        .w
+        .discard_live_rows(Box::new(|_: &str| true))
+        .unwrap();
     origin.rows("s", 10..=12);
     origin.w.evict_before(10).unwrap();
     let link = connect(&o, &c);

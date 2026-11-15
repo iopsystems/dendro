@@ -35,6 +35,20 @@ cannot reach a failed release any other way.
 
 ### Changed
 
+- Eviction never deletes a live WAL row, one past its stream's newest
+  sealed segment. `ArchiveMut::evict_before`, `evict_streams_before`, their
+  `_with_floor` forms and the matching `SourceWriter` methods delete
+  segments wholly before the cutoff and the WAL rows before it that a
+  segment covers, and keep live rows whatever their timestamp. Before, a
+  live row older than the cutoff was deleted though no segment held it, and
+  for an encoder that states a schema once per segment, deleting a stream's
+  oldest live rows could leave the rest undecodable. An archive whose
+  streams seal less often than it evicts now holds more than the lookback
+  until they seal. `Evicted::live_rows`, the count of live rows deleted, is
+  replaced by `Evicted::kept_live_rows`, the count of live rows before the
+  cutoff that the pass kept. A caller that evicts at `i64::MAX` to remove
+  a stream entirely must call `discard_live_rows` for it as well, or its
+  live rows stay.
 - An archive holds at most one source per uuid. `ArchiveMut::insert_source_with_uuid`,
   `Transaction::insert_source_with_uuid`, `rewrite::copy_sources_into` and
   `Writer::add_source_with_uuid` refuse a uuid the archive already holds as

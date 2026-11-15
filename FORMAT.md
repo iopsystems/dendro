@@ -319,13 +319,16 @@ and backfilling either is not out of order. Late samples *within* one stream
 remain unsupported; see [out-of-order
 appends](docs/journal/2026-09-11-out-of-order-appends.md).
 
-**Retention and live rows.** Eviction deletes by timestamp and does not
-know which rows have been sealed. A live row older than the cutoff, one a
-stream has not sealed yet because its seal cadence is slower than the
-lookback, is deleted too, and was in no segment. `Evicted::live_rows`
-counts them, and the writer logs it. The invariant is the caller's: seal at
-least as often as you evict (`SealPolicy::max_age` no longer than the
-lookback).
+**Retention and live rows.** Eviction deletes segments wholly before the
+cutoff and the WAL rows before it that a segment covers. It never deletes a
+live row. A live row older than the cutoff, one a stream has not sealed yet
+because its seal cadence is slower than the lookback, stays until a seal
+puts it in a segment and a later pass evicts that segment.
+`Evicted::kept_live_rows` counts them, and the writer logs it. An archive
+whose streams seal less often than it evicts holds more than the lookback;
+`SealPolicy::max_age` no longer than the lookback bounds it. Live rows are
+deleted only by `ArchiveMut::discard_live_rows` (or
+`SourceWriter::discard_live_rows`).
 
 ### 3.4 `clock_offsets`
 

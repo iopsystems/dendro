@@ -268,7 +268,7 @@ retryable has its live rows evicted (`src/writer.rs:2590-2640`).
    neither; see Outcome.
 3. Decide C.
 4. Design B with metriken-storage, starting from the question above.
-5. Decide D.
+5. Decide D. Decided: dendro guarantees it; see Outcome.
 
 Whether 0.8.0 (#82) waits for any of this is open. A changes nothing on the
 wire. B could change what a `Sync` frame has to delete.
@@ -372,7 +372,7 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A is done; B, C and D are not started.
+Open. A and D are done; B and C are not started.
 
 A, decided 2026-11-15 and implemented in the change that adds
 `tests/seal_atomic.rs`:
@@ -397,3 +397,30 @@ A, decided 2026-11-15 and implemented in the change that adds
   covered rows, a trigger refuses deleting them, and the sync must fail with
   the copy unchanged. Against the previous `src/writer.rs` the sync succeeds,
   because the failed prune after its commit only logged a warning.
+
+D, decided 2026-11-15: dendro guarantees it. Eviction keeps live rows.
+
+- The other option was for the writer to seal a stream before evicting it.
+  It was rejected because the writer thread holds no `SealPolicy`, so it
+  would choose segment edges (`max_rows`, `align`) the caller did not, and
+  `src/seal.rs` documents that dendro never seals on its own.
+- The rule applies to `ArchiveMut` eviction as well as the writer's, so one
+  operation has one meaning. Live rows are deleted only by
+  `discard_live_rows`.
+- `Evicted::live_rows` is replaced by `kept_live_rows`, so a caller that
+  read the old count gets a compile error instead of a changed meaning.
+- Cost: an archive whose streams seal less often than it evicts holds more
+  than the lookback until they seal.
+- rezolus is affected. `crates/report-save/src/lib.rs` removes orphan
+  streams with `evict_streams_before(id, i64::MAX, ..)`, and from 0.8.0 that
+  call keeps their live rows unless it also calls `discard_live_rows`.
+- `eviction_keeps_an_unsealed_streams_anchor` (`tests/deferred_seal.rs`)
+  evicts past a never-sealed stream's anchor row and then seals it; every
+  row decodes. With the WAL delete made unconditional again it fails, and
+  so do the two encoder-failure tests in that file.
+- B's loss path through retention (an anchor row evicted before its run is
+  sealed) is closed by this; B's design question is unchanged.
+- Left as it was: the writer still holds a stream whose deferred seal could
+  not commit out of a pass (`Evicted::held_streams`). That hold existed to
+  protect live rows, which eviction now keeps anyway, so it only delays the
+  eviction of that stream's segments. Removing it is a separate change.
