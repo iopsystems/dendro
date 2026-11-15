@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
 ### Changed
 
 - Eviction never deletes a live WAL row (one stamped after its stream's
@@ -59,7 +61,8 @@ cannot reach a failed release any other way.
   deferred, so clock offsets are cut at the cutoff as in any whole-source
   pass. `Evicted::held_streams`, which counted the streams left out, is
   removed.
-- An archive holds at most one source per uuid. `ArchiveMut::insert_source_with_uuid`,
+- An archive holds at most one source per uuid.
+  `ArchiveMut::insert_source_with_uuid`,
   `Transaction::insert_source_with_uuid`, `rewrite::copy_sources_into` and
   `Writer::add_source_with_uuid` refuse a uuid the archive already holds as
   the new `Error::DuplicateSource`; a copy of the same archive twice into
@@ -68,11 +71,13 @@ cannot reach a failed release any other way.
   is unchanged, and an archive created earlier, which has no index, is
   checked at each insert instead. `verify` reports a duplicate already in a
   file as the new `Problem::DuplicateUuid`.
-- A replication `Subscriber` refuses a `Handshake` whose uuid its archive
-  already holds, as `Error::DuplicateSource`. A reconnect, or a restart that
-  opened the same archive, used to copy every source again under the same
-  uuid; catch up into a new archive instead. A source whose handshake has
-  no uuid is still added, as before.
+- A replication `Subscriber` from `Subscriber::new` refuses a `Handshake`
+  whose uuid its archive already holds, as `Error::DuplicateSource`. A
+  reconnect, or a restart that opened the same archive, used to copy every
+  source again under the same uuid. On protocol version 1, catch up into a
+  new archive. To continue a copy, open the subscriber with
+  `Subscriber::resume` and the publisher with `ArchivePublisher::resuming`
+  (below). A source whose handshake has no uuid is still added, as before.
 - The writer drops an append at or below its stream's newest live row,
   as it already dropped one at or below the newest sealed row, and counts it
   in `SourceWriter::dropped_out_of_order`. Such a row was stored and
@@ -122,8 +127,9 @@ cannot reach a failed release any other way.
   that writer for all its sources. The `-lock` file is created on first
   use and left in place; it holds no data and a copy of the archive does
   not need it. The lock is released when its handle is dropped or its
-  process ends; a child process forked while it is held keeps it until the
-  child execs or exits.
+  process ends. A child process forked or spawned while it is held keeps a
+  copy of it until the child execs or exits, so in that window a writer the
+  parent dropped can be refused as `Error::InUse` when it reopens.
 
 ### Added
 
@@ -180,6 +186,9 @@ cannot reach a failed release any other way.
   connection had already delivered for their stream, or repeated a
   `(stream, ts)` within the frame.
 - `Writer::encoder_version`, the version the archive's encoder reports.
+- `Transaction::record_stream_bound` and `Transaction::record_caller_row_bound`
+  record a stream's or a caller-row name's bound in `bounds` (FORMAT.md
+  §3.7), as a copy does for the rows a time-bounded copy left out.
 
 ### Fixed
 
@@ -219,7 +228,8 @@ cannot reach a failed release any other way.
   refused, before any source row is written. Present since 0.2.0. A caller
   that fed a reconnect's frames to the same `Subscriber` now gets this
   error where it used to get a duplicate source; open a new `Subscriber`
-  per connection.
+  per connection: `Subscriber::new` on a new archive, or
+  `Subscriber::resume` on the copy.
 - `Subscriber::finish` finalized a complete source whose publisher had sent
   no `ClockOffset` frame with the observation `(0, 0)`, so the copy's
   `clock_offsets` held an entry no publisher made. It now finalizes such a
@@ -239,7 +249,7 @@ cannot reach a failed release any other way.
   encoder not known to decode them, and its copy's `encoder` key named its
   own version. The handshake is now refused before any source row is
   written; either side reporting no version is not a mismatch, as on every
-  read path.
+  read path. Present since 0.2.0.
 - `ArchivePublisher::next` put every row of a source since the last poll
   into one `Rows` frame. Past `MAX_FRAME_BYTES` (64 MiB) that frame could
   not be encoded, and the publisher's cursor had already moved past its
@@ -253,10 +263,10 @@ cannot reach a failed release any other way.
   those frames; a missing index entry made the subscriber skip every later
   row of its source. A failed call now leaves the publisher as it was.
   `next` also fails, where it used to return a frame that could not be
-  encoded, when one row or a segment of a stream first seen sealed makes a
-  frame above `MAX_FRAME_BYTES` on its own; that error repeats on every call
-  and holds back every source until the row is discarded or evicted, or the
-  segment evicted.
+  encoded, when one row, or on protocol version 1 a segment of a stream
+  first seen sealed, makes a frame above `MAX_FRAME_BYTES` on its own; that
+  error repeats on every call and holds back every source until the row is
+  discarded with `discard_live_rows`, or the segment evicted.
   Present since 0.2.0.
 - A seal whose encoder returned a segment with a `last_ts` that is not the
   timestamp of one of its input rows panicked the writer thread, so every
@@ -303,16 +313,6 @@ cannot reach a failed release any other way.
   reported a running writer for a source nothing could append to. Its
   heartbeat now stops when its handle is dropped, and a reader sees it as
   stopped; the writer's other sources go on beating. Present since 0.3.4.
-- After a writer retention pass (`SourceWriter::evict_before` and its
-  variants) evicted every segment of a stream, the writer still dropped
-  that stream's appends at or below its old newest sealed row as out of
-  order, and counted them in `dropped_out_of_order`. The archive has no
-  watermark for such a stream, so those rows are readable; the writer kept
-  the old watermark in memory until it restarted. It now re-reads the
-  source's watermarks after each successful retention pass. A resumed
-  source's handle still refuses rows at or before its previous session's
-  newest row. Rows accepted this way at or below a running replication
-  publisher's last shipped row are not replicated. Present since 0.1.0.
 
 ## [0.7.1] - 2026-11-11
 
