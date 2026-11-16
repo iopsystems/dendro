@@ -1882,12 +1882,14 @@ fn an_oversized_row_the_encoder_refuses_to_seal_stays_live() {
     link.close();
 }
 
-/// An encoder whose rows depend on the row that opens their run, as
-/// metriken-storage's do: its writer puts a group's schema only on the first
-/// row after a seal. A row whose payload starts with `b'A'` is such an
-/// anchor. A row before the first anchor of the rows given cannot be
+/// An encoder whose rows depend on an earlier row, as metriken-storage's
+/// do: its writer puts a group's schema on the first row after a seal and
+/// on each change of schema. A row whose payload starts with `b'A'` is such
+/// an anchor. A row before the first anchor of the rows given cannot be
 /// decoded; like metriken-storage's encoder, this claims it and leaves it
-/// out of the segment, and gives no segment when no row decodes.
+/// out of the segment, and gives no segment when no row decodes. A part of
+/// a capped seal is anchored from the rows before it, as metriken-storage's
+/// `encode_after` does.
 struct Anchored;
 
 impl SegmentEncoder for Anchored {
@@ -1897,6 +1899,24 @@ impl SegmentEncoder for Anchored {
         };
         Ok(Some(Segment {
             bytes: tags(rows[first..].iter().map(|r| r.ts)),
+            rows: rows.len() as u64,
+            first_ts: rows[0].ts,
+            last_ts: rows[rows.len() - 1].ts,
+            index: None,
+        }))
+    }
+
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[WalRow],
+        rows: &[WalRow],
+    ) -> EncodeResult {
+        if rows.is_empty() || !before.iter().any(is_anchor) {
+            return self.encode(ctx, rows);
+        }
+        Ok(Some(Segment {
+            bytes: tags(rows.iter().map(|r| r.ts)),
             rows: rows.len() as u64,
             first_ts: rows[0].ts,
             last_ts: rows[rows.len() - 1].ts,
@@ -2051,5 +2071,52 @@ fn a_sync_after_eviction_seals_the_copys_tail_with_its_anchor() {
     assert_eq!(link.opened.rows_unsealable, 0);
     link.close();
     assert_eq!(decodable(&c), (1..=5).chain(9..=11).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// A known loss, pinned so that a fix has to change this test. The origin
+/// seals the run 4..=13, which the copy holds live, in two parts with
+/// `seal_capped`. The copy adopts each part's `SegmentAfter` in its own
+/// transaction, and adopting [4, 8] deletes 4, the run's anchor, so 9..=13
+/// stay live with nothing to decode them by. The connection drops between
+/// the two frames. The origin then seals the next run and evicts before it,
+/// and the resume's `Sync` seals 9..=13 on the copy with `encode`, which
+/// gives no segment, so they are deleted as unsealable.
+#[test]
+fn a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, anchored());
+    run(&mut origin, 1..=3, true);
+    origin.seal(&["s"]);
+    run(&mut origin, 4..=13, true);
+    let mut link = connect_with(&o, &c, anchored);
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.w.seal_capped(vec!["s".to_string()], 5).unwrap();
+    origin.w.sync().unwrap();
+    let frames = link.publisher.next(&Archive::open(&o).unwrap()).unwrap();
+    assert_eq!(count(&frames, is_segment_after), 2);
+    let cut = frames.iter().position(is_segment_after).unwrap() + 1;
+    pump(frames[..cut].to_vec(), &mut link.sub);
+    link.close();
+    assert_eq!(decodable(&o), (1..=13).collect::<Vec<_>>());
+    assert_eq!(
+        decodable(&c),
+        (1..=8).collect::<Vec<_>>(),
+        "9..=13 live, no anchor"
+    );
+
+    run(&mut origin, 14..=15, true);
+    origin.seal(&["s"]);
+    origin.w.evict_before(14).unwrap();
+    origin.w.sync().unwrap();
+    let link = connect_with(&o, &c, anchored);
+    assert!(link
+        .frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 13, .. })));
+    assert_eq!(link.opened.rows_unsealable, 5);
+    link.close();
+    assert_eq!(decodable(&c), (1..=8).chain(14..=15).collect::<Vec<_>>());
     origin.close();
 }

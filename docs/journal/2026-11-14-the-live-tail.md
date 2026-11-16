@@ -221,8 +221,9 @@ from it, in dendro and in metriken-storage:
 - A replica's `Sync` seals its live rows at a boundary of its own and deletes
   the rows its encoder refuses (WIRE.md §4.7, `sync_stream`,
   `src/writer.rs:3156`). I do not know how many of those refusals come from
-  anchoring rather than from an incomplete trailing record. Answered for
-  anchoring after 0.8.0: none in the cases tested; see Outcome.
+  anchoring rather than from an incomplete trailing record. Partly answered
+  after 0.8.0: a capped seal the copy receives in part leads to one; see
+  Outcome.
 
 The [encoder boundary entry](2026-09-11-encoder-boundary.md) records that
 the trait bans state across segments because a reader has none of the
@@ -280,7 +281,7 @@ evicted (`src/writer.rs:2590-2640`).
    neither; see Outcome.
 3. Decide C.
 4. Design B with metriken-storage, starting from the question above.
-   Decided after 0.8.0: not now; see Outcome.
+   After 0.8.0, a loss path on a copy was found; see Outcome.
 5. Decide D. Decided: dendro guarantees it; see Outcome.
 
 0.8.0 (#82, released 2026-11-16) shipped A and D and did not wait for B or
@@ -386,7 +387,8 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A and D shipped in 0.8.0; B is set aside (below); C is not started.
+Open. A and D shipped in 0.8.0; B has a confirmed loss path on a copy
+(below); C is not started.
 
 A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
@@ -487,29 +489,50 @@ Merged as #85 (2c66d96), released in 0.8.0.
     from `ArchiveMut::create`, because `ArchiveMut::open` takes an
     exclusive lock.
 
-B, decided 2026-11-16 at 99dadaa: not now. Reopen if a test shows a run's
-first row lost on a path a writer or a copy takes in normal operation, or if
-`SegmentEncoder` gains access to per-source state for another reason.
+B, tested 2026-11-16 at 99dadaa. The first draft of this section set B
+aside because the tests below found no loss; review then found one, which
+meets the reopen condition that draft set ("a test shows a run's first row
+lost on a path a writer or a copy takes in normal operation"). B stays open.
 
-- Since #85 retention keeps live rows, so the head of an open run survives
-  every path but `ArchiveMut::prune_wal` past the watermark, an explicit
-  `discard_live_rows` (which deletes the whole run), and files left by a
-  metriken-storage 0.2.2 writer.
-- The `Sync` path was the open question. A copy's live rows start at an
-  origin run's head as long as no sync point falls inside the origin's open
-  run, and two rules in `src/replicate/publisher.rs` keep it out. The resume
-  takes the fast path, with no `Sync`, unless the origin has sealed past the
-  copy's watermark. When it has, `cursor_sync` starts from `low`, which is at
-  most the origin's oldest row minus one when the origin holds any row at or
-  below the copy's newest. Since #85 that oldest row is at or before the
-  head of the open run. Four tests in `tests/replicate_resume.rs`, with an
-  encoder that decodes a run only from its first row, as metriken-storage's
-  does, check that the copy decodes every row the origin does: on a resume
-  inside the origin's open run, a `Sync` below an origin seal, a connected
-  seal, and a `Sync` after eviction. With the fast path disabled and `low`
-  set to the copy's newest, the first fails: the copy decodes 1..=3 of
-  1..=5, because it seals 1..=3 itself and takes 4 and 5 without their
-  anchor. Either change alone leaves all four passing.
+- Since #85 retention keeps live rows, so on the origin the head of an open
+  run survives every path but `ArchiveMut::prune_wal` past the watermark, an
+  explicit `discard_live_rows` (which deletes the whole run), and files left
+  by a metriken-storage 0.2.2 writer.
+- The `Sync` point stays out of the origin's open run. The resume takes the
+  fast path, with no `Sync`, unless the origin has sealed past the copy's
+  watermark (`src/replicate/publisher.rs:592`). When it has, `cursor_sync`
+  starts from `low`, which is the origin's oldest row minus one when the
+  origin holds a row at or below the copy's newest (`publisher.rs:676`).
+  Since #85 that oldest row is at or before the head of the open run. Four
+  tests in `tests/replicate_resume.rs`, with an encoder `Anchored` that
+  decodes rows only from an anchor row on, as metriken-storage's does,
+  check that the copy decodes every row the origin does on a resume inside
+  the origin's open run, a `Sync` below an origin seal, a connected seal,
+  and a `Sync` after eviction. With the fast path disabled, the first fails
+  on its `Sync` count and its `decodable` checks pass. With `low` also set
+  to the copy's newest and that count assertion removed, the copy decodes
+  1..=3 of 1..=5: it seals 1..=3 itself and takes 4 and 5 without their
+  anchor.
+- The loss: a capped seal delivered in part. The origin seals a run the
+  copy holds live in parts (`seal_capped`, which metriken-storage's writer
+  calls). Each part reaches the copy as a `SegmentAfter`, adopted in its own
+  transaction, and adopting the first deletes the run's anchor with the
+  rows it covers. Until the last part is adopted, the copy's remaining live
+  rows of the run have no anchor. A connection lost, or a copy that stops,
+  between two parts leaves it that way: a reader of the copy sees the first
+  part and not the rest. If the origin evicts the rest before the copy
+  resumes, the resume's `Sync` seals them on the copy with `encode`, which
+  gives no segment, and they are deleted as unsealable. Pinned by
+  `a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail` (rows
+  4..=13 sealed as [4, 8] and [9, 13], the connection cut after the first;
+  the copy then decodes 1..=8, and after the eviction and resume, 1..=8 and
+  14..=15, with `rows_unsealable` 5). The same steps with `Tags`, whose rows
+  decode alone, run as a control and not committed, left the copy holding
+  1..=15 with `rows_unsealable` 0.
+- Fixes, not tried: adopt all parts of one seal in one transaction, which
+  needs the frames to say where a seal ends; keep a copy's covered rows
+  until the rows after them are sealed, which changes when `wal` rows are
+  deleted; or B itself, which removes the dependence.
 - What B would cost, read from the code and not built: `EncodeContext` holds
   only the source id, its uuid and the stream (`src/segment.rs:103`), so an
   encoder cannot read anchors kept outside the rows without a change to the
@@ -529,6 +552,7 @@ first row lost on a path a writer or a copy takes in normal operation, or if
 
 Open after 0.8.0:
 
+- B, plan step 4, with the capped-seal loss above.
 - C, plan step 3.
 
 Resolved after 0.8.0:
