@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-14
-updated: 2026-11-15
+updated: 2026-11-16
 ---
 
 # The live tail: liveness from a watermark, and rows anchored to seals
@@ -66,6 +66,11 @@ generality is [the encoder boundary](2026-09-11-encoder-boundary.md).
 
 ### A. Liveness is computed from the watermark
 
+Line numbers are at f2d59d8. A row is still live by the watermark at HEAD.
+The prune outside the transaction described here is the behaviour before
+#84: in 0.7.1 for `seal_batch`, and on main from #79 until #84 for
+`sync_stream`. The Outcome records #84's change in 0.8.0.
+
 A WAL row is live when its timestamp is above its stream's newest sealed row
 (`LIVE_WAL_PREDICATE`, `src/archive/sqlite.rs:500`; FORMAT.md §3.3). The rule
 is what makes a crash between the seal's commit and its prune harmless: rows
@@ -110,11 +115,11 @@ dendro sets no `fullfsync`, so a commit on macOS is a plain `fsync`, which
 does not flush the drive's cache; that is why this host cannot show what a
 commit costs on Linux. Rows are 1,925 bytes (DESIGN.md's mixed workload), and
 the archive is checkpointed before the seal. A segment is N × 1,925 / 8 bytes,
-an assumed 8:1 compression; real segment sizes were not measured. SEP is
-today's shape: the segments' transaction, then one `prune_wal` per stream. IN
-deletes the rows with `Transaction::delete_wal_range` inside the
-transaction. AA is SEP again, for the floor. Each trial checks that the
-sealed streams' `wal` rows are gone. Times are writer-thread wall time in
+an assumed 8:1 compression; real segment sizes were not measured. SEP is the
+shape up to 0.7.1: the segments' transaction, then one `prune_wal` per stream.
+IN deletes the rows with `Transaction::delete_wal_range` inside the
+transaction. AA is SEP again, for the floor. Each trial checks that the sealed
+streams' `wal` rows are gone. Times are writer-thread wall time in
 milliseconds from opening the segments' transaction to the end of the last
 prune; they exclude the `live_wal` read and the encode that precede it in
 `seal_batch`. Medians of 15 (measured); "prune" is SEP's time after its
@@ -198,17 +203,21 @@ from it, in dendro and in metriken-storage:
   the rows before it (`src/segment.rs:217`), and metriken-storage carries
   three `anchor_*` functions to re-anchor a part (`encoder.rs:381`, 402, 425).
 - `read::stream_range` returned nothing from the live tail for such an
-  encoder from 0.1.0, until the fix listed under Unreleased in CHANGELOG.md,
-  which ships in 0.8.0 (#82).
-- An unsealed run whose first row retention deletes cannot be decoded. The
-  encoder claims the skipped rows as encoded (`encoder.rs:289`). Once a later
-  anchored row seals with them, the prune deletes them and no segment holds
-  them. Until then they stay live and are skipped on every read. A warning is
-  logged per materialization (`metriken-storage/src/wal.rs:341-347`) and no
-  counter moves. metriken-storage seals a stream before retention can cut its
-  first row, so this needs a file a metriken-storage 0.2.2 writer left, or a deferred seal
+  encoder from 0.1.0 until 0.8.0.
+- Up to 0.7.1: an unsealed run whose first row retention deletes cannot be
+  decoded. The encoder claims the skipped rows as encoded (`encoder.rs:289`).
+  Once a later anchored row seals with them, the prune deletes them and no
+  segment holds them. Until then they stay live and are skipped on every
+  read. A warning is logged per materialization
+  (`metriken-storage/src/wal.rs:341-347`) and no counter moves.
+  metriken-storage seals a stream before retention can cut its first row, so
+  this needs a file a metriken-storage 0.2.2 writer left, or a deferred seal
   whose retry before an eviction failed with an error that is not retryable
-  (the comment at `encoder.rs:289-301` lists both).
+  (the comment at `encoder.rs:289-301` lists both). Since 0.8.0 (#85)
+  eviction keeps live rows, so retention no longer starts this; a run whose
+  first row is already gone, such as one in a file a metriken-storage 0.2.2
+  writer left, still cannot be decoded, and `ArchiveMut::prune_wal` past the
+  watermark can still cut one.
 - A replica's `Sync` seals its live rows at a boundary of its own and deletes
   the rows its encoder refuses (WIRE.md §4.7, `sync_stream`,
   `src/writer.rs:3156`). I do not know how many of those refusals come from
@@ -251,14 +260,16 @@ Save-as-Report (`crates/report-save/src/lib.rs`). So dendro's check at
 
 ### D. Retention deletes unsealed rows
 
-FORMAT.md §3.3: eviction deletes by timestamp, a live row below the cutoff is
-deleted though no segment holds it, `Evicted::live_rows` counts it, and the
-caller must seal at least as often as it evicts. The writer seals deferred
-streams before a retention pass (`retry_deferred_seals`, `src/writer.rs:3001`).
-A stream whose retry fails with a retryable error is left out of the pass,
-and so is every deferred stream after it, without a retry
-(`src/writer.rs:3014-3016`); one whose retry fails with an error that is not
-retryable has its live rows evicted (`src/writer.rs:2590-2640`).
+This is the behaviour up to 0.7.1, and on main until #85 (line numbers at
+f2d59d8); the Outcome below records the change in 0.8.0. FORMAT.md §3.3:
+eviction deletes by timestamp, a live row below the cutoff is deleted though
+no segment holds it, `Evicted::live_rows` counts it, and the caller must seal
+at least as often as it evicts. The writer seals deferred streams before a
+retention pass (`retry_deferred_seals`, `src/writer.rs:3001`). A stream whose
+retry fails with a retryable error is left out of the pass, and so is every
+deferred stream after it, without a retry (`src/writer.rs:3014-3016`); one
+whose retry fails with an error that is not retryable has its live rows
+evicted (`src/writer.rs:2590-2640`).
 
 ## Plan
 
@@ -270,8 +281,9 @@ retryable has its live rows evicted (`src/writer.rs:2590-2640`).
 4. Design B with metriken-storage, starting from the question above.
 5. Decide D. Decided: dendro guarantees it; see Outcome.
 
-Whether 0.8.0 (#82) waits for any of this is open. A changes nothing on the
-wire. B could change what a `Sync` frame has to delete.
+0.8.0 (#82, released 2026-11-16) shipped A and D and did not wait for B or
+C. A changes nothing on the wire. B could change what a `Sync` frame has to
+delete.
 
 ## The benchmark
 
@@ -372,10 +384,9 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A and D are done; B and C are not started.
+Open. A and D shipped in 0.8.0; B and C are not started.
 
-A, decided 2026-11-15 and implemented in the change that adds
-`tests/seal_atomic.rs`:
+A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
 - `seal_batch` deletes each sealed stream's WAL rows up to its newest
   segment's `last_ts` inside the seal's transaction, and `sync_stream`
@@ -388,7 +399,8 @@ A, decided 2026-11-15 and implemented in the change that adds
   sealed stream and adds no statement to the transaction beyond the deletes
   those autocommits ran, so I expect it to cost no more there than on macOS;
   that is inferred, not measured.
-- `a_seal_whose_wal_delete_fails_commits_no_segment` makes the delete fail
+- `a_seal_whose_wal_delete_fails_commits_no_segment` (`tests/seal_atomic.rs`)
+  makes the delete fail
   with a trigger and checks that no segment lands. Run against the previous
   `src/writer.rs` it fails: the error is `failed to prune WAL for a:
   refused`, from the prune after the commit. Against the change it passes.
@@ -399,6 +411,7 @@ A, decided 2026-11-15 and implemented in the change that adds
   because the failed prune after its commit only logged a warning.
 
 D, decided 2026-11-15: dendro guarantees it. Eviction keeps live rows.
+Merged as #85 (2c66d96), released in 0.8.0.
 
 - The other option was for the writer to seal a stream before evicting it.
   It was rejected because the writer thread holds no `SealPolicy`, so it
@@ -471,3 +484,15 @@ D, decided 2026-11-15: dendro guarantees it. Eviction keeps live rows.
     `ArchiveMut` handle and can meet another connection's lock only on one
     from `ArchiveMut::create`, because `ArchiveMut::open` takes an
     exclusive lock.
+
+Open after 0.8.0:
+
+- B and C, plan steps 4 and 3.
+- The rustdoc on `ArchivePublisher::next` names one way to clear an
+  oversized live row, `discard_live_rows`; evicting the segment is for an
+  oversized segment on version 1, and since #85 eviction keeps live rows.
+  The 0.8.0 release review reported a second on protocol version 2: sealing
+  the row, after which it ships in a segment frame with no frame size check
+  (`src/replicate/publisher.rs`: `cursor_sync`'s `SegmentAfter` frames for a
+  stream already shipped, and the `version_2` branch of the first-seen
+  segment loop). Not tested; the rustdoc gains it once a test shows it.
