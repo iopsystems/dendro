@@ -221,7 +221,8 @@ from it, in dendro and in metriken-storage:
 - A replica's `Sync` seals its live rows at a boundary of its own and deletes
   the rows its encoder refuses (WIRE.md §4.7, `sync_stream`,
   `src/writer.rs:3156`). I do not know how many of those refusals come from
-  anchoring rather than from an incomplete trailing record.
+  anchoring rather than from an incomplete trailing record. Answered for
+  anchoring after 0.8.0: none in the cases tested; see Outcome.
 
 The [encoder boundary entry](2026-09-11-encoder-boundary.md) records that
 the trait bans state across segments because a reader has none of the
@@ -279,6 +280,7 @@ evicted (`src/writer.rs:2590-2640`).
    neither; see Outcome.
 3. Decide C.
 4. Design B with metriken-storage, starting from the question above.
+   Decided after 0.8.0: not now; see Outcome.
 5. Decide D. Decided: dendro guarantees it; see Outcome.
 
 0.8.0 (#82, released 2026-11-16) shipped A and D and did not wait for B or
@@ -384,7 +386,7 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A and D shipped in 0.8.0; B and C are not started.
+Open. A and D shipped in 0.8.0; B is set aside (below); C is not started.
 
 A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
@@ -485,9 +487,49 @@ Merged as #85 (2c66d96), released in 0.8.0.
     from `ArchiveMut::create`, because `ArchiveMut::open` takes an
     exclusive lock.
 
+B, decided 2026-11-16 at 99dadaa: not now. Reopen if a test shows a run's
+first row lost on a path a writer or a copy takes in normal operation, or if
+`SegmentEncoder` gains access to per-source state for another reason.
+
+- Since #85 retention keeps live rows, so the head of an open run survives
+  every path but `ArchiveMut::prune_wal` past the watermark, an explicit
+  `discard_live_rows` (which deletes the whole run), and files left by a
+  metriken-storage 0.2.2 writer.
+- The `Sync` path was the open question. A copy's live rows start at an
+  origin run's head as long as no sync point falls inside the origin's open
+  run, and two rules in `src/replicate/publisher.rs` keep it out. The resume
+  takes the fast path, with no `Sync`, unless the origin has sealed past the
+  copy's watermark. When it has, `cursor_sync` starts from `low`, which is at
+  most the origin's oldest row minus one when the origin holds any row at or
+  below the copy's newest. Since #85 that oldest row is at or before the
+  head of the open run. Four tests in `tests/replicate_resume.rs`, with an
+  encoder that decodes a run only from its first row, as metriken-storage's
+  does, check that the copy decodes every row the origin does: on a resume
+  inside the origin's open run, a `Sync` below an origin seal, a connected
+  seal, and a `Sync` after eviction. With the fast path disabled and `low`
+  set to the copy's newest, the first fails: the copy decodes 1..=3 of
+  1..=5, because it seals 1..=3 itself and takes 4 and 5 without their
+  anchor. Either change alone leaves all four passing.
+- What B would cost, read from the code and not built: `EncodeContext` holds
+  only the source id, its uuid and the stream (`src/segment.rs:103`), so an
+  encoder cannot read anchors kept outside the rows without a change to the
+  trait and to every encode call site (seal, split seal, `Sync`, copy, live
+  tail read). metriken-storage would write a new row encoding under a new
+  `ENCODER_VERSION`, which under C as it stands makes every older reader
+  refuse new recordings outright, so B waits on C. `caller_rows` is evicted
+  at the cutoff, and its floor function sees only a name's oldest row, so
+  keeping an anchor a live row still names needs new dendro behaviour or
+  writer state the floor function reads. `documents` belong to no source and
+  replication does not carry them (FORMAT.md §3.6).
+- What B would remove: metriken-storage's `encode_after` and its three
+  `anchor_*` functions (`encoder.rs` at c27b6b5), and its writer's tracking
+  of seal boundaries (`sealing`, `opened`).
+- The GO criterion's measurement was not taken; no design was built to
+  measure.
+
 Open after 0.8.0:
 
-- B and C, plan steps 4 and 3.
+- C, plan step 3.
 
 Resolved after 0.8.0:
 

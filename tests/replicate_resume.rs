@@ -148,10 +148,18 @@ fn pump(frames: Vec<Frame>, sub: &mut Subscriber) -> Applied {
 
 /// Open the copy for a resume, and its request through the codec.
 fn resume_copy(copy: &Path) -> (Subscriber, ResumeRequest) {
+    resume_copy_with(copy, || Box::new(Tags))
+}
+
+/// [`resume_copy`], with the copy's writer sealing with `encoder`.
+fn resume_copy_with(
+    copy: &Path,
+    encoder: fn() -> Box<dyn SegmentEncoder + Send>,
+) -> (Subscriber, ResumeRequest) {
     let writer = if copy.exists() {
-        Writer::open(copy, Box::new(Tags)).unwrap()
+        Writer::open(copy, encoder()).unwrap()
     } else {
-        Writer::create(copy, Box::new(Tags)).unwrap()
+        Writer::create(copy, encoder()).unwrap()
     };
     let (sub, request) = Subscriber::resume(writer).unwrap();
     let request = ResumeRequest::decode(&request.encode().unwrap()).unwrap();
@@ -168,7 +176,16 @@ struct Link {
 
 /// The opening batch and the first poll, which ships the live rows.
 fn connect(origin: &Path, copy: &Path) -> Link {
-    let (mut sub, request) = resume_copy(copy);
+    connect_with(origin, copy, || Box::new(Tags))
+}
+
+/// [`connect`], with the copy sealing with `encoder`.
+fn connect_with(
+    origin: &Path,
+    copy: &Path,
+    encoder: fn() -> Box<dyn SegmentEncoder + Send>,
+) -> Link {
+    let (mut sub, request) = resume_copy_with(copy, encoder);
     let db = Archive::open(origin).unwrap();
     let (mut publisher, mut frames) = ArchivePublisher::resuming(&db, &request).unwrap();
     frames.extend(publisher.next(&db).unwrap());
@@ -1863,4 +1880,176 @@ fn an_oversized_row_the_encoder_refuses_to_seal_stays_live() {
     let (_, frames) = link.poll(&o);
     assert!(shipped_rows(&frames, "s").is_empty());
     link.close();
+}
+
+/// An encoder whose rows depend on the row that opens their run, as
+/// metriken-storage's do: its writer puts a group's schema only on the first
+/// row after a seal. A row whose payload starts with `b'A'` is such an
+/// anchor. A row before the first anchor of the rows given cannot be
+/// decoded; like metriken-storage's encoder, this claims it and leaves it
+/// out of the segment, and gives no segment when no row decodes.
+struct Anchored;
+
+impl SegmentEncoder for Anchored {
+    fn encode(&self, _ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        let Some(first) = rows.iter().position(is_anchor) else {
+            return Ok(None);
+        };
+        Ok(Some(Segment {
+            bytes: tags(rows[first..].iter().map(|r| r.ts)),
+            rows: rows.len() as u64,
+            first_ts: rows[0].ts,
+            last_ts: rows[rows.len() - 1].ts,
+            index: None,
+        }))
+    }
+}
+
+fn is_anchor(row: &WalRow) -> bool {
+    row.row.first() == Some(&b'A')
+}
+
+fn anchored() -> Box<dyn SegmentEncoder + Send> {
+    Box::new(Anchored)
+}
+
+/// A run of `ts` rows of stream `s` as the origin's writer writes it after
+/// a seal: the first row carries the anchor when `opens` is set.
+fn run(origin: &mut Origin, ts: std::ops::RangeInclusive<i64>, opens: bool) {
+    let first = *ts.start();
+    let rows = ts
+        .map(|t| {
+            let mut r = row("s", t);
+            r.row
+                .insert(0, if opens && t == first { b'A' } else { b'R' });
+            r
+        })
+        .collect();
+    origin.w.wal(rows).unwrap();
+    origin.w.sync().unwrap();
+}
+
+/// What a reader of `path` can decode of stream `s`: the rows its segments
+/// hold, and the live rows from the first anchor of the live tail on.
+fn decodable(path: &Path) -> Vec<i64> {
+    let db = Archive::open(path).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    let mut ts: Vec<i64> = Vec::new();
+    for seg in db
+        .segments_overlapping(id, "s", i64::MIN, i64::MAX)
+        .unwrap()
+    {
+        let text = String::from_utf8(seg.bytes).unwrap();
+        ts.extend(
+            text.split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse::<i64>().unwrap()),
+        );
+    }
+    let live = db.live_wal(id, "s").unwrap();
+    if let Some(first) = live.iter().position(is_anchor) {
+        ts.extend(live[first..].iter().map(|r| r.ts));
+    }
+    ts
+}
+
+/// The copy holds the origin's open run 1..=3 live and reconnects after
+/// the origin wrote 4 and 5 to it. Nothing is sealed past the copy's
+/// watermark, so the publisher sends no `Sync` and the copy keeps the run's
+/// anchor among its live rows; after the origin seals, the copy takes the
+/// segment and the next run with its anchor.
+#[test]
+fn a_resume_inside_the_origins_open_run_keeps_the_runs_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, anchored());
+    run(&mut origin, 1..=3, true);
+    connect_with(&o, &c, anchored).close();
+    run(&mut origin, 4..=5, false);
+    let link = connect_with(&o, &c, anchored);
+    assert_eq!(count(&link.frames, is_sync), 0);
+    link.close();
+    assert_eq!(decodable(&c), (1..=5).collect::<Vec<_>>());
+
+    origin.seal(&["s"]);
+    run(&mut origin, 6..=7, true);
+    connect_with(&o, &c, anchored).close();
+    assert_eq!(decodable(&o), (1..=7).collect::<Vec<_>>());
+    assert_eq!(decodable(&c), decodable(&o));
+    origin.close();
+}
+
+/// The copy holds 1..=3 live; the origin seals 1..=5 and opens a run at 6.
+/// The sync point falls below the origin's segment, and the copy takes the
+/// segment whole and the open run from its anchor.
+#[test]
+fn a_sync_below_an_origin_seal_ships_the_open_run_from_its_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, anchored());
+    run(&mut origin, 1..=3, true);
+    connect_with(&o, &c, anchored).close();
+    run(&mut origin, 4..=5, false);
+    origin.seal(&["s"]);
+    run(&mut origin, 6..=7, true);
+    let link = connect_with(&o, &c, anchored);
+    assert!(link
+        .frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 0, .. })));
+    assert_eq!(shipped_rows(&link.frames, "s"), vec![6, 7]);
+    link.close();
+    assert_eq!(decodable(&c), (1..=7).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// While connected, the origin seals the run the copy holds live and opens
+/// another: the segment replaces the copy's live rows, and the new run
+/// arrives with its anchor.
+#[test]
+fn a_connected_seal_ships_the_next_run_from_its_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, anchored());
+    run(&mut origin, 1..=3, true);
+    let mut link = connect_with(&o, &c, anchored);
+    run(&mut origin, 4..=5, false);
+    link.poll(&o);
+    origin.seal(&["s"]);
+    run(&mut origin, 6..=7, true);
+    let (_, frames) = link.poll(&o);
+    assert_eq!(count(&frames, is_segment_after), 1);
+    link.close();
+    assert_eq!(decodable(&c), (1..=7).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// The copy holds 1..=5 live, one run; the origin seals it with more rows,
+/// opens and seals a run at 9, and evicts before 9. The `Sync` at the copy's
+/// newest row seals the copy's live rows with its own encoder, and the run's
+/// anchor is among them, so none is lost.
+#[test]
+fn a_sync_after_eviction_seals_the_copys_tail_with_its_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, anchored());
+    run(&mut origin, 1..=3, true);
+    connect_with(&o, &c, anchored).close();
+    run(&mut origin, 4..=5, false);
+    connect_with(&o, &c, anchored).close();
+    run(&mut origin, 6..=8, false);
+    origin.seal(&["s"]);
+    run(&mut origin, 9..=11, true);
+    origin.seal(&["s"]);
+    origin.w.evict_before(9).unwrap();
+    origin.w.sync().unwrap();
+    let link = connect_with(&o, &c, anchored);
+    assert!(link
+        .frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 5, .. })));
+    assert_eq!(link.opened.rows_unsealable, 0);
+    link.close();
+    assert_eq!(decodable(&c), (1..=5).chain(9..=11).collect::<Vec<_>>());
+    origin.close();
 }
