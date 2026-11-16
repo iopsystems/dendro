@@ -63,7 +63,11 @@ struct Origin {
 
 impl Origin {
     fn create(path: &Path) -> Self {
-        let mut archive = Writer::create(path, Box::new(Tags)).unwrap();
+        Self::create_with(path, Box::new(Tags))
+    }
+
+    fn create_with(path: &Path, encoder: Box<dyn SegmentEncoder + Send>) -> Self {
+        let mut archive = Writer::create(path, encoder).unwrap();
         let w = archive
             .add_source(SourceMeta {
                 labels: BTreeMap::from([("source".to_string(), "a".to_string())]),
@@ -106,7 +110,10 @@ fn readable(path: &Path) -> BTreeMap<String, Vec<i64>> {
                 .segments_overlapping(rec.id, &stream, i64::MIN, i64::MAX)
                 .unwrap()
             {
-                let text = String::from_utf8(seg.bytes).unwrap();
+                // `Padded` segments end in spaces after the timestamps.
+                let mut bytes = seg.bytes;
+                bytes.truncate(padding_start(&bytes));
+                let text = String::from_utf8(bytes).unwrap();
                 ts.extend(text.split(',').map(|t| t.parse::<i64>().unwrap()));
             }
             ts.extend(db.live_wal(rec.id, &stream).unwrap().iter().map(|r| r.ts));
@@ -116,6 +123,11 @@ fn readable(path: &Path) -> BTreeMap<String, Vec<i64>> {
         }
     }
     out
+}
+
+/// Where a segment's padding starts, or its length if it has none.
+fn padding_start(bytes: &[u8]) -> usize {
+    bytes.iter().position(|&b| b == b' ').unwrap_or(bytes.len())
 }
 
 /// Through the version 2 codec and into the subscriber.
@@ -1687,4 +1699,168 @@ fn rows_a_connected_sync_deleted_are_shipped_again() {
     assert_eq!(shipped_rows(&frames, "s"), vec![7, 8]);
     link.close();
     assert_eq!(readable(&c)["s"], (1..=8).collect::<Vec<_>>());
+}
+
+/// `Tags`, with each segment padded with spaces to the size of the rows it
+/// holds, as an encoder that keeps the rows' bytes would make it.
+struct Padded;
+
+impl SegmentEncoder for Padded {
+    fn encode(&self, ctx: &EncodeContext<'_>, rows: &[WalRow]) -> EncodeResult {
+        let mut segment = Tags.encode(ctx, rows)?;
+        if let Some(segment) = segment.as_mut() {
+            let size: usize = rows.iter().map(|r| r.row.len()).sum();
+            if segment.bytes.len() < size {
+                segment.bytes.resize(size, b' ');
+            }
+        }
+        Ok(segment)
+    }
+}
+
+/// One live row whose `Rows` frame is above `MAX_FRAME_BYTES` on its own.
+fn oversized_row(stream: &str, ts: i64) -> WalRow {
+    WalRow {
+        stream: stream.to_string(),
+        ts,
+        wall_offset: 0,
+        row: vec![7; dendro::replicate::wire::MAX_FRAME_BYTES + 1],
+    }
+}
+
+fn poll_error(link: &mut Link, origin: &Path) -> String {
+    link.publisher
+        .next(&Archive::open(origin).unwrap())
+        .unwrap_err()
+        .to_string()
+}
+
+/// On version 2, a live row too large for a frame stops `next` until it is
+/// sealed: the seal ships it in a `SegmentAfter` after the stream's shipped
+/// rows, sent in parts because the segment is above the frame limit too, and
+/// the copy ends up holding what the origin holds.
+#[test]
+fn an_oversized_row_on_a_shipped_stream_is_cleared_by_sealing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, Box::new(Padded));
+    origin.rows("s", [1]);
+    origin.seal(&["s"]);
+    origin.rows("s", [2]);
+    let mut link = connect(&o, &c);
+    assert_eq!(shipped_rows(&link.frames, "s"), vec![2]);
+
+    origin.w.wal(vec![oversized_row("s", 3)]).unwrap();
+    origin.w.sync().unwrap();
+    for _ in 0..2 {
+        let err = poll_error(&mut link, &o);
+        assert!(err.contains("a row makes a"), "{err}");
+    }
+
+    origin.seal(&["s"]);
+    let (applied, frames) = link.poll(&o);
+    let sizes: Vec<usize> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::SegmentAfter { bytes, .. } => Some(bytes.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sizes.len(), 1);
+    assert!(
+        sizes[0] > dendro::replicate::wire::MAX_FRAME_BYTES,
+        "{sizes:?}"
+    );
+    assert_eq!(applied.rows_unsealable, 0);
+    link.close();
+    assert_eq!(readable(&c), readable(&o));
+    assert_eq!(readable(&c)["s"], vec![1, 2, 3]);
+    origin.close();
+}
+
+/// The same on a stream the publisher has shipped nothing of: once sealed,
+/// the stream is first seen sealed and its segment, above the frame limit,
+/// ships in parts.
+#[test]
+fn an_oversized_row_on_an_unshipped_stream_is_cleared_by_sealing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, Box::new(Padded));
+    origin.rows("s", [1]);
+    let mut link = connect(&o, &c);
+
+    origin.w.wal(vec![oversized_row("t", 2)]).unwrap();
+    origin.w.sync().unwrap();
+    for _ in 0..2 {
+        let err = poll_error(&mut link, &o);
+        assert!(err.contains("a row makes a"), "{err}");
+    }
+
+    origin.seal(&["t"]);
+    let (applied, frames) = link.poll(&o);
+    let sizes: Vec<usize> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Segment { bytes, .. } => Some(bytes.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sizes.len(), 1);
+    assert!(
+        sizes[0] > dendro::replicate::wire::MAX_FRAME_BYTES,
+        "{sizes:?}"
+    );
+    assert_eq!(applied.segments, 1);
+    link.close();
+    assert_eq!(readable(&c), readable(&o));
+    assert_eq!(readable(&c)["t"], vec![2]);
+    origin.close();
+}
+
+/// A seal the encoder refuses leaves the oversized row live, so `next` keeps
+/// failing. The writer has stopped, so its `discard_live_rows` returns the
+/// encoder's error; after the join, `ArchiveMut::discard_live_rows` removes
+/// the row and `next` succeeds.
+#[test]
+fn an_oversized_row_the_encoder_refuses_to_seal_stays_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let mut origin = Origin::create_with(&o, Box::new(Padded));
+    origin.rows("s", [1]);
+    origin.seal(&["s"]);
+    let mut link = connect(&o, &c);
+
+    // `Tags` refuses rows in [1000, 2000).
+    origin.w.wal(vec![oversized_row("s", 1_500)]).unwrap();
+    origin.w.sync().unwrap();
+    let err = poll_error(&mut link, &o);
+    assert!(err.contains("a row makes a"), "{err}");
+
+    origin.w.seal(vec!["s".to_string()]).unwrap();
+    let refused = origin.w.sync().unwrap_err().to_string();
+    assert!(refused.contains("do not encode"), "{refused}");
+    let db = Archive::open(&o).unwrap();
+    let id = db.read_sources().unwrap()[0].id;
+    let live: Vec<i64> = db.live_wal(id, "s").unwrap().iter().map(|r| r.ts).collect();
+    assert_eq!(live, vec![1_500]);
+    drop(db);
+    let err = poll_error(&mut link, &o);
+    assert!(err.contains("a row makes a"), "{err}");
+
+    let mut w = origin.w;
+    let stopped = w
+        .discard_live_rows(Box::new(|s: &str| s == "s"))
+        .unwrap_err()
+        .to_string();
+    assert!(stopped.contains("do not encode"), "{stopped}");
+    drop(w);
+    let mut archive = origin.archive;
+    assert!(archive.join().is_err());
+
+    let mut db = ArchiveMut::open(&o).unwrap();
+    assert_eq!(db.discard_live_rows(id, &|s: &str| s == "s").unwrap(), 1);
+    drop(db);
+    let (_, frames) = link.poll(&o);
+    assert!(shipped_rows(&frames, "s").is_empty());
+    link.close();
 }
