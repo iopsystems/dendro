@@ -488,11 +488,27 @@ Merged as #85 (2c66d96), released in 0.8.0.
 Open after 0.8.0:
 
 - B and C, plan steps 4 and 3.
-- The rustdoc on `ArchivePublisher::next` names one way to clear an
+
+Resolved after 0.8.0:
+
+- The rustdoc on `ArchivePublisher::next` named one way to clear an
   oversized live row, `discard_live_rows`; evicting the segment is for an
   oversized segment on version 1, and since #85 eviction keeps live rows.
   The 0.8.0 release review reported a second on protocol version 2: sealing
   the row, after which it ships in a segment frame with no frame size check
   (`src/replicate/publisher.rs`: `cursor_sync`'s `SegmentAfter` frames for a
   stream already shipped, and the `version_2` branch of the first-seen
-  segment loop). Not tested; the rustdoc gains it once a test shows it.
+  segment loop). Confirmed by
+  `an_oversized_row_on_a_shipped_stream_is_cleared_by_sealing_it` and
+  `an_oversized_row_on_an_unshipped_stream_is_cleared_by_sealing_it`
+  (`tests/replicate_resume.rs`), each with a segment above
+  `MAX_FRAME_BYTES`; a size check added to either path fails its test. The
+  rustdoc now names sealing and the conditions under which it removes the
+  row, which depend on the protocol version, whether the stream has a
+  cursor, and what the encoder does with the row; three reviews each found
+  a case the previous wording got wrong.
+  `an_oversized_row_the_encoder_refuses_to_seal_stays_live` covers a refused
+  seal: it stops the writer, and the row is then removed with
+  `ArchiveMut::discard_live_rows` after `Writer::join`. The version 1 cases
+  and an encoder that drops the row were checked by the reviews' probes and
+  have no test.

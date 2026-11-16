@@ -286,10 +286,23 @@ impl ArchivePublisher {
     /// `MAX_FRAME_BYTES` on its own. On version 2
     /// ([`resuming`](Self::resuming)) it fails when one row makes a frame
     /// larger than that, and when a stream has no sync point. Each of these
-    /// repeats on every call until its cause is removed (the row discarded
-    /// with `SourceWriter::discard_live_rows`, the segment
-    /// evicted), and it holds back every source, because one call answers for
-    /// all of them.
+    /// repeats on every call until its cause is removed, and it holds back
+    /// every source, because one call answers for all of them.
+    ///
+    /// An oversized row is removed by `SourceWriter::discard_live_rows`, or by
+    /// sealing it. On version 2 its segment ships in parts, up to
+    /// `MAX_SPLIT_FRAME_BYTES`. On version 1 it ships only if its frame is
+    /// within `MAX_FRAME_BYTES`, and for a stream that already has a cursor
+    /// (see the [type-level documentation](Self) for the streams that have
+    /// none), only after a reconnect with [`catching_up`](Self::catching_up),
+    /// because the seal moves the watermark past the cursor. A seal leaves the row live when the encoder returns no
+    /// segment or one that ends before the row, and deletes it without sealing
+    /// it when the segment starts after it. A `seal` or `seal_capped` the
+    /// encoder refuses stops the writer for every source: the row stays live,
+    /// every `SourceWriter` call that reaches the writer after that returns the
+    /// encoder's error, and the row is removed with
+    /// `ArchiveMut::discard_live_rows` after `Writer::join`. An oversized
+    /// segment on version 1 is removed by evicting it.
     pub fn next(&mut self, db: &Archive) -> Result<Vec<Frame>> {
         // A call that fails returns no frames, so it must not move any cursor
         // either: the frames it built for earlier sources, and the index and
