@@ -296,6 +296,11 @@ nothing is unchecked, so an unversioned encoder and a source from before
 the key behave as before. The one-line follow-on the encoder-boundary entry
 asked for, riding on item 4's primitive. `tests/encoder_version.rs`.
 
+Superseded in 0.8.0 by [the live tail](2026-11-14-the-live-tail.md), D
+(#85): eviction no longer deletes live rows, and `Evicted::live_rows` was
+replaced by `Evicted::kept_live_rows`. The paragraph below records the
+decision as it was made here.
+
 **Retention versus encoder anchors (landed as loudness, not as a new
 rule).** The two designs named below — the encoder declaring its oldest
 self-sufficient row, or eviction never deleting live rows — each move a
