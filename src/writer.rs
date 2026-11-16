@@ -111,9 +111,9 @@ enum Msg {
         /// watermark already covers, which a reconnect produces normally.
         reply: SyncSender<Result<bool>>,
     },
-    /// Retention: drop everything wholly older than `cutoff_ts`, then trickle
-    /// freed pages back if the free list has grown. Only a caller with a
-    /// retention policy sends this.
+    /// Retention: drop segments wholly older than `cutoff_ts` and the WAL rows
+    /// before it that a segment covers, then trickle freed pages back if the
+    /// free list has grown. Only a caller with a retention policy sends this.
     ///
     /// `streams` restricts the pass, so different streams can be worth
     /// different amounts of time; `None` is the whole source. It is boxed
@@ -1395,17 +1395,21 @@ impl SourceWriter {
     /// Not fire-and-forget, unlike `wal` and `seal`: it waits for the writer
     /// thread to run the pass and returns what it removed, or its error.
     ///
+    /// The pass keeps every live row, whatever its timestamp, and counts the
+    /// ones before the cutoff in [`Evicted::kept_live_rows`]; see
+    /// [`ArchiveMut::evict_before`](crate::archive::ArchiveMut::evict_before).
+    ///
     /// A stream whose last [`seal`](Self::seal) was deferred is sealed first,
-    /// with that seal's retries, because its live rows are in no segment and
-    /// the oldest of them may be one the rest need to decode. A stream still
-    /// unsealed after that is left out of the pass and counted in
-    /// [`Evicted::held_streams`]; the first pass after its seal commits
-    /// evicts it. After the first deferred stream whose retry fails with a
-    /// retryable error, the remaining ones are held without being tried, so
-    /// a pass waits for at most one retry schedule. A stream whose retried
-    /// seal fails with an error that is not retryable, such as an encoder
-    /// error, is not held: it is logged and its live rows are evicted. This
-    /// applies to every eviction spelling.
+    /// with that seal's retries, so the rows it seals can be evicted. After
+    /// the first deferred stream whose retry fails with a retryable error,
+    /// the remaining ones are not tried, so a pass waits for at most one
+    /// retry schedule before its own transaction, which waits up to one
+    /// busy timeout; those stay deferred and are retried before the next
+    /// pass. A stream whose retried seal fails with an error that is not
+    /// retryable, such as an encoder error, is logged and no longer
+    /// deferred. Either way the pass evicts the stream's segments and keeps
+    /// its live rows, as for any stream. This applies to every eviction
+    /// spelling.
     pub fn evict_before(&mut self, cutoff_ts: i64) -> Result<Evicted> {
         self.evict(cutoff_ts, None, None)
     }
@@ -2270,12 +2274,10 @@ fn writer_loop(
     // retention, which can remove a name's newest rows.
     let mut caller_floors: BTreeMap<(i64, String), CallerFloor> = BTreeMap::new();
     // Per source, the streams whose last seal was deferred, with the
-    // smallest `max_rows` asked for them. Their live rows are in no segment,
-    // and the oldest of them is the one a caller's encoder may need to
-    // decode the rest (a schema stated once at a segment's start), so a
-    // retention pass must not delete them. `Evict` retries their seal first
-    // and leaves out any stream still listed. A seal that commits takes its
-    // streams off the list.
+    // smallest `max_rows` asked for them. `Evict` retries their seal first;
+    // a stream still listed after that keeps its live rows through the
+    // pass, as any stream does. A seal that commits takes its streams off
+    // the list.
     let mut deferred: BTreeMap<i64, BTreeMap<String, usize>> = BTreeMap::new();
     // How many sources were opened, and how many closed cleanly. Reclaim at
     // exit only when they match: an unclean exit is the recovery artifact and
@@ -2428,9 +2430,9 @@ fn writer_loop(
                     )
                 }) {
                     Ok(()) => {
-                        if let Some(held) = deferred.get_mut(&source_id) {
+                        if let Some(pending) = deferred.get_mut(&source_id) {
                             for stream in &batch {
-                                held.remove(stream);
+                                pending.remove(stream);
                             }
                         }
                     }
@@ -2441,9 +2443,9 @@ fn writer_loop(
                              before the next retention pass",
                             batch.len()
                         );
-                        let held = deferred.entry(source_id).or_default();
+                        let pending = deferred.entry(source_id).or_default();
                         for stream in batch {
-                            let cap = held.entry(stream).or_insert(max_rows);
+                            let cap = pending.entry(stream).or_insert(max_rows);
                             *cap = (*cap).min(max_rows);
                         }
                     }
@@ -2592,11 +2594,11 @@ fn writer_loop(
                 reply,
             }) => {
                 // A stream whose seal was deferred is sealed now, before
-                // anything is cut. Its rows are in no segment, and deleting
-                // the oldest of them can leave the rest undecodable. A
-                // stream still unsealed after a retryable failure is left
-                // out of the pass, its sealed segments included.
-                let held = retry_deferred_seals(
+                // anything is cut, so the rows it seals can be evicted. One
+                // still unsealed after a retryable failure stays deferred;
+                // the pass evicts its segments and keeps its live rows, as
+                // for any stream.
+                let unsealed = retry_deferred_seals(
                     db,
                     source_id,
                     &mut deferred,
@@ -2604,31 +2606,15 @@ fn writer_loop(
                     &mut watermarks,
                     encoder,
                 );
-                // Reported, not swallowed. `Evicted` exists so a caller can
-                // tell "the window moved" from "nothing was old enough yet",
-                // and the writer used to throw it away - which made it
-                // unreachable through the only supported path.
-                // Counted only where the caller's own filter would have
-                // evicted, so the count is what this pass held back.
-                let held: BTreeSet<String> = held
-                    .into_iter()
-                    .filter(|s| streams.as_ref().is_none_or(|evict| evict(s)))
-                    .collect();
-                let streams: Option<StreamFilter> = if held.is_empty() {
-                    streams
-                } else {
+                if !unsealed.is_empty() {
                     warn!(
-                        "retention on source {source_id} skipped {} stream(s) whose seal is \
-                         deferred: {:?}; they are evicted by the first pass after they seal",
-                        held.len(),
-                        held
+                        "retention on source {source_id} could not seal {} deferred stream(s) \
+                         first: {:?}; their live rows are kept and they are retried before \
+                         the next pass",
+                        unsealed.len(),
+                        unsealed
                     );
-                    let held = held.clone();
-                    Some(match streams {
-                        Some(evict) => Box::new(move |s: &str| !held.contains(s) && evict(s)),
-                        None => Box::new(move |s: &str| !held.contains(s)),
-                    })
-                };
+                }
                 let evicted = match streams {
                     Some(keep) => match &floor {
                         Some(floor) => db.evict_streams_before_with_floor(
@@ -2641,17 +2627,13 @@ fn writer_loop(
                         None => db.evict_before(source_id, cutoff_ts),
                     },
                 };
-                let evicted = evicted.map(|mut e| {
-                    e.held_streams = held.len();
-                    e
-                });
                 if let Ok(e) = &evicted {
-                    if e.live_rows > 0 {
+                    if e.kept_live_rows > 0 {
                         warn!(
-                            "retention on source {source_id} deleted {} row(s) no segment \
-                             held: the stream's seal cadence is slower than the lookback. \
-                             Seal at least as often as you evict",
-                            e.live_rows
+                            "retention on source {source_id} kept {} row(s) before the cutoff \
+                             that no segment holds; they stay until a seal covers them or \
+                             `discard_live_rows` deletes them",
+                            e.kept_live_rows
                         );
                     }
                 }
@@ -2700,8 +2682,8 @@ fn writer_loop(
                 // A deferred seal of a discarded stream would find no live
                 // rows, and warn about it if the stream never sealed.
                 if discarded.is_ok() {
-                    if let Some(held) = deferred.get_mut(&source_id) {
-                        held.retain(|stream, _| !streams(stream));
+                    if let Some(pending) = deferred.get_mut(&source_id) {
+                        pending.retain(|stream, _| !streams(stream));
                     }
                     refresh_newest(db, &mut newest, source_id, "discarding live rows");
                 }
@@ -2984,8 +2966,8 @@ fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
 /// failure does not hold back another; nothing relies on deferred streams
 /// sealing together.
 ///
-/// After the first retryable failure the remaining streams are held without
-/// being tried. A lock or I/O error that outlasted one retry schedule will
+/// After the first retryable failure the remaining streams stay deferred
+/// without being tried. A lock or I/O error that outlasted one retry schedule will
 /// almost always outlast the next, and a schedule per stream would block
 /// the writer thread for one schedule (about 20 s at the default busy
 /// timeout) per deferred stream.
@@ -2993,11 +2975,11 @@ fn reclaim_all(db: &mut ArchiveMut) -> Result<()> {
 /// A stream that seals, or whose seal fails with an error that is not
 /// retryable, is taken off `deferred`. The second is logged rather than
 /// returned, because retention failing must not stop the writer, and it is
-/// not held: an encoder that fails on these rows fails on them at every
-/// pass, so holding them would keep the stream out of retention for good
-/// and re-encode its growing backlog each time. The pass then treats its
-/// live rows as it treated them before deferrals were tracked, and a
-/// `Seal` of the stream that fails the same way stops the writer.
+/// not retried at later passes: an encoder that fails on these rows fails on
+/// them at every pass, and each retry would re-encode the stream's growing
+/// backlog. Retention keeps its live rows, so unless the caller deletes them
+/// with `discard_live_rows`, a `Seal` of the stream that fails the same way
+/// stops the writer.
 fn retry_deferred_seals(
     db: &mut ArchiveMut,
     source_id: i64,
@@ -3009,10 +2991,10 @@ fn retry_deferred_seals(
     let Some(listed) = deferred.remove(&source_id) else {
         return BTreeSet::new();
     };
-    let mut held = BTreeMap::new();
+    let mut still = BTreeMap::new();
     for (stream, cap) in listed {
-        if !held.is_empty() {
-            held.insert(stream, cap);
+        if !still.is_empty() {
+            still.insert(stream, cap);
             continue;
         }
         match with_retries("sealing a deferred stream before retention", || {
@@ -3028,17 +3010,17 @@ fn retry_deferred_seals(
         }) {
             Ok(()) => {}
             Err(e) if e.is_retryable() => {
-                held.insert(stream, cap);
+                still.insert(stream, cap);
             }
             Err(e) => warn!(
                 "sealing deferred stream `{stream}` of source {source_id} before retention \
-                 failed ({e}); its live rows are evicted as unsealed rows"
+                 failed ({e}); its segments are evicted and its live rows are kept"
             ),
         }
     }
-    let streams = held.keys().cloned().collect();
-    if !held.is_empty() {
-        deferred.insert(source_id, held);
+    let streams = still.keys().cloned().collect();
+    if !still.is_empty() {
+        deferred.insert(source_id, still);
     }
     streams
 }
@@ -3230,7 +3212,10 @@ fn sync_stream(
         .unwrap_or(0);
 
     with_retries("syncing a stream", || {
-        db.transaction(|tx| {
+        // Immediate: the first statement, the `CREATE TABLE IF NOT EXISTS
+        // bounds` that recording a bound or deleting a segment begins with,
+        // reads.
+        db.transaction_immediate(|tx| {
             if let Some(newest) = held_newest.filter(|n| *n > at) {
                 tx.record_stream_bound(source_id, stream, newest)?;
             }

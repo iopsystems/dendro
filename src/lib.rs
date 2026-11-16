@@ -79,10 +79,11 @@
 //!   source, stop before the source does, and leave gaps. Nothing in the
 //!   container says otherwise, and nothing records what its span was meant to
 //!   be.
-//! * A stream can stop existing. Once retention has evicted its last segment
-//!   and its last WAL row it vanishes from `all_streams`, and the archive
-//!   keeps no record that it was ever there. Reusing the name later starts a
-//!   new one.
+//! * A stream can stop existing. Once its segments and WAL rows are gone
+//!   (retention removes the segments and the rows they cover,
+//!   `discard_live_rows` the live rows) it vanishes from `all_streams`, and
+//!   the archive keeps no record that it was ever there. Reusing the name
+//!   later starts a new one.
 //!
 //! The nesting is therefore about containment, not lifetime: an archive holds
 //! what its sources' streams currently hold, and nothing more.

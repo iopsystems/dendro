@@ -262,6 +262,143 @@ fn a_busy_database_is_retried_rather_than_fatal() {
     archive.join().unwrap();
 }
 
+/// A retention pass, and a discard of live rows, that meets another
+/// connection's write lock waits for it through the busy timeout. Each
+/// transaction begins with a read (bounds, the live-row count), and a
+/// deferred transaction upgraded to a write under a held lock failed with
+/// `SQLITE_BUSY` at once. Retention is not retried, so the pass returned
+/// that error; a discard is, so its lock is held past the retry schedule
+/// (about 310 ms). Both eviction spellings, whole source and per stream.
+#[test]
+fn a_retention_pass_waits_for_a_held_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("evict-busy.dendro");
+    let mut archive = Writer::create_with_busy_timeout(
+        &path,
+        Box::new(Tags),
+        Duration::from_secs(10),
+        Duration::from_millis(2_000),
+    )
+    .unwrap();
+    let mut w = archive.add_source(source("a")).unwrap();
+    let id = w.source_id();
+    w.wal(
+        vec![row(1_000), row(2_000)]
+            .into_iter()
+            .map(|mut r| {
+                r.stream = "s".to_string();
+                r
+            })
+            .collect(),
+    )
+    .unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.wal(vec![row(3_000)]).unwrap();
+    w.sync().unwrap();
+
+    let hold = |ms: u64| {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let lock_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&lock_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(ms));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        holder
+    };
+
+    let holder = hold(150);
+    let evicted = w
+        .evict_streams_before(2_500, Box::new(|s: &str| s == "s"))
+        .unwrap();
+    holder.join().unwrap();
+    assert_eq!(evicted.segments, 1, "{evicted:?}");
+
+    let holder = hold(150);
+    w.evict_before(2_500).unwrap();
+    holder.join().unwrap();
+
+    // `discard_live_rows` begins with a read too. Held past the writer's
+    // retries, so only a transaction that waits for the lock gets through.
+    let holder = hold(600);
+    assert_eq!(
+        w.discard_live_rows(Box::new(|s: &str| s == "s")).unwrap(),
+        1
+    );
+    holder.join().unwrap();
+
+    let db = Archive::open(&path).unwrap();
+    assert!(db.read_segment_meta(id, "s").unwrap().is_empty());
+    assert_eq!(wal_ts(&db, id), Vec::<i64>::new());
+    drop(w);
+    archive.join().unwrap();
+}
+
+/// Holds another connection's write lock until the returned sender fires or
+/// 20 s pass, whichever is first.
+fn hold_write_lock(
+    path: &std::path::Path,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let lock_path = path.to_path_buf();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&lock_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// Operations with nothing to write do not wait for another connection's
+/// write lock: a seal of a stream with no live rows, and a discard whose
+/// filter matches no stream. An IMMEDIATE transaction would wait out the
+/// busy timeout for them.
+#[test]
+fn operations_with_nothing_to_write_do_not_wait_for_a_held_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nothing.dendro");
+    let mut archive = Writer::create_with_busy_timeout(
+        &path,
+        Box::new(Tags),
+        Duration::from_secs(10),
+        Duration::from_millis(2_000),
+    )
+    .unwrap();
+    let mut w = archive.add_source(source("a")).unwrap();
+    w.wal(vec![row(1_000)]).unwrap();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.sync().unwrap();
+
+    let (release, holder) = hold_write_lock(&path);
+    let started = std::time::Instant::now();
+    w.seal(vec!["s".to_string()]).unwrap();
+    w.sync().unwrap();
+    let sealed = started.elapsed();
+    let started = std::time::Instant::now();
+    let discarded = w.discard_live_rows(Box::new(|_: &str| false));
+    let discard_took = started.elapsed();
+    let _ = release.send(());
+    holder.join().unwrap();
+    assert!(
+        sealed < Duration::from_millis(1_000),
+        "an empty seal waited {sealed:?} for the lock"
+    );
+    assert!(
+        discard_took < Duration::from_millis(1_000),
+        "an empty discard waited {discard_took:?} for the lock"
+    );
+    assert_eq!(discarded.unwrap(), 0);
+    drop(w);
+    archive.join().unwrap();
+}
+
 /// An encoder that panics on the writer thread used to leave every handle
 /// reporting `WriterGone`, as if the archive had been joined. It is the
 /// encoder's failure and is reported as one, with the panic's message.

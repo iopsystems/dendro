@@ -172,9 +172,11 @@ of the nesting above.
 A stream is thinner still. There is no `streams` table. A stream is a name
 that rows in `segments` and `wal` carry, and the set of streams is the union
 of those two columns. So a stream needs no declaration, has no lifetime of
-its own, and **stops existing** once retention takes its last segment and its
-last WAL row: it disappears from `all_streams`, and the archive keeps no
-record that it was there. Reusing the name later starts a new stream.
+its own, and stops existing once its segments and WAL rows are gone:
+retention removes its segments and the rows they cover, and
+`discard_live_rows` removes its live rows. It then disappears from
+`all_streams`, and the archive keeps no record that it was there. Reusing
+the name later starts a new stream.
 
 ## Quick start
 
@@ -206,12 +208,16 @@ integer and a string) unrelated to the telemetry dendro was extracted from.
 ## Also here
 
 - **Retention, as policy you write.** `SourceWriter::evict_before` drops
-  everything wholly older than a cutoff and reports what it removed;
-  `evict_streams_before` restricts that to the streams a predicate accepts,
-  so different streams can have different retention periods. `segment_sizes`
-  and `archive_bytes` are what a size cap consults. Freed pages return to the
-  filesystem gradually, which is what bounds a rolling buffer. dendro
-  supplies the mechanism and applies no policy of its own.
+  the segments wholly older than a cutoff and the WAL rows before it that a
+  segment covers, keeps rows no segment holds yet, and reports what it
+  removed and kept; `evict_streams_before` restricts that to the streams a
+  predicate accepts, so different streams can have different retention
+  periods. `segment_sizes` and `archive_bytes` are what a size cap
+  consults. Freed pages return to the filesystem gradually. A stream that
+  goes longer without sealing than the retention window (the span from the
+  cutoff to the stream's newest row) keeps rows older than the cutoff;
+  sealing each stream at least once per window, in row time, avoids that.
+  dendro supplies the mechanism and applies no policy of its own.
   `discard_live_rows` deletes only a stream's live rows, the rows after its
   newest segment or every row of a stream with no segment, for a stream
   whose rows cannot be sealed. Rows written to the stream afterwards must

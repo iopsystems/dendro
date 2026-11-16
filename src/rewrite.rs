@@ -342,7 +342,9 @@ pub fn compact_stream_with<M: MetadataMerge + ?Sized>(
         // would be handed sealed rows again as a live tail. Other
         // connections see the whole thing or none of it.
         let seq = run[0].0;
-        db.transaction(|tx| {
+        // Immediate: the first statement, `delete_segment`'s
+        // `CREATE TABLE IF NOT EXISTS bounds`, reads.
+        db.transaction_immediate(|tx| {
             for (s, _) in run {
                 tx.delete_segment(source_id, stream, *s)?;
             }

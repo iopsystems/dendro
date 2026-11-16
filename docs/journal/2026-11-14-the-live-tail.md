@@ -268,7 +268,7 @@ retryable has its live rows evicted (`src/writer.rs:2590-2640`).
    neither; see Outcome.
 3. Decide C.
 4. Design B with metriken-storage, starting from the question above.
-5. Decide D.
+5. Decide D. Decided: dendro guarantees it; see Outcome.
 
 Whether 0.8.0 (#82) waits for any of this is open. A changes nothing on the
 wire. B could change what a `Sync` frame has to delete.
@@ -372,7 +372,7 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A is done; B, C and D are not started.
+Open. A and D are done; B and C are not started.
 
 A, decided 2026-11-15 and implemented in the change that adds
 `tests/seal_atomic.rs`:
@@ -397,3 +397,77 @@ A, decided 2026-11-15 and implemented in the change that adds
   covered rows, a trigger refuses deleting them, and the sync must fail with
   the copy unchanged. Against the previous `src/writer.rs` the sync succeeds,
   because the failed prune after its commit only logged a warning.
+
+D, decided 2026-11-15: dendro guarantees it. Eviction keeps live rows.
+
+- The other option was for the writer to seal a stream before evicting it.
+  It was rejected because the writer thread holds no `SealPolicy`, so it
+  would choose segment edges (`max_rows`, `align`) the caller did not, and
+  `src/seal.rs` documents that dendro never seals on its own.
+- The rule applies to `ArchiveMut` eviction as well as the writer's, so one
+  operation has one meaning. `discard_live_rows` deletes a stream's live
+  rows, and `ArchiveMut::prune_wal` past the watermark deletes those at or
+  below its `upto_ts`.
+- `Evicted::live_rows` is replaced by `kept_live_rows`, so a caller that
+  read the old count gets a compile error instead of a changed meaning. No
+  caller in rezolus or metriken-storage reads it.
+- Cost: a stream that goes longer without sealing than the retention window
+  (the span from the cutoff to the stream's newest row) keeps rows older
+  than the cutoff until it seals. A stream whose rows the encoder refuses
+  keeps them through retention, so its next seal fails until
+  `discard_live_rows` deletes them.
+- Callers, from a review of rezolus and metriken-storage 0.13.0:
+  - rezolus removes orphan streams with `evict_streams_before(id, i64::MAX,
+    ..)` (`crates/report-save/src/lib.rs:391`,
+    `src/parquet_tools/filter.rs:225`). From 0.8.0 that call keeps live
+    rows. The copies it runs on hold none for those streams, because
+    `copy_sources_into` seals each stream's live tail and metriken-storage's
+    encoder seals an occupant stream's rows to the last one, so the result
+    is unchanged. Two tests in `crates/rez/src/reader.rs` (lines 1544 and
+    1589) evict at `i64::MAX` on finalized fixtures, whose rows are all
+    sealed.
+  - metriken-storage's `SourceRecorder::evict_before`, which rezolus
+    hindsight's rolling buffer calls, does not seal occupant streams first.
+    Their live rows before the lagged cutoff are now kept until they seal,
+    which `SealPolicy::max_age` (300 s by default) bounds.
+- `eviction_keeps_an_unsealed_streams_anchor` (`tests/deferred_seal.rs`)
+  evicts past a never-sealed stream's anchor row and then seals it; every
+  row decodes. With the WAL delete made unconditional again it fails, as do
+  other eviction tests in `tests/deferred_seal.rs` and `tests/retention.rs`.
+- B's loss path through retention (an anchor row evicted before its run is
+  sealed) is closed by this; B's design question is unchanged.
+- The writer no longer holds a stream whose deferred seal could not commit
+  out of a pass, and `Evicted::held_streams` is removed. The hold existed to
+  protect live rows, which eviction now keeps. The retry before each pass
+  stays, because it is what seals a deferred stream the caller does not
+  name in a later seal.
+- Removing the hold exposed a bug older than this change: a write
+  transaction whose first statement reads (every retention pass records
+  bounds or counts live rows first) failed with `SQLITE_BUSY` at once under
+  another connection's write lock, instead of waiting for the busy timeout.
+  The hold had kept the tests that hold the lock during a pass away from the
+  stream being evicted.
+  - First fix, refuted: make `ArchiveMut::transaction` begin `IMMEDIATE`.
+    An IMMEDIATE transaction waits for the lock even when it writes
+    nothing. Review measured, at a 400 ms busy timeout under a held lock, a
+    seal of a stream with no live rows taking 2.05 s and being deferred,
+    and a document delete of a missing key or a refused put taking 2.04 s
+    and returning `database is locked`; the empty `ArchiveMut::insert_*`
+    calls failed the same way.
+  - Fix as landed: `ArchiveMut::transaction` stays deferred, and a
+    crate-private `transaction_immediate` is used by the callers that read
+    first and always write: eviction, `discard_live_rows` (which skips the
+    transaction when its filter matches no stream), `prune_wal` past the
+    watermark, compaction and `sync_stream`.
+  - `a_retention_pass_waits_for_a_held_write_lock` fails with those callers
+    deferred, and
+    `operations_with_nothing_to_write_do_not_wait_for_a_held_write_lock`
+    (both in `tests/writer_policy.rs`) fails with every transaction
+    IMMEDIATE (the empty seal waited 10.7 s) and with the empty-discard
+    guard removed. The first test also discards under a lock held past the
+    writer's retry schedule, and fails with `discard_live_rows` deferred.
+  - Not tested under a held lock: `sync_stream`, which the writer retries
+    like a discard, and `prune_wal` and compaction, which run on an
+    `ArchiveMut` handle and can meet another connection's lock only on one
+    from `ArchiveMut::create`, because `ArchiveMut::open` takes an
+    exclusive lock.

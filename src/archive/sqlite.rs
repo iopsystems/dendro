@@ -453,27 +453,17 @@ fn evict_caller_rows(
 pub struct Evicted {
     /// Sealed segments deleted.
     pub segments: usize,
-    /// WAL rows deleted, live and already-sealed together.
+    /// WAL rows deleted. Every one was covered by a sealed segment.
     pub wal_rows: usize,
-    /// How many of `wal_rows` were LIVE — past their stream's newest sealed
-    /// segment — when they were deleted. Those rows were in no segment: an
-    /// unclean kill would have kept them, and retention did not. It happens
-    /// when a stream's seal cadence is slower than the retention lookback,
-    /// and it is data loss the caller's own two policies caused, so it is
-    /// reported rather than hidden: a caller seeing this non-zero must seal at
-    /// least as often as it evicts.
-    pub live_rows: usize,
+    /// Live WAL rows (FORMAT.md §3.3) stamped before the cutoff, which the
+    /// pass kept. Retention never deletes a row no segment holds: such a row
+    /// stays until a seal puts it in a segment and a later pass evicts that
+    /// segment. A stream that goes longer without sealing than the retention
+    /// window keeps rows older than the cutoff this way until it seals. To
+    /// delete live rows, call [`ArchiveMut::discard_live_rows`].
+    pub kept_live_rows: usize,
     /// Rows of the caller's time-keyed store deleted; see [`CallerRow`].
     pub caller_rows: usize,
-    /// Streams the pass left alone because a seal of theirs was deferred
-    /// and still could not commit when the pass ran, counting only streams
-    /// the pass's own filter would have evicted. Only the writer
-    /// ([`SourceWriter::evict_before`](crate::writer::SourceWriter::evict_before)
-    /// and its variants) holds a stream back; an `ArchiveMut` pass has no
-    /// seals to wait for and reports 0. A held stream keeps everything this
-    /// pass would have removed, and the next pass after its seal commits
-    /// removes it.
-    pub held_streams: usize,
 }
 
 /// How many rows a table holds and what time span they cover, answered from
@@ -2866,12 +2856,34 @@ impl ArchiveMut {
     /// in a seal batch*. The writer also deletes a seal's covered WAL rows in
     /// the same transaction, through a crate-private method.
     pub fn transaction<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        self.transaction_with(rusqlite::TransactionBehavior::Deferred, f)
+    }
+
+    /// [`transaction`](Self::transaction), taking the write lock at BEGIN
+    /// through the busy handler. For a caller whose first statement reads
+    /// and which always writes: a deferred transaction holds a read snapshot
+    /// when its first write asks for the lock, and SQLite answers that with
+    /// SQLITE_BUSY at once instead of waiting out the busy timeout. Not the
+    /// default, because an IMMEDIATE transaction waits for the lock even
+    /// when it ends up writing nothing.
+    pub(crate) fn transaction_immediate<T>(
+        &mut self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.transaction_with(rusqlite::TransactionBehavior::Immediate, f)
+    }
+
+    fn transaction_with<T>(
+        &mut self,
+        behavior: rusqlite::TransactionBehavior,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let layout = self.db.layout;
         let tx = Transaction {
             tx: self
                 .db
                 .conn
-                .transaction()
+                .transaction_with_behavior(behavior)
                 .map_err(Error::sqlite("failed to begin transaction"))?,
             layout,
         };
@@ -3023,7 +3035,7 @@ impl ArchiveMut {
                 .execute(SQL, params)
                 .map_err(Error::sqlite(format!("failed to prune WAL for {stream}")));
         }
-        self.transaction(|tx| {
+        self.transaction_immediate(|tx| {
             record_stream_bounds(&tx.tx, source_id, Some(stream), None)?;
             tx.tx
                 .execute(SQL, params)
@@ -3032,8 +3044,14 @@ impl ArchiveMut {
     }
 
     /// **Retention.** Drop every segment that lies wholly before `cutoff_ts`,
-    /// and every WAL row stamped before it. This is what makes a bounded
-    /// rolling buffer possible.
+    /// and every WAL row stamped before it that a segment covers. This is
+    /// what makes a bounded rolling buffer possible.
+    ///
+    /// Live WAL rows (FORMAT.md §3.3) are kept whatever their timestamp, and
+    /// counted in [`Evicted::kept_live_rows`]: they are in no segment, and
+    /// deleting the oldest of a stream's live rows can leave the rest
+    /// undecodable for an encoder that states a schema once per segment. To
+    /// delete them, call [`discard_live_rows`](Self::discard_live_rows).
     ///
     /// Segment granularity is deliberate and visible to the caller: a segment
     /// goes only when its NEWEST row is out of the window (`last_ts <
@@ -3047,18 +3065,16 @@ impl ArchiveMut {
     /// statement.
     ///
     /// **The segment delete and the WAL delete are one transaction**, and that
-    /// is required for correctness. Deleting a
-    /// segment lowers `live_wal`'s watermark for its stream, so WAL rows the
-    /// segment already covered would become live again — a reader would splice
-    /// them back in as a tail. The same-cutoff WAL delete is what stops that,
-    /// and it only stops it if the two land together: a straddling row has
-    /// `ts <= last_ts < cutoff_ts`, so the WAL delete provably covers every row
-    /// the segment delete un-shadows.
+    /// is required for correctness. Deleting a segment lowers `live_wal`'s
+    /// watermark for its stream, so WAL rows the segment covered would become
+    /// live again, and a reader would splice them back in as a tail. The WAL
+    /// delete runs first, while those rows are still covered, and deletes
+    /// every covered row stamped before the cutoff: a row the segment delete
+    /// un-shadows has `ts <= last_ts < cutoff_ts`, so it is among them.
     pub fn evict_before(&mut self, source_id: i64, cutoff_ts: i64) -> Result<Evicted> {
         self.evict(
             source_id,
             "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
-            "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
             cutoff_ts,
             None,
         )
@@ -3080,7 +3096,6 @@ impl ArchiveMut {
         self.evict(
             source_id,
             "DELETE FROM segments WHERE source_id = ?1 AND last_ts < ?2",
-            "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2",
             cutoff_ts,
             Some(floor),
         )
@@ -3135,7 +3150,7 @@ impl ArchiveMut {
     /// `last_ts`, or every row of a stream with no segment. Rows at or
     /// before that `last_ts`, the streams' segments, caller rows and the
     /// source's clock offsets are kept. Returns the number of rows deleted.
-    /// One transaction.
+    /// One transaction, or none when `discard` accepts no stream.
     ///
     /// Use it for a stream whose live rows the encoder cannot seal: its
     /// earlier segments stay readable, and a read no longer materializes
@@ -3154,7 +3169,10 @@ impl ArchiveMut {
             .into_iter()
             .filter(|s| discard(s))
             .collect();
-        self.transaction(|tx| {
+        if streams.is_empty() {
+            return Ok(0);
+        }
+        self.transaction_immediate(|tx| {
             let mut deleted = 0;
             for stream in &streams {
                 record_stream_bounds(&tx.tx, source_id, Some(stream), None)?;
@@ -3188,13 +3206,14 @@ impl ArchiveMut {
             }
         }
         let streams: Vec<String> = streams.into_iter().filter(|s| evict(s)).collect();
-        self.transaction(|tx| {
+        self.transaction_immediate(|tx| {
             let mut total = Evicted::default();
             for stream in &streams {
                 let params = rusqlite::params![source_id, stream, cutoff_ts];
                 record_stream_bounds(&tx.tx, source_id, Some(stream), Some(cutoff_ts))?;
-                // Before the segment delete, for the reason `evict` gives.
-                total.live_rows += tx
+                // Both before the segment delete, for the reason `evict_before`
+                // gives: which rows are live depends on the segments.
+                total.kept_live_rows += tx
                     .tx
                     .query_row(
                         &format!("SELECT COUNT(*) FROM wal WHERE {LIVE_WAL_PREDICATE} AND ts < ?3"),
@@ -3204,6 +3223,16 @@ impl ArchiveMut {
                     .map_err(Error::sqlite(format!(
                         "failed to count live {stream} rows before eviction"
                     )))? as usize;
+                total.wal_rows += tx
+                    .tx
+                    .execute(
+                        &format!(
+                            "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3 \
+                             AND NOT ({LIVE_WAL_PREDICATE_FOR_ROW})"
+                        ),
+                        params,
+                    )
+                    .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
                 total.segments += tx
                     .tx
                     .execute(
@@ -3212,13 +3241,6 @@ impl ArchiveMut {
                         params,
                     )
                     .map_err(Error::sqlite(format!("failed to evict {stream} segments")))?;
-                total.wal_rows += tx
-                    .tx
-                    .execute(
-                        "DELETE FROM wal WHERE source_id = ?1 AND stream = ?2 AND ts < ?3",
-                        params,
-                    )
-                    .map_err(Error::sqlite(format!("failed to evict {stream} WAL rows")))?;
                 total.caller_rows +=
                     evict_caller_rows(&tx.tx, source_id, stream, cutoff_ts, floor)?;
             }
@@ -3249,7 +3271,6 @@ impl ArchiveMut {
         &mut self,
         source_id: i64,
         segments_sql: &str,
-        wal_sql: &str,
         cutoff_ts: i64,
         floor: Option<CallerRowFloor<'_>>,
     ) -> Result<Evicted> {
@@ -3260,13 +3281,13 @@ impl ArchiveMut {
             Some(_) => self.db.caller_row_streams(source_id)?,
             None => Vec::new(),
         };
-        self.transaction(|tx| {
+        self.transaction_immediate(|tx| {
             let params = rusqlite::params![source_id, cutoff_ts];
             record_stream_bounds(&tx.tx, source_id, None, Some(cutoff_ts))?;
-            // Counted BEFORE the segment delete: removing a stream's segments
-            // lowers its watermark, and rows those segments already covered
-            // would count as live afterwards when they were not.
-            let live_rows: i64 = tx
+            // Counted, and the covered rows deleted, BEFORE the segment
+            // delete: removing a stream's segments lowers its watermark, and
+            // rows those segments covered would count as live afterwards.
+            let kept_live_rows: i64 = tx
                 .tx
                 .query_row(
                     &format!(
@@ -3277,14 +3298,20 @@ impl ArchiveMut {
                     |row| row.get(0),
                 )
                 .map_err(Error::sqlite("failed to count live rows before eviction"))?;
+            let wal_rows = tx
+                .tx
+                .execute(
+                    &format!(
+                        "DELETE FROM wal WHERE source_id = ?1 AND ts < ?2 \
+                         AND NOT ({LIVE_WAL_PREDICATE_FOR_ROW})"
+                    ),
+                    params,
+                )
+                .map_err(Error::sqlite("failed to evict WAL rows"))?;
             let segments = tx
                 .tx
                 .execute(segments_sql, params)
                 .map_err(Error::sqlite("failed to evict segments"))?;
-            let wal_rows = tx
-                .tx
-                .execute(wal_sql, params)
-                .map_err(Error::sqlite("failed to evict WAL rows"))?;
             // The clock-offset series is per SOURCE, so it is cut by the same
             // cutoff whichever streams the pass named. Without this the series
             // is the one part of a rolling buffer that grows without bound: one
@@ -3321,9 +3348,8 @@ impl ArchiveMut {
             Ok(Evicted {
                 segments,
                 wal_rows,
-                live_rows: live_rows as usize,
+                kept_live_rows: kept_live_rows as usize,
                 caller_rows,
-                held_streams: 0,
             })
         })
     }
@@ -4774,14 +4800,14 @@ mod tests {
         );
     }
 
-    /// `evict_before(u64::MAX)` means "evict everything", and used to mean the
-    /// exact opposite.
+    /// `evict_before(i64::MAX)` evicts every segment; the unsigned sentinel
+    /// `u64::MAX` used to evict nothing.
     ///
     /// `u64::MAX as i64` is -1, so `last_ts < -1` matched nothing and the call
     /// returned `Ok(Evicted { 0, 0 })`. A retention loop written against the
     /// obvious sentinel silently never evicted, and the archive grew forever.
     #[test]
-    fn an_unbounded_cutoff_evicts_everything_rather_than_nothing() {
+    fn an_unbounded_cutoff_evicts_every_segment_rather_than_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = ArchiveMut::create(&dir.path().join("t.dendro")).unwrap();
         let id = db
@@ -4816,8 +4842,17 @@ mod tests {
 
         let evicted = db.evict_before(id, i64::MAX).unwrap();
         assert_eq!(evicted.segments, 1);
-        assert_eq!(evicted.wal_rows, 1);
-        assert!(db.all_streams(id).unwrap().is_empty());
+        assert_eq!(evicted.wal_rows, 0);
+        assert_eq!(evicted.kept_live_rows, 1, "eviction keeps live rows");
+        assert!(db.read_segment_meta(id, "s").unwrap().is_empty());
+        assert_eq!(
+            db.live_wal(id, "s")
+                .unwrap()
+                .into_iter()
+                .map(|r| r.ts)
+                .collect::<Vec<_>>(),
+            vec![30]
+        );
     }
 
     /// The whole signed range is usable, including negatives.

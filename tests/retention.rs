@@ -74,22 +74,31 @@ fn per_stream_eviction_cuts_clock_offsets_at_the_oldest_surviving_row() {
     assert_eq!(evicted.segments, 2);
     assert_eq!(offsets(&db, id), vec![150, 200, 250]);
 
-    // Evict `b` before 300 as well: nothing is left, so the cutoff applies.
+    // Evict `b` before 300 as well: its segment goes and its live row at
+    // 250 is kept, so the series keeps 250.
+    let evicted = db.evict_streams_before(id, 300, &|s| s == "b").unwrap();
+    assert_eq!((evicted.segments, evicted.kept_live_rows), (1, 1));
+    assert_eq!(offsets(&db, id), vec![250]);
+
+    // Discard that row and evict again: nothing is left, so the cutoff
+    // applies.
+    db.discard_live_rows(id, &|s| s == "b").unwrap();
     db.evict_streams_before(id, 300, &|s| s == "b").unwrap();
     assert!(db.all_streams(id).unwrap().is_empty());
     assert!(offsets(&db, id).is_empty());
 }
 
-/// Retention that deletes rows no segment held is data loss the caller's
-/// two policies caused between them, and it is reported, not hidden.
+/// Retention never deletes a row no segment holds: it keeps the live rows
+/// before the cutoff, counts them, and they stay live once the segment
+/// below them is evicted.
 #[test]
-fn eviction_reports_the_unsealed_rows_it_deleted() {
+fn eviction_keeps_and_reports_the_unsealed_rows_before_the_cutoff() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.dendro");
     let mut db = ArchiveMut::create(&path).unwrap();
     let id = db.insert_source(&source()).unwrap();
-    // `a`: sealed through 100, with a shadowed (pruned-later) row at 100
-    // still in the WAL, and live rows at 150 and 250.
+    // `a`: sealed through 100, with a covered row at 100 still in the WAL,
+    // and live rows at 150 and 250.
     segment(&mut db, id, "a", 0, 50, 100);
     db.insert_wal_rows(
         id,
@@ -136,13 +145,20 @@ fn eviction_reports_the_unsealed_rows_it_deleted() {
     .unwrap();
 
     let evicted = db.evict_before(id, 200).unwrap();
-    // Deleted: the segment; WAL rows 100 (shadowed), 150 (live!), 10 (live!).
+    // Deleted: the segment and the covered WAL row 100. Kept: 150 on `a` and
+    // 10 on `b`, which no segment holds.
     assert_eq!(evicted.segments, 1);
-    assert_eq!(evicted.wal_rows, 3);
-    assert_eq!(
-        evicted.live_rows, 2,
-        "150 on `a` and 10 on `b` were in no segment"
-    );
+    assert_eq!(evicted.wal_rows, 1);
+    assert_eq!(evicted.kept_live_rows, 2);
+    let live = |db: &ArchiveMut, id: i64, stream: &str| -> Vec<i64> {
+        db.live_wal(id, stream)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ts)
+            .collect()
+    };
+    assert_eq!(live(&db, id, "a"), vec![150, 250]);
+    assert_eq!(live(&db, id, "b"), vec![10, 300]);
 
     // Per stream, the same accounting, per stream.
     let mut db2 = ArchiveMut::create(&dir.path().join("r2.dendro")).unwrap();
@@ -166,5 +182,11 @@ fn eviction_reports_the_unsealed_rows_it_deleted() {
     )
     .unwrap();
     let evicted = db2.evict_streams_before(id2, 200, &|s| s == "b").unwrap();
-    assert_eq!((evicted.wal_rows, evicted.live_rows), (1, 1));
+    assert_eq!((evicted.wal_rows, evicted.kept_live_rows), (0, 1));
+    assert_eq!(live(&db2, id2, "b"), vec![10]);
+
+    // `discard_live_rows` is how live rows are deleted.
+    assert_eq!(db2.discard_live_rows(id2, &|s| s == "b").unwrap(), 1);
+    assert_eq!(live(&db2, id2, "b"), Vec::<i64>::new());
+    assert_eq!(live(&db2, id2, "c"), vec![10]);
 }
