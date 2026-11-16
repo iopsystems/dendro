@@ -287,7 +287,7 @@ impl ArchivePublisher {
     /// ([`resuming`](Self::resuming)) it fails when one row makes a frame
     /// larger than that, and when a stream has no sync point. Each of these
     /// repeats on every call until its cause is removed (the row discarded
-    /// with `SourceWriter::discard_live_rows` or evicted, the segment
+    /// with `SourceWriter::discard_live_rows`, the segment
     /// evicted), and it holds back every source, because one call answers for
     /// all of them.
     pub fn next(&mut self, db: &Archive) -> Result<Vec<Frame>> {
