@@ -222,8 +222,9 @@ from it, in dendro and in metriken-storage:
   the rows its encoder refuses (WIRE.md §4.7, `sync_stream`,
   `src/writer.rs:3156`). I do not know how many of those refusals come from
   anchoring rather than from an incomplete trailing record. Partly answered
-  after 0.8.0: a capped seal the copy receives in part leads to such a refusal; see
-  Outcome.
+  after 0.8.0: a capped seal the copy receives in part, with the rest
+  evicted on the origin before the copy resumes, leads to such a refusal;
+  see Outcome.
 
 The [encoder boundary entry](2026-09-11-encoder-boundary.md) records that
 the trait bans state across segments because a reader has none of the
@@ -490,34 +491,36 @@ Merged as #85 (2c66d96), released in 0.8.0.
     exclusive lock.
 
 B, tested 2026-11-16 at 99dadaa. The four tests below found no loss on the
-paths they cover; review of them found the capped-seal loss below, a run's
-first row lost on a path a copy takes in normal operation. B stays open.
+paths they cover. Review of them found the capped-seal loss below, in which
+rows of a run are lost after the copy deletes the run's anchor, on a path a
+copy takes in normal operation. B stays open.
 
 - Since #85 retention keeps live rows, so on the origin the head of an open
   run survives every path but `ArchiveMut::prune_wal` past the watermark, an
   explicit `discard_live_rows` (which deletes the whole run), and files left
   by a metriken-storage 0.2.2 writer.
-- The `Sync` point stays out of the origin's open run. The resume takes the
+- The `Sync` point stays below the origin's open run. The resume takes the
   fast path, with no `Sync`, unless the origin has sealed past the copy's
-  watermark (`src/replicate/publisher.rs:592`). When it has, `cursor_sync`
+  watermark (`src/replicate/publisher.rs:594`). When it has, `cursor_sync`
   takes the largest point in [`low`, `high`] inside no segment
   (`sync_point`, `publisher.rs:446`). `low` is the origin's oldest row minus
   one when the origin holds a row at or below the copy's newest, and the
   copy's newest otherwise (`publisher.rs:676`); `high` is the larger of the
-  copy's watermark and `low`. When the copy's watermark is at or below the
-  origin's newest segment, which holds for every case tested here, the
-  point is below the head of the origin's open run, since #85 keeps that
-  head and every row after it. Four tests in `tests/replicate_resume.rs`,
-  with an encoder `Anchored` that decodes rows only from an anchor row on,
-  as metriken-storage's does,
+  copy's watermark and `low`. Both callers reach `cursor_sync` only when the
+  origin holds a segment ending past the copy's watermark
+  (`publisher.rs:594`, `publisher.rs:999`), so `high` is below the origin's
+  watermark and the point is below every live row of the origin, including
+  the head of its open run; #85 keeps that head on the origin so it can be
+  shipped.
+- Four tests in `tests/replicate_resume.rs`, with an encoder `Anchored` that
+  decodes rows only from an anchor row on, as metriken-storage's does,
   check that the copy decodes every row the origin does on a resume inside
-  the origin's open run, a `Sync` below an origin seal, a connected seal,
-  and a `Sync` after eviction. With the fast path disabled, the first fails
-  on its `Sync` count; with that assertion removed, its `decodable` checks
-  pass. With `low` also set
-  to the copy's newest and that count assertion removed, the copy decodes
-  1..=3 of 1..=5: it seals 1..=3 itself and takes 4 and 5 without their
-  anchor.
+  the origin's open run (the fast path), a `Sync` below an origin seal, a
+  connected seal, and a `Sync` after eviction. With the fast path disabled,
+  the first fails on its `Sync` count; with that assertion removed, its
+  `decodable` checks pass. With `low` also set to the copy's newest and the
+  assertion still removed, the copy decodes 1..=3 of 1..=5: it seals 1..=3 itself and takes 4 and 5
+  without their anchor.
 - The loss: a capped seal delivered in part. The origin seals a run the
   copy holds live in parts (`seal_capped`, which metriken-storage's writer
   calls). Each part reaches the copy as a `SegmentAfter`, adopted in its own
