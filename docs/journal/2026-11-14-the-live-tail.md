@@ -222,7 +222,7 @@ from it, in dendro and in metriken-storage:
   the rows its encoder refuses (WIRE.md §4.7, `sync_stream`,
   `src/writer.rs:3156`). I do not know how many of those refusals come from
   anchoring rather than from an incomplete trailing record. Partly answered
-  after 0.8.0: a capped seal the copy receives in part leads to one; see
+  after 0.8.0: a capped seal the copy receives in part leads to such a refusal; see
   Outcome.
 
 The [encoder boundary entry](2026-09-11-encoder-boundary.md) records that
@@ -489,10 +489,9 @@ Merged as #85 (2c66d96), released in 0.8.0.
     from `ArchiveMut::create`, because `ArchiveMut::open` takes an
     exclusive lock.
 
-B, tested 2026-11-16 at 99dadaa. The first draft of this section set B
-aside because the tests below found no loss; review then found one, which
-meets the reopen condition that draft set ("a test shows a run's first row
-lost on a path a writer or a copy takes in normal operation"). B stays open.
+B, tested 2026-11-16 at 99dadaa. The four tests below found no loss on the
+paths they cover; review of them found the capped-seal loss below, a run's
+first row lost on a path a copy takes in normal operation. B stays open.
 
 - Since #85 retention keeps live rows, so on the origin the head of an open
   run survives every path but `ArchiveMut::prune_wal` past the watermark, an
@@ -501,15 +500,21 @@ lost on a path a writer or a copy takes in normal operation"). B stays open.
 - The `Sync` point stays out of the origin's open run. The resume takes the
   fast path, with no `Sync`, unless the origin has sealed past the copy's
   watermark (`src/replicate/publisher.rs:592`). When it has, `cursor_sync`
-  starts from `low`, which is the origin's oldest row minus one when the
-  origin holds a row at or below the copy's newest (`publisher.rs:676`).
-  Since #85 that oldest row is at or before the head of the open run. Four
-  tests in `tests/replicate_resume.rs`, with an encoder `Anchored` that
-  decodes rows only from an anchor row on, as metriken-storage's does,
+  takes the largest point in [`low`, `high`] inside no segment
+  (`sync_point`, `publisher.rs:446`). `low` is the origin's oldest row minus
+  one when the origin holds a row at or below the copy's newest, and the
+  copy's newest otherwise (`publisher.rs:676`); `high` is the larger of the
+  copy's watermark and `low`. When the copy's watermark is at or below the
+  origin's newest segment, which holds for every case tested here, the
+  point is below the head of the origin's open run, since #85 keeps that
+  head and every row after it. Four tests in `tests/replicate_resume.rs`,
+  with an encoder `Anchored` that decodes rows only from an anchor row on,
+  as metriken-storage's does,
   check that the copy decodes every row the origin does on a resume inside
   the origin's open run, a `Sync` below an origin seal, a connected seal,
   and a `Sync` after eviction. With the fast path disabled, the first fails
-  on its `Sync` count and its `decodable` checks pass. With `low` also set
+  on its `Sync` count; with that assertion removed, its `decodable` checks
+  pass. With `low` also set
   to the copy's newest and that count assertion removed, the copy decodes
   1..=3 of 1..=5: it seals 1..=3 itself and takes 4 and 5 without their
   anchor.
@@ -535,9 +540,10 @@ lost on a path a writer or a copy takes in normal operation"). B stays open.
   deleted; or B itself, which removes the dependence.
 - What B would cost, read from the code and not built: `EncodeContext` holds
   only the source id, its uuid and the stream (`src/segment.rs:103`), so an
-  encoder cannot read anchors kept outside the rows without a change to the
-  trait and to every encode call site (seal, split seal, `Sync`, copy, live
-  tail read). metriken-storage would write a new row encoding under a new
+  encoder cannot read anchors kept outside the rows without a new
+  `EncodeContext` field (it is `#[non_exhaustive]`, so the trait need not
+  change) filled at every encode call site (seal, split seal, `Sync`, copy,
+  live tail read). metriken-storage would write a new row encoding under a new
   `ENCODER_VERSION`, which under C as it stands makes every older reader
   refuse new recordings outright, so B waits on C. `caller_rows` is evicted
   at the cutoff, and its floor function sees only a name's oldest row, so
