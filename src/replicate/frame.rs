@@ -5,10 +5,11 @@
 //! [`SourceUpdate`](Frame::SourceUpdate) for a change to a row of `sources`
 //! after its handshake. The archive-level
 //! `documents` table has none; see the module docs. Protocol version 2 adds
-//! three frames that act on what a resumed copy already holds:
-//! [`Sync`](Frame::Sync), [`SegmentAfter`](Frame::SegmentAfter) and
-//! [`Unavailable`](Frame::Unavailable), [`SegmentGroup`](Frame::SegmentGroup). No I/O here; [`wire`](super::wire)
-//! turns these into bytes.
+//! four frames that act on what a resumed copy already holds:
+//! [`Sync`](Frame::Sync), [`SegmentAfter`](Frame::SegmentAfter),
+//! [`Unavailable`](Frame::Unavailable) and
+//! [`SegmentGroup`](Frame::SegmentGroup). No I/O here;
+//! [`wire`](super::wire) turns these into bytes.
 
 use std::collections::BTreeMap;
 

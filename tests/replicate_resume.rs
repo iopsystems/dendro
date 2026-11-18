@@ -2248,6 +2248,41 @@ fn a_group_with_a_refused_part_adopts_none() {
     origin.close();
 }
 
+/// A group whose later part fails inside the adopting transaction commits
+/// none of its parts: a trigger on the copy refuses the insert of [9, 13]
+/// after [4, 8] has been inserted and 4..=8 deleted in the same
+/// transaction.
+#[test]
+fn a_group_whose_later_insert_fails_commits_no_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal(&o, &c);
+    let raw = rusqlite::Connection::open(&c).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_second_part BEFORE INSERT ON segments \
+         WHEN NEW.first_ts = 9 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    drop(raw);
+    let second = frames.iter().rposition(is_segment_after).unwrap();
+    pump(frames[..second].to_vec(), &mut link.sub);
+    let err = link
+        .sub
+        .apply(frames[second].clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refused"), "{err}");
+    assert!(link.sub.finish().is_err());
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 1, "only [1, 3]");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
 /// Past the staging limit the copy adopts a group's frames as they arrive,
 /// so a cut between them leaves what it left before the kind existed.
 #[test]
@@ -2259,7 +2294,11 @@ fn a_group_past_the_staging_limit_is_adopted_frame_by_frame() {
     let cut = frames.iter().position(is_segment_after).unwrap() + 1;
     let applied = pump(frames[..cut].to_vec(), &mut link.sub);
     assert_eq!(applied.segments, 1);
-    assert!(link.sub.finish().is_err(), "the group is still due");
+    let err = link.sub.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("1 frame(s) of the group were adopted"),
+        "{err}"
+    );
     assert_eq!(decodable(&c), (1..=8).collect::<Vec<_>>());
     origin.close();
 }

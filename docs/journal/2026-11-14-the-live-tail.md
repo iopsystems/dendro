@@ -658,17 +658,25 @@ copy takes in normal operation. B stays open.
     (1..=8, then `rows_unsealable` 5).
   - `a_capped_seal_goes_out_as_one_group`,
     `a_group_interrupted_by_another_frame_stops_the_source`,
-    `a_group_with_a_refused_part_adopts_none` and
+    `a_group_with_a_refused_part_adopts_none`,
+    `a_group_whose_later_insert_fails_commits_no_part` and
     `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover the
     rest. The wire round trip and the version 1 skip are in
     `src/replicate/wire.rs`'s tests.
-  - Mutations, each run against `tests/replicate_resume.rs`: with the
-    publisher never sending the group, or the subscriber ignoring it, five
-    of the six tests fail; with each part committed in its own
-    transaction, the refused-part test fails; with `finish` ignoring a
-    group still due, the cut test and the staging-limit test fail; with no
-    check for an interrupting frame, the interrupted-group test fails.
-  - Gates: `cargo test --features test-support` 434 passed, 0 failed;
+  - Mutations, each run against `tests/replicate_resume.rs` before the
+    insert-failure test existed: with the publisher never sending the
+    group, or the subscriber ignoring it, five of the six tests fail; with
+    the subscriber handing each part to the writer in its own call, the
+    refused-part test fails; with `finish` ignoring a group still due, the
+    cut test and the staging-limit test fail; with no check for an
+    interrupting frame, the interrupted-group test fails.
+  - Review found that with the writer committing each part in its own
+    transaction inside one call, no test failed: the refused-part test is
+    refused by the checks, which run before any transaction opens.
+    `a_group_whose_later_insert_fails_commits_no_part` was added for it,
+    with a trigger on the copy that refuses the second part's insert, and
+    fails under that mutation.
+  - Gates: `cargo test --features test-support` 435 passed, 0 failed;
     clippy with `-D warnings` on all three feature sets, `cargo doc` with
     `-D warnings`, the wasm check and `cargo fmt --check` pass.
 - What B would cost, read from the code and not built: `EncodeContext` holds

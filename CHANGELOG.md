@@ -38,16 +38,22 @@ cannot reach a failed release any other way.
 - Replication protocol version 2 has a `SegmentGroup` frame (kind 10,
   WIRE.md §4.10). A publisher sends one before two or more `SegmentAfter`
   frames that replace a copy's live rows, as the parts of a capped seal do,
-  and a `Subscriber` adopts those frames in one transaction. Before, it adopted each alone, and a connection lost between
-  them could leave the copy holding live rows whose earlier row the first
-  segment had deleted; for an encoder whose rows depend on an earlier row,
-  a later `Sync` then deleted them as unsealable. The kind is skippable, so
-  a subscriber on 0.8.0 adopts the frames one at a time, as before. A
-  `Subscriber` holds a group's frames in memory up to
-  `MAX_STAGED_GROUP_BYTES` (256 MiB) and adopts them one at a time past it.
-  It refuses any other frame of the source before the group completes, and
-  `Subscriber::finish` returns an error for a source whose group is
-  incomplete.
+  and a `Subscriber` adopts those frames in one transaction. Before, it
+  adopted each alone, and a connection lost between them could leave the
+  copy holding live rows whose earlier row the first segment had deleted;
+  for an encoder whose rows depend on an earlier row, a later `Sync` then
+  deleted them as unsealable. The kind is skippable, so a subscriber on
+  0.8.0 adopts the frames one at a time, as before. A `Subscriber` holds up
+  to `MAX_STAGED_GROUP_BYTES` (256 MiB) of a group's segments in memory;
+  past that it adopts the frames it holds together and each later frame as
+  it arrives.
+
+### Changed
+
+- A resumed `Subscriber` refuses any frame of a source other than the next
+  `SegmentAfter` of a `SegmentGroup` that has not completed, and the source
+  stops. `Subscriber::finish` returns an error for a source whose group has
+  not completed, and does not finalize it.
 
 ## [0.8.0] - 2026-11-16
 

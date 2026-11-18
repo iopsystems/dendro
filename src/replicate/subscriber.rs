@@ -133,6 +133,8 @@ struct SourceState {
 /// still arriving.
 struct Group {
     stream: String,
+    /// The group's `count`.
+    count: u32,
     /// `SegmentAfter` frames still to come.
     remaining: u32,
     /// The frames received, not yet handed to the writer.
@@ -144,9 +146,30 @@ struct Group {
     unstaged: bool,
 }
 
-/// The most segment bytes a [`Subscriber`] holds in memory for one
-/// [`SegmentGroup`](Frame::SegmentGroup) before it adopts the group's frames
-/// one at a time instead (WIRE.md §4.10).
+impl Group {
+    /// What the copy holds of a group that did not complete, for an error.
+    fn left_behind(&self) -> String {
+        if self.unstaged {
+            format!(
+                "{} frame(s) of the group were adopted past the staging limit, so the copy \
+                 may hold rows of `{}` without the row they decode with, and a resume \
+                 sends the rest",
+                self.count - self.remaining,
+                self.stream
+            )
+        } else {
+            "the copy keeps what it held before the group, and a resume sends the group's \
+             segments again"
+                .to_string()
+        }
+    }
+}
+
+/// The segment bytes of one [`SegmentGroup`](Frame::SegmentGroup) a
+/// [`Subscriber`] holds in memory. When a group's staged segments pass it,
+/// checked after each frame is added, the subscriber adopts the staged
+/// frames together and each later frame of the group as it arrives (WIRE.md
+/// §4.10).
 pub const MAX_STAGED_GROUP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Keep each stream's newest span only, when the request would encode to
@@ -643,6 +666,7 @@ impl Subscriber {
                 }
                 st.group = Some(Group {
                     stream,
+                    count,
                     remaining: count,
                     staged: Vec::new(),
                     staged_bytes: 0,
@@ -833,9 +857,10 @@ impl Subscriber {
             if let Some(group) = &st.group {
                 stopped.get_or_insert(Error::Message(format!(
                     "source {ordinal}: the subscriber finished with {} `SegmentAfter` \
-                     frame(s) of the segment group of `{}` still due; the copy keeps what \
-                     it held before the group, and a resume sends its segments again",
-                    group.remaining, group.stream
+                     frame(s) of the segment group of `{}` still due; {}",
+                    group.remaining,
+                    group.stream,
+                    group.left_behind()
                 )));
                 drop(st);
                 continue;
@@ -883,11 +908,11 @@ impl Subscriber {
         }
         Some(Error::Message(format!(
             "source {ordinal}: a {} frame arrived while {} more `SegmentAfter` frame(s) of \
-             the segment group of `{}` were due; the group is dropped and the source stops, \
-             and a resume sends its segments again",
+             the segment group of `{}` were due, so the source stops; {}",
             frame_name(frame),
             group.remaining,
-            group.stream
+            group.stream,
+            group.left_behind()
         )))
     }
 
