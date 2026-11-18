@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::archive::{Archive, CallerRow, SourceMeta};
 use crate::error::{Error, Result};
-use crate::writer::{SourceWriter, Writer};
+use crate::writer::{AfterPart, SourceWriter, Writer};
 
 use super::frame::{Frame, IndexKind, IndexState, NO_INDEX_STATE};
 use super::resume::{CallerRowPosition, ResumeRequest, SourcePosition, StreamPosition};
@@ -125,7 +125,29 @@ struct SourceState {
     /// Whether a frame for this replica failed. Its later frames are refused,
     /// so nothing is written past what the failed frame left out.
     stopped: bool,
+    /// The [`SegmentGroup`](Frame::SegmentGroup) being staged, if any.
+    group: Option<Group>,
 }
+
+/// A [`SegmentGroup`](Frame::SegmentGroup) whose `SegmentAfter` frames are
+/// still arriving.
+struct Group {
+    stream: String,
+    /// `SegmentAfter` frames still to come.
+    remaining: u32,
+    /// The frames received, not yet handed to the writer.
+    staged: Vec<AfterPart>,
+    /// The `bytes` and `caller_index` sizes of `staged`.
+    staged_bytes: usize,
+    /// Whether staging passed the limit, after which each frame is adopted
+    /// as it arrives.
+    unstaged: bool,
+}
+
+/// The most segment bytes a [`Subscriber`] holds in memory for one
+/// [`SegmentGroup`](Frame::SegmentGroup) before it adopts the group's frames
+/// one at a time instead (WIRE.md §4.10).
+pub const MAX_STAGED_GROUP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Keep each stream's newest span only, when the request would encode to
 /// more than `limit` bytes. A request above `MAX_FRAME_BYTES` cannot be sent,
@@ -185,6 +207,8 @@ pub struct Subscriber {
     /// `Some` on a subscriber opened with [`resume`](Self::resume): the
     /// sources its request named, by uuid, until their handshakes arrive.
     resumed: Option<BTreeMap<String, Held>>,
+    /// [`MAX_STAGED_GROUP_BYTES`], unless a test lowered it.
+    group_limit: usize,
 }
 
 impl std::fmt::Debug for Subscriber {
@@ -206,6 +230,7 @@ impl Subscriber {
             writer,
             sources: BTreeMap::new(),
             resumed: None,
+            group_limit: MAX_STAGED_GROUP_BYTES,
         }
     }
 
@@ -295,6 +320,7 @@ impl Subscriber {
                 writer,
                 sources: BTreeMap::new(),
                 resumed: Some(held),
+                group_limit: MAX_STAGED_GROUP_BYTES,
             },
             request,
         ))
@@ -313,7 +339,16 @@ impl Subscriber {
                 Self::check_poisoned(ordinal, st)?;
             }
         }
-        let applied = self.apply_frame(frame);
+        let applied = match self.sources.get_mut(&ordinal) {
+            Some(st) if !handshake => match Self::interrupts_group(ordinal, st, &frame) {
+                Some(e) => {
+                    st.group = None;
+                    Err(e)
+                }
+                None => self.apply_frame(frame),
+            },
+            _ => self.apply_frame(frame),
+        };
         if applied.is_err() && !handshake {
             if let Some(st) = self.sources.get_mut(&ordinal) {
                 st.stopped |= st.replica;
@@ -408,6 +443,7 @@ impl Subscriber {
                         newest,
                         replica,
                         stopped: false,
+                        group: None,
                     },
                 );
                 Ok(Applied {
@@ -594,6 +630,27 @@ impl Subscriber {
                 })
             }
 
+            Frame::SegmentGroup {
+                source,
+                stream,
+                count,
+            } => {
+                let st = Self::replica_mut(&mut self.sources, source)?;
+                if count == 0 {
+                    return Err(Error::Message(format!(
+                        "source {source}: a segment group of `{stream}` with no frames"
+                    )));
+                }
+                st.group = Some(Group {
+                    stream,
+                    remaining: count,
+                    staged: Vec::new(),
+                    staged_bytes: 0,
+                    unstaged: false,
+                });
+                Ok(Applied::default())
+            }
+
             Frame::SegmentAfter {
                 source,
                 stream,
@@ -602,18 +659,51 @@ impl Subscriber {
                 bytes,
                 caller_index,
             } => {
+                let limit = self.group_limit;
                 let st = Self::replica_mut(&mut self.sources, source)?;
-                let pruned = st.writer.adopt_segment_after(
-                    &stream,
+                let part = AfterPart {
                     after,
-                    &meta,
-                    &bytes,
-                    caller_index.as_deref(),
-                )?;
-                let n = st.newest.entry(stream).or_insert(meta.last_ts);
-                *n = (*n).max(meta.last_ts);
+                    meta,
+                    bytes,
+                    caller_index,
+                };
+                let parts = match st.group.as_mut() {
+                    None => vec![part],
+                    Some(group) => {
+                        group.remaining -= 1;
+                        group.staged_bytes +=
+                            part.bytes.len() + part.caller_index.as_ref().map_or(0, Vec::len);
+                        group.staged.push(part);
+                        if !group.unstaged && group.staged_bytes > limit {
+                            warn!(
+                                "source {source}, stream {stream}: a segment group passed the \
+                                 {limit}-byte staging limit, so its frames are adopted as \
+                                 they arrive; a disconnect before the group's last frame \
+                                 can leave rows of the stream without the rows they depend \
+                                 on"
+                            );
+                            group.unstaged = true;
+                        }
+                        let parts = if group.unstaged || group.remaining == 0 {
+                            std::mem::take(&mut group.staged)
+                        } else {
+                            Vec::new()
+                        };
+                        if group.remaining == 0 {
+                            st.group = None;
+                        }
+                        parts
+                    }
+                };
+                let Some(newest) = parts.iter().map(|p| p.meta.last_ts).max() else {
+                    return Ok(Applied::default());
+                };
+                let segments = parts.len();
+                let pruned = st.writer.adopt_segments_after(&stream, parts)?;
+                let n = st.newest.entry(stream).or_insert(newest);
+                *n = (*n).max(newest);
                 Ok(Applied {
-                    segments: 1,
+                    segments,
                     rows_pruned: pruned as usize,
                     ..Applied::default()
                 })
@@ -738,6 +828,18 @@ impl Subscriber {
                 drop(st);
                 continue;
             }
+            // A group cut short leaves the copy short of the segments the
+            // publisher counts as shipped.
+            if let Some(group) = &st.group {
+                stopped.get_or_insert(Error::Message(format!(
+                    "source {ordinal}: the subscriber finished with {} `SegmentAfter` \
+                     frame(s) of the segment group of `{}` still due; the copy keeps what \
+                     it held before the group, and a resume sends its segments again",
+                    group.remaining, group.stream
+                )));
+                drop(st);
+                continue;
+            }
             let SourceState {
                 writer,
                 complete,
@@ -757,9 +859,36 @@ impl Subscriber {
         stopped.map_or(Ok(()), Err)
     }
 
+    /// Set the staging limit for a segment group, in place of
+    /// [`MAX_STAGED_GROUP_BYTES`], so a test can pass it with small segments.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_group_staging_limit(&mut self, bytes: usize) {
+        self.group_limit = bytes;
+    }
+
     /// The archive being written.
     pub fn path(&self) -> &std::path::Path {
         self.writer.path()
+    }
+
+    /// The error for `frame` when it arrives while `st` stages a segment
+    /// group it does not belong to: anything but the group's next
+    /// `SegmentAfter` (WIRE.md §4.10).
+    fn interrupts_group(ordinal: u32, st: &SourceState, frame: &Frame) -> Option<Error> {
+        let group = st.group.as_ref()?;
+        if let Frame::SegmentAfter { stream, .. } = frame {
+            if *stream == group.stream {
+                return None;
+            }
+        }
+        Some(Error::Message(format!(
+            "source {ordinal}: a {} frame arrived while {} more `SegmentAfter` frame(s) of \
+             the segment group of `{}` were due; the group is dropped and the source stops, \
+             and a resume sends its segments again",
+            frame_name(frame),
+            group.remaining,
+            group.stream
+        )))
     }
 
     fn check_poisoned(ordinal: u32, st: &SourceState) -> Result<()> {
@@ -799,6 +928,22 @@ impl Subscriber {
                  every frame names a source by the ordinal its handshake assigned"
             ))
         })
+    }
+}
+
+/// A frame's kind, for an error message.
+fn frame_name(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::Handshake { .. } => "Handshake",
+        Frame::Index { .. } => "Index",
+        Frame::Rows { .. } => "Rows",
+        Frame::Segment { .. } => "Segment",
+        Frame::ClockOffset { .. } => "ClockOffset",
+        Frame::SourceUpdate { .. } => "SourceUpdate",
+        Frame::Sync { .. } => "Sync",
+        Frame::SegmentAfter { .. } => "SegmentAfter",
+        Frame::Unavailable { .. } => "Unavailable",
+        Frame::SegmentGroup { .. } => "SegmentGroup",
     }
 }
 

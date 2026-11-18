@@ -648,7 +648,9 @@ fn open_resumed_source(
 /// Pick a stream's sync point against the copy's spans as `cursor` holds
 /// them and this archive's `origin` spans, and emit the `Sync` and the
 /// `SegmentAfter` frames above it; or, when the point is the copy's
-/// watermark, the `SegmentAfter` frames alone. An `Unavailable` precedes
+/// watermark, the `SegmentAfter` frames alone, preceded by a
+/// `SegmentGroup` when two or more replace live rows the copy holds. An
+/// `Unavailable` precedes
 /// them when this archive's oldest row is more than one past the copy's
 /// newest. Moves the stream's row cursor to what the copy then holds, and
 /// returns the point.
@@ -707,6 +709,31 @@ fn cursor_sync(
         .filter(|s| s.meta.last_ts > at)
         .collect();
     above.sort_by_key(|s| s.meta.first_ts);
+    // Without a `Sync` the copy still holds its live rows above `at`, and
+    // the segments that start at or below its newest row delete them. A
+    // row there may decode only with an earlier row that one of those
+    // segments deletes, so the copy adopts them together (WIRE.md §4.10).
+    // One segment is already adopted in one transaction.
+    let grouped = if synced {
+        0
+    } else {
+        above
+            .iter()
+            .take_while(|s| s.meta.first_ts <= copy_newest)
+            .count()
+    };
+    if grouped >= 2 {
+        frames.push(Frame::SegmentGroup {
+            source: ordinal,
+            stream: stream.to_string(),
+            count: u32::try_from(grouped).map_err(|_| {
+                Error::Message(format!(
+                    "source {source_id}: stream `{stream}` has more than u32::MAX segments \
+                     to send in one group"
+                ))
+            })?,
+        });
+    }
     for segment in above {
         let last = segment.meta.last_ts;
         entry.copy_spans.push((segment.meta.first_ts, last));

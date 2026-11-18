@@ -123,8 +123,9 @@
 //! Protocol version 2 numbers every frame, so a reader refuses a stream that
 //! lost one, and carries a frame larger than `MAX_FRAME_BYTES` in parts. It
 //! adds [`Sync`](crate::replicate::Frame::Sync),
-//! [`SegmentAfter`](crate::replicate::Frame::SegmentAfter) and
-//! [`Unavailable`](crate::replicate::Frame::Unavailable), which act on a
+//! [`SegmentAfter`](crate::replicate::Frame::SegmentAfter),
+//! [`Unavailable`](crate::replicate::Frame::Unavailable) and
+//! [`SegmentGroup`](crate::replicate::Frame::SegmentGroup), which act on a
 //! copy resumed with a [`ResumeRequest`](crate::replicate::ResumeRequest).
 //! [`FrameWriter`](crate::replicate::wire::FrameWriter) writes either
 //! version, and [`FrameReader`](crate::replicate::wire::FrameReader) reads
@@ -147,4 +148,4 @@ pub use publisher::ArchivePublisher;
 #[cfg(feature = "write")]
 mod subscriber;
 #[cfg(feature = "write")]
-pub use subscriber::{Applied, Subscriber};
+pub use subscriber::{Applied, Subscriber, MAX_STAGED_GROUP_BYTES};

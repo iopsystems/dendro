@@ -11,8 +11,8 @@ the same contents in flight — and the two version independently. A frame
 carries no schema version, and a change here does not bump the archive's.
 
 Protocol versions: 1 and 2 (`src/replicate/wire.rs`, `PROTOCOL_VERSION` and
-`PROTOCOL_VERSION_2`). Version 2 differs in its framing (§2.1), adds three
-frames that act on a resumed copy (§4.7 to §4.9), and has a resume request
+`PROTOCOL_VERSION_2`). Version 2 differs in its framing (§2.1), adds four
+frames that act on a resumed copy (§4.7 to §4.10), and has a resume request
 (§8). Every frame of version 1 has the same payload in version 2.
 
 ## 1. The model
@@ -140,8 +140,8 @@ One kind per table in the set `rewrite` copies (`src/rewrite.rs`, `COPIED`) —
 `sources`, `caller_rows`, `wal`, `segments`, `clock_offsets` — so the frame set
 has a completeness check rather than a guess, plus `SourceUpdate` for a change
 to a source's row in `sources` after its handshake. Version 2's `Sync`,
-`SegmentAfter` and `Unavailable` act on what a resumed copy holds and are
-outside this mapping.
+`SegmentAfter`, `Unavailable` and `SegmentGroup` act on what a resumed copy
+holds and are outside this mapping.
 
 | `kind` | frame | lands in |
 |---|---|---|
@@ -152,6 +152,7 @@ outside this mapping.
 | 5 | `ClockOffset` | `clock_offsets` |
 | 6 | `SourceUpdate` | `sources` |
 | 9 | `Unavailable` | nothing (version 2) |
+| 10 | `SegmentGroup` | nothing (version 2) |
 | 135 (`0x87`) | `Sync` | `segments`, `wal` (version 2) |
 | 136 (`0x88`) | `SegmentAfter` | `segments`, `wal` (version 2) |
 
@@ -159,7 +160,7 @@ The high bit of `kind` (`0x80`) marks a kind a reader must understand to apply
 the stream correctly; see §7. `Sync` and `SegmentAfter` set it, and so do the
 kinds of a split frame's parts (`0xfe`, `0xff`, §2.1). A version 1 stream that
 carries `Sync` or `SegmentAfter` is refused; one that carries `Unavailable`
-has it skipped, as an unknown kind.
+or `SegmentGroup` has it skipped, as an unknown kind.
 
 ### 4.1 `Handshake` (kind 1)
 
@@ -393,6 +394,44 @@ changes nothing in the copy, so the kind is skippable, and a subscriber that
 skips it holds the same rows. A `Subscriber` counts it in
 `Applied::unavailable`.
 
+### 4.10 `SegmentGroup` (kind 10, version 2)
+
+```
+u32          source
+str          stream
+u32          count                  SegmentAfter frames that follow
+```
+
+The next `count` frames of the source are `SegmentAfter` frames of the
+stream, and the copy adopts them together, in one transaction. A row of a
+stream may decode only with an earlier row of it, as with an encoder that
+writes a schema on the first row after a seal; when a seal of rows the copy
+holds live arrives in several segments, adopting the first alone deletes
+that earlier row while the copy still holds later rows live, and a
+connection lost before the rest arrive leaves those rows undecodable.
+
+The publisher sends one before the `SegmentAfter` frames of §8.2 when no
+`Sync` precedes them and two or more of them have a `first_ts` at or below
+the copy's newest row; `count` is the number of those, and the frames after
+them are adopted one at a time.
+
+A `Subscriber` applies it to a source of a resumed copy and refuses it
+otherwise. It holds the group's frames in memory and counts nothing for them
+until the last arrives, whose `Applied` counts all `count` segments and
+their `rows_pruned`. Each frame is checked as §4.8 says against the copy as
+the frames before it leave it, and one that fails commits none of them.
+Any other frame of the source before the group completes, a `SegmentGroup`
+included, is refused, and the source stops. A group still incomplete when
+the connection ends is not adopted, and `Subscriber::finish` returns an
+error for its source; a resume sends its segments again. Past
+`MAX_STAGED_GROUP_BYTES` (256 MiB) of the group's segments, the subscriber
+adopts the frames held and each later frame of the group as it arrives, and
+logs a warning.
+
+The kind is skippable. A subscriber that skips it adopts each `SegmentAfter`
+on its own, which is valid, and a connection lost between them can leave
+the copy's later live rows undecodable, as above.
+
 ## 5. Protocol rules
 
 1. A `Handshake` identifies a source and assigns the ordinal its later frames
@@ -604,7 +643,9 @@ handled by what the copy holds of it:
   `first <= X < last`. The stream gets a `Sync` to `X` unless `X` is `W`,
   then the archive's segments with `last_ts` above `X`, oldest first, as
   `SegmentAfter` frames, each `after` the previous one's `last_ts`, then
-  the live rows past what the copy then holds.
+  the live rows past what the copy then holds. With no `Sync`, a
+  `SegmentGroup` (§4.10) precedes the `SegmentAfter` frames when two or
+  more of them have a `first_ts` at or below `P`.
 
 A stream whose `O` is more than one past `P` also gets an `Unavailable` from
 `P` to `O`. A stream the copy holds and the archive holds no row of gets one

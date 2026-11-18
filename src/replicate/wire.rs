@@ -30,7 +30,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// reader detects a lost or repeated frame; a frame larger than
 /// [`MAX_FRAME_BYTES`] travels in parts; and the frames that act on a
 /// resumed copy ([`Frame::Sync`], [`Frame::SegmentAfter`],
-/// [`Frame::Unavailable`]) exist. A [`FrameWriter`] opened for it writes it.
+/// [`Frame::Unavailable`], [`Frame::SegmentGroup`]) exist. A [`FrameWriter`] opened for it writes it.
 pub const PROTOCOL_VERSION_2: u16 = 2;
 
 /// The largest frame or version 2 part this build will read, and the bound
@@ -119,6 +119,7 @@ const KIND_SEGMENT: u8 = 4;
 const KIND_CLOCK_OFFSET: u8 = 5;
 const KIND_SOURCE_UPDATE: u8 = 6;
 const KIND_UNAVAILABLE: u8 = 9;
+const KIND_SEGMENT_GROUP: u8 = 10;
 const KIND_SYNC: u8 = KIND_MUST_UNDERSTAND | 7;
 const KIND_SEGMENT_AFTER: u8 = KIND_MUST_UNDERSTAND | 8;
 /// The first part of a split frame (WIRE.md §2.1), version 2 only.
@@ -211,6 +212,7 @@ fn version_2_only(frame: &Frame) -> Option<&'static str> {
         Frame::Sync { .. } => Some("Sync"),
         Frame::SegmentAfter { .. } => Some("SegmentAfter"),
         Frame::Unavailable { .. } => Some("Unavailable"),
+        Frame::SegmentGroup { .. } => Some("SegmentGroup"),
         _ => None,
     }
 }
@@ -306,6 +308,7 @@ fn payload_len(frame: &Frame) -> usize {
             ..
         } => segment_frame_bytes(stream, bytes, caller_index.as_deref()) + 8,
         Frame::Unavailable { stream, .. } => 1 + 4 + bytes(stream.as_bytes()) + 8 + 8,
+        Frame::SegmentGroup { stream, .. } => 1 + 4 + bytes(stream.as_bytes()) + 4,
     }
 }
 
@@ -448,6 +451,16 @@ fn put_payload(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
             put_i64(out, *after);
             put_i64(out, *before);
         }
+        Frame::SegmentGroup {
+            source,
+            stream,
+            count,
+        } => {
+            put_u8(out, KIND_SEGMENT_GROUP);
+            put_u32(out, *source);
+            put_str(out, stream)?;
+            put_u32(out, *count);
+        }
     }
     Ok(())
 }
@@ -586,8 +599,9 @@ pub fn decode_payload(payload: &[u8]) -> Result<Frame> {
 /// unless the kind has [`KIND_MUST_UNDERSTAND`] set, which is an error.
 /// Only the kind byte of an unknown frame is read: its layout is not known,
 /// and the length prefix already says where it ends. In a version 1 stream,
-/// `Sync` and `SegmentAfter` are refused and `Unavailable` is skipped as an
-/// unknown kind, as a reader on 0.7.1 skips it.
+/// `Sync` and `SegmentAfter` are refused, and `Unavailable` and
+/// `SegmentGroup` are skipped as unknown kinds, as a reader on 0.7.1 skips
+/// them.
 fn decode_known(payload: &[u8], version: u16) -> Result<Option<Frame>> {
     let mut c = Cursor::new(payload);
     let kind = c.u8()?;
@@ -598,7 +612,7 @@ fn decode_known(payload: &[u8], version: u16) -> Result<Option<Frame>> {
                  {version}"
             )));
         }
-        if kind == KIND_UNAVAILABLE {
+        if matches!(kind, KIND_UNAVAILABLE | KIND_SEGMENT_GROUP) {
             return Ok(None);
         }
     }
@@ -697,6 +711,11 @@ fn decode_known(payload: &[u8], version: u16) -> Result<Option<Frame>> {
             stream: c.string()?,
             after: c.i64()?,
             before: c.i64()?,
+        },
+        KIND_SEGMENT_GROUP => Frame::SegmentGroup {
+            source: c.u32()?,
+            stream: c.string()?,
+            count: c.u32()?,
         },
         KIND_SPLIT_FIRST | KIND_SPLIT_NEXT => {
             return Err(malformed(&format!(
@@ -1762,6 +1781,11 @@ mod tests {
                 after: i64::MIN,
                 before: 40,
             },
+            Frame::SegmentGroup {
+                source: 0,
+                stream: "cpu".to_string(),
+                count: 2,
+            },
             Frame::Rows {
                 source: 0,
                 seq: 1,
@@ -1799,7 +1823,7 @@ mod tests {
     /// `encode_frame` write, byte for byte.
     #[test]
     fn a_version_1_writer_writes_the_version_1_bytes() {
-        let frames = &version_2_frames()[4..];
+        let frames = &version_2_frames()[5..];
         let mut by_hand = Vec::new();
         write_preamble(&mut by_hand).unwrap();
         for f in frames {
@@ -1814,7 +1838,7 @@ mod tests {
 
     #[test]
     fn version_2_frames_are_refused_on_version_1() {
-        for frame in &version_2_frames()[1..4] {
+        for frame in &version_2_frames()[1..5] {
             let err = encode(frame).unwrap_err().to_string();
             assert!(
                 err.contains("only in replication protocol version 2"),
@@ -1825,8 +1849,8 @@ mod tests {
             assert_eq!(w.into_inner().len(), 14, "nothing after the preamble");
 
             // A version 1 stream that carries one anyway: `Sync` and
-            // `SegmentAfter` are refused, and `Unavailable` is skipped as a
-            // reader on 0.7.1 skips it.
+            // `SegmentAfter` are refused, and `Unavailable` and
+            // `SegmentGroup` are skipped as a reader on 0.7.1 skips them.
             let mut payload = Vec::new();
             put_payload(frame, &mut payload).unwrap();
             assert!(decode_payload(&payload).is_err());
@@ -1834,7 +1858,10 @@ mod tests {
             write_preamble(&mut bytes).unwrap();
             put_u32(&mut bytes, payload.len() as u32);
             bytes.extend_from_slice(&payload);
-            if matches!(frame, Frame::Unavailable { .. }) {
+            if matches!(
+                frame,
+                Frame::Unavailable { .. } | Frame::SegmentGroup { .. }
+            ) {
                 let mut reader = FrameReader::new(std::io::Cursor::new(bytes)).unwrap();
                 assert_eq!(reader.next_frame().unwrap(), None);
                 assert_eq!(reader.skipped(), 1);
