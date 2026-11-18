@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-14
-updated: 2026-11-16
+updated: 2026-11-18
 ---
 
 # The live tail: liveness from a watermark, and rows anchored to seals
@@ -221,7 +221,10 @@ from it, in dendro and in metriken-storage:
 - A replica's `Sync` seals its live rows at a boundary of its own and deletes
   the rows its encoder refuses (WIRE.md §4.7, `sync_stream`,
   `src/writer.rs:3156`). I do not know how many of those refusals come from
-  anchoring rather than from an incomplete trailing record.
+  anchoring rather than from an incomplete trailing record. Partly answered
+  after 0.8.0: a capped seal the copy receives in part, with the rest
+  evicted on the origin before the copy resumes, leads to such a refusal;
+  see Outcome.
 
 The [encoder boundary entry](2026-09-11-encoder-boundary.md) records that
 the trait bans state across segments because a reader has none of the
@@ -279,6 +282,7 @@ evicted (`src/writer.rs:2590-2640`).
    neither; see Outcome.
 3. Decide C.
 4. Design B with metriken-storage, starting from the question above.
+   After 0.8.0, a loss path on a copy was found; see Outcome.
 5. Decide D. Decided: dendro guarantees it; see Outcome.
 
 0.8.0 (#82, released 2026-11-16) shipped A and D and did not wait for B or
@@ -384,7 +388,8 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A and D shipped in 0.8.0; B and C are not started.
+Open. A and D shipped in 0.8.0; B has a confirmed loss path on a copy
+(below); C is not started.
 
 A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
@@ -485,9 +490,179 @@ Merged as #85 (2c66d96), released in 0.8.0.
     from `ArchiveMut::create`, because `ArchiveMut::open` takes an
     exclusive lock.
 
+B, tested 2026-11-16 at 99dadaa. The four tests below found no loss on the
+paths they cover. Review of them found the capped-seal loss below, in which
+rows of a run are lost after the copy deletes the run's anchor, on a path a
+copy takes in normal operation. B stays open.
+
+- Since #85 retention keeps live rows, so on the origin the head of an open
+  run survives every path but `ArchiveMut::prune_wal` past the watermark, an
+  explicit `discard_live_rows` (which deletes the whole run), and files left
+  by a metriken-storage 0.2.2 writer.
+- The `Sync` point stays below the origin's open run. The resume takes the
+  fast path, with no `Sync`, unless the origin has sealed past the copy's
+  watermark (`src/replicate/publisher.rs:594`). When it has, `cursor_sync`
+  takes the largest point in [`low`, `high`] inside no segment
+  (`sync_point`, `publisher.rs:446`). `low` is the origin's oldest row minus
+  one when the origin holds a row at or below the copy's newest, and the
+  copy's newest otherwise (`publisher.rs:676`); `high` is the larger of the
+  copy's watermark and `low`. Both callers reach `cursor_sync` only when the
+  origin holds a segment ending past the copy's watermark
+  (`publisher.rs:594`, `publisher.rs:999`), so `high` is below the origin's
+  watermark and the point is below every live row of the origin, including
+  the head of its open run; #85 keeps that head on the origin so it can be
+  shipped.
+- Four tests in `tests/replicate_resume.rs`, with an encoder `Anchored` that
+  decodes rows only from an anchor row on, as metriken-storage's does,
+  check that the copy decodes every row the origin does on a resume inside
+  the origin's open run (the fast path), a `Sync` below an origin seal, a
+  connected seal, and a `Sync` after eviction. With the fast path disabled,
+  the first fails on its `Sync` count; with that assertion removed, its
+  `decodable` checks pass. With `low` also set to the copy's newest and the
+  assertion still removed, the copy decodes 1..=3 of 1..=5: it seals 1..=3 itself and takes 4 and 5
+  without their anchor.
+- The loss: a capped seal delivered in part. The origin seals a run the
+  copy holds live in parts (`seal_capped`, which metriken-storage's writer
+  calls). Each part reaches the copy as a `SegmentAfter`, adopted in its own
+  transaction, and adopting the first deletes the run's anchor with the
+  rows it covers. Until the last part is adopted, the copy's remaining live
+  rows of the run have no anchor. A connection lost, or a copy that stops,
+  between two parts leaves it that way: a reader of the copy sees the first
+  part and not the rest. If the origin evicts the rest before the copy
+  resumes, the resume's `Sync` seals them on the copy with `encode`, which
+  gives no segment, and they are deleted as unsealable. Pinned by
+  `a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail` (rows
+  4..=13 sealed as [4, 8] and [9, 13], the connection cut after the first;
+  the copy then decodes 1..=8, and after the eviction and resume, 1..=8 and
+  14..=15, with `rows_unsealable` 5). The same steps with `Tags`, whose rows
+  decode alone, run as a control and not committed, left the copy holding
+  1..=15 with `rows_unsealable` 0.
+- Fixes, not tried: adopt all parts of one seal in one transaction, which
+  needs the frames to say where a seal ends; keep a copy's covered rows
+  until the rows after them are sealed, which changes when `wal` rows are
+  deleted; or B itself, which removes the dependence.
+- Design references for the first fix, read 2026-11-18. Where a detail
+  was not checked against the source, the bullet says so.
+  - Raft's `InstallSnapshot`: chunks carry an `offset` and a `done` flag,
+    and the follower applies the snapshot only on `done`. The RPC's field
+    list is from memory of the paper's Figure 13; the thesis was not read.
+    hashicorp/raft and etcd do not use the paper's chunks: each sends the
+    snapshot as one streamed transfer to a temporary location, renames it
+    when complete, and resends it whole after a failure (from memory, not
+    checked against the source).
+  - PostgreSQL logical replication, protocol version 2: a large
+    transaction arrives as Stream Start (with a first-segment flag),
+    changes, Stream Stop, repeated, then Stream Commit. The subscriber
+    spools the changes and applies them at commit in one local
+    transaction, which also records the origin's position. That the spool
+    is discarded on restart, so the publisher sends the transaction again,
+    was inferred and not read in the code.
+  - QPACK (RFC 9204 §2.1.1, §3.2.2; blocked decoding §2.2.1): the encoder
+    must not evict a dynamic table entry that has unacknowledged
+    references, and a decoder blocks on a field section whose Required
+    Insert Count it has not reached. This is the second fix's rule.
+    QPACK's decoder can wait because the encoder keeps the entry; a copy
+    cannot wait for an anchor the origin has already evicted, so the
+    decoder half of the rule has no counterpart here. The section numbers
+    are from memory.
+  - Prometheus's WAL: a checkpoint keeps a `Series` record while the
+    series is still in the head block, written to a temporary directory,
+    fsynced and renamed (from memory). This is a model for B or the second
+    fix, and has no counterpart for the first.
+  - OTel Arrow: schema and dictionary state lasts one gRPC stream, a new
+    `schema_id` arrives in the same payload as its schema, state is reset
+    on every reconnect, and a decode failure ends the stream. The last two
+    details were not checked. The rule taken from it, which rests on those
+    two details: never resume partly applied state, and refuse a part
+    rather than apply rows without their anchor.
+- The first fix, as designed 2026-11-18 from those references and not
+  built:
+  - A new frame kind, `SegmentGroup { source, stream, count }`, without the
+    must-understand bit. `cursor_sync` (`publisher.rs:655`) emits it before
+    the `SegmentAfter` frames it builds when it sends no `Sync` and at
+    least two of them have `first_ts` at or below the copy's newest row.
+    `count` covers the frames up to the last of those. After a `Sync` the
+    copy holds no live row above the sync point (WIRE.md §4.7), so no
+    group is needed. The frames after the group delete only live rows the
+    origin no longer holds (`rows_pruned`), and are adopted one at a time
+    as now. A single frame is already adopted in one transaction.
+  - The subscriber stages the next `count` `SegmentAfter` frames of that
+    stream and adopts them in one writer transaction, through a new writer
+    message beside `adopt_segment_after` (`writer.rs:1259`). Each part is
+    checked against the copy as the parts before it leave it. `apply`
+    returns an `Applied` with nothing counted for a staged frame, and the
+    frame that completes the group reports all `count` segments and their
+    summed `rows_pruned`. `Subscriber::sync` and `finish` do not adopt a
+    partial group.
+  - Staged frames are dropped on a disconnect, and the resume continues
+    from what the copy held before the group: it sends the segments again
+    while the origin holds them. Once the origin has evicted them, the
+    resume's own `Sync` below the remaining segments (`publisher.rs:696`)
+    seals the copy's live rows with their anchor present. When the origin
+    holds no segment of the stream the resume sends no `Sync`
+    (`publisher.rs:594`), and the `Sync` of the poll that ships its next
+    seal does it. Another `SegmentGroup`, or any
+    other frame for the source, before the group completes is refused: the
+    source stops, as after any failed frame, and the copy keeps its
+    watermark until it resumes. Dropping the group and continuing would
+    leave the publisher's cursor past segments the copy never adopted
+    (`cursor_sync` moves it as it builds the frames).
+  - No protocol version bump: WIRE.md §7 allows a new skippable kind. A
+    subscriber built before the kind existed skips it and adopts each part
+    alone, as today, and a publisher that does not send it leaves a new
+    subscriber doing the same.
+  - Staging is in memory, and one `SegmentAfter` can be a split frame of up
+    to `MAX_SPLIT_FRAME_BYTES` (1 GiB, `src/replicate/wire.rs:54`). Past a
+    staging limit the subscriber would adopt the staged parts and the rest
+    of the group one at a time and log a warning. That breaks the rule
+    taken from OTel Arrow and keeps the loss a disconnect between parts
+    causes today.
+  - Refusing an oversized group instead stops the source until the origin
+    evicts the group's first segment. Each resume before that sends the
+    same group, and the first resume after it takes a `Sync` below the
+    remaining parts, which the copy applies with its anchor still held. A
+    review checked this with a probe of the pinned scenario and
+    `evict_before(9)`: `Sync` at 8, the copy decodes 1..=15,
+    `rows_unsealable` 0. The cost is lag on every stream of the source
+    until that eviction, which never comes on an origin without retention.
+    I chose the fallback, whose loss needs both a disconnect inside an
+    oversized group and the origin evicting the rest before the resume.
+  - Staging on disk, in a table of the copy's file moved into `segments` by
+    the adopting transaction, would remove the limit, and with it both the
+    fallback and the refusal. It needs a new table in the archive format
+    (FORMAT.md), so it is left for when a group above the limit is seen.
+  - Rejected: inferring the group from the `Rows` frame that ends each
+    poll. Nothing in WIRE.md requires that order, and on a resume it would
+    stage the whole catch-up.
+  - Tests: the pinned test would assert that the copy decodes 1..=13 after
+    the cut and 1..=15 after the resume, with `rows_unsealable` 0, as the
+    `Tags` control does today. A review ran this by applying only the
+    frames before the first `SegmentAfter`, which is what a dropped group
+    leaves. New tests for each pairing of old and new publisher and
+    subscriber, a group dropped by a reconnect, a group interrupted by
+    another frame, and the staging limit.
+- What B would cost, read from the code and not built: `EncodeContext` holds
+  only the source id, its uuid and the stream (`src/segment.rs:103`), so an
+  encoder cannot read anchors kept outside the rows without a new
+  `EncodeContext` field (it is `#[non_exhaustive]`, so the trait need not
+  change) filled at every encode call site (seal, split seal, `Sync`, copy,
+  live tail read). metriken-storage would write a new row encoding under a new
+  `ENCODER_VERSION`, which under C as it stands makes every older reader
+  refuse new recordings outright, so B waits on C. `caller_rows` is evicted
+  at the cutoff, and its floor function sees only a name's oldest row, so
+  keeping an anchor a live row still names needs new dendro behaviour or
+  writer state the floor function reads. `documents` belong to no source and
+  replication does not carry them (FORMAT.md §3.6).
+- What B would remove: metriken-storage's `encode_after` and its three
+  `anchor_*` functions (`encoder.rs` at c27b6b5), and its writer's tracking
+  of seal boundaries (`sealing`, `opened`).
+- The GO criterion's measurement was not taken; no design was built to
+  measure.
+
 Open after 0.8.0:
 
-- B and C, plan steps 4 and 3.
+- B, plan step 4, with the capped-seal loss above.
+- C, plan step 3.
 
 Resolved after 0.8.0:
 
