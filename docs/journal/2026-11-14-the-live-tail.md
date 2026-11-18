@@ -594,8 +594,11 @@ copy takes in normal operation. B stays open.
     frame that completes the group reports all `count` segments and their
     summed `rows_pruned`. `Subscriber::sync` and `finish` do not adopt a
     partial group.
-  - Staged frames are dropped on a disconnect, and the resume sends the
-    segments again (`publisher.rs:594`). Another `SegmentGroup`, or any
+  - Staged frames are dropped on a disconnect, and the resume continues
+    from what the copy held before the group: it sends the segments again
+    while the origin holds them, and once the origin has evicted them it
+    sends a `Sync` that seals the copy's live rows with their anchor
+    present (`publisher.rs:594`). Another `SegmentGroup`, or any
     other frame for the source, before the group completes is refused: the
     source stops, as after any failed frame, and the copy keeps its
     watermark until it resumes. Dropping the group and continuing would
