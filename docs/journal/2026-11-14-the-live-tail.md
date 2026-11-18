@@ -572,9 +572,9 @@ copy takes in normal operation. B stays open.
   - OTel Arrow: schema and dictionary state lasts one gRPC stream, a new
     `schema_id` arrives in the same payload as its schema, state is reset
     on every reconnect, and a decode failure ends the stream. The last two
-    details were not checked. The rule taken from it: never resume partly
-    applied state, and refuse a part rather than apply rows without their
-    anchor.
+    details were not checked. The rule taken from it, which rests on those
+    two details: never resume partly applied state, and refuse a part
+    rather than apply rows without their anchor.
 - The first fix, as designed 2026-11-18 from those references and not
   built:
   - A new frame kind, `SegmentGroup { source, stream, count }`, without the
@@ -588,9 +588,12 @@ copy takes in normal operation. B stays open.
     as now. A single frame is already adopted in one transaction.
   - The subscriber stages the next `count` `SegmentAfter` frames of that
     stream and adopts them in one writer transaction, through a new writer
-    message beside `adopt_segment_after` (`writer.rs:1259`). `apply`
-    returns an `Applied` with nothing counted for a staged frame, and
-    `Subscriber::sync` and `finish` do not adopt a partial group.
+    message beside `adopt_segment_after` (`writer.rs:1259`). Each part is
+    checked against the copy as the parts before it leave it. `apply`
+    returns an `Applied` with nothing counted for a staged frame, and the
+    frame that completes the group reports all `count` segments and their
+    summed `rows_pruned`. `Subscriber::sync` and `finish` do not adopt a
+    partial group.
   - Staged frames are dropped on a disconnect, and the resume sends the
     segments again (`publisher.rs:594`). Another `SegmentGroup`, or any
     other frame for the source, before the group completes is refused: the
@@ -607,8 +610,21 @@ copy takes in normal operation. B stays open.
     staging limit the subscriber would adopt the staged parts and the rest
     of the group one at a time and log a warning. That breaks the rule
     taken from OTel Arrow and keeps the loss a disconnect between parts
-    causes today. Refusing the group instead would stop the copy for good,
-    because each resume sends the same group again.
+    causes today.
+  - Refusing an oversized group instead stops the source until the origin
+    evicts the group's first segment. Each resume before that sends the
+    same group, and the first resume after it takes a `Sync` below the
+    remaining parts, which the copy applies with its anchor still held. A
+    review checked this with a probe of the pinned scenario and
+    `evict_before(9)`: `Sync` at 8, the copy decodes 1..=15,
+    `rows_unsealable` 0. The cost is lag on every stream of the source
+    until that eviction, which never comes on an origin without retention.
+    I chose the fallback, whose loss needs both a disconnect inside an
+    oversized group and the origin evicting the rest before the resume.
+  - Staging on disk, in a table of the copy's file moved into `segments` by
+    the adopting transaction, would remove the limit, and with it both the
+    fallback and the refusal. It needs a new table in the archive format
+    (FORMAT.md), so it is left for when a group above the limit is seen.
   - Rejected: inferring the group from the `Rows` frame that ends each
     poll. Nothing in WIRE.md requires that order, and on a resume it would
     stage the whole catch-up.
