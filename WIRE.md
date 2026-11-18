@@ -403,7 +403,8 @@ u32          count                  SegmentAfter frames that follow
 ```
 
 The next `count` frames of the source are `SegmentAfter` frames of the
-stream, and the copy adopts them together, in one transaction. A row of a
+stream, which the copy adopts together, in one transaction, up to the size
+limit below. A row of a
 stream may decode only with an earlier row of it, as with an encoder that
 writes a schema on the first row after a seal; when a seal of rows the copy
 holds live arrives in several segments, adopting the first alone deletes
@@ -419,20 +420,24 @@ A `Subscriber` applies it to a source of a resumed copy and refuses it
 otherwise. Any other frame of the source before the group completes, a
 `SegmentGroup` included, is refused, and the source stops. A group still
 incomplete when the connection ends makes `Subscriber::finish` return an
-error for its source; a resume sends the group's segments again.
+error for its source.
 
 Up to `MAX_STAGED_GROUP_BYTES` (256 MiB) of the group's segments, the
 subscriber holds the group's frames in memory and counts nothing for them
 until the last arrives, whose `Applied` counts all `count` segments and
 their `rows_pruned`. Each frame is checked as §4.8 says against the copy as
 the frames before it leave it, and one that fails commits none of them. A
-group still incomplete when the connection ends is not adopted.
+group still incomplete when the connection ends is not adopted: the copy
+keeps what it held before the group, and a resume continues from it
+(§8.2).
 
-When the group's segments pass that size, the subscriber adopts the frames
-it holds, together, and each later frame of the group as it arrives, and
-logs a warning. The guarantees of the previous paragraph then do not hold
-for the group, and a connection lost before its last frame can leave the
-copy's later live rows undecodable.
+When the group's segments and caller indexes pass that size, the
+subscriber adopts the frames it holds, together, and each later frame of
+the group as it arrives, and logs a warning. The guarantees of the previous
+paragraph then do not hold for the group. A connection lost before its last
+frame can leave the copy's later live rows without the row they decode
+with. A resume sends the group's later segments if the publisher still
+holds them; otherwise its `Sync` deletes those rows as unsealable.
 
 The kind is skippable. A subscriber that skips it adopts each `SegmentAfter`
 on its own, which is valid, and a connection lost between them can leave
@@ -665,11 +670,11 @@ every segment it ships, less those a `Sync` deleted) and the copy's newest
 row of each stream. A poll that finds a segment ending past the copy's
 watermark runs the same procedure, with that newest row as `P`, the
 `Unavailable` included. When `X` is the copy's watermark, the segments go
-out as `SegmentAfter` frames, preceded by a `SegmentGroup` as above;
-otherwise a `Sync` precedes them. A
-source created after the publisher opened, and a source the request did not
-name, are caught up from `since_for_new_sources`; the copy's spans for them
-start as every segment the archive holds.
+out as `SegmentAfter` frames, preceded by a `SegmentGroup` when two or more
+of them have a `first_ts` at or below `P`, as above; otherwise a `Sync`
+precedes them. A source created after the publisher opened, and a source
+the request did not name, are caught up from `since_for_new_sources`; the
+copy's spans for them start as every segment the archive holds.
 
 Limits:
 

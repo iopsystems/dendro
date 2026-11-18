@@ -152,23 +152,25 @@ impl Group {
         if self.unstaged {
             format!(
                 "{} frame(s) of the group were adopted past the staging limit, so the copy \
-                 may hold rows of `{}` without the row they decode with, and a resume \
-                 sends the rest",
+                 may hold rows of `{}` without the row they decode with; a resume sends \
+                 the group's later segments if the publisher still holds them, and \
+                 otherwise deletes those rows as unsealable",
                 self.count - self.remaining,
                 self.stream
             )
         } else {
-            "the copy keeps what it held before the group, and a resume sends the group's \
-             segments again"
+            "the copy keeps what it held before the group, and a resume continues from it \
+             (WIRE.md §8.2)"
                 .to_string()
         }
     }
 }
 
-/// The segment bytes of one [`SegmentGroup`](Frame::SegmentGroup) a
-/// [`Subscriber`] holds in memory. When a group's staged segments pass it,
-/// checked after each frame is added, the subscriber adopts the staged
-/// frames together and each later frame of the group as it arrives (WIRE.md
+/// The segment and caller-index bytes of one
+/// [`SegmentGroup`](Frame::SegmentGroup) above which a [`Subscriber`] stops
+/// holding its frames in memory. It is checked after each frame is added,
+/// so the frames held can exceed it by one frame; the subscriber then adopts
+/// them together, and each later frame of the group as it arrives (WIRE.md
 /// §4.10).
 pub const MAX_STAGED_GROUP_BYTES: usize = 256 * 1024 * 1024;
 
@@ -840,6 +842,8 @@ impl Subscriber {
     /// A resumed source that stopped, on a failed frame or a dropped write,
     /// is not finalized, and this returns its error after joining the
     /// writer: the copy has a hole, and finalizing it would say it does not.
+    /// A resumed source with a [`SegmentGroup`](Frame::SegmentGroup) still
+    /// incomplete is not finalized either, and this returns an error for it.
     pub fn finish(mut self) -> Result<()> {
         let mut stopped = None;
         for (ordinal, mut st) in std::mem::take(&mut self.sources) {

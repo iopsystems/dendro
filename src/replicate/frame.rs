@@ -293,9 +293,11 @@ pub enum Frame {
     },
 
     /// The next `count` frames of the source are
-    /// [`SegmentAfter`](Frame::SegmentAfter) frames of `stream`, which the
-    /// copy adopts together, in one transaction. Protocol version 2 only
-    /// (WIRE.md §4.10).
+    /// [`SegmentAfter`](Frame::SegmentAfter) frames of `stream`, which a
+    /// [`Subscriber`](crate::replicate::Subscriber) adopts together, in one
+    /// transaction, up to
+    /// [`MAX_STAGED_GROUP_BYTES`](crate::replicate::MAX_STAGED_GROUP_BYTES).
+    /// Protocol version 2 only (WIRE.md §4.10).
     ///
     /// The kind is skippable: a subscriber that skips it adopts each frame
     /// on its own. A [`Subscriber`](crate::replicate::Subscriber) applies it

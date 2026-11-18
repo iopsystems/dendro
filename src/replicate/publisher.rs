@@ -241,19 +241,20 @@ impl ArchivePublisher {
     /// [`SegmentAfter`](Frame::SegmentAfter) frames, then its live rows.
     /// With no `Sync`, a [`SegmentGroup`](Frame::SegmentGroup) precedes the
     /// `SegmentAfter` frames when two or more of them replace live rows the
-    /// copy holds (WIRE.md §4.10). A
-    /// stream whose oldest row here is more than one past the copy's newest,
-    /// or that retention here removed entirely after rows the copy lacks,
-    /// gets an [`Unavailable`](Frame::Unavailable). A caller-row name
+    /// copy holds (WIRE.md §4.10). A stream whose oldest row here is more
+    /// than one past the copy's newest, or that retention here removed
+    /// entirely after rows the copy lacks, gets an
+    /// [`Unavailable`](Frame::Unavailable). A caller-row name
     /// continues after the request's position, and clock offsets are sent
     /// again from the smallest sync point.
     ///
     /// While tailing, a seal in this archive goes out as `SegmentAfter`
-    /// frames, preceded by a `SegmentGroup` as above, or by a `Sync` when
-    /// the sync point is not the copy's
-    /// watermark and by an `Unavailable` when this archive's oldest row is
-    /// more than one past the copy's newest, so a seal that outruns a poll is
-    /// not an error as it is on version 1.
+    /// frames: with a `Sync` before them when the sync point is not the
+    /// copy's watermark, otherwise with a `SegmentGroup` before them when two
+    /// or more replace live rows the copy holds, and with an `Unavailable`
+    /// when this archive's oldest row is more than one past the copy's
+    /// newest. A seal that outruns a poll is therefore not an error as it is
+    /// on version 1.
     ///
     /// # Errors
     ///

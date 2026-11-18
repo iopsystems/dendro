@@ -50,9 +50,9 @@ cannot reach a failed release any other way.
 
 ### Changed
 
-- A resumed `Subscriber` refuses any frame of a source other than the next
-  `SegmentAfter` of a `SegmentGroup` that has not completed, and the source
-  stops. `Subscriber::finish` returns an error for a source whose group has
+- While a `SegmentGroup` of a source has not completed, a resumed
+  `Subscriber` refuses any frame of that source other than the group's next
+  `SegmentAfter`, and the source stops. `Subscriber::finish` returns an error for a source whose group has
   not completed, and does not finalize it.
 
 ## [0.8.0] - 2026-11-16
