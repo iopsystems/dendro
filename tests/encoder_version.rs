@@ -91,6 +91,9 @@ fn the_writing_encoders_version_is_recorded_and_a_mismatch_is_refused() {
     assert!(is_mismatch(
         read::stream_range(&db, id, "s", 0, 10, &Tags("v2")).unwrap_err()
     ));
+    assert!(is_mismatch(
+        read::stream_indexes(&db, id, "s", &Tags("v2")).unwrap_err()
+    ));
 
     // An encoder that does not version itself is never checked.
     assert!(read::read_archive(&db, &Tags("")).is_ok());

@@ -363,8 +363,7 @@ pub fn stream_segments(
 }
 
 /// Materialize a stream's live tail, telling the encoder whose rows they
-/// are. The source's uuid is looked up only when there is a tail to encode,
-/// which a finalized archive never has.
+/// are. The source's uuid is looked up only when there is a tail to encode.
 fn materialize_tail(
     db: &Archive,
     encoder: &dyn SegmentEncoder,

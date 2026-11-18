@@ -280,7 +280,8 @@ evicted (`src/writer.rs:2590-2640`).
    Skipped; see Outcome.
 2. Decide A's reader story: a schema version, or prune-on-open. Decided:
    neither; see Outcome.
-3. Decide C.
+3. Decide C. Deferred on 2026-11-18 until B's design says whether segment
+   columns change; see Outcome.
 4. Design B with metriken-storage, starting from the question above.
    After 0.8.0, a loss path on a copy was found; see Outcome.
 5. Decide D. Decided: dendro guarantees it; see Outcome.
@@ -390,8 +391,8 @@ mod bench_prune {
 
 Open. A and D shipped in 0.8.0; B had a confirmed loss path on a copy,
 fixed by a `SegmentGroup` frame (below) when both sides have it and the
-group is at most 256 MiB, and B's design question is still open; C is not
-started.
+group is at most 256 MiB, and B's design question is still open; C was
+reviewed on 2026-11-18 and deferred until B has a design (below).
 
 A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
@@ -698,12 +699,15 @@ copy takes in normal operation. B stays open.
   `EncodeContext` field (it is `#[non_exhaustive]`, so the trait need not
   change) filled at every encode call site (seal, split seal, `Sync`, copy,
   live tail read). metriken-storage would write a new row encoding under a new
-  `ENCODER_VERSION`, which under C as it stands makes every older reader
-  refuse new recordings outright, so B waits on C. `caller_rows` is evicted
-  at the cutoff, and its floor function sees only a name's oldest row, so
-  keeping an anchor a live row still names needs new dendro behaviour or
-  writer state the floor function reads. `documents` belong to no source and
-  replication does not carry them (FORMAT.md §3.6).
+  `ENCODER_VERSION`, which older readers refuse through metriken-storage's
+  own `READABLE_ENCODERS` check whatever dendro does. (Corrected
+  2026-11-18: this said that C as it stands makes every older reader refuse
+  new recordings, so B waits on C. C waits on B, because what C needs
+  depends on whether B changes segment columns; see the C review below.)
+  `caller_rows` is evicted at the cutoff, and its floor function sees only a
+  name's oldest row, so keeping an anchor a live row still names needs new
+  dendro behaviour or writer state the floor function reads. `documents`
+  belong to no source and replication does not carry them (FORMAT.md §3.6).
 - What B would remove: metriken-storage's `encode_after` and its three
   `anchor_*` functions (`encoder.rs` at c27b6b5), and its writer's tracking
   of seal boundaries (`sealing`, `opened`).
@@ -715,7 +719,81 @@ Open after 0.8.0:
 - B, plan step 4. The capped-seal loss above is fixed by `SegmentGroup`
   when both sides run a build that has it and the group's segments total
   at most `MAX_STAGED_GROUP_BYTES` (256 MiB).
-- C, plan step 3.
+- C, plan step 3. Deferred on 2026-11-18 until B has a design.
+  - What was tried: `SegmentEncoder::can_read(&self, written: &str) -> bool`,
+    built on a local branch that was not pushed or merged. Read paths
+    accepted a recorded version the encoder listed; a copy refused to
+    re-encode an in-range live tail under another version.
+    The owner rejected it: a read re-encodes the live tail with the reading
+    encoder (`materialize_tail`, `src/read.rs`), so one read would return
+    sealed segments in the recorded version's layout and a live tail in the
+    reader's, with nothing marking which is which. A replacement,
+    `for_version(&self, written: &str) -> Option<&dyn SegmentEncoder>`,
+    returning an encoder for the recorded version, was proposed and not
+    built.
+  - A design review (fresh agent, 2026-11-18, against dendro 4ebf94f,
+    metriken 3e483c0, rezolus f8b4ea82) found:
+    - No caller in metriken or rezolus calls `dendro::read::*`. `git grep`
+      finds no `dendro::read` path and no `read::probe`,
+      `read::read_archive`, `read::stream_range`, `read::stream_segments`
+      or `read::stream_indexes` call; the bare names `probe` and
+      `read_archive` match only metriken's and rezolus's own code. rezolus
+      reads through metriken-storage's `ArchiveReader`, which builds the
+      live tail itself and checks `READABLE_ENCODERS` itself
+      (`metriken-storage/src/reader.rs:2040` at 3e483c0). The dendro check
+      that reaches rezolus is the one in `copy_sources_into`.
+    - In metriken and rezolus, only a metriken test
+      (`metriken-storage/tests/read_consistency.rs:271`) calls
+      `resume_source`, so the writer's check (`src/writer.rs:2108`) does
+      not reach rezolus either.
+    - metriken-storage (`metriken-storage/Cargo.toml:19, 49`) and rezolus
+      (`Cargo.toml:52`) depend on dendro 0.7.1, so no change to C reaches
+      them before they take 0.8.
+    - No `/2` encoder exists. B as written changes the row encoding
+      (criterion B above; the cost note above), and FORMAT.md §6 says the
+      `encoder` key versions the row encoding. If B changes rows only, a
+      `/2` encoder that decodes `/1` rows produces the same segment columns,
+      the mixed layout does not arise, and `can_read`'s copy refusal refuses
+      copies that would be correct. If B changes segment columns,
+      `for_version`'s behaviour is the right one.
+    - An encoder can already choose the layout per source with no dendro
+      change: `EncodeContext` carries `source_id`, a copy keeps each
+      source's `encoder` metadata, and dendro skips the check for an encoder
+      whose `version()` is `None` (`segment::check_encoder`,
+      `src/segment.rs:384`). The
+      reviewer's probe at 4ebf94f read and copied a live `v1` and a live
+      `v2` source from one archive with such an encoder, and each tail came
+      out in its recorded layout; with `version()` returning `Some("v2")`
+      the copy failed with `EncoderMismatch`. The cost is that dendro then
+      checks nothing for that encoder.
+  - Reopen when B's design says whether segment columns change. Then:
+    - rows only: choose the encoding per source inside metriken-storage; if
+      dendro should still check, add the recorded version to
+      `EncodeContext` (`#[non_exhaustive]`) and relax the check, with no
+      trait method;
+    - segment columns change: `for_version`'s behaviour, built as one
+      encoder value holding both versions, instead of returning
+      `Option<&dyn SegmentEncoder>`.
+  - GO when a metriken-storage build writing B's encoding can open a `/1`
+    recording; snapshot, filter, combine and Save-as-Report a finalized one;
+    copy a live `/1` hindsight buffer with its tail in the `/1` layout; and
+    do these on an archive holding both versions. NO-GO for any dendro API
+    added before B fixes whether segment columns change.
+  - Set aside: readers on 0.8.1 and earlier reading B's recordings (B's
+    decision); replication between builds of different versions, which in
+    rezolus goes through metriken's `StreamSubscriber`, whose recorder
+    drops the producer's `encoder` key without comparing it and writes its
+    own, so no version check runs on that path; resume across versions.
+  - Found by the same review: the rustdoc on `materialize_tail`
+    (`src/read.rs`) said a finalized archive never has a tail. It can:
+    `finalize` marks the source complete without sealing
+    (`src/writer.rs:2842-2870`), so any row not sealed before it stays
+    live, including rows an encoder drops at the end of a stream
+    (`src/segment.rs:39-40`), and a rezolus hindsight buffer is never
+    finalized. The rustdoc was corrected in the commit that deferred C.
+  - A code review of the `can_read` branch found that nothing tested
+    `read::stream_indexes`'s refusal of a different version. The assertion
+    was added to `tests/encoder_version.rs` in the commit that deferred C.
 
 Resolved after 0.8.0:
 
