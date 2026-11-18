@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-14
-updated: 2026-11-16
+updated: 2026-11-18
 ---
 
 # The live tail: liveness from a watermark, and rows anchored to seals
@@ -541,6 +541,68 @@ copy takes in normal operation. B stays open.
   needs the frames to say where a seal ends; keep a copy's covered rows
   until the rows after them are sealed, which changes when `wal` rows are
   deleted; or B itself, which removes the dependence.
+- Design references for the first fix, read 2026-11-18. Where a detail
+  was not checked against the source, the bullet says so.
+  - Raft's `InstallSnapshot`: chunks carry an `offset` and a `done` flag,
+    and the follower applies the snapshot only on `done`. hashicorp/raft
+    and etcd stream the chunks to a temporary file, rename it when the
+    transfer completes, and restart a broken transfer from offset 0. The
+    RPC's field list is from memory of the paper's Figure 13; the thesis
+    was not read.
+  - PostgreSQL logical replication, protocol version 2: a large
+    transaction arrives as Stream Start (with a first-segment flag),
+    changes, Stream Stop, repeated, then Stream Commit. The subscriber
+    spools the changes and applies them at commit in one local
+    transaction, which also records the origin's position. That the spool
+    is discarded on restart, so the publisher sends the transaction again,
+    was inferred and not read in the code.
+  - QPACK (RFC 9204 §3.2.2): the encoder must not evict a dynamic table
+    entry that an unacknowledged field section references, and a decoder
+    blocks on a section whose Required Insert Count it has not reached.
+    This is the second fix's rule. A copy cannot wait for an anchor the
+    origin has already evicted, which is where it stops applying here.
+  - Prometheus's WAL: a checkpoint keeps a `Series` record while a sample
+    still refers to it, written as a temporary file, fsync, rename. This
+    is a model for B or the second fix, and has no counterpart for the
+    first.
+  - OTel Arrow: schema and dictionary state lasts one gRPC stream, a new
+    `schema_id` arrives in the same payload as its schema, state is reset
+    on every reconnect, and a decode failure ends the stream. The rule
+    taken from it: never resume partly applied state, and refuse a part
+    rather than apply rows without their anchor.
+- The first fix, as designed 2026-11-18 from those references and not
+  built:
+  - A new frame kind, `SegmentGroup { source, stream, count }`, without the
+    must-understand bit. `cursor_sync` (`publisher.rs:655`) emits it before
+    the `SegmentAfter` frames it builds when it sends no `Sync` and the
+    first of them has `first_ts` at or below the copy's newest row. Only
+    those segments delete live rows on the copy; after a `Sync` the copy
+    holds no live row above the sync point (WIRE.md §4.7). `count` covers
+    the frames up to the last whose `first_ts` is at or below the copy's
+    newest row; the frames after it delete nothing live and are adopted
+    one at a time as now.
+  - The subscriber stages the next `count` `SegmentAfter` frames of that
+    stream and adopts them in one writer transaction, through a new writer
+    message beside `adopt_segment_after` (`writer.rs:1259`).
+  - Staged frames are dropped on a disconnect, on another `SegmentGroup`,
+    and on any other frame for the stream before the group completes. The
+    copy keeps its watermark, and the resume sends the segments again
+    (`publisher.rs:594`).
+  - No protocol version bump: WIRE.md §7 allows a new skippable kind. A
+    subscriber that does not know the kind skips it and adopts each part
+    alone, as today, and a publisher that does not send it leaves a new
+    subscriber doing the same.
+  - Staging is in memory, and one `SegmentAfter` can be a split frame of up
+    to `MAX_SPLIT_FRAME_BYTES` (1 GiB, `src/replicate/wire.rs:54`). Past a
+    staging limit the subscriber would adopt the parts one at a time and
+    log a warning, which keeps replication moving with today's exposure.
+  - Rejected: inferring the group from the `Rows` frame that ends each
+    poll. Nothing in WIRE.md requires that order, a subscriber cannot tell
+    an old publisher from a new one that way, and on a resume it would
+    stage the whole catch-up.
+  - Tests: the pinned test would assert that the copy keeps 9..=13; new
+    tests for each pairing of old and new publisher and subscriber, a group
+    dropped by a reconnect, and the staging limit.
 - What B would cost, read from the code and not built: `EncodeContext` holds
   only the source id, its uuid and the stream (`src/segment.rs:103`), so an
   encoder cannot read anchors kept outside the rows without a new
