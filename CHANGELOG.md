@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-18
+
 ### Added
 
 - Replication protocol version 2 has a `SegmentGroup` frame (kind 10,
@@ -44,9 +46,9 @@ cannot reach a failed release any other way.
   for an encoder whose rows depend on an earlier row, a later `Sync` then
   deleted them as unsealable. The kind is skippable, so a subscriber on
   0.8.0 adopts the frames one at a time, as before. A `Subscriber` holds up
-  to `MAX_STAGED_GROUP_BYTES` (256 MiB) of a group's segments in memory;
-  past that it adopts the frames it holds together and each later frame as
-  it arrives.
+  to `MAX_STAGED_GROUP_BYTES` (256 MiB) of a group's segments and caller
+  indexes in memory; past that it adopts the frames it holds together and
+  each later frame as it arrives.
 
 ### Changed
 
