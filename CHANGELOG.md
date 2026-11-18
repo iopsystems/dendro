@@ -52,14 +52,15 @@ cannot reach a failed release any other way.
 
 - While a `SegmentGroup` of a source has not completed, a resumed
   `Subscriber` refuses any frame of that source other than the group's next
-  `SegmentAfter`, and the source stops; a `Handshake` for its ordinal is
-  refused as before and does not stop it.
+  `SegmentAfter` or a `Handshake`, and the source stops. A `Handshake` for
+  its ordinal is refused as before and does not stop the source.
   `Subscriber::finish` returns an error for a source whose group has not
   completed, and does not finalize it.
-- Within a `SegmentGroup`, `Subscriber::apply` of a `SegmentAfter` before
-  the last holds the frame in memory, writes nothing, and returns an
-  `Applied` with no segments counted; the last reports all of them, up to
-  the staging limit.
+- For a `SegmentGroup` within the staging limit, `Subscriber::apply` of a
+  `SegmentAfter` before the last holds the frame in memory, writes nothing,
+  and returns an `Applied` with no segments counted; the last reports all
+  of them. Past the limit, the frame that passes it reports the frames
+  held, and each later frame reports itself.
   `Subscriber::sync` does not write held frames. The staging limit can be
   changed only under the `test-support` feature, and the frames held can
   exceed it by one frame, which can be up to `MAX_SPLIT_FRAME_BYTES`

@@ -645,11 +645,12 @@ copy takes in normal operation. B stays open.
     subscriber, a group dropped by a reconnect, a group interrupted by
     another frame, and the staging limit.
 - The first fix, built 2026-11-18 on the branch `feat/segment-group`, as
-  designed (the line numbers in the design cite 058f812, before the build
-  moved them, and `adopt_segment_after` is now `adopt_segments_after`),
-  with two differences: past the staging limit the subscriber
-  adopts the frames it holds in one transaction and each later frame alone,
-  and it accepts a group of one, which the publisher does not send. Tests
+  designed. The design's line numbers cite 058f812; the build moved them,
+  and renamed `adopt_segment_after` to `adopt_segments_after`. The build
+  differs from the design in two ways: past the staging limit the
+  subscriber adopts the frames it holds in one transaction and each later
+  frame alone, and it accepts a group of one, which the publisher does not
+  send. Tests
   in `tests/replicate_resume.rs`:
   - `a_capped_seal_cut_between_its_parts_keeps_the_copys_anchor` replaces
     the pinned test: the copy decodes 1..=13 after the cut, `finish`
@@ -663,7 +664,7 @@ copy takes in normal operation. B stays open.
     `a_group_interrupted_by_another_frame_stops_the_source`,
     `a_group_with_a_refused_part_adopts_none`,
     `a_group_whose_later_insert_fails_commits_no_part`,
-    `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`
+    `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`,
     `a_group_crossing_the_limit_commits_the_frames_held_together` and
     `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover the
     rest. The wire round trip and the version 1 skip are in

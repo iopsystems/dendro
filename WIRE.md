@@ -417,11 +417,12 @@ the copy's newest row; `count` is the number of those, and the frames after
 them are adopted one at a time.
 
 A `Subscriber` applies it to a source of a resumed copy and refuses it
-otherwise. Before the group completes, any other frame of the source, a
-`SegmentGroup` included, is refused and stops the source. A `Handshake` for
-the source's ordinal is refused as §5 rule 1 says, and does not stop the
-source or end the group. A group still incomplete when the connection ends
-makes `Subscriber::finish` return an error for its source.
+otherwise. Before the group completes, any frame of the source other than
+a `SegmentAfter` of the group's stream or a `Handshake`, a `SegmentGroup`
+included, is refused and stops the source. A `Handshake` for the source's
+ordinal is refused as §5 rule 1 says, and does not stop the source or end
+the group. A group still incomplete when the connection ends makes
+`Subscriber::finish` return an error for its source.
 
 Up to `MAX_STAGED_GROUP_BYTES` (256 MiB) of the group's segments, the
 subscriber holds the group's frames in memory and counts nothing for them
