@@ -30,7 +30,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// reader detects a lost or repeated frame; a frame larger than
 /// [`MAX_FRAME_BYTES`] travels in parts; and the frames that act on a
 /// resumed copy ([`Frame::Sync`], [`Frame::SegmentAfter`],
-/// [`Frame::Unavailable`], [`Frame::SegmentGroup`]) exist. A [`FrameWriter`] opened for it writes it.
+/// [`Frame::Unavailable`], [`Frame::SegmentGroup`]) exist. A
+/// [`FrameWriter`] opened for it writes it.
 pub const PROTOCOL_VERSION_2: u16 = 2;
 
 /// The largest frame or version 2 part this build will read, and the bound

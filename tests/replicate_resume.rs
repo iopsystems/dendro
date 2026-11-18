@@ -2083,13 +2083,21 @@ fn is_segment_group(f: &Frame) -> bool {
 /// parts, [4, 8] and [9, 13], with `seal_capped`. Returns the poll that
 /// ships the seal.
 fn capped_seal(o: &Path, c: &Path) -> (Origin, Link, Vec<Frame>) {
+    capped_seal_by(o, c, 5)
+}
+
+/// [`capped_seal`], with parts of at most `max_rows` rows.
+fn capped_seal_by(o: &Path, c: &Path, max_rows: usize) -> (Origin, Link, Vec<Frame>) {
     let mut origin = Origin::create_with(o, anchored());
     run(&mut origin, 1..=3, true);
     origin.seal(&["s"]);
     run(&mut origin, 4..=13, true);
     let link = connect_with(o, c, anchored);
     assert_eq!(decodable(c), (1..=13).collect::<Vec<_>>());
-    origin.w.seal_capped(vec!["s".to_string()], 5).unwrap();
+    origin
+        .w
+        .seal_capped(vec!["s".to_string()], max_rows)
+        .unwrap();
     origin.w.sync().unwrap();
     let mut link = link;
     let frames = link.publisher.next(&Archive::open(o).unwrap()).unwrap();
@@ -2279,6 +2287,42 @@ fn a_group_whose_later_insert_fails_commits_no_part() {
         .segments_overlapping(source, "s", i64::MIN, i64::MAX)
         .unwrap();
     assert_eq!(held.len(), 1, "only [1, 3]");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// A limit crossed with more than one frame held adopts the frames held
+/// together, then each later frame of the group as it arrives. The seal of
+/// 4..=13 in parts of three rows makes four frames, and the limit is the
+/// first frame's size, so the second crosses it.
+#[test]
+fn a_group_crossing_the_staging_limit_adopts_the_frames_held_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal_by(&o, &c, 3);
+    let group = frames.iter().position(is_segment_group).unwrap();
+    assert!(matches!(
+        &frames[group],
+        Frame::SegmentGroup { count: 4, .. }
+    ));
+    let Frame::SegmentAfter { bytes, .. } = &frames[group + 1] else {
+        panic!("a SegmentAfter follows the group");
+    };
+    link.sub.set_group_staging_limit(bytes.len());
+    pump(frames[..=group].to_vec(), &mut link.sub);
+    let segments: Vec<usize> = frames[group + 1..group + 5]
+        .iter()
+        .map(|f| link.sub.apply(f.clone()).unwrap().segments)
+        .collect();
+    assert_eq!(segments, vec![0, 2, 1, 1]);
+    link.sub.apply_all(frames[group + 5..].to_vec()).unwrap();
+    link.close();
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 5, "[1, 3] and the four parts");
     assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
     origin.close();
 }

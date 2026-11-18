@@ -52,8 +52,16 @@ cannot reach a failed release any other way.
 
 - While a `SegmentGroup` of a source has not completed, a resumed
   `Subscriber` refuses any frame of that source other than the group's next
-  `SegmentAfter`, and the source stops. `Subscriber::finish` returns an error for a source whose group has
-  not completed, and does not finalize it.
+  `SegmentAfter` or a `Handshake`, and the source stops.
+  `Subscriber::finish` returns an error for a source whose group has not
+  completed, and does not finalize it.
+- Within a `SegmentGroup`, `Subscriber::apply` of a `SegmentAfter` before
+  the last holds the frame in memory, writes nothing, and returns an
+  `Applied` with no segments counted; the last reports all of them.
+  `Subscriber::sync` does not write held frames. The staging limit can be
+  changed only under the `test-support` feature, and the frames held can
+  exceed it by one frame, which can be up to `MAX_SPLIT_FRAME_BYTES`
+  (1 GiB).
 
 ## [0.8.0] - 2026-11-16
 

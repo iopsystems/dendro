@@ -154,7 +154,7 @@ impl Group {
                 "{} frame(s) of the group were adopted past the staging limit, so the copy \
                  may hold rows of `{}` without the row they decode with; a resume sends \
                  the group's later segments if the publisher still holds them, and \
-                 otherwise deletes those rows as unsealable",
+                 otherwise a later `Sync` deletes those rows as unsealable",
                 self.count - self.remaining,
                 self.stream
             )

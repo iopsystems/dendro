@@ -253,8 +253,8 @@ impl ArchivePublisher {
     /// copy's watermark, otherwise with a `SegmentGroup` before them when two
     /// or more replace live rows the copy holds, and with an `Unavailable`
     /// when this archive's oldest row is more than one past the copy's
-    /// newest. A seal that outruns a poll is therefore not an error as it is
-    /// on version 1.
+    /// newest. On version 2 a seal that outruns a poll is not an error, as it
+    /// is on version 1.
     ///
     /// # Errors
     ///
@@ -655,9 +655,8 @@ fn open_resumed_source(
 /// `SegmentAfter` frames above it; or, when the point is the copy's
 /// watermark, the `SegmentAfter` frames alone, preceded by a
 /// `SegmentGroup` when two or more replace live rows the copy holds. An
-/// `Unavailable` precedes
-/// them when this archive's oldest row is more than one past the copy's
-/// newest. Moves the stream's row cursor to what the copy then holds, and
+/// `Unavailable` precedes them when this archive's oldest row is more than
+/// one past the copy's newest. Moves the stream's row cursor to what the copy then holds, and
 /// returns the point.
 fn cursor_sync(
     cursor: &mut SourceCursor,

@@ -659,8 +659,10 @@ copy takes in normal operation. B stays open.
   - `a_capped_seal_goes_out_as_one_group`,
     `a_group_interrupted_by_another_frame_stops_the_source`,
     `a_group_with_a_refused_part_adopts_none`,
-    `a_group_whose_later_insert_fails_commits_no_part` and
-    `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover the
+    `a_group_whose_later_insert_fails_commits_no_part`,
+    `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`
+    and `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover
+    the
     rest. The wire round trip and the version 1 skip are in
     `src/replicate/wire.rs`'s tests.
   - Mutations, each run against `tests/replicate_resume.rs` before the
@@ -675,8 +677,12 @@ copy takes in normal operation. B stays open.
     refused by the checks, which run before any transaction opens.
     `a_group_whose_later_insert_fails_commits_no_part` was added for it,
     with a trigger on the copy that refuses the second part's insert, and
-    fails under that mutation.
-  - Gates: `cargo test --features test-support` 435 passed, 0 failed;
+    fails under that mutation. A later review found that adopting only the
+    frame that crosses the limit, and dropping the frames held, also passed
+    every test, because the limit test held at most one frame;
+    `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`
+    was added and fails under that mutation.
+  - Gates: `cargo test --features test-support` 436 passed, 0 failed;
     clippy with `-D warnings` on all three feature sets, `cargo doc` with
     `-D warnings`, the wasm check and `cargo fmt --check` pass.
 - What B would cost, read from the code and not built: `EncodeContext` holds
@@ -700,7 +706,8 @@ copy takes in normal operation. B stays open.
 Open after 0.8.0:
 
 - B, plan step 4. The capped-seal loss above is fixed by `SegmentGroup`
-  when both sides run a build that has it.
+  when both sides run a build that has it and the group's segments total
+  at most `MAX_STAGED_GROUP_BYTES` (256 MiB).
 - C, plan step 3.
 
 Resolved after 0.8.0:

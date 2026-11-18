@@ -404,12 +404,12 @@ u32          count                  SegmentAfter frames that follow
 
 The next `count` frames of the source are `SegmentAfter` frames of the
 stream, which the copy adopts together, in one transaction, up to the size
-limit below. A row of a
-stream may decode only with an earlier row of it, as with an encoder that
-writes a schema on the first row after a seal; when a seal of rows the copy
-holds live arrives in several segments, adopting the first alone deletes
-that earlier row while the copy still holds later rows live, and a
-connection lost before the rest arrive leaves those rows undecodable.
+limit below. A row of a stream may decode only with an earlier row of it,
+as with an encoder that writes a schema on the first row after a seal; when
+a seal of rows the copy holds live arrives in several segments, adopting
+the first alone deletes that earlier row while the copy still holds later
+rows live, and a connection lost before the rest arrive leaves those rows
+undecodable.
 
 The publisher sends one before the `SegmentAfter` frames of §8.2 when no
 `Sync` precedes them and two or more of them have a `first_ts` at or below
@@ -417,8 +417,10 @@ the copy's newest row; `count` is the number of those, and the frames after
 them are adopted one at a time.
 
 A `Subscriber` applies it to a source of a resumed copy and refuses it
-otherwise. Any other frame of the source before the group completes, a
-`SegmentGroup` included, is refused, and the source stops. A group still
+otherwise. Any other frame of the source but a `Handshake` before the group
+completes, a `SegmentGroup` included, is refused, and the source stops. A
+`Handshake` for the source's ordinal is refused as §5 rule 1 says, and the
+group continues. A group still
 incomplete when the connection ends makes `Subscriber::finish` return an
 error for its source.
 
@@ -437,7 +439,10 @@ the group as it arrives, and logs a warning. The guarantees of the previous
 paragraph then do not hold for the group. A connection lost before its last
 frame can leave the copy's later live rows without the row they decode
 with. A resume sends the group's later segments if the publisher still
-holds them; otherwise its `Sync` deletes those rows as unsealable.
+holds them. Otherwise the copy keeps those rows live and undecodable until
+a `Sync` deletes them as unsealable: the resume's own `Sync`, or, when the
+publisher holds no segment of the stream, the `Sync` of the poll that ships
+its next seal.
 
 The kind is skippable. A subscriber that skips it adopts each `SegmentAfter`
 on its own, which is valid, and a connection lost between them can leave
