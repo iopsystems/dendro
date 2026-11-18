@@ -389,8 +389,9 @@ mod bench_prune {
 ## Outcome
 
 Open. A and D shipped in 0.8.0; B had a confirmed loss path on a copy,
-fixed by a `SegmentGroup` frame (below), and B's design question is still
-open; C is not started.
+fixed by a `SegmentGroup` frame (below) when both sides have it and the
+group is at most 256 MiB, and B's design question is still open; C is not
+started.
 
 A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
@@ -644,7 +645,9 @@ copy takes in normal operation. B stays open.
     subscriber, a group dropped by a reconnect, a group interrupted by
     another frame, and the staging limit.
 - The first fix, built 2026-11-18 on the branch `feat/segment-group`, as
-  designed, with two differences: past the staging limit the subscriber
+  designed (the line numbers in the design cite 058f812, before the build
+  moved them, and `adopt_segment_after` is now `adopt_segments_after`),
+  with two differences: past the staging limit the subscriber
   adopts the frames it holds in one transaction and each later frame alone,
   and it accepts a group of one, which the publisher does not send. Tests
   in `tests/replicate_resume.rs`:
@@ -661,8 +664,8 @@ copy takes in normal operation. B stays open.
     `a_group_with_a_refused_part_adopts_none`,
     `a_group_whose_later_insert_fails_commits_no_part`,
     `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`
-    and `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover
-    the
+    `a_group_crossing_the_limit_commits_the_frames_held_together` and
+    `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover the
     rest. The wire round trip and the version 1 skip are in
     `src/replicate/wire.rs`'s tests.
   - Mutations, each run against `tests/replicate_resume.rs` before the
@@ -681,8 +684,11 @@ copy takes in normal operation. B stays open.
     frame that crosses the limit, and dropping the frames held, also passed
     every test, because the limit test held at most one frame;
     `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`
-    was added and fails under that mutation.
-  - Gates: `cargo test --features test-support` 436 passed, 0 failed;
+    was added and fails under that mutation. The next review found that
+    adopting each held frame in its own call at the crossing also passed;
+    `a_group_crossing_the_limit_commits_the_frames_held_together`, with a
+    trigger refusing the second held part's insert, was added for it.
+  - Gates: `cargo test --features test-support` 437 passed, 0 failed;
     clippy with `-D warnings` on all three feature sets, `cargo doc` with
     `-D warnings`, the wasm check and `cargo fmt --check` pass.
 - What B would cost, read from the code and not built: `EncodeContext` holds

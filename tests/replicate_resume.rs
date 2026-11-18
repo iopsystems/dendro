@@ -2327,6 +2327,44 @@ fn a_group_crossing_the_staging_limit_adopts_the_frames_held_together() {
     origin.close();
 }
 
+/// The frames held when the limit is crossed commit together: a trigger
+/// refuses the insert of the second, [7, 9], so the first, [4, 6], is not
+/// committed either.
+#[test]
+fn a_group_crossing_the_limit_commits_the_frames_held_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal_by(&o, &c, 3);
+    let group = frames.iter().position(is_segment_group).unwrap();
+    let Frame::SegmentAfter { bytes, .. } = &frames[group + 1] else {
+        panic!("a SegmentAfter follows the group");
+    };
+    link.sub.set_group_staging_limit(bytes.len());
+    let raw = rusqlite::Connection::open(&c).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_second_part BEFORE INSERT ON segments \
+         WHEN NEW.first_ts = 7 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    drop(raw);
+    pump(frames[..=group + 1].to_vec(), &mut link.sub);
+    let err = link
+        .sub
+        .apply(frames[group + 2].clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refused"), "{err}");
+    assert!(link.sub.finish().is_err());
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 1, "only [1, 3]");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
 /// Past the staging limit the copy adopts a group's frames as they arrive,
 /// so a cut between them leaves what it left before the kind existed.
 #[test]
