@@ -596,9 +596,11 @@ copy takes in normal operation. B stays open.
     partial group.
   - Staged frames are dropped on a disconnect, and the resume continues
     from what the copy held before the group: it sends the segments again
-    while the origin holds them, and once the origin has evicted them it
-    sends a `Sync` that seals the copy's live rows with their anchor
-    present (`publisher.rs:594`). Another `SegmentGroup`, or any
+    while the origin holds them. Once the origin has evicted them it
+    sends a `Sync` below the rest (`publisher.rs:696`), or no `Sync` when
+    it holds no segment of the stream (`publisher.rs:594`), and the `Sync`
+    of a later poll then seals the copy's live rows with their anchor
+    present. Another `SegmentGroup`, or any
     other frame for the source, before the group completes is refused: the
     source stops, as after any failed frame, and the copy keeps its
     watermark until it resumes. Dropping the group and continuing would
