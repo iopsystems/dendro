@@ -238,18 +238,23 @@ impl ArchivePublisher {
     /// `[L, max(L, W)]` inside no segment of either side; the stream gets a
     /// [`Sync`](Frame::Sync) to it unless it is the copy's watermark, then
     /// this archive's segments above it as
-    /// [`SegmentAfter`](Frame::SegmentAfter) frames, then its live rows. A
-    /// stream whose oldest row here is more than one past the copy's newest,
-    /// or that retention here removed entirely after rows the copy lacks,
-    /// gets an [`Unavailable`](Frame::Unavailable). A caller-row name
+    /// [`SegmentAfter`](Frame::SegmentAfter) frames, then its live rows.
+    /// With no `Sync`, a [`SegmentGroup`](Frame::SegmentGroup) precedes the
+    /// `SegmentAfter` frames when two or more of them replace live rows the
+    /// copy holds (WIRE.md §4.10). A stream whose oldest row here is more
+    /// than one past the copy's newest, or that retention here removed
+    /// entirely after rows the copy lacks, gets an
+    /// [`Unavailable`](Frame::Unavailable). A caller-row name
     /// continues after the request's position, and clock offsets are sent
     /// again from the smallest sync point.
     ///
     /// While tailing, a seal in this archive goes out as `SegmentAfter`
-    /// frames, preceded by a `Sync` when the sync point is not the copy's
-    /// watermark and by an `Unavailable` when this archive's oldest row is
-    /// more than one past the copy's newest, so a seal that outruns a poll is
-    /// not an error as it is on version 1.
+    /// frames: with a `Sync` before them when the sync point is not the
+    /// copy's watermark, otherwise with a `SegmentGroup` before them when two
+    /// or more replace live rows the copy holds, and with an `Unavailable`
+    /// when this archive's oldest row is more than one past the copy's
+    /// newest. On version 2 a seal that outruns a poll is not an error; on
+    /// version 1 it is.
     ///
     /// # Errors
     ///
@@ -648,10 +653,11 @@ fn open_resumed_source(
 /// Pick a stream's sync point against the copy's spans as `cursor` holds
 /// them and this archive's `origin` spans, and emit the `Sync` and the
 /// `SegmentAfter` frames above it; or, when the point is the copy's
-/// watermark, the `SegmentAfter` frames alone. An `Unavailable` precedes
-/// them when this archive's oldest row is more than one past the copy's
-/// newest. Moves the stream's row cursor to what the copy then holds, and
-/// returns the point.
+/// watermark, the `SegmentAfter` frames alone, preceded by a
+/// `SegmentGroup` when two or more replace live rows the copy holds. An
+/// `Unavailable` precedes them when this archive's oldest row is more than
+/// one past the copy's newest. Moves the stream's row cursor to what the
+/// copy then holds, and returns the point.
 fn cursor_sync(
     cursor: &mut SourceCursor,
     db: &Archive,
@@ -707,6 +713,31 @@ fn cursor_sync(
         .filter(|s| s.meta.last_ts > at)
         .collect();
     above.sort_by_key(|s| s.meta.first_ts);
+    // Without a `Sync` the copy still holds its live rows above `at`, and
+    // the segments that start at or below its newest row delete them. A
+    // row there may decode only with an earlier row that one of those
+    // segments deletes, so the copy adopts them together (WIRE.md §4.10).
+    // One segment is already adopted in one transaction.
+    let grouped = if synced {
+        0
+    } else {
+        above
+            .iter()
+            .take_while(|s| s.meta.first_ts <= copy_newest)
+            .count()
+    };
+    if grouped >= 2 {
+        frames.push(Frame::SegmentGroup {
+            source: ordinal,
+            stream: stream.to_string(),
+            count: u32::try_from(grouped).map_err(|_| {
+                Error::Message(format!(
+                    "source {source_id}: stream `{stream}` has more than u32::MAX segments \
+                     to send in one group"
+                ))
+            })?,
+        });
+    }
     for segment in above {
         let last = segment.meta.last_ts;
         entry.copy_spans.push((segment.meta.first_ts, last));

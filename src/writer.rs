@@ -218,13 +218,12 @@ enum Msg {
         at: i64,
         reply: SyncSender<Result<Synced>>,
     },
-    /// Insert a segment that replaces a replicated copy's live rows above
-    /// `after` (WIRE.md §4.8). Replies with the rows deleted below the
-    /// segment's `first_ts`.
+    /// Insert segments of one stream that each replace a replicated copy's
+    /// live rows above their `after` (WIRE.md §4.8), all in one transaction.
+    /// Replies with the rows deleted below each segment's `first_ts`.
     AdoptAfter {
         source_id: i64,
-        after: i64,
-        segment: Box<Adopted>,
+        parts: Vec<AdoptedAfter>,
         reply: SyncSender<Result<u64>>,
     },
     /// Clear one source's `complete` flag.
@@ -1253,28 +1252,32 @@ impl SourceWriter {
         })
     }
 
-    /// Insert a segment that replaces this copy's live rows of `stream` in
-    /// `(after, meta.last_ts]` (WIRE.md §4.8), waiting for the writer, and
-    /// return the live rows it deleted below `meta.first_ts`.
-    pub(crate) fn adopt_segment_after(
+    /// Insert segments of `stream`, each of which replaces this copy's live
+    /// rows in `(after, meta.last_ts]` (WIRE.md §4.8), in one transaction,
+    /// waiting for the writer, and return the live rows they deleted below
+    /// their `first_ts`. Each part is checked against the copy as the parts
+    /// before it leave it; one that fails the check commits none of them.
+    pub(crate) fn adopt_segments_after(
         &mut self,
         stream: &str,
-        after: i64,
-        meta: &SegmentMeta,
-        bytes: &[u8],
-        caller_index: Option<&[u8]>,
+        parts: Vec<AfterPart>,
     ) -> Result<u64> {
-        let segment = Box::new(Adopted {
-            stream: stream.to_string(),
-            meta: *meta,
-            bytes: bytes.to_vec(),
-            caller_index: caller_index.map(<[u8]>::to_vec),
-        });
+        let parts = parts
+            .into_iter()
+            .map(|p| AdoptedAfter {
+                after: p.after,
+                segment: Adopted {
+                    stream: stream.to_string(),
+                    meta: p.meta,
+                    bytes: p.bytes,
+                    caller_index: p.caller_index,
+                },
+            })
+            .collect();
         let source_id = self.source_id;
         self.request(|reply| Msg::AdoptAfter {
             source_id,
-            after,
-            segment,
+            parts,
             reply,
         })
     }
@@ -2143,6 +2146,21 @@ pub(crate) struct Adopted {
     caller_index: Option<Vec<u8>>,
 }
 
+/// One `SegmentAfter` frame's segment, as the subscriber hands it to
+/// [`SourceWriter::adopt_segments_after`].
+pub(crate) struct AfterPart {
+    pub(crate) after: i64,
+    pub(crate) meta: SegmentMeta,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) caller_index: Option<Vec<u8>>,
+}
+
+/// An [`AfterPart`] on its way to the writer thread.
+pub(crate) struct AdoptedAfter {
+    after: i64,
+    segment: Adopted,
+}
+
 /// The writer thread body. Every fallible operation returns `Err`; the loop
 /// exits on the first error so the failure surfaces on the next hand-off
 /// instead of accumulating against a broken source.
@@ -2548,8 +2566,7 @@ fn writer_loop(
             }
             Ok(Msg::AdoptAfter {
                 source_id,
-                after,
-                segment,
+                parts,
                 reply,
             }) => {
                 let adopted = if !replicas.contains(&source_id) {
@@ -2561,23 +2578,18 @@ fn writer_loop(
                     Err(poisoned_error(source_id))
                 } else {
                     with_retries("adopting a segment", || {
-                        adopt_segment_after(
-                            db,
-                            source_id,
-                            after,
-                            &mut next_seq,
-                            &mut watermarks,
-                            &segment,
-                        )
+                        adopt_segments_after(db, source_id, &mut next_seq, &mut watermarks, &parts)
                     })
                 };
                 if adopted.is_ok() {
-                    let n = newest
-                        .entry(source_id)
-                        .or_default()
-                        .entry(segment.stream.clone())
-                        .or_insert(segment.meta.last_ts);
-                    *n = (*n).max(segment.meta.last_ts);
+                    for part in &parts {
+                        let n = newest
+                            .entry(source_id)
+                            .or_default()
+                            .entry(part.segment.stream.clone())
+                            .or_insert(part.segment.meta.last_ts);
+                        *n = (*n).max(part.segment.meta.last_ts);
+                    }
                 }
                 let _ = reply.send(adopted);
             }
@@ -3255,66 +3267,91 @@ fn sync_stream(
     Ok(synced)
 }
 
-/// The writer-thread half of [`SourceWriter::adopt_segment_after`] (WIRE.md
-/// §4.8). Returns the live rows deleted below the segment's `first_ts`.
-fn adopt_segment_after(
+/// The writer-thread half of [`SourceWriter::adopt_segments_after`] (WIRE.md
+/// §4.8). Checks every part against the copy as the parts before it leave
+/// it, then deletes and inserts for all of them in one transaction. Returns
+/// the live rows deleted below each segment's `first_ts`.
+fn adopt_segments_after(
     db: &mut ArchiveMut,
     source_id: i64,
-    after: i64,
     next_seq: &mut BTreeMap<(i64, String), u64>,
     watermarks: &mut BTreeMap<i64, BTreeMap<String, i64>>,
-    segment: &Adopted,
+    parts: &[AdoptedAfter],
 ) -> Result<u64> {
-    let Adopted {
-        stream,
-        meta,
-        bytes,
-        caller_index,
-    } = segment;
-    let stream = stream.as_str();
-    if meta.rows == 0 || meta.first_ts > meta.last_ts || meta.last_ts <= after {
+    let Some(first) = parts.first() else {
+        return Ok(0);
+    };
+    let stream = first.segment.stream.as_str();
+    if let Some(p) = parts.iter().find(|p| p.segment.stream != stream) {
         return Err(Error::Message(format!(
-            "source {source_id}: the segment offered for `{stream}` after {after} claims {} \
-             row(s) over [{}, {}], which is not a segment that can follow it",
-            meta.rows, meta.first_ts, meta.last_ts
+            "source {source_id}: segments of `{stream}` and `{}` offered to adopt together; \
+             a group belongs to one stream",
+            p.segment.stream
         )));
     }
-    let w0 = watermarks
+    let mut w = watermarks
         .get(&source_id)
         .and_then(|m| m.get(stream))
         .copied();
-    if let Some(w) = w0.filter(|w| *w > after || meta.first_ts <= *w) {
-        return Err(Error::Message(format!(
-            "source {source_id}: the copy holds `{stream}` sealed to {w}, and the segment \
-             offered over [{}, {}] after {after} would overlap it",
-            meta.first_ts, meta.last_ts
-        )));
-    }
-    let live = db.live_wal(source_id, stream)?;
-    if let Some(r) = live.iter().find(|r| r.ts <= after) {
-        return Err(Error::Message(format!(
-            "source {source_id}: the copy holds a live row of `{stream}` at {}, at or below \
-             {after}, where the segment offered after {after} says it holds none",
-            r.ts
-        )));
-    }
-    let pruned = live
+    let mut live: Vec<i64> = db
+        .live_wal(source_id, stream)?
         .iter()
-        .filter(|r| r.ts > after && r.ts < meta.first_ts)
-        .count() as u64;
+        .map(|r| r.ts)
+        .collect();
+    let mut pruned = 0u64;
+    for AdoptedAfter { after, segment } in parts {
+        let after = *after;
+        let meta = &segment.meta;
+        if meta.rows == 0 || meta.first_ts > meta.last_ts || meta.last_ts <= after {
+            return Err(Error::Message(format!(
+                "source {source_id}: the segment offered for `{stream}` after {after} claims \
+                 {} row(s) over [{}, {}], which is not a segment that can follow it",
+                meta.rows, meta.first_ts, meta.last_ts
+            )));
+        }
+        if let Some(w) = w.filter(|w| *w > after || meta.first_ts <= *w) {
+            return Err(Error::Message(format!(
+                "source {source_id}: the copy holds `{stream}` sealed to {w}, and the segment \
+                 offered over [{}, {}] after {after} would overlap it",
+                meta.first_ts, meta.last_ts
+            )));
+        }
+        if let Some(ts) = live.iter().find(|ts| **ts <= after) {
+            return Err(Error::Message(format!(
+                "source {source_id}: the copy holds a live row of `{stream}` at {ts}, at or \
+                 below {after}, where the segment offered after {after} says it holds none"
+            )));
+        }
+        pruned += live
+            .iter()
+            .filter(|ts| **ts > after && **ts < meta.first_ts)
+            .count() as u64;
+        live.retain(|ts| *ts > meta.last_ts);
+        w = Some(meta.last_ts);
+    }
     let seq = next_seq
         .get(&(source_id, stream.to_string()))
         .copied()
         .unwrap_or(0);
     db.transaction(|tx| {
-        tx.delete_wal_range(source_id, stream, Some(after), Some(meta.last_ts))?;
-        tx.insert_segment_with_index(source_id, stream, seq, meta, bytes, caller_index.as_deref())
+        for (i, AdoptedAfter { after, segment }) in parts.iter().enumerate() {
+            tx.delete_wal_range(source_id, stream, Some(*after), Some(segment.meta.last_ts))?;
+            tx.insert_segment_with_index(
+                source_id,
+                stream,
+                seq + i as u64,
+                &segment.meta,
+                &segment.bytes,
+                segment.caller_index.as_deref(),
+            )?;
+        }
+        Ok(())
     })?;
-    next_seq.insert((source_id, stream.to_string()), seq + 1);
+    next_seq.insert((source_id, stream.to_string()), seq + parts.len() as u64);
     watermarks
         .entry(source_id)
         .or_default()
-        .insert(stream.to_string(), meta.last_ts);
+        .insert(stream.to_string(), w.expect("one part at least"));
     Ok(pruned)
 }
 

@@ -388,8 +388,10 @@ mod bench_prune {
 
 ## Outcome
 
-Open. A and D shipped in 0.8.0; B has a confirmed loss path on a copy
-(below); C is not started.
+Open. A and D shipped in 0.8.0; B had a confirmed loss path on a copy,
+fixed by a `SegmentGroup` frame (below) when both sides have it and the
+group is at most 256 MiB, and B's design question is still open; C is not
+started.
 
 A, decided 2026-11-15, merged as #84 (5e2f8e5), released in 0.8.0:
 
@@ -531,7 +533,8 @@ copy takes in normal operation. B stays open.
   part and not the rest. If the origin evicts the rest before the copy
   resumes, the resume's `Sync` seals them on the copy with `encode`, which
   gives no segment, and they are deleted as unsealable. Pinned by
-  `a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail` (rows
+  `a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail`, which
+  the fix below replaced (rows
   4..=13 sealed as [4, 8] and [9, 13], the connection cut after the first;
   the copy then decodes 1..=8, and after the eviction and resume, 1..=8 and
   14..=15, with `rows_unsealable` 5). The same steps with `Tags`, whose rows
@@ -641,6 +644,54 @@ copy takes in normal operation. B stays open.
     leaves. New tests for each pairing of old and new publisher and
     subscriber, a group dropped by a reconnect, a group interrupted by
     another frame, and the staging limit.
+- The first fix, built 2026-11-18 on the branch `feat/segment-group`, as
+  designed. The design's line numbers cite 058f812; the build moved them,
+  and renamed `adopt_segment_after` to `adopt_segments_after`. The build
+  differs from the design in two ways: past the staging limit the
+  subscriber adopts the frames it holds in one transaction and each later
+  frame alone, and it accepts a group of one, which the publisher does not
+  send. Tests
+  in `tests/replicate_resume.rs`:
+  - `a_capped_seal_cut_between_its_parts_keeps_the_copys_anchor` replaces
+    the pinned test: the copy decodes 1..=13 after the cut, `finish`
+    returns an error for the group still due, and after the eviction and
+    resume the copy decodes 1..=15 with `rows_unsealable` 0.
+  - `a_subscriber_that_skips_the_group_adopts_each_part_alone` filters the
+    `SegmentGroup` frame out, which is what a subscriber on 0.8.0 and a
+    publisher that does not send it both leave, and gets the old result
+    (1..=8, then `rows_unsealable` 5).
+  - `a_capped_seal_goes_out_as_one_group`,
+    `a_group_interrupted_by_another_frame_stops_the_source`,
+    `a_group_with_a_refused_part_adopts_none`,
+    `a_group_whose_later_insert_fails_commits_no_part`,
+    `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`,
+    `a_group_crossing_the_limit_commits_the_frames_held_together` and
+    `a_group_past_the_staging_limit_is_adopted_frame_by_frame` cover the
+    rest. The wire round trip and the version 1 skip are in
+    `src/replicate/wire.rs`'s tests.
+  - Mutations, each run against `tests/replicate_resume.rs` before the
+    insert-failure test existed: with the publisher never sending the
+    group, or the subscriber ignoring it, five of the six tests fail; with
+    the subscriber handing each part to the writer in its own call, the
+    refused-part test fails; with `finish` ignoring a group still due, the
+    cut test and the staging-limit test fail; with no check for an
+    interrupting frame, the interrupted-group test fails.
+  - Review found that with the writer committing each part in its own
+    transaction inside one call, no test failed: the refused-part test is
+    refused by the checks, which run before any transaction opens.
+    `a_group_whose_later_insert_fails_commits_no_part` was added for it,
+    with a trigger on the copy that refuses the second part's insert, and
+    fails under that mutation. A later review found that adopting only the
+    frame that crosses the limit, and dropping the frames held, also passed
+    every test, because the limit test held at most one frame;
+    `a_group_crossing_the_staging_limit_adopts_the_frames_held_together`
+    was added and fails under that mutation. The next review found that
+    adopting each held frame in its own call at the crossing also passed;
+    `a_group_crossing_the_limit_commits_the_frames_held_together`, with a
+    trigger refusing the second held part's insert, was added for it.
+  - Gates: `cargo test --features test-support` 437 passed, 0 failed;
+    clippy with `-D warnings` on all three feature sets, `cargo doc` with
+    `-D warnings`, the wasm check and `cargo fmt --check` pass.
 - What B would cost, read from the code and not built: `EncodeContext` holds
   only the source id, its uuid and the stream (`src/segment.rs:103`), so an
   encoder cannot read anchors kept outside the rows without a new
@@ -661,7 +712,9 @@ copy takes in normal operation. B stays open.
 
 Open after 0.8.0:
 
-- B, plan step 4, with the capped-seal loss above.
+- B, plan step 4. The capped-seal loss above is fixed by `SegmentGroup`
+  when both sides run a build that has it and the group's segments total
+  at most `MAX_STAGED_GROUP_BYTES` (256 MiB).
 - C, plan step 3.
 
 Resolved after 0.8.0:

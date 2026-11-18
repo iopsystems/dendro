@@ -2074,32 +2074,114 @@ fn a_sync_after_eviction_seals_the_copys_tail_with_its_anchor() {
     origin.close();
 }
 
-/// A known loss, pinned so that a fix has to change this test. The origin
-/// seals the run 4..=13, which the copy holds live, in two parts with
-/// `seal_capped`. The copy adopts each part's `SegmentAfter` in its own
-/// transaction, and adopting [4, 8] deletes 4, the run's anchor, so 9..=13
-/// stay live with nothing to decode them by. The connection drops between
-/// the two frames. The origin then seals the next run and evicts before it,
-/// and the resume's `Sync` seals 9..=13 on the copy with `encode`, which
-/// gives no segment, so they are deleted as unsealable.
-#[test]
-fn a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail() {
-    let dir = tempfile::tempdir().unwrap();
-    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
-    let mut origin = Origin::create_with(&o, anchored());
+fn is_segment_group(f: &Frame) -> bool {
+    matches!(f, Frame::SegmentGroup { .. })
+}
+
+/// An origin holding the run 4..=13 live after a sealed 1..=3, a copy
+/// connected to it holding the same, and the origin's seal of 4..=13 in two
+/// parts, [4, 8] and [9, 13], with `seal_capped`. Returns the poll that
+/// ships the seal.
+fn capped_seal(o: &Path, c: &Path) -> (Origin, Link, Vec<Frame>) {
+    capped_seal_by(o, c, 5)
+}
+
+/// [`capped_seal`], with parts of at most `max_rows` rows.
+fn capped_seal_by(o: &Path, c: &Path, max_rows: usize) -> (Origin, Link, Vec<Frame>) {
+    let mut origin = Origin::create_with(o, anchored());
     run(&mut origin, 1..=3, true);
     origin.seal(&["s"]);
     run(&mut origin, 4..=13, true);
-    let mut link = connect_with(&o, &c, anchored);
-    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
-    origin.w.seal_capped(vec!["s".to_string()], 5).unwrap();
+    let link = connect_with(o, c, anchored);
+    assert_eq!(decodable(c), (1..=13).collect::<Vec<_>>());
+    origin
+        .w
+        .seal_capped(vec!["s".to_string()], max_rows)
+        .unwrap();
     origin.w.sync().unwrap();
-    let frames = link.publisher.next(&Archive::open(&o).unwrap()).unwrap();
+    let mut link = link;
+    let frames = link.publisher.next(&Archive::open(o).unwrap()).unwrap();
+    (origin, link, frames)
+}
+
+/// The parts of a capped seal go out as a `SegmentGroup` of two, and the
+/// copy adopts them together: the frame that completes the group reports
+/// both segments.
+#[test]
+fn a_capped_seal_goes_out_as_one_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal(&o, &c);
     assert_eq!(count(&frames, is_segment_after), 2);
+    let group = frames.iter().position(is_segment_group).unwrap();
+    assert!(matches!(
+        &frames[group],
+        Frame::SegmentGroup { count: 2, .. }
+    ));
+    assert!(is_segment_after(&frames[group + 1]) && is_segment_after(&frames[group + 2]));
+    pump(frames[..=group].to_vec(), &mut link.sub);
+    let staged = link.sub.apply(frames[group + 1].clone()).unwrap();
+    assert_eq!(staged.segments, 0, "the first part is staged");
+    link.sub.sync().unwrap();
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    let done = link.sub.apply(frames[group + 2].clone()).unwrap();
+    assert_eq!(done.segments, 2);
+    link.sub.apply_all(frames[group + 3..].to_vec()).unwrap();
+    link.close();
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// The connection drops between the two parts of a capped seal. The copy
+/// adopted neither, so it keeps 4..=13 live with 4, the run's anchor. The
+/// origin then seals the next run and evicts before it, and the resume's
+/// `Sync` seals 4..=13 on the copy with the anchor present.
+///
+/// Before `SegmentGroup`, the copy adopted [4, 8] alone, which deleted 4,
+/// and the `Sync` then deleted 9..=13 as unsealable.
+#[test]
+fn a_capped_seal_cut_between_its_parts_keeps_the_copys_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (mut origin, mut link, frames) = capped_seal(&o, &c);
     let cut = frames.iter().position(is_segment_after).unwrap() + 1;
     pump(frames[..cut].to_vec(), &mut link.sub);
-    link.close();
+    let err = link.sub.finish().unwrap_err().to_string();
+    assert!(err.contains("still due"), "{err}");
     assert_eq!(decodable(&o), (1..=13).collect::<Vec<_>>());
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+
+    run(&mut origin, 14..=15, true);
+    origin.seal(&["s"]);
+    origin.w.evict_before(14).unwrap();
+    origin.w.sync().unwrap();
+    let link = connect_with(&o, &c, anchored);
+    assert!(link
+        .frames
+        .iter()
+        .any(|f| matches!(f, Frame::Sync { at: 13, .. })));
+    assert_eq!(link.opened.rows_unsealable, 0);
+    link.close();
+    assert_eq!(decodable(&c), (1..=15).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// A subscriber that skips `SegmentGroup`, as one built before the kind
+/// existed does, adopts each part on its own, and a cut between them loses
+/// the copy's unanchored rows as before the kind existed.
+#[test]
+fn a_subscriber_that_skips_the_group_adopts_each_part_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (mut origin, mut link, frames) = capped_seal(&o, &c);
+    let frames: Vec<Frame> = frames
+        .into_iter()
+        .filter(|f| !is_segment_group(f))
+        .collect();
+    let cut = frames.iter().position(is_segment_after).unwrap() + 1;
+    let applied = pump(frames[..cut].to_vec(), &mut link.sub);
+    assert_eq!(applied.segments, 1);
+    link.close();
     assert_eq!(
         decodable(&c),
         (1..=8).collect::<Vec<_>>(),
@@ -2111,12 +2193,194 @@ fn a_capped_seal_delivered_in_part_loses_the_copys_unanchored_tail() {
     origin.w.evict_before(14).unwrap();
     origin.w.sync().unwrap();
     let link = connect_with(&o, &c, anchored);
-    assert!(link
-        .frames
-        .iter()
-        .any(|f| matches!(f, Frame::Sync { at: 13, .. })));
     assert_eq!(link.opened.rows_unsealable, 5);
     link.close();
     assert_eq!(decodable(&c), (1..=8).chain(14..=15).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// Any other frame of the source before a group completes is refused, and
+/// the source stops; the copy keeps what it held, and a resume sends the
+/// group again.
+#[test]
+fn a_group_interrupted_by_another_frame_stops_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal(&o, &c);
+    let first = frames.iter().position(is_segment_after).unwrap();
+    pump(frames[..=first].to_vec(), &mut link.sub);
+    let rows = frames.last().unwrap().clone();
+    assert!(matches!(rows, Frame::Rows { .. }));
+    let err = link.sub.apply(rows).unwrap_err().to_string();
+    assert!(err.contains("Rows frame arrived while 1 more"), "{err}");
+    assert!(
+        link.sub.apply(frames[first + 1].clone()).is_err(),
+        "stopped"
+    );
+    assert!(link.sub.finish().is_err());
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+
+    let link = connect_with(&o, &c, anchored);
+    assert_eq!(count(&link.frames, is_segment_group), 1);
+    assert_eq!(link.opened.segments, 2);
+    link.close();
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// A group whose later part the copy refuses commits none of its parts.
+#[test]
+fn a_group_with_a_refused_part_adopts_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, mut frames) = capped_seal(&o, &c);
+    let second = frames.iter().rposition(is_segment_after).unwrap();
+    if let Frame::SegmentAfter { after, .. } = &mut frames[second] {
+        *after = 3;
+    }
+    pump(frames[..second].to_vec(), &mut link.sub);
+    let err = link
+        .sub
+        .apply(frames[second].clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("would overlap it"), "{err}");
+    assert!(link.sub.finish().is_err());
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 1, "only [1, 3]");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// A group whose later part fails inside the adopting transaction commits
+/// none of its parts: a trigger on the copy refuses the insert of [9, 13]
+/// after [4, 8] has been inserted and 4..=8 deleted in the same
+/// transaction.
+#[test]
+fn a_group_whose_later_insert_fails_commits_no_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal(&o, &c);
+    let raw = rusqlite::Connection::open(&c).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_second_part BEFORE INSERT ON segments \
+         WHEN NEW.first_ts = 9 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    drop(raw);
+    let second = frames.iter().rposition(is_segment_after).unwrap();
+    pump(frames[..second].to_vec(), &mut link.sub);
+    let err = link
+        .sub
+        .apply(frames[second].clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refused"), "{err}");
+    assert!(link.sub.finish().is_err());
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 1, "only [1, 3]");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// A limit crossed with more than one frame held adopts the frames held
+/// together, then each later frame of the group as it arrives. The seal of
+/// 4..=13 in parts of three rows makes four frames, and the limit is the
+/// first frame's size, so the second crosses it.
+#[test]
+fn a_group_crossing_the_staging_limit_adopts_the_frames_held_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal_by(&o, &c, 3);
+    let group = frames.iter().position(is_segment_group).unwrap();
+    assert!(matches!(
+        &frames[group],
+        Frame::SegmentGroup { count: 4, .. }
+    ));
+    let Frame::SegmentAfter { bytes, .. } = &frames[group + 1] else {
+        panic!("a SegmentAfter follows the group");
+    };
+    link.sub.set_group_staging_limit(bytes.len());
+    pump(frames[..=group].to_vec(), &mut link.sub);
+    let segments: Vec<usize> = frames[group + 1..group + 5]
+        .iter()
+        .map(|f| link.sub.apply(f.clone()).unwrap().segments)
+        .collect();
+    assert_eq!(segments, vec![0, 2, 1, 1]);
+    link.sub.apply_all(frames[group + 5..].to_vec()).unwrap();
+    link.close();
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 5, "[1, 3] and the four parts");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// The frames held when the limit is crossed commit together: a trigger
+/// refuses the insert of the second, [7, 9], so the first, [4, 6], is not
+/// committed either.
+#[test]
+fn a_group_crossing_the_limit_commits_the_frames_held_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal_by(&o, &c, 3);
+    let group = frames.iter().position(is_segment_group).unwrap();
+    let Frame::SegmentAfter { bytes, .. } = &frames[group + 1] else {
+        panic!("a SegmentAfter follows the group");
+    };
+    link.sub.set_group_staging_limit(bytes.len());
+    let raw = rusqlite::Connection::open(&c).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_second_part BEFORE INSERT ON segments \
+         WHEN NEW.first_ts = 7 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    drop(raw);
+    pump(frames[..=group + 1].to_vec(), &mut link.sub);
+    let err = link
+        .sub
+        .apply(frames[group + 2].clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refused"), "{err}");
+    assert!(link.sub.finish().is_err());
+    let copy = Archive::open(&c).unwrap();
+    let source = copy.read_sources().unwrap()[0].id;
+    let held = copy
+        .segments_overlapping(source, "s", i64::MIN, i64::MAX)
+        .unwrap();
+    assert_eq!(held.len(), 1, "only [1, 3]");
+    assert_eq!(decodable(&c), (1..=13).collect::<Vec<_>>());
+    origin.close();
+}
+
+/// Past the staging limit the copy adopts a group's frames as they arrive,
+/// so a cut between them leaves what it left before the kind existed.
+#[test]
+fn a_group_past_the_staging_limit_is_adopted_frame_by_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let (o, c) = (dir.path().join("o"), dir.path().join("c"));
+    let (origin, mut link, frames) = capped_seal(&o, &c);
+    link.sub.set_group_staging_limit(0);
+    let cut = frames.iter().position(is_segment_after).unwrap() + 1;
+    let applied = pump(frames[..cut].to_vec(), &mut link.sub);
+    assert_eq!(applied.segments, 1);
+    let err = link.sub.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("1 frame(s) of the group were adopted"),
+        "{err}"
+    );
+    assert_eq!(decodable(&c), (1..=8).collect::<Vec<_>>());
     origin.close();
 }

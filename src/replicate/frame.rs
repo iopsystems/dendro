@@ -5,10 +5,11 @@
 //! [`SourceUpdate`](Frame::SourceUpdate) for a change to a row of `sources`
 //! after its handshake. The archive-level
 //! `documents` table has none; see the module docs. Protocol version 2 adds
-//! three frames that act on what a resumed copy already holds:
-//! [`Sync`](Frame::Sync), [`SegmentAfter`](Frame::SegmentAfter) and
-//! [`Unavailable`](Frame::Unavailable). No I/O here; [`wire`](super::wire)
-//! turns these into bytes.
+//! four frames that act on what a resumed copy already holds:
+//! [`Sync`](Frame::Sync), [`SegmentAfter`](Frame::SegmentAfter),
+//! [`Unavailable`](Frame::Unavailable) and
+//! [`SegmentGroup`](Frame::SegmentGroup). No I/O here;
+//! [`wire`](super::wire) turns these into bytes.
 
 use std::collections::BTreeMap;
 
@@ -290,6 +291,28 @@ pub enum Frame {
         /// The publisher's oldest held timestamp of the stream.
         before: i64,
     },
+
+    /// The next `count` frames of the source are
+    /// [`SegmentAfter`](Frame::SegmentAfter) frames of `stream`, which a
+    /// [`Subscriber`](crate::replicate::Subscriber) adopts together, in one
+    /// transaction, up to
+    /// [`MAX_STAGED_GROUP_BYTES`](crate::replicate::MAX_STAGED_GROUP_BYTES).
+    /// Protocol version 2 only (WIRE.md §4.10).
+    ///
+    /// The kind is skippable: a subscriber that skips it adopts each frame
+    /// on its own. A [`Subscriber`](crate::replicate::Subscriber) applies it
+    /// to a source of a resumed copy and refuses it otherwise, and refuses a
+    /// group that another frame of the source interrupts.
+    SegmentGroup {
+        /// Which source, by handshake ordinal.
+        source: u32,
+        /// The stream.
+        stream: String,
+        /// How many `SegmentAfter` frames follow. An
+        /// [`ArchivePublisher`](crate::replicate::ArchivePublisher) sends at
+        /// least two.
+        count: u32,
+    },
 }
 
 impl Frame {
@@ -304,7 +327,8 @@ impl Frame {
             | Frame::SourceUpdate { source, .. }
             | Frame::Sync { source, .. }
             | Frame::SegmentAfter { source, .. }
-            | Frame::Unavailable { source, .. } => *source,
+            | Frame::Unavailable { source, .. }
+            | Frame::SegmentGroup { source, .. } => *source,
         }
     }
 }

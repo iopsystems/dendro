@@ -33,6 +33,39 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- Replication protocol version 2 has a `SegmentGroup` frame (kind 10,
+  WIRE.md §4.10). A publisher sends one before two or more `SegmentAfter`
+  frames that replace a copy's live rows, as the parts of a capped seal do,
+  and a `Subscriber` adopts those frames in one transaction. Before, it
+  adopted each alone, and a connection lost between them could leave the
+  copy holding live rows whose earlier row the first segment had deleted;
+  for an encoder whose rows depend on an earlier row, a later `Sync` then
+  deleted them as unsealable. The kind is skippable, so a subscriber on
+  0.8.0 adopts the frames one at a time, as before. A `Subscriber` holds up
+  to `MAX_STAGED_GROUP_BYTES` (256 MiB) of a group's segments in memory;
+  past that it adopts the frames it holds together and each later frame as
+  it arrives.
+
+### Changed
+
+- While a `SegmentGroup` of a source has not completed, a resumed
+  `Subscriber` refuses any frame of that source other than the group's next
+  `SegmentAfter` or a `Handshake`, and the source stops. A `Handshake` for
+  its ordinal is refused as before and does not stop the source.
+  `Subscriber::finish` returns an error for a source whose group has not
+  completed, and does not finalize it.
+- For a `SegmentGroup` within the staging limit, `Subscriber::apply` of a
+  `SegmentAfter` before the last holds the frame in memory, writes nothing,
+  and returns an `Applied` with no segments counted; the last reports all
+  of them. Past the limit, the frame that passes it reports the frames
+  held, and each later frame reports itself.
+  `Subscriber::sync` does not write held frames. The staging limit can be
+  changed only under the `test-support` feature, and the frames held can
+  exceed it by one frame, which can be up to `MAX_SPLIT_FRAME_BYTES`
+  (1 GiB).
+
 ## [0.8.0] - 2026-11-16
 
 ### Changed
