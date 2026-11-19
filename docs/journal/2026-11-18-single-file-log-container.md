@@ -25,12 +25,12 @@ in `src/`.
 |---|---|---|---|
 | WAL (today) | `-wal`, `-shm` | `-wal`, `-shm`; deleting `-wal` loses commits | yes; readers do not block the writer |
 | WAL, `locking_mode=EXCLUSIVE` | `-wal` | `-wal` | no |
-| rollback journal (`DELETE`, `TRUNCATE`, `PERSIST`) | `-journal` during each write | a hot `-journal`; deleting it corrupts the file | readers block commits |
+| rollback journal | `-journal` during each write (`DELETE`); a `-journal` that stays after the first write (`TRUNCATE`, `PERSIST`) | a hot `-journal`; deleting it corrupts the file | readers block commits |
 | `journal_mode=OFF` or `MEMORY` | none | a kill mid-commit can corrupt the file | readers block commits |
 
-Each row loses one of three properties FORMAT.md §1 relies on: a durable
-commit per append, a valid file at every instant, and reads while the writer
-commits. This is SQLite's documented behaviour
+Every mode either leaves a sidecar file beside the archive or loses one of
+three properties FORMAT.md §1 relies on: a durable commit per append, a
+valid file at every instant, and reads while the writer commits. This is SQLite's documented behaviour
 (sqlite.org/wal.html, sqlite.org/lockingv3.html), not a dendro measurement.
 
 The `-lock` file is a consequence of SQLite too. dendro cannot `flock` the
@@ -40,7 +40,7 @@ lock the process holds on it (DESIGN.md, "One writing connection"). The
 storage audit's finding 1 (2026-11-18-storage-audit.md) is that second
 property: `sniff` closes a descriptor in the writer's process, SQLite's lock
 is gone, and a refused `ArchiveMut::open` checkpoints and deletes a live
-`-wal`. Confirmed by test; committed rows are lost.
+`-wal`. Reproduced in a scratch probe; committed rows were lost.
 
 ## The candidate
 
@@ -145,7 +145,7 @@ In: the container's file layout, commit, recovery, locking and retention.
 
 Out: the encoder, segment format (Parquet stays), the replication wire, and
 the audit's other findings. Findings 1 (lock ordering) and 4 (no
-`journal_size_limit`) are fixed on the current format whatever this probe
+`journal_size_limit`) need fixing on the current format whatever this probe
 decides, because the current format ships until a replacement does.
 
 ## Plan
@@ -176,8 +176,9 @@ SQLite arm is therefore the writer thread's own connection and its own
   arms rotate their start position each trial. Arms: `sqlite_a`, `sqlite_b`
   (identical; their difference is the floor), `log_a`, `log_b`, and on
   macOS `sqlite_full` and `log_full` with `F_FULLFSYNC`. The log arm's time
-  includes encoding the record and its CRC32; the SQLite arm's includes
-  binding. The figure per arm is the median over trials of each trial's
+  includes encoding the record and its CRC32, and also generating the
+  tick's rows, which the SQLite arm does before its timer starts; that
+  biases against the log arm. The SQLite arm's time includes binding. The figure per arm is the median over trials of each trial's
   median per-tick time.
 - **G2:** one writer appends ticks and a 4 MiB seal record every 1,000
   ticks, each followed by `fsync` (`fdatasync` on Linux). Once a live span
@@ -207,8 +208,8 @@ Measured, 15 trials, per-tick microseconds:
 - **G1 holds on APFS.** The A-vs-A floor is 2.5 us (222.8 against 220.3).
   The log arm is 151 us faster per tick, a factor of 3.1, and the trial
   ranges do not overlap.
-- **The prediction held.** The ratio matches the 3.14x write volume, but
-  that is derived, not shown: the probe did not count bytes written.
+- **The prediction held.** The probe did not count bytes written, so this
+  does not show that write volume is the cause.
 - **`F_FULLFSYNC` erases the median difference.** Both arms take about
   4.25 ms, so the cache flush is the whole cost. The log arm's p99 is 2.5x
   lower (6.8 ms against 17.3 ms). The SQLite tail is probably the commits
@@ -233,8 +234,11 @@ Setup: Debian 13 guests (`debian-13-6.12`, image build 20261113.1, kernel
 01a1f2f4-4eba-719a-0fb7-79f7b0be970d). Each filesystem is made fresh on a
 24 GiB loop device (`--direct-io=on`), backed by a file on the guest's ext4
 root disk `vda`, which reports `write back`. A guest `fdatasync` therefore
-goes through the loop device and virtio to the host's storage. That costs
-16 to 19 ms per commit, about 80 times the Mac. The absolute times describe
+goes through the loop device and virtio to the host's storage. Each tick
+takes 16 to 19 ms on this stack, about 80 times the Mac's SQLite arm and 250
+times its log arm; the probe did not time `fdatasync` separately. The time
+follows the host rather than the filesystem: hv02 gave about 18.7 ms in
+both of its runs, hv01 16.2 to 16.6 ms. The absolute times describe
 this stack, not bare-metal disks; the comparison between arms holds because
 both arms ran on the same stack, interleaved.
 
@@ -250,12 +254,14 @@ Measured, 15 trials, per-tick microseconds, median of trial medians:
 - **G1 holds on ext4 and xfs.** On ext4 the log is 677 us faster (3.6%)
   against a floor of 20 us. On xfs it is 651 us faster (4.0%) against a
   floor of 41 us.
-- **The fsync dominates on this stack.** The absolute saving is about 4x
+- **The sync probably dominates on this stack,** inferred from the small
+  relative difference; it was not timed. The absolute saving is about 4x
   the Mac's 151 us. I don't know why; the probe did not measure where
   inside the commit the time goes.
-- **The trial medians are bimodal.** Most trials sit near the median and a
-  few run at half the time in every arm. I don't know why; the arms were
-  interleaved, so it affects all arms alike.
+- **The first trials of each job ran fast.** Trial 0 of each job, and on
+  xfs the first two arms of trial 1, ran at 35% to 55% of the others'
+  per-tick time, in every arm that ran in that window: about the first 45 s
+  of the job. I don't know why. The trial ranges in the table include them.
 
 G2, allocated over live bytes:
 
@@ -270,6 +276,9 @@ G2, allocated over live bytes:
 - **G2 fails on xfs as written.** Allocated bytes swing between 275.8 and
   765.0 MiB against 256 MiB live, and the excess does not trend with bytes
   appended. Punches took a median of 133 us and a p99 of 473 us.
+- **Extent counts were not collected.** The criterion asked for them, but
+  `filefrag` produced no output in any Linux job, and the probe discards a
+  failed command silently.
 - **The Linux reader checks prove nothing.** With 16 to 18 ms per sync the
   writer never got 256 MiB ahead of the reader. The reader read all 97,611
   records whole and none punched, so the punched-region check never ran.
@@ -328,24 +337,23 @@ and loop setup.
 - **Hole punching frees space on all three filesystems.** The NO-GO
   condition, retention that needs rewrite-and-rename, is not met.
 - **G2 as written fails on default-mounted xfs.** While the file is open,
-  xfs's speculative preallocation holds up to 2x the working set beyond the
-  live data, and returns it at close. A mount option fixes it, but dendro
-  cannot require a mount option of its users.
-- **Open question for the owner.** Either accept a transient overshoot of
-  up to 3x the working set on xfs, or make the writer control preallocation
-  for its own file, which needs a further probe. Two per-file controls are
-  candidates: an extent size hint (`FS_IOC_FSSETXATTR` with `fsx_extsize`)
-  or explicit `fallocate` in fixed chunks. Whether either suppresses xfs
-  speculative preallocation is unverified.
+  xfs holds up to 2x the working set beyond the live data, and releases it
+  at close. That this is speculative preallocation past EOF is inferred
+  from A, B and the hint run below, not observed. A mount option fixes it,
+  but dendro cannot require a mount option of its users.
+- **Open question for the owner, after the first xfs run.** Either accept a
+  transient overshoot of up to 3x on xfs, or have the writer control
+  preallocation for its own file. The follow-up below tested two per-file
+  controls, and both hold G2 on xfs.
 
 Status stays `open`: the probe finished, and the decision to design the
 format is the owner's.
 
 ### Follow-up: the writer controls its own preallocation
 
-The owner's direction (2026-11-19): use an xfs extent size hint if one
-works; otherwise preallocate in fixed chunks, which the owner prefers on
-other grounds too.
+The owner's direction (2026-11-19): find out whether xfs has an extent size
+hint that works; otherwise preallocate in fixed chunks, which the owner
+thought probably good for several reasons.
 
 Two variants, written before running:
 
@@ -359,9 +367,11 @@ Two variants, written before running:
   EOF: `fallocate(FALLOC_FL_KEEP_SIZE)` on Linux, and
   `fcntl(F_PREALLOCATE, F_ALLOCATEALL, F_PEOFPOSMODE)` on macOS. `O_APPEND`
   still appends after the last record.
-- **Bound:** allocated bytes stay at most live + 16 MiB + 1 MiB (the punch
-  granularity) + one record. At a 256 MiB working set that is at most
-  1.07x.
+- **Bound:** allocated bytes stay below live + 16 MiB (the chunk) + 1 MiB
+  (the punch granularity) + one filesystem block: about 1.067x at a 256 MiB
+  working set. (As first written this added one record and stated 1.07x;
+  with a 4 MiB seal record that sum is 1.082x, and the term is not needed,
+  because allocation runs before each write.)
 - **Prediction, xfs:** both variants hold G2. The hint gives about 1.00x
   and chunks at most 1.07x, steady from 10x to 20x. A hint run that
   overshoots like the default mount refutes the expectation.
@@ -417,18 +427,18 @@ G1, per-tick microseconds, median of 15 trial medians:
   costs nothing per tick anywhere.
   - On APFS it is 22% faster than the plain log (51.0 against 65.4 us).
   - On ext4 it is 80 us (0.5%) faster, against a 9 us floor.
-  - On xfs the difference is within the floor, and so is the hint's.
+  - On xfs the preallocated arm is 35 us faster than `log_a` and the hint
+    arm 41 us, against a 33 us floor: just outside it, and under 0.25%.
 - **Why APFS gains, not shown.** Probably the `fsync` after an append that
   stays inside allocated space does not have to persist an allocation; the
   probe did not trace it.
-- **The bimodal trial medians of the first Linux runs did not recur.**
-  Every arm's range is now within 4% of its median. I don't know what
-  caused them.
+- **The fast first trials did not recur.** Every Linux arm's range is now
+  within 4% of its median. This G1 ran after about 30 minutes of G2, so it
+  never ran in a job's first 45 s; that is probably why (inferred).
 
 Both mechanisms work on xfs. Chunks work on all three filesystems, bound
 the allocation at the working set plus one chunk whatever the filesystem
-would do by itself, and cost nothing per tick. The owner leaned towards
-chunks before these results. Which one the design uses, and whether xfs
+would do by itself, and cost nothing per tick. Which one the design uses, and whether xfs
 also gets the hint, is the owner's choice and is not yet made.
 
 ## Outcome

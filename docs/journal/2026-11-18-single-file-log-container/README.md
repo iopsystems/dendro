@@ -6,13 +6,14 @@ It is not part of the crate or its workspace, and CI does not build it.
 
 It needs two things dendro does not export: the writer thread's own open,
 `ArchiveMut::open_for_write`, and a way to set `fullfsync`. `dendro.patch`
-adds both. Apply it to a scratch checkout at a7000b5, not to a branch:
+adds both, against a7000b5. From the root of a checkout that contains this
+directory, build it in a scratch worktree at a7000b5, not on a branch:
 
 ```sh
 git worktree add --detach /tmp/dendro-probe a7000b5
-cd /tmp/dendro-probe
-git apply docs/journal/2026-11-18-single-file-log-container/dendro.patch
-cd docs/journal/2026-11-18-single-file-log-container
+git -C /tmp/dendro-probe apply "$PWD/docs/journal/2026-11-18-single-file-log-container/dendro.patch"
+cp -R docs/journal/2026-11-18-single-file-log-container /tmp/dendro-probe/docs/journal/
+cd /tmp/dendro-probe/docs/journal/2026-11-18-single-file-log-container
 cargo build --release
 ```
 

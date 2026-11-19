@@ -31,7 +31,9 @@ transactions, WAL and connection use, failure and restart, and docs against
 code. Each one built and ran probes in a scratch copy. Every finding marked
 confirmed below was either reproduced again in a fresh worktree at a7000b5
 or traced through the code by the auditor. Reproduced: findings 1, 2, 3, 4,
-6, 7 and 13, and docs items d1–d3. Traced: findings 5, 8 and 9.
+6, 7 and 13, and docs items d1–d3. Traced: findings 5, 8 and 9. Findings
+14–18 and docs items d4–d13 rest on the reviewers' runs or reading and were
+not re-checked by the auditor.
 
 ## Invariants
 
@@ -72,12 +74,12 @@ the auditor, not taken from the docs.
 
 | Invariant | Verdict | Evidence |
 |---|---|---|
-| 1 | broken across a kill during create | findings 10 and 1 |
+| 1 | broken | finding 1 (a refused open writes); plausibly also across a kill during create (finding 10, not staged) |
 | 2 | broken | finding 1 (committed rows lost); finding 11 on Apple; finding 5 (loss bound under a failing disk) |
 | 3 | holds | one transaction; `seq` advances after commit; a failed seal left seqs 0..16 contiguous |
 | 4 | holds | writer, retention and copy paths traced; retention control test below |
 | 5 | holds | seal, `split_seal`, compaction and copy traced |
-| 6 | holds | every delete of a stream's newest row records `bounds` first, in its own transaction |
+| 6 | holds | every delete of a stream's newest row records `bounds` first, in the delete's transaction |
 | 7 | holds | control test: live set `[11, 12]` unchanged at cutoffs 5, 7, 11 and 100 |
 | 8 | holds | `foreign_keys=ON` on every writing connection; the bundled build also defaults it on |
 | 9 | broken as worded | finding 16: `finalize` and `clock_offset` store the caller's pair |
@@ -186,8 +188,9 @@ finding's disposition is open until the owner decides.
 ### 6. A panic in a caller closure kills the writer silently
 
 - **Status:** confirmed, reproduced.
-- **Location:** `sqlite.rs:3208` and `:3170` call `StreamFilter` and
-  `CallerRowFloorFn` on the writer thread, with no `catch_unwind`.
+- **Location:** `sqlite.rs:3208` and `:3170` call a `StreamFilter`, and
+  `:433` calls a `CallerRowFloorFn`, on the writer thread, with no
+  `catch_unwind`.
 - **Probe:** `evict` returned `Err(WriterGone)` with no cause. The next
   `wal` returned `Ok` and its row was lost. `wal(vec![])` and `seal(vec![])`
   kept returning `Ok`. The archive stayed consistent.
@@ -289,7 +292,7 @@ finding's disposition is open until the owner decides.
 - **Status:** confirmed, reproduced. This is also a design question.
 - **Location:** `writer.rs:3487` deletes up to `last_ts`.
 - **What happens:** rows ahead of the encoder's first anchor are deleted in
-  the seal and counted nowhere. Copies omit them too (`rewrite.rs:1002`).
+  the seal and counted nowhere. Copies omit them too (`rewrite.rs:943`).
   The docs say a dropped trailing run stays live, and say nothing about a
   leading one.
 - **Probe:** rows 1–5 went in with the anchor at 3. The result was segment
@@ -324,12 +327,13 @@ finding's disposition is open until the owner decides.
 
 ### Docs against code (invariant 15)
 
-All confirmed unless noted. Proposed replacement text is in the reviewer
-outputs and is summarized here.
+All confirmed unless noted. The reviewers' proposed replacement text was
+not kept; each item summarizes it.
 
 - **d1.** FORMAT.md:502, DESIGN.md:316 and the `read_snapshot` comment say a
   held snapshot stops a checkpoint "from moving anything". In fact it stops
-  the checkpoint at the snapshot's commit: a measured `(0, 22, 12)` moved
+  the checkpoint at the snapshot's commit: `wal_checkpoint` returned (busy 0, 22 frames in the log, 12
+  checkpointed), so it moved
   the 12 frames the reader could see. FORMAT §2.2's "a plain copy is at
   most that stale" needs the snapshot caveat.
 - **d2.** FORMAT §4.6 and DESIGN.md:246 say a read-only open of an unfinished
