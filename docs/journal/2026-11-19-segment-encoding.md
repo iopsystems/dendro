@@ -64,7 +64,9 @@ is built:
 - rezolus #1394 (2026-10-02) sends groups of slots long on the agent's
   stream.
 - metriken-storage builds long segments and occupant streams in its
-  `long_table` and `occupants` modules, present since 2026-10-10.
+  `long_table` and `occupants` modules. They have been in metriken-storage
+  since #250 (2026-10-10); `long_table` dates from #178 (2026-09-28) under
+  an earlier path.
 
 The design is rezolus's entry, [The layout of a rezolus dendro
 archive](https://github.com/iopsystems/rezolus/blob/main/docs/journal/2026-09-25-dendro-archive-layout.md).
@@ -90,7 +92,7 @@ draft of this entry repeated it. It says:
   the busy host's `cpu_usage_task` took 219.4 MB wide, 37.8 MB long in
   arrival order, and 0.77 MB long sorted by `(occupant, timestamp)`. On the
   quiet host it was 181.3, 496.8 and 4.39 MB.
-- **Sorting is an option.** metriken-storage's `LongTable::finish(sort)`
+- **Sorting is an option.** metriken-storage's `LongTableBuilder::finish(sort)`
   orders rows by `(occupant, timestamp)` when asked, and otherwise keeps
   arrival order. Which recording paths ask for it is not checked here.
 - **A wide segment can also fail outright.** arrow-rs cannot open a segment
