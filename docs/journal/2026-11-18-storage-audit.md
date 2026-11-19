@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-18
-updated: 2026-11-18
+updated: 2026-11-19
 ---
 
 # Audit: the file format, the SQLite schema, and how dendro uses SQLite
@@ -90,10 +90,39 @@ the auditor, not taken from the docs.
 | 14 | holds, with exceptions | findings 17 and 18; docs item d10 |
 | 15 | broken | docs list below |
 
+## Disposition (owner, 2026-11-19)
+
+None of the findings will be fixed on the current SQLite format. The owner
+decided to pursue the append-only single-file container
+([2026-11-18-single-file-log-container.md](2026-11-18-single-file-log-container.md))
+instead. That entry carries every finding as a requirement on the new
+format, under "Requirements carried from the audit".
+
+The auditor recommended fixing findings 1 and 2 on the current format
+anyway, and the owner chose not to.
+
+- **Finding 1** loses committed rows today, when a second `ArchiveMut::open`
+  runs in the writer's own process.
+- **Finding 2**'s read path outlives the switch: a copy-forward still reads
+  v4 and v5 files.
+- **Exposure until the new format ships:** both findings stay live, and the
+  workaround for finding 1 is to never open a second write handle in a
+  recording process.
+
+**Reopen** any finding on the current format if the single-file effort
+reaches NO-GO or stops, or if finding 1 or 2 is reported from use.
+
+| Finding | Where it lands |
+|---|---|
+| 1, 2, 3, 4, 10, 11, 12, 17, 18 | SQLite-specific. Each becomes a property the new container must hold by construction, listed in the container entry. |
+| 5, 6, 7, 8, 9, 13, 14 | Writer logic, not SQLite. A new container does not fix them by itself, so each is a requirement with a test in the new writer. |
+| 15, 16 | Design questions (below). They are decided in the new format's design. |
+| d1–d13 | Docs of the current format. They are rewritten with the new format's FORMAT.md, and not patched before. |
+
 ## Findings
 
 Ranked by consequence. Status is confirmed, plausible or refuted. Each
-finding's disposition is open until the owner decides.
+finding's disposition is under "Disposition" above.
 
 ### 1. A refused `ArchiveMut::open` can delete a live writer's `-wal`
 

@@ -144,9 +144,13 @@ format is worth designing, not that it ships.
 In: the container's file layout, commit, recovery, locking and retention.
 
 Out: the encoder, segment format (Parquet stays), the replication wire, and
-the audit's other findings. Findings 1 (lock ordering) and 4 (no
-`journal_size_limit`) need fixing on the current format whatever this probe
-decides, because the current format ships until a replacement does.
+the audit's other findings. As first written, this said findings 1 (lock
+ordering) and 4 (no `journal_size_limit`) need fixing on the current format
+whatever this probe decides. On 2026-11-19 the owner decided instead to fix
+no audit finding on the current format and to carry them all here; see
+"Requirements carried from the audit". The segment encoding inside a record
+is its own entry:
+[2026-11-19-segment-encoding.md](2026-11-19-segment-encoding.md).
 
 ## Plan
 
@@ -443,6 +447,60 @@ Both mechanisms work on xfs. Chunks work on all three filesystems, bound
 the allocation at the working set plus one chunk whatever the filesystem
 would do by itself, and cost nothing per tick. Which one the design uses, and whether xfs
 also gets the hint, is the owner's choice and is not yet made.
+
+## Decisions (owner, 2026-11-19)
+
+- **Preallocation:** the writer preallocates its file in fixed chunks on
+  every filesystem, and sets no xfs extent size hint. The reason is that
+  the space bound is then the working set plus one chunk on any filesystem,
+  measured at 1.0625x on APFS, ext4 and xfs.
+- **Open design item:** a filesystem that refuses `fallocate`
+  (`EOPNOTSUPP`; NFS before 4.2 is one) needs a fallback, presumably plain
+  appends whose space bound is whatever the filesystem gives. The probe did
+  not test one.
+- **Segment payloads are opaque to the container.** A record carries the
+  segment's bytes and the catalog fields the encoder reports (rows, first
+  and last timestamps). The encoding inside is decided separately, in
+  [2026-11-19-segment-encoding.md](2026-11-19-segment-encoding.md).
+
+## Requirements carried from the audit
+
+The owner decided on 2026-11-19 not to fix the storage audit's findings
+(2026-11-18-storage-audit.md) on the SQLite format, but to make each one a
+requirement here. Each requirement needs a test in the new format that
+fails if it is broken.
+
+SQLite-specific findings, each a property the new container must hold by
+construction:
+
+| Audit finding | Requirement on the new format |
+|---|---|
+| 1: a refused open deletes a live `-wal` | A refused open writes nothing, and no `close()` in the writer's process releases the writer's lock. The `flock` is on the archive file itself. |
+| 2: the `immutable=1` fallback reads pages rewritten under it | A reader never assumes the file is unchanging unless the writer says it is finished. Every read validates each record's checksum. |
+| 3: copies are not in WAL mode | A copy is the same format as its source, with no mode to reset. |
+| 4: `-wal` keeps its high-water size | Space is bounded by retention and the preallocation chunk (measured above); no sidecar exists. |
+| 10: a kill during create leaves an unopenable file | Create is atomic: a file either has a valid header record or does not exist under its name (write and sync elsewhere, then rename). |
+| 11: no `fullfsync` on macOS | Decide and document what a commit's sync means on macOS. `F_FULLFSYNC` cost 4.25 ms per tick in the probe, against 71 us for `fsync`. |
+| 12: checkpoint-on-close enabled late | No connection has close-time side effects. |
+| 17: retention reads one page per segment | Retention reads the catalog only (index records), never segment payloads. |
+| 18: catalog reads are not index-only | The catalog in index records serves the catalog queries without reading payloads. |
+
+Writer-logic findings, which a new container does not fix by itself:
+
+| Audit finding | Requirement on the new writer |
+|---|---|
+| 5: dropped ticks reported as `Ok`, uncounted | Dropped ticks are counted and readable. The consecutive count resets only on a tick commit. |
+| 6: a caller closure's panic kills the writer silently | A panic in caller code becomes the writer's reported error. |
+| 7: a stream named twice in a seal batch stops the writer | A seal batch names each stream once (deduplicated or refused). |
+| 8: add and resume are several commits | Adding and resuming a source are one record each. |
+| 9: a seal that keeps failing is never surfaced | Deferred seals are counted per stream. |
+| 13: a tick's fallback loses cross-source atomicity | A tick is one record, so it is atomic across sources; there is no per-source fallback. |
+| 14: `seq` wraps through `as i64` | Sequence numbers are checked on every conversion. |
+
+Two design questions are decided in the new format's design, not here:
+finding 15 (a seal deletes an encoder's dropped leading run) and finding 16
+(`clock_offsets` holds caller pairs). The audit's docs items d1–d13 describe
+the SQLite format and are replaced with the new FORMAT.md.
 
 ## Outcome
 
