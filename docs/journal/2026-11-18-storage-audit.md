@@ -1,7 +1,7 @@
 ---
 status: open
 opened: 2026-11-18
-updated: 2026-11-18
+updated: 2026-11-19
 ---
 
 # Audit: the file format, the SQLite schema, and how dendro uses SQLite
@@ -90,10 +90,48 @@ the auditor, not taken from the docs.
 | 14 | holds, with exceptions | findings 17 and 18; docs item d10 |
 | 15 | broken | docs list below |
 
+## Disposition (owner, 2026-11-19)
+
+No finding is fixed on the current SQLite format. The owner first proposed
+skipping fixes on the current format if the single-file container
+([2026-11-18-single-file-log-container.md](2026-11-18-single-file-log-container.md))
+is pursued. The owner asked that the findings be carried into that entry,
+where each is a requirement under "Requirements carried from the audit".
+When asked about findings 1 and 2 separately, the owner chose to leave
+them unfixed too.
+
+The auditor had recommended fixing findings 1 and 2 anyway:
+
+- **Finding 1** loses committed rows when a process that holds a writer
+  closes a descriptor on the archive (`sniff` does) and an `ArchiveMut::open`
+  from another process is then refused.
+- **Finding 2** can return corrupt reads from the `immutable=1` fallback. A
+  copy-forward from v4 and v5 files would still use that read path after
+  the switch.
+
+Until the new format ships, both findings stay live. Workarounds:
+
+- For finding 1: in a process that holds a writer, do not call `sniff` and
+  do not open and close the archive file with `std::fs`. Do not run
+  `ArchiveMut::open` against a live archive.
+- For finding 2: do not read an archive with a live writer from a
+  directory the reader cannot write.
+
+**Reopen** any finding on the current format if the single-file effort
+reaches NO-GO or stops, or if finding 1 or 2 is reported from use.
+
+| Finding | Where it lands |
+|---|---|
+| 1, 2, 3, 4, 10, 12, 14, 17, 18 | Container-level. Each becomes a property the new container must hold, listed in the container entry. |
+| 11 | A decision the new format must make and document: what a commit's sync means on macOS. |
+| 5, 6, 7, 8, 9, 13 | Writer logic, not SQLite. A new container does not fix them by itself, so each is a requirement with a test in the new writer. |
+| 15, 16 | Design questions (below). They are decided in the new format's design. |
+| d1–d13 | Docs of the current format. They are rewritten with the new format's FORMAT.md, and not patched before. |
+
 ## Findings
 
 Ranked by consequence. Status is confirmed, plausible or refuted. Each
-finding's disposition is open until the owner decides.
+finding's disposition is under "Disposition" above.
 
 ### 1. A refused `ArchiveMut::open` can delete a live writer's `-wal`
 
