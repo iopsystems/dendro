@@ -124,21 +124,41 @@ long tables rezolus writes.
 Written before the probe runs. The thresholds are proposals for the owner
 to confirm or change before it does.
 
-Input: recordings written long by current rezolus, with their
-`<stream>/occupants` streams.
+Input, revised 2026-11-19 before anything ran (owner agreed). Two kinds,
+because each covers what the other cannot:
 
-- **The two recordings above are wide.** They were converted with segment
-  bytes unchanged. No local `.dendro` archive checked on 2026-11-19 has an
-  `/occupants` stream, so none was written long.
-- **Two ways to get long input:** record one or more new recordings with
-  current rezolus (one on a host with heavy process churn, to match the
-  busy host), or convert the two old ones, if rezolus's converter reshapes
-  them. Whether it does is not checked here.
-- **What each arm encodes:** each arm re-encodes both the data stream and
-  its occupant stream from the decoded rows.
-- **Row order:** rows are sorted by `(occupant, timestamp)` with
-  metriken-storage's own sort. Arrival order is also run and reported. The
-  verdict uses the sorted run.
+- **Real recordings, re-encoded long.**
+  - What: the two recordings above, each slotted table's wide segments
+    decoded and rebuilt as long segments and `<table>/occupants` streams
+    by metriken-storage's own `LongTableBuilder`, the production encoder.
+  - What it gives: real value distributions, including the busy host's
+    396,117 PIDs.
+  - Limit: each long segment holds one wide segment's rows, so it keeps
+    the wide writer's segmentation rather than the long writer's own seal
+    sizes.
+- **Fresh recordings from current rezolus.**
+  - What: recorded on a rack VM under the synthetic load rezolus's layout
+    entry used on 2026-09-28. That is 300 threads a second, each living
+    0.5–5 s, in four named pools; and 5 cgroup jobs a second, each living
+    10–60 s; at 1 s and 100 ms sampling.
+  - What it gives: the production writer end to end, with its own seals
+    and its own row order.
+  - Limit: the values are synthetic. The load generator was not
+    committed in rezolus, so this probe writes its own from that
+    description.
+
+Each arm re-encodes both the data stream and its occupant stream from the
+same decoded rows.
+
+**Row order:** production writes long segments in arrival order.
+`WriterConfig::sort_long` defaults to `false`, nothing sets it, and
+compaction and copies do not sort. So the verdict uses arrival order.
+Rows sorted by `(occupant, timestamp)` are run and reported too. As first
+written, this paragraph said the verdict used the sorted run. That was
+changed after checking the code, before any run.
+
+**If the two inputs disagree** on the verdict, the result is no verdict,
+and both go to the owner.
 
 Arms, each holding the same rows:
 
@@ -208,9 +228,10 @@ What a change of encoding would cost, given and not measured:
 1. A probe crate beside this entry, like the container probe. It reads
    each long recording's segments with dendro's API, decodes them, and
    writes each arm.
-2. Long recordings, as in Decision Criteria. They are not committed to
+2. Both inputs as in Decision Criteria. The recordings are not committed to
    the repository; this entry records their sizes, shapes and the rezolus
-   version that wrote them, not their contents.
+   version that wrote them, not their contents. The load generator and the
+   rack spec that records under it are committed beside the probe.
 3. Run on the Mac. The measurements are reads and encodes, not syncs, so
    one platform answers the question. Repeat on Linux only if a result is
    within 5 percentage points of a threshold.
