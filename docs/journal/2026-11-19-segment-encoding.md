@@ -58,10 +58,18 @@ unchanged:
   entry, which carries every task's labels as field metadata.
 
 That cost comes from the wide layout: one column per task, labels in each
-column's metadata. rezolus has already decided to change that layout. Its
-entry, [The layout of a rezolus dendro
-archive](https://github.com/iopsystems/rezolus/blob/main/docs/journal/2026-09-25-dendro-archive-layout.md)
-(status: design, nothing built), says:
+column's metadata. rezolus has since changed that layout, and the change
+is built:
+
+- rezolus #1394 (2026-10-02) sends groups of slots long on the agent's
+  stream.
+- metriken-storage builds long segments and occupant streams in its
+  `long_table` and `occupants` modules, present since 2026-10-10.
+
+The design is rezolus's entry, [The layout of a rezolus dendro
+archive](https://github.com/iopsystems/rezolus/blob/main/docs/journal/2026-09-25-dendro-archive-layout.md).
+Its status still reads "design, nothing built", which is stale; an earlier
+draft of this entry repeated it. It says:
 
 - **Long tables.** Every table with slots (task, cgroup, per-CPU, device)
   is written long. The columns are `timestamp`, the tick's `:wall_offset`,
@@ -81,14 +89,16 @@ archive](https://github.com/iopsystems/rezolus/blob/main/docs/journal/2026-09-25
 - **Row order matters as much as the layout.** One occupant's read from
   the busy host's `cpu_usage_task` took 219.4 MB wide, 37.8 MB long in
   arrival order, and 0.77 MB long sorted by `(occupant, timestamp)`. On the
-  quiet host it was 181.3, 496.8 and 4.39 MB. rezolus's converter sorts.
-  Whether the writer sorts at seal is not decided.
+  quiet host it was 181.3, 496.8 and 4.39 MB.
+- **Sorting is an option.** metriken-storage's `LongTable::finish(sort)`
+  orders rows by `(occupant, timestamp)` when asked, and otherwise keeps
+  arrival order. Which recording paths ask for it is not checked here.
 - **A wide segment can also fail outright.** arrow-rs cannot open a segment
   of 52,109 columns (`TooManyTables`), and long tables avoid that too.
 
-So the wide-segment problem has a design that removes it without changing
-the format. The remaining question is whether Arrow IPC beats Parquet for
-the long tables rezolus will write.
+So the wide-segment problem was removed by a layout change, not a format
+change. The remaining question is whether Arrow IPC beats Parquet for the
+long tables rezolus writes.
 
 ### What Arrow IPC would and would not change
 
@@ -112,13 +122,21 @@ the long tables rezolus will write.
 Written before the probe runs. The thresholds are proposals for the owner
 to confirm or change before it does.
 
-Input: the two recordings above in rezolus's long layout. The probe builds
-the layout itself, following the rezolus entry: the same long reshaping
-and the same `<stream>/occupants` stream. Each arm encodes both the data
-stream and its occupant stream. Rows are sorted by `(occupant, timestamp)`,
-as rezolus's converter writes them. Arrival order is also run and
-reported, because the writer has not decided to sort at seal. The verdict
-uses the sorted run.
+Input: recordings written long by current rezolus, with their
+`<stream>/occupants` streams.
+
+- **The two recordings above are wide.** They were converted with segment
+  bytes unchanged. No local `.dendro` archive checked on 2026-11-19 has an
+  `/occupants` stream, so none was written long.
+- **Two ways to get long input:** record one or more new recordings with
+  current rezolus (one on a host with heavy process churn, to match the
+  busy host), or convert the two old ones, if rezolus's converter reshapes
+  them. Whether it does is not checked here.
+- **What each arm encodes:** each arm re-encodes both the data stream and
+  its occupant stream from the decoded rows.
+- **Row order:** rows are sorted by `(occupant, timestamp)` with
+  metriken-storage's own sort. Arrival order is also run and reported. The
+  verdict uses the sorted run.
 
 Arms, each holding the same rows:
 
@@ -186,11 +204,11 @@ What a change of encoding would cost, given and not measured:
 ## Plan
 
 1. A probe crate beside this entry, like the container probe. It reads
-   each recording's segments with dendro's API, reshapes them long, and
+   each long recording's segments with dendro's API, decodes them, and
    writes each arm.
-2. The two recordings measured on 2026-09-25, from local copies matched by
-   size. They are not in the repository; this entry records their sizes,
-   shapes and the converter version, not their contents.
+2. Long recordings, as in Decision Criteria. They are not committed to
+   the repository; this entry records their sizes, shapes and the rezolus
+   version that wrote them, not their contents.
 3. Run on the Mac. The measurements are reads and encodes, not syncs, so
    one platform answers the question. Repeat on Linux only if a result is
    within 5 percentage points of a threshold.
