@@ -98,7 +98,7 @@ the long tables rezolus will write.
 - **Parquet's copy is base64.** Its `ARROW:schema` value is base64 of the
   IPC schema, so each IPC copy is about 3/4 its size (derived).
 - **For the old wide layout that would have been worse:** about 41 MB of
-  schema in the widest segment, against 27.5 MB (derived). Under the long
+  schema in the largest segment, against 27.5 MB (derived). Under the long
   layout the schema is small in both formats.
 - **What remains to compare:** column encodings and compression, and decode
   cost on read. dendro's Parquet uses plain encoding with RLE levels and
@@ -117,7 +117,8 @@ the layout itself, following the rezolus entry: the same long reshaping
 and the same `<stream>/occupants` stream. Each arm encodes both the data
 stream and its occupant stream. Rows are sorted by `(occupant, timestamp)`,
 as rezolus's converter writes them. Arrival order is also run and
-reported, because the writer has not decided to sort at seal.
+reported, because the writer has not decided to sort at seal. The verdict
+uses the sorted run.
 
 Arms, each holding the same rows:
 
