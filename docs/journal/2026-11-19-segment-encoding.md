@@ -162,7 +162,13 @@ and both go to the owner.
 
 Arms, each holding the same rows:
 
-- **P:** Parquet with dendro's current writer properties.
+- **P:** Parquet with dendro's current writer properties. Correction, made
+  before the verdict: this was ambiguous, and the first runs read it as
+  LZ4_RAW (dendro's `segment::writer_props` and metriken-storage's
+  `segment_writer_props`). The archive writer actually seals with
+  `segment_props(default_compression())`: zstd level 3, dictionary off.
+  P is that. Every result below uses it; the LZ4 runs are superseded (see
+  Evidence).
 - **P′:** a second, identical run of P. The difference between P and P′ is
   the floor.
 - **A:** Arrow IPC file format, LZ4 buffer compression.
@@ -225,9 +231,10 @@ What a change of encoding would cost, given and not measured:
 
 ## Plan
 
-1. A probe crate beside this entry, like the container probe. It reads
-   each long recording's segments with dendro's API, decodes them, and
-   writes each arm.
+1. A probe crate beside this entry, in
+   [2026-11-19-segment-encoding/probe/](2026-11-19-segment-encoding/probe/).
+   It reads each recording's segments through SQLite, read-only, decodes
+   them, and writes each arm.
 2. Both inputs as in Decision Criteria. The recordings are not committed to
    the repository; this entry records their sizes, shapes and the rezolus
    version that wrote them, not their contents. The load generator and the
@@ -239,8 +246,161 @@ What a change of encoding would cost, given and not measured:
 
 ## Evidence
 
-None yet.
+### Setup
+
+- **Where it ran:** Apple M4 Max, macOS 26.6.2, release build. Warm reads
+  from memory: every arm's segments are loaded before timing.
+- **Runs:** 7 interleaved runs per arm; the starting arm rotates each run.
+  Each figure is the median of the 7.
+- **Arms:**
+  - P and P2 are the same bytes, timed separately; their difference is the
+    floor.
+  - A is Arrow IPC with LZ4_FRAME buffers, and Az is Arrow IPC with zstd
+    buffers, both converted from P's decoded rows.
+  - Pl, an extra control not in the criteria, is Parquet with LZ4_RAW.
+
+### Inputs
+
+- **Real recordings, re-encoded long.**
+  - Sources: the two 2026-09-25 recordings, the quiet older one and the
+    busy 5.22.0 one.
+  - Tables: `cpu_usage_task`, `syscall_counts_cgroup` and `cpu_usage_cpu`,
+    each with its occupant stream.
+  - Method: the occupant labels are the keys whose values differ among the
+    columns of one metric, plus `id`.
+  - Occupants found: 6,644 and 396,117 task occupants. These are the
+    distinct slot counts in rezolus's layout entry.
+- **The reshape is exact.**
+  - Sizes: they match rezolus's 2026-09-27 gate harness. The quiet
+    `cpu_usage_task` came to 483 MiB long in arrival order and 334 MiB
+    sorted, at that run's LZ4 setting, against the gate's 505.4 and
+    348.7 MB.
+  - Cells: non-null cells match the wide source in 12 of 12 segments
+    checked.
+  - Values: in the largest checked segment, 525,874 of 525,874 values
+    match by occupant labels and timestamp.
+- **Fresh recordings from current rezolus.**
+  - Agent and recorder: rezolus `ba47c3f5` (6.0.0-alpha.152), on hv02,
+    kernel 6.12.116, experiment 01a1f60f-a9c0-71bd-e9c9-ff8ccefd1061.
+  - Load: `probe/rack/loadgen.c`. It spawned 180,000 threads with 10 ms of
+    CPU each and 3,000 cgroup jobs.
+  - Two recordings, at 1 s and at 100 ms intervals.
+  - Recording size: the 1 s one is 11.7 MB, with 3 task segments and
+    143,203 task occupants. The 100 ms one is 42.3 MB, with 22 task
+    segments and 161,222 task occupants.
+- **The fresh runs differ from rezolus's September spike in two ways.**
+  - Fewer task occupants than September's 177,854 and 184,332. 6.0's
+    default `task_min_lifetime = 1s` gives no series to threads younger
+    than 1 s (inferred, not checked).
+  - Per-thread series are off by default in 6.0, so the agent config adds
+    `task_attribution = true`.
+- **Two earlier rack runs were not usable.**
+  - 01a1f5cb: the image's own rezolus 5.31.0 agent held the port, so 5.31.0
+    served.
+  - 01a1f5ee: the run had no `task_attribution`, so there was no task
+    table.
+
+### Results, arrival order (the verdict's)
+
+Measure 1 is bytes over the three tables and their occupant streams. The
+other measures compare median times against P. A negative figure means
+faster than P.
+
+| input | P bytes | A / P | Az / P | m3 A | m3 Az | m4 A | m4 Az | m5 A | m5 Az | floor m3, m4 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| real, busy | 23,339,255 | 2.12x | 0.97x | −28.0% | −30.5% | −10.5% | −11.3% | −52.1% | −31.5% | 0.0%, 0.3% |
+| real, quiet | 222,442,053 | 2.22x | 0.85x | −28.6% | −34.9% | −6.6% | −16.5% | −32.6% | −27.3% | 0.5%, 0.4% |
+| fresh, 1 s | 4,630,826 | 2.26x | 1.27x | −32.9% | −24.3% | −20.0% | −18.8% | −53.0% | −22.2% | 0.1%, 0.2% |
+| fresh, 100 ms | 11,061,100 | 2.03x | 1.09x | −27.3% | −25.5% | −12.2% | −15.3% | −59.7% | −32.9% | 1.9%, 0.5% |
+
+Every floor is under 5%, so the floor is 5% everywhere.
+
+Bytes read on measure 3, for P and Az:
+
+- busy: 15.6 MB and 13.0 MB;
+- quiet: 209 MB and 177 MB;
+- fresh 1 s: 0.74 MB and 0.73 MB;
+- fresh 100 ms: 4.2 MB and 3.9 MB.
+
+IPC reads each record batch whole, yet in arrival order Az still reads no
+more than P. Parquet's projection saves little there, because one
+occupant's rows are spread across every page.
+
+Per input, against the criteria:
+
+- **Real, busy: GO for Az, marginal.** m3 is 30.5% faster, 0.5 points over
+  the bar. m4 and m5 are faster, and storage is 0.97x.
+- **Real, quiet: GO for Az.** m3 is 34.9% faster, and storage is 0.85x.
+- **Fresh, 1 s: no verdict.**
+  - A reads 32.9% faster but stores 2.26x, over the 1.25x limit.
+  - Az stores 1.27x, also over the limit.
+  - Neither meets GO, and A's speed rules out NO-GO.
+- **Fresh, 100 ms: NO-GO.** Neither arm reaches 30% (A 27.3%, Az 25.5%).
+
+### Superseded: the LZ4 runs
+
+The first runs on the real recordings used LZ4_RAW for P (see the
+correction under Arms). They showed Az at 0.36x to 0.45x of P's bytes. That
+was zstd against LZ4, not IPC against production. Rerun with production's
+settings, Az is 0.85x to 1.27x of P. The LZ4 control Pl is 1.8x to 2.4x the
+size of P, so production's zstd 3 already takes most of the saving.
+
+The read and encode comparisons moved less between the two runs:
+
+- **Measure 3, real recordings:** Az was 21% to 24% faster than an LZ4 P,
+  and is 30% to 35% faster than a zstd P.
+
+The raw outputs are not committed. The probe regenerates them.
+
+### Sorted order (reported, not the verdict)
+
+Az is 0.96x to 1.25x of sorted P's bytes on the four inputs. On measure 3,
+Az is 25% to 48% faster than sorted P.
+
+The probe does not use Parquet's page index for a single-occupant read, so
+sorted Parquet's single-occupant reads are slower here than a reader that
+pruned pages would see. The sorted figures understate Parquet.
+
+## Verdict
+
+**No verdict.** The two kinds of input disagree:
+
+- the real recordings give GO for Az, one of them by 0.5 points;
+- the fresh recordings give one NO-GO and one no verdict.
+
+Under the criteria written before the runs, that goes to the owner.
+
+Plan step 3 said to repeat on Linux when a result is within 5 points of a
+threshold. The busy GO is, and it was not repeated. A Linux result could
+only turn that GO into a NO-GO, and the inputs would still disagree.
+
+What the runs show, across all four inputs:
+
+- **Reads:** Arrow IPC with zstd reads one series 24% to 35% faster than
+  Parquet with production's settings, and a whole segment 11% to 19%
+  faster, warm and from memory.
+- **Encoding:** it encodes 22% to 33% faster.
+- **Storage:** it stores 0.85x to 1.27x of P. It is smaller on the real
+  recordings and larger on the fresh ones, whose tables are smaller and
+  whose occupants live shorter.
+- **IPC with LZ4** stores about twice P and fails the storage limit
+  everywhere.
+
+Not measured:
+
+- cold reads from disk;
+- Parquet with dictionary encoding on;
+- a reader that prunes Parquet pages;
+- rezolus's real query paths, which read through metriken-storage's own
+  readers, not this probe's.
+
+The author's recommendation: keep Parquet. The gain is a quarter to a third
+on warm single-series reads, at about the same storage. Taking it means
+rewriting compaction and projection for IPC, changing rezolus's reader,
+and giving up segments that any Parquet tool opens. A cold-read
+measurement through metriken-storage's reader would be the next step, if
+the owner wants to pursue the gain.
 
 ## Outcome
 
-Open. Nothing run.
+Open, pending the owner's decision on the verdict above.

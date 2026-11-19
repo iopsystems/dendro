@@ -1,0 +1,23 @@
+[package]
+name = "segenc-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+metriken-storage = { path = "../../../../../metriken/metriken-storage" }
+metriken-types = { path = "../../../../../metriken/metriken-types" }
+arrow = { version = "60.0.0", default-features = false }
+arrow-array = "60.0.0"
+arrow-schema = "60.0.0"
+arrow-ord = "60.0.0"
+arrow-select = "60.0.0"
+arrow-ipc = { version = "60.0.0", features = ["lz4", "zstd"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "lz4", "zstd"] }
+bytes = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+[profile.release]
+debug = true
+
+[workspace]

@@ -1,0 +1,95 @@
+# Records two rezolus .dendro archives under thread and cgroup churn
+# (loadgen.c), for dendro's segment-encoding probe. Agent and recorder are
+# built from iopsystems/rezolus at ba47c3f5a7b91e2fd4820aaf4ed8ed4182d6b82b. Each run: 700 s recording, 30 s
+# quiet, 600 s of load, then quiet; heavy threads (10 ms CPU each), at a
+# 1 s and a 100 ms interval. The agent runs config/agent.toml with
+# task_attribution = true added (per-thread series are off by default).
+name = "dendro-segenc-recordings"
+
+[[jobs]]
+name = "vm"
+tags = ["hypervisor", "x86_64", "scratch"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+[jobs.steps.with]
+shape = "auto.c"
+image = "debian-13-6.12"
+gpu = false
+boot_timeout = 300
+payload_timeout = 7200
+artifacts = ["/tmp/job/run.log", "/tmp/job/status", "/tmp/job/heavy-1s.dendro.zst", "/tmp/job/heavy-100ms.dendro.zst"]
+payload = '''
+set -o pipefail
+mkdir -p /tmp/job
+echo 1 > /tmp/job/status
+{
+  uname -r; nproc; cat /etc/anvil-image.json 2>/dev/null | grep build
+  mount | grep cgroup2
+  sudo apt-get update -qq >/dev/null 2>&1
+  sudo apt-get install -y -qq clang libelf-dev zlib1g-dev pkg-config zstd sqlite3 gcc curl >/dev/null 2>&1 || { echo APT FAILED; exit 1; }
+  cd /tmp/job
+  git clone -q https://github.com/iopsystems/rezolus rezolus && cd rezolus && git checkout -q ba47c3f5a7b91e2fd4820aaf4ed8ed4182d6b82b || { echo CLONE FAILED; exit 1; }
+  git rev-parse HEAD
+  cargo build --release -q > /tmp/job/build.log 2>&1 || { tail -40 /tmp/job/build.log; echo BUILD FAILED; exit 1; }
+  sccache --stop-server >/dev/null 2>&1 || true
+  ./target/release/rezolus --version
+  echo "LyoKICogbG9hZGdlbi5jOiB0aHJlYWQgYW5kIGNncm91cCBjaHVybiBmb3IgdGhlIHNlZ21lbnQtZW5jb2RpbmcgcHJvYmUuCiAqCiAqIFJlcHJvZHVjZXMgdGhlIHN5bnRoZXRpYyBsb2FkIGRlc2NyaWJlZCBpbiByZXpvbHVzJ3MKICogZG9jcy9qb3VybmFsLzIwMjYtMDktMjUtZGVuZHJvLWFyY2hpdmUtbGF5b3V0Lm1kLCAiQSBzeW50aGV0aWMgc3Bpa2UiOgogKgogKiAgIHRocmVhZC1wZXItcmVxdWVzdDogVEhSRUFEU19QRVJfU0VDIG5ldyB0aHJlYWRzIGEgc2Vjb25kLCBlYWNoIG5hbWVkCiAqICAgICBpbnRvIG9uZSBvZiBmb3VyIHBvb2xzICgicG9vbC1hIiAuLiAicG9vbC1kIiwgcm91bmQgcm9iaW4pLCBsaXZpbmcgYQogKiAgICAgdW5pZm9ybSAwLjUtNSBzLiBFYWNoIGJ1cm5zIFRIUkVBRF9DUFVfTVMgb2YgaXRzIG93biBDUFUgdGltZSBhdAogKiAgICAgc3RhcnQgKG1lYXN1cmVkIHdpdGggQ0xPQ0tfVEhSRUFEX0NQVVRJTUVfSUQpLCB0aGVuIHNsZWVwcyBvdXQgdGhlCiAqICAgICByZXN0IG9mIGl0cyBsaWZlLgogKiAgIGNncm91cCBjaHVybjogSk9CU19QRVJfU0VDIG5ldyBwcm9jZXNzZXMgYSBzZWNvbmQsIGVhY2ggbW92ZWQgaW50byBpdHMKICogICAgIG93biBjZ3JvdXAgdjIgZGlyZWN0b3J5IHVuZGVyIC9zeXMvZnMvY2dyb3VwL2xvYWRnZW4gd2l0aCB0aGUgY3B1CiAqICAgICBjb250cm9sbGVyIGVuYWJsZWQsIGJ1cm5pbmcgSk9CX0NQVV9NUyBvZiBDUFUgYW5kIGxpdmluZyBhIHVuaWZvcm0KICogICAgIDEwLTYwIHMuIEEgcmVhcGVyIHRocmVhZCB3YWl0cyBmb3IgZWFjaCBqb2IgYW5kIHJlbW92ZXMgaXRzIGNncm91cC4KICoKICogUnVucyBmb3IgRFVSQVRJT05fUyBzZWNvbmRzLCB0aGVuIHdhaXRzIGZvciBldmVyeSBqb2IgdG8gZXhpdC4KICoKICogVXNhZ2UgKGFzIHJvb3QsIGZvciB0aGUgY2dyb3Vwcyk6CiAqICAgbG9hZGdlbiBbZHVyYXRpb25fcz02MDBdIFt0aHJlYWRfY3B1X21zPTEwXSBbdGhyZWFkc19wZXJfc2VjPTMwMF0KICogICAgICAgICAgIFtqb2JzX3Blcl9zZWM9NV0gW2pvYl9jcHVfbXM9NTBdCiAqCiAqIEJ1aWxkOiBjYyAtTzIgLXB0aHJlYWQgLW8gbG9hZGdlbiBsb2FkZ2VuLmMKICovCiNkZWZpbmUgX0dOVV9TT1VSQ0UKI2luY2x1ZGUgPGVycm5vLmg+CiNpbmNsdWRlIDxmY250bC5oPgojaW5jbHVkZSA8cHRocmVhZC5oPgojaW5jbHVkZSA8c2lnbmFsLmg+CiNpbmNsdWRlIDxzdGRpby5oPgojaW5jbHVkZSA8c3RkbGliLmg+CiNpbmNsdWRlIDxzdHJpbmcuaD4KI2luY2x1ZGUgPHN5cy9zdGF0Lmg+CiNpbmNsdWRlIDxzeXMvdHlwZXMuaD4KI2luY2x1ZGUgPHN5cy93YWl0Lmg+CiNpbmNsdWRlIDx0aW1lLmg+CiNpbmNsdWRlIDx1bmlzdGQuaD4KCiNkZWZpbmUgQ0dfUk9PVCAiL3N5cy9mcy9jZ3JvdXAiCiNkZWZpbmUgQ0dfQkFTRSBDR19ST09UICIvbG9hZGdlbiIKI2RlZmluZSBNQVhfSk9CUyA2NTUzNgoKc3RhdGljIGxvbmcgdGhyZWFkX2NwdV9tcyA9IDEwOwpzdGF0aWMgbG9uZyBqb2JfY3B1X21zID0gNTA7CnN0YXRpYyBwaWRfdCBqb2JfcGlkc1tNQVhfSk9CU107CnN0YXRpYyB2b2xhdGlsZSBpbnQgam9ic19zdGFydGVkID0gMDsKc3RhdGljIHZvbGF0aWxlIGludCBqb2JzX3JlYXBlZCA9IDA7CgpzdGF0aWMgZG91YmxlIG5vd19zKGNsb2NraWRfdCBjKSB7CiAgICBzdHJ1Y3QgdGltZXNwZWMgdHM7CiAgICBjbG9ja19nZXR0aW1lKGMsICZ0cyk7CiAgICByZXR1cm4gdHMudHZfc2VjICsgdHMudHZfbnNlYyAvIDFlOTsKfQoKLyogQnVybiBgbXNgIG9mIHRoaXMgdGhyZWFkJ3MgKG9yIHByb2Nlc3MncykgQ1BVIHRpbWUuICovCnN0YXRpYyB2b2lkIGJ1cm4oY2xvY2tpZF90IGMsIGxvbmcgbXMpIHsKICAgIGRvdWJsZSBlbmQgPSBub3dfcyhjKSArIG1zIC8gMTAwMC4wOwogICAgdm9sYXRpbGUgdW5zaWduZWQgbG9uZyB4ID0gMDsKICAgIHdoaWxlIChub3dfcyhjKSA8IGVuZCkKICAgICAgICBmb3IgKGludCBpID0gMDsgaSA8IDEwMDA7IGkrKykgeCArPSBpOwp9CgpzdGF0aWMgdm9pZCBzbGVlcF9zKGRvdWJsZSBzKSB7CiAgICBpZiAocyA8PSAwKSByZXR1cm47CiAgICBzdHJ1Y3QgdGltZXNwZWMgdHMgPSB7KHRpbWVfdClzLCAobG9uZykoKHMgLSAodGltZV90KXMpICogMWU5KX07CiAgICB3aGlsZSAobmFub3NsZWVwKCZ0cywgJnRzKSA9PSAtMSAmJiBlcnJubyA9PSBFSU5UUikge30KfQoKc3RhdGljIGRvdWJsZSB1bmlmb3JtKHVuc2lnbmVkICpzZWVkLCBkb3VibGUgbG8sIGRvdWJsZSBoaSkgewogICAgcmV0dXJuIGxvICsgKGhpIC0gbG8pICogKHJhbmRfcihzZWVkKSAvIChkb3VibGUpUkFORF9NQVgpOwp9CgpzdHJ1Y3Qgd29ya2VyIHsgaW50IHBvb2w7IHVuc2lnbmVkIHNlZWQ7IH07CgpzdGF0aWMgdm9pZCAqd29ya2VyX21haW4odm9pZCAqYXJnKSB7CiAgICBzdHJ1Y3Qgd29ya2VyIHcgPSAqKHN0cnVjdCB3b3JrZXIgKilhcmc7CiAgICBmcmVlKGFyZyk7CiAgICBjaGFyIG5hbWVbMTZdOwogICAgc25wcmludGYobmFtZSwgc2l6ZW9mIG5hbWUsICJwb29sLSVjIiwgJ2EnICsgdy5wb29sKTsKICAgIHB0aHJlYWRfc2V0bmFtZV9ucChwdGhyZWFkX3NlbGYoKSwgbmFtZSk7CiAgICBkb3VibGUgbGlmZSA9IHVuaWZvcm0oJncuc2VlZCwgMC41LCA1LjApOwogICAgZG91YmxlIHN0YXJ0ID0gbm93X3MoQ0xPQ0tfTU9OT1RPTklDKTsKICAgIGJ1cm4oQ0xPQ0tfVEhSRUFEX0NQVVRJTUVfSUQsIHRocmVhZF9jcHVfbXMpOwogICAgc2xlZXBfcyhsaWZlIC0gKG5vd19zKENMT0NLX01PTk9UT05JQykgLSBzdGFydCkpOwogICAgcmV0dXJuIE5VTEw7Cn0KCnN0YXRpYyB2b2lkIHdyaXRlX2ZpbGUoY29uc3QgY2hhciAqcGF0aCwgY29uc3QgY2hhciAqcykgewogICAgaW50IGZkID0gb3BlbihwYXRoLCBPX1dST05MWSk7CiAgICBpZiAoZmQgPCAwIHx8IHdyaXRlKGZkLCBzLCBzdHJsZW4ocykpIDwgMCkgewogICAgICAgIGZwcmludGYoc3RkZXJyLCAid3JpdGUgJXM6ICVzXG4iLCBwYXRoLCBzdHJlcnJvcihlcnJubykpOwogICAgICAgIGV4aXQoMSk7CiAgICB9CiAgICBjbG9zZShmZCk7Cn0KCnN0YXRpYyB2b2lkIGpvYl9tYWluKGludCBuLCB1bnNpZ25lZCBzZWVkKSB7CiAgICBjaGFyIGRpclsxMjhdLCBwcm9jc1sxNjBdLCBwaWRbMzJdOwogICAgc25wcmludGYoZGlyLCBzaXplb2YgZGlyLCBDR19CQVNFICIvam9iLSVkIiwgbik7CiAgICBpZiAobWtkaXIoZGlyLCAwNzU1KSAhPSAwKSBfZXhpdCgyKTsKICAgIHNucHJpbnRmKHByb2NzLCBzaXplb2YgcHJvY3MsICIlcy9jZ3JvdXAucHJvY3MiLCBkaXIpOwogICAgc25wcmludGYocGlkLCBzaXplb2YgcGlkLCAiJWQiLCBnZXRwaWQoKSk7CiAgICBpbnQgZmQgPSBvcGVuKHByb2NzLCBPX1dST05MWSk7CiAgICBpZiAoZmQgPCAwIHx8IHdyaXRlKGZkLCBwaWQsIHN0cmxlbihwaWQpKSA8IDApIF9leGl0KDMpOwogICAgY2xvc2UoZmQpOwogICAgZG91YmxlIGxpZmUgPSB1bmlmb3JtKCZzZWVkLCAxMC4wLCA2MC4wKTsKICAgIGRvdWJsZSBzdGFydCA9IG5vd19zKENMT0NLX01PTk9UT05JQyk7CiAgICBidXJuKENMT0NLX1BST0NFU1NfQ1BVVElNRV9JRCwgam9iX2NwdV9tcyk7CiAgICBzbGVlcF9zKGxpZmUgLSAobm93X3MoQ0xPQ0tfTU9OT1RPTklDKSAtIHN0YXJ0KSk7CiAgICBfZXhpdCgwKTsKfQoKc3RhdGljIHZvaWQgKnJlYXBlcl9tYWluKHZvaWQgKmFyZykgewogICAgKHZvaWQpYXJnOwogICAgZm9yICg7OykgewogICAgICAgIGludCBzdDsKICAgICAgICBwaWRfdCBwID0gd2FpdHBpZCgtMSwgJnN0LCAwKTsKICAgICAgICBpZiAocCA8IDApIHsKICAgICAgICAgICAgaWYgKGVycm5vID09IEVDSElMRCkgeyBzbGVlcF9zKDAuMDUpOyBjb250aW51ZTsgfQogICAgICAgICAgICBjb250aW51ZTsKICAgICAgICB9CiAgICAgICAgZm9yIChpbnQgaSA9IDA7IGkgPCBqb2JzX3N0YXJ0ZWQ7IGkrKykgewogICAgICAgICAgICBpZiAoam9iX3BpZHNbaV0gPT0gcCkgewogICAgICAgICAgICAgICAgY2hhciBkaXJbMTI4XTsKICAgICAgICAgICAgICAgIHNucHJpbnRmKGRpciwgc2l6ZW9mIGRpciwgQ0dfQkFTRSAiL2pvYi0lZCIsIGkpOwogICAgICAgICAgICAgICAgaWYgKHJtZGlyKGRpcikgIT0gMCkKICAgICAgICAgICAgICAgICAgICBmcHJpbnRmKHN0ZGVyciwgInJtZGlyICVzOiAlc1xuIiwgZGlyLCBzdHJlcnJvcihlcnJubykpOwogICAgICAgICAgICAgICAgaWYgKCFXSUZFWElURUQoc3QpIHx8IFdFWElUU1RBVFVTKHN0KSAhPSAwKQogICAgICAgICAgICAgICAgICAgIGZwcmludGYoc3RkZXJyLCAiam9iICVkIGV4aXRlZCBhYm5vcm1hbGx5ICglZClcbiIsIGksIHN0KTsKICAgICAgICAgICAgICAgIGJyZWFrOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgICAgIF9fc3luY19mZXRjaF9hbmRfYWRkKCZqb2JzX3JlYXBlZCwgMSk7CiAgICB9CiAgICByZXR1cm4gTlVMTDsKfQoKaW50IG1haW4oaW50IGFyZ2MsIGNoYXIgKiphcmd2KSB7CiAgICBsb25nIGR1cmF0aW9uX3MgPSBhcmdjID4gMSA/IGF0b2woYXJndlsxXSkgOiA2MDA7CiAgICB0aHJlYWRfY3B1X21zID0gYXJnYyA+IDIgPyBhdG9sKGFyZ3ZbMl0pIDogMTA7CiAgICBsb25nIHRocmVhZHNfcGVyX3NlYyA9IGFyZ2MgPiAzID8gYXRvbChhcmd2WzNdKSA6IDMwMDsKICAgIGxvbmcgam9ic19wZXJfc2VjID0gYXJnYyA+IDQgPyBhdG9sKGFyZ3ZbNF0pIDogNTsKICAgIGpvYl9jcHVfbXMgPSBhcmdjID4gNSA/IGF0b2woYXJndls1XSkgOiA1MDsKICAgIGZwcmludGYoc3RkZXJyLAogICAgICAgICAgICAibG9hZGdlbjogJWxkcywgdGhyZWFkcyAlbGQvcyBhdCAlbGRtcyBDUFUsIGpvYnMgJWxkL3MgYXQgJWxkbXMgQ1BVXG4iLAogICAgICAgICAgICBkdXJhdGlvbl9zLCB0aHJlYWRzX3Blcl9zZWMsIHRocmVhZF9jcHVfbXMsIGpvYnNfcGVyX3NlYywgam9iX2NwdV9tcyk7CgogICAgLyogY2dyb3VwIHYyOiBlbmFibGUgY3B1IGZvciBjaGlsZHJlbiBvZiB0aGUgcm9vdCBhbmQgb2Ygb3VyIGJhc2UuICovCiAgICB3cml0ZV9maWxlKENHX1JPT1QgIi9jZ3JvdXAuc3VidHJlZV9jb250cm9sIiwgIitjcHUiKTsKICAgIGlmIChta2RpcihDR19CQVNFLCAwNzU1KSAhPSAwICYmIGVycm5vICE9IEVFWElTVCkgewogICAgICAgIHBlcnJvcigibWtkaXIgIiBDR19CQVNFKTsKICAgICAgICByZXR1cm4gMTsKICAgIH0KICAgIHdyaXRlX2ZpbGUoQ0dfQkFTRSAiL2Nncm91cC5zdWJ0cmVlX2NvbnRyb2wiLCAiK2NwdSIpOwoKICAgIHB0aHJlYWRfdCByZWFwZXI7CiAgICBwdGhyZWFkX2NyZWF0ZSgmcmVhcGVyLCBOVUxMLCByZWFwZXJfbWFpbiwgTlVMTCk7CgogICAgcHRocmVhZF9hdHRyX3QgYXR0cjsKICAgIHB0aHJlYWRfYXR0cl9pbml0KCZhdHRyKTsKICAgIHB0aHJlYWRfYXR0cl9zZXRkZXRhY2hzdGF0ZSgmYXR0ciwgUFRIUkVBRF9DUkVBVEVfREVUQUNIRUQpOwogICAgcHRocmVhZF9hdHRyX3NldHN0YWNrc2l6ZSgmYXR0ciwgMjU2ICogMTAyNCk7CgogICAgLyogT25lIHRpY2sgcGVyIHRocmVhZCBzcGF3bjsgam9icyBhcmUgc3Bhd25lZCBvbiB0aGUgdGlja3MgdGhhdCBmYWxsCiAgICAgKiBkdWUsIHNvIGJvdGggcmF0ZXMgaG9sZCBvbiBhdmVyYWdlIG92ZXIgZWFjaCBzZWNvbmQuICovCiAgICBkb3VibGUgdDAgPSBub3dfcyhDTE9DS19NT05PVE9OSUMpOwogICAgZG91YmxlIHRocmVhZF9zdGVwID0gMS4wIC8gdGhyZWFkc19wZXJfc2VjLCBqb2Jfc3RlcCA9IDEuMCAvIGpvYnNfcGVyX3NlYzsKICAgIGRvdWJsZSBuZXh0X3RocmVhZCA9IHQwLCBuZXh0X2pvYiA9IHQwOwogICAgbG9uZyB0aHJlYWRzID0gMCwgZmFpbGVkID0gMDsKICAgIHVuc2lnbmVkIHNlZWQgPSAxMjM0NTsKICAgIHdoaWxlIChub3dfcyhDTE9DS19NT05PVE9OSUMpIC0gdDAgPCBkdXJhdGlvbl9zKSB7CiAgICAgICAgZG91YmxlIHQgPSBub3dfcyhDTE9DS19NT05PVE9OSUMpOwogICAgICAgIHdoaWxlIChuZXh0X3RocmVhZCA8PSB0KSB7CiAgICAgICAgICAgIHN0cnVjdCB3b3JrZXIgKncgPSBtYWxsb2Moc2l6ZW9mICp3KTsKICAgICAgICAgICAgdy0+cG9vbCA9IHRocmVhZHMgJSA0OwogICAgICAgICAgICB3LT5zZWVkID0gc2VlZCArICh1bnNpZ25lZCl0aHJlYWRzICogMjY1NDQzNTc2MXU7CiAgICAgICAgICAgIHB0aHJlYWRfdCB0aDsKICAgICAgICAgICAgaWYgKHB0aHJlYWRfY3JlYXRlKCZ0aCwgJmF0dHIsIHdvcmtlcl9tYWluLCB3KSAhPSAwKSB7IGZyZWUodyk7IGZhaWxlZCsrOyB9CiAgICAgICAgICAgIHRocmVhZHMrKzsKICAgICAgICAgICAgbmV4dF90aHJlYWQgKz0gdGhyZWFkX3N0ZXA7CiAgICAgICAgfQogICAgICAgIHdoaWxlIChuZXh0X2pvYiA8PSB0ICYmIGpvYnNfc3RhcnRlZCA8IE1BWF9KT0JTKSB7CiAgICAgICAgICAgIGludCBuID0gam9ic19zdGFydGVkOwogICAgICAgICAgICBwaWRfdCBwID0gZm9yaygpOwogICAgICAgICAgICBpZiAocCA9PSAwKSBqb2JfbWFpbihuLCBzZWVkIF4gKHVuc2lnbmVkKW4gKiA0MDUwM3UpOwogICAgICAgICAgICBpZiAocCA+IDApIHsgam9iX3BpZHNbbl0gPSBwOyBqb2JzX3N0YXJ0ZWQgPSBuICsgMTsgfQogICAgICAgICAgICBuZXh0X2pvYiArPSBqb2Jfc3RlcDsKICAgICAgICB9CiAgICAgICAgZG91YmxlIHdha2UgPSBuZXh0X3RocmVhZCA8IG5leHRfam9iID8gbmV4dF90aHJlYWQgOiBuZXh0X2pvYjsKICAgICAgICBzbGVlcF9zKHdha2UgLSBub3dfcyhDTE9DS19NT05PVE9OSUMpKTsKICAgIH0KICAgIGZwcmludGYoc3RkZXJyLCAibG9hZGdlbjogc3Bhd25lZCAlbGQgdGhyZWFkcyAoJWxkIGZhaWxlZCksICVkIGpvYnM7IHdhaXRpbmcgZm9yIGpvYnNcbiIsCiAgICAgICAgICAgIHRocmVhZHMsIGZhaWxlZCwgam9ic19zdGFydGVkKTsKICAgIHdoaWxlIChqb2JzX3JlYXBlZCA8IGpvYnNfc3RhcnRlZCkgc2xlZXBfcygwLjIpOwogICAgc2xlZXBfcyg1LjUpOyAvKiBsZXQgdGhlIGxhc3QgdGhyZWFkcyBmaW5pc2ggdGhlaXIgNSBzIGxpdmVzICovCiAgICBybWRpcihDR19CQVNFKTsKICAgIGZwcmludGYoc3RkZXJyLCAibG9hZGdlbjogZG9uZVxuIik7CiAgICByZXR1cm4gMDsKfQo=" | base64 -d > /tmp/job/loadgen.c
+  cc -O2 -pthread -o /tmp/job/loadgen /tmp/job/loadgen.c || { echo LOADGEN BUILD FAILED; exit 1; }
+  # The image runs its own rezolus agent on :4241; stop it so the built one serves.
+  sudo systemctl stop rezolus 2>/dev/null; sudo systemctl disable rezolus 2>/dev/null; sleep 2
+  sudo ss -ltnp | grep ':4241 ' && { echo "PORT 4241 STILL TAKEN"; exit 1; }
+  # Per-thread series are off by default in 6.0; turn them on, defaults otherwise.
+  sed -i 's/^\[samplers.cpu_usage\]$/[samplers.cpu_usage]\ntask_attribution = true/' config/agent.toml
+  grep -n -A1 '^\[samplers.cpu_usage\]' config/agent.toml
+  sudo ./target/release/rezolus config/agent.toml > /tmp/job/agent.log 2>&1 &
+  for i in $(seq 1 60); do curl -sf -o /dev/null http://localhost:4241/ && break; sleep 1; done
+  curl -s -o /dev/null -w "agent http %{http_code}\n" http://localhost:4241/
+  sudo ss -ltnp | grep ':4241 '
+  sudo ss -ltnp | grep ':4241 ' | grep -q 'target/release/rezolus\|"rezolus",pid' || true
+  pgrep -af 'target/release/rezolus config' || { echo "BUILT AGENT NOT RUNNING"; tail -20 /tmp/job/agent.log; exit 1; }
+  ok=1
+  for run in "heavy-1s 1s" "heavy-100ms 100ms"; do
+    set -- $run; name=$1; interval=$2
+    echo "=== $name: interval $interval ==="
+    ./target/release/rezolus record --url http://localhost:4241 -o /tmp/job/$name.dendro --interval $interval --duration 700s > /tmp/job/$name-record.log 2>&1 &
+    rec=$!
+    sleep 30
+    sudo /tmp/job/loadgen 600 10 300 5 50 2>&1 | sed "s/^/[$name] /"
+    wait $rec; echo "record exited $?"
+    tail -5 /tmp/job/$name-record.log
+    ls -la /tmp/job/$name.dendro*
+    sqlite3 -readonly "file:/tmp/job/$name.dendro?immutable=1" "select stream, count(*), sum(length(bytes)) from segments group by stream order by 3 desc limit 12;" || ok=0
+    zstd -q -3 -T0 -f /tmp/job/$name.dendro -o /tmp/job/$name.dendro.zst && zstd -q -t /tmp/job/$name.dendro.zst && ls -la /tmp/job/$name.dendro.zst || ok=0
+  done
+  sudo pkill -f 'rezolus config/agent.toml' || true
+  grep -i -m5 'error\|panic' /tmp/job/agent.log
+  [ $ok = 1 ] && echo 0 > /tmp/job/status
+} 2>&1 | tee /tmp/job/run.log
+exit 0
+'''
+
+[[jobs.steps]]
+uses = "upload-artifact"
+[jobs.steps.with]
+path = "run.log"
+
+[[jobs.steps]]
+uses = "upload-artifact"
+[jobs.steps.with]
+path = "status"
+
+[[jobs.steps]]
+uses = "upload-artifact"
+[jobs.steps.with]
+path = "heavy-1s.dendro.zst"
+
+[[jobs.steps]]
+uses = "upload-artifact"
+[jobs.steps.with]
+path = "heavy-100ms.dendro.zst"
+
+[[jobs.steps]]
+uses = "shell"
+[jobs.steps.with]
+run = "set +e; rc=$(cat status); echo \"work exited $rc\"; exit $rc"
