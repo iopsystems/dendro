@@ -280,8 +280,9 @@ G2, allocated over live bytes:
 - **Extent counts were not collected.** The criterion asked for them, but
   `filefrag` produced no output in any Linux job, and the probe discards a
   failed command silently.
-- **The Linux reader checks prove nothing.** With 16 to 18 ms per sync the
-  writer never got 256 MiB ahead of the reader. The reader read all 97,611
+- **The Linux reader checks prove nothing.** With 16 to 20 ms per record (G2
+  wall time over records written), the writer never got 256 MiB ahead of
+  the reader. The reader read all 97,611
   records whole and none punched, so the punched-region check never ran.
 
 ### Follow-up: what xfs's excess is (prediction written before running)
