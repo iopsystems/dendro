@@ -49,7 +49,7 @@ One file, written only by appending. Every commit is one record: a header
 `fdatasync`.
 
 - **Tick:** one record holding the tick's rows.
-- **Seal:** one record holding the Parquet segment, its catalog entry, the
+- **Seal:** one record holding the segment, its catalog entry, the
   clock observation, and the watermark that retires the WAL rows it covers.
   One record is one commit, so seal atomicity (audit invariant 3) is the
   record's checksum.
@@ -143,14 +143,15 @@ format is worth designing, not that it ships.
 
 In: the container's file layout, commit, recovery, locking and retention.
 
-Out: the encoder, segment format (Parquet stays), the replication wire, and
-the audit's other findings. As first written, this said findings 1 (lock
-ordering) and 4 (no `journal_size_limit`) need fixing on the current format
-whatever this probe decides. On 2026-11-19 the owner decided instead to fix
-no audit finding on the current format and to carry them all here; see
-"Requirements carried from the audit". The segment encoding inside a record
-is its own entry:
-[2026-11-19-segment-encoding.md](2026-11-19-segment-encoding.md).
+Out: the encoder, the segment encoding (its own entry,
+[2026-11-19-segment-encoding.md](2026-11-19-segment-encoding.md)), and the
+replication wire.
+
+As first written, this also put the audit's other findings out of scope.
+It said findings 1 (lock ordering) and 4 (no `journal_size_limit`) need
+fixing on the current format whatever this probe decides. On 2026-11-19 the
+owner chose instead to fix no audit finding on the current format and to
+carry them all here; see "Requirements carried from the audit".
 
 ## Plan
 
@@ -448,42 +449,54 @@ the allocation at the working set plus one chunk whatever the filesystem
 would do by itself, and cost nothing per tick. Which one the design uses, and whether xfs
 also gets the hint, is the owner's choice and is not yet made.
 
-## Decisions (owner, 2026-11-19)
+## Decisions and open items
 
-- **Preallocation:** the writer preallocates its file in fixed chunks on
-  every filesystem, and sets no xfs extent size hint. The reason is that
-  the space bound is then the working set plus one chunk on any filesystem,
-  measured at 1.0625x on APFS, ext4 and xfs.
-- **Open design item:** a filesystem that refuses `fallocate`
-  (`EOPNOTSUPP`; NFS before 4.2 is one) needs a fallback, presumably plain
-  appends whose space bound is whatever the filesystem gives. The probe did
-  not test one.
-- **Segment payloads are opaque to the container.** A record carries the
-  segment's bytes and the catalog fields the encoder reports (rows, first
-  and last timestamps). The encoding inside is decided separately, in
+- **Preallocation (owner, 2026-11-19).** The writer preallocates its file
+  in fixed chunks on every filesystem, and sets no xfs extent size hint.
+  The owner's reason: chunks alone keep the behaviour "consistent
+  regardless of filesystem". The space bound is then the working set plus
+  one chunk on any filesystem: measured at 1.0625x at 20x on APFS, ext4
+  and xfs, and at most 1.0661x over the run.
+- **Open: a filesystem without `fallocate`.** A filesystem that refuses
+  `fallocate` (`EOPNOTSUPP`) needs a fallback. Such a filesystem may refuse
+  hole punching too (NFS before 4.2 has neither operation; stated from
+  knowledge, not checked here). Retention there would then need
+  rewrite-and-rename, or dendro refuses the filesystem. The probe tested
+  neither.
+- **Proposed, not yet confirmed by the owner: segment payloads are opaque
+  to the container.** A record would carry the segment's bytes and the
+  catalog fields the encoder reports (rows, first and last timestamps). The
+  encoding inside is its own entry,
   [2026-11-19-segment-encoding.md](2026-11-19-segment-encoding.md).
 
 ## Requirements carried from the audit
 
-The owner decided on 2026-11-19 not to fix the storage audit's findings
-(2026-11-18-storage-audit.md) on the SQLite format, but to make each one a
-requirement here. Each requirement needs a test in the new format that
+On 2026-11-19 the owner chose not to fix the storage audit's findings
+(2026-11-18-storage-audit.md) on the SQLite format, and to carry each one
+here as a requirement. Each requirement needs a test in the new format that
 fails if it is broken.
 
-SQLite-specific findings, each a property the new container must hold by
-construction:
+Container-level findings, each a property the new container must hold:
 
 | Audit finding | Requirement on the new format |
 |---|---|
 | 1: a refused open deletes a live `-wal` | A refused open writes nothing, and no `close()` in the writer's process releases the writer's lock. The `flock` is on the archive file itself. |
-| 2: the `immutable=1` fallback reads pages rewritten under it | A reader never assumes the file is unchanging unless the writer says it is finished. Every read validates each record's checksum. |
+| 2: the `immutable=1` fallback reads pages rewritten under it | A reader never assumes the file is unchanging unless the writer says it is finished. Every record a reader uses is checked against a checksum. The copy-forward from v4 and v5 opens its source with `immutable=1` only when the filesystem is read-only (`statvfs` `ST_RDONLY`), and otherwise refuses a source with a live writer. |
 | 3: copies are not in WAL mode | A copy is the same format as its source, with no mode to reset. |
 | 4: `-wal` keeps its high-water size | Space is bounded by retention and the preallocation chunk (measured above); no sidecar exists. |
-| 10: a kill during create leaves an unopenable file | Create is atomic: a file either has a valid header record or does not exist under its name (write and sync elsewhere, then rename). |
-| 11: no `fullfsync` on macOS | Decide and document what a commit's sync means on macOS. `F_FULLFSYNC` cost 4.25 ms per tick in the probe, against 71 us for `fsync`. |
+| 10: a kill during create leaves an unopenable file | Create is atomic: a file either has a valid header record or does not exist under its name (write and sync under a temporary name, then rename without replacing an existing file: `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS; then sync the directory). |
+| 11: no `fullfsync` on macOS | Decide and document what a commit's sync means on macOS. In the probe a log-arm tick took 4.24 ms with `F_FULLFSYNC`, against 71 us with plain `fsync`. |
 | 12: checkpoint-on-close enabled late | No connection has close-time side effects. |
-| 17: retention reads one page per segment | Retention reads the catalog only (index records), never segment payloads. |
-| 18: catalog reads are not index-only | The catalog in index records serves the catalog queries without reading payloads. |
+| 14: `seq` wraps through `as i64` | Sequence numbers are checked on every conversion. |
+| 17: retention reads one page per segment | Retention reads catalog fields only, never segment payloads. |
+| 18: catalog reads are not index-only | Catalog queries read catalog fields only. |
+
+Requirements 2, 17 and 18 conflict under the candidate as written. A seal
+record has one checksum over its catalog entry and its payload, so a reader
+cannot verify the catalog fields of the seal records after the newest
+index record without reading their payloads. The design has to give the
+catalog fields their own checksum within the record, or accept reading
+those trailing seal records in full.
 
 Writer-logic findings, which a new container does not fix by itself:
 
@@ -494,8 +507,7 @@ Writer-logic findings, which a new container does not fix by itself:
 | 7: a stream named twice in a seal batch stops the writer | A seal batch names each stream once (deduplicated or refused). |
 | 8: add and resume are several commits | Adding and resuming a source are one record each. |
 | 9: a seal that keeps failing is never surfaced | Deferred seals are counted per stream. |
-| 13: a tick's fallback loses cross-source atomicity | A tick is one record, so it is atomic across sources; there is no per-source fallback. |
-| 14: `seq` wraps through `as i64` | Sequence numbers are checked on every conversion. |
+| 13: a tick's fallback loses cross-source atomicity, and its warning names the wrong cause | A tick is one record, so it is atomic across sources; there is no per-source fallback. A tick naming an unknown source is refused whole, with an error that names the source. |
 
 Two design questions are decided in the new format's design, not here:
 finding 15 (a seal deletes an encoder's dropped leading run) and finding 16
