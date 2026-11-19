@@ -447,7 +447,8 @@ G1, per-tick microseconds, median of 15 trial medians:
 Both mechanisms work on xfs. Chunks work on all three filesystems, bound
 the allocation at the working set plus one chunk whatever the filesystem
 would do by itself, and cost nothing per tick. Which one the design uses, and whether xfs
-also gets the hint, is the owner's choice and is not yet made.
+also gets the hint, is the owner's choice and is not yet made. (Decided
+2026-11-19: chunks, no hint; see "Decisions and open items".)
 
 ## Decisions and open items
 

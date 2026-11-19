@@ -53,7 +53,7 @@ unchanged:
 - **Width set the footer's share.** Narrow streams were 1–3% footer. The
   per-task stream was 49% footer at 2,325 columns per segment in the older
   recording, and 88% at 13,941 in the 5.22.0 one.
-- **The widest segment.** It held 37,644 columns and 301 rows: 35.6 MB, of
+- **The largest segment.** It held 37,644 columns and 301 rows: 35.6 MB, of
   which 32.1 MB was footer. 27.5 MB of the footer was the `ARROW:schema`
   entry, which carries every task's labels as field metadata.
 
@@ -64,13 +64,25 @@ archive](https://github.com/iopsystems/rezolus/blob/main/docs/journal/2026-09-25
 (status: design, nothing built), says:
 
 - **Long tables.** Every table with slots (task, cgroup, per-CPU, device)
-  is written long: `timestamp`, `occupant`, one column per metric.
+  is written long. The columns are `timestamp`, the tick's `:wall_offset`,
+  `:window_begin` and `:window_width`, `occupant`, and one column per
+  metric.
 - **Labels move out of the schema.** Occupant labels go to an occupant
-  table in `caller_rows`, and field metadata keeps fixed facts only.
+  stream, `<stream>/occupants`. It is a Parquet stream sealed, compacted
+  and retained like any other (decided 2026-09-28). Field metadata keeps
+  fixed facts only.
 - **The gain is measured** in that entry: each column costs about 520 bytes
-  of footer per segment of about 300 rows. Going long took the busy
-  per-task table from 273 to 26 MB, cgroup tables from 12.5 to 1.5 MB, and
-  per-CPU tables from 2.8 to 2.1 MB.
+  of footer per segment of about 300 rows.
+  - On the busy host (the 5.22.0 recording), going long and sorted took
+    `cpu_usage_task` from 273.3 to 26.3 MB, `syscall_counts_cgroup` from
+    12.5 to 1.7 MB, and `cpu_usage_cpu` from 2.8 to 2.1 MB.
+  - On the quiet host (the older recording), `cpu_usage_task` went from
+    524.0 to 348.7 MB.
+- **Row order matters as much as the layout.** One occupant's read from
+  the busy host's `cpu_usage_task` took 219.4 MB wide, 37.8 MB long in
+  arrival order, and 0.77 MB long sorted by `(occupant, timestamp)`. On the
+  quiet host it was 181.3, 496.8 and 4.39 MB. rezolus's converter sorts.
+  Whether the writer sorts at seal is not decided.
 - **A wide segment can also fail outright.** arrow-rs cannot open a segment
   of 52,109 columns (`TooManyTables`), and long tables avoid that too.
 
@@ -88,9 +100,10 @@ the long tables rezolus will write.
 - **For the old wide layout that would have been worse:** about 41 MB of
   schema in the widest segment, against 27.5 MB (derived). Under the long
   layout the schema is small in both formats.
-- **What remains to compare:** column encodings and compression (Parquet's
-  dictionary, RLE and page compression against IPC's per-buffer LZ4 or
-  zstd), and decode cost on read. For long tables sorted by
+- **What remains to compare:** column encodings and compression, and decode
+  cost on read. dendro's Parquet uses plain encoding with RLE levels and
+  `LZ4_RAW` page compression, with dictionary off
+  (`segment::writer_props`). IPC uses per-buffer LZ4 or zstd. For long tables sorted by
   `(occupant, timestamp)` I expect Parquet to store fewer bytes. Whether IPC
   reads enough faster to pay for that, I don't know.
 
@@ -101,7 +114,10 @@ to confirm or change before it does.
 
 Input: the two recordings above in rezolus's long layout. The probe builds
 the layout itself, following the rezolus entry: the same long reshaping
-and the same occupant table in `caller_rows`.
+and the same `<stream>/occupants` stream. Each arm encodes both the data
+stream and its occupant stream. Rows are sorted by `(occupant, timestamp)`,
+as rezolus's converter writes them. Arrival order is also run and
+reported, because the writer has not decided to sort at seal.
 
 Arms, each holding the same rows:
 
@@ -117,9 +133,10 @@ arm, interleaved:
 1. Total segment bytes.
 2. Bytes read and time to learn every stream's columns at open, both ways:
    2a reading one segment per stream, 2b reading every segment's schema.
+   Reported, not used for the verdict.
 3. Time to read one occupant's series for one metric across every segment
    of the per-task stream, including the occupant-table lookup.
-4. Time to read the whole of one per-task segment.
+4. Time to read the whole of the largest per-task segment, by bytes.
 5. Encode time per segment, on the writer's seal path.
 
 The floor is the larger of the P-against-P′ difference and 5% of P, per
@@ -140,7 +157,8 @@ formats. Parquet stores the sorted long tables in fewer bytes, and IPC's
 decode advantage on measures 3 and 4 stays under 30%.
 
 **Refutation:** A or Az is at least 30% faster than P on measure 3 or 4
-within the storage and encode limits.
+within the storage and encode limits, or A or Az stores no more bytes
+than P on measure 1.
 
 ## Scope
 
