@@ -1,0 +1,22 @@
+diff --git a/src/archive/sqlite.rs b/src/archive/sqlite.rs
+index 679e901..f86a096 100644
+--- a/src/archive/sqlite.rs
++++ b/src/archive/sqlite.rs
+@@ -3555,11 +3555,16 @@ impl ArchiveMut {
+     /// with it. There must be exactly one writing connection to a file; this
+     /// is for the writer thread that will own it.
+     #[cfg_attr(not(feature = "write"), allow(dead_code))]
+-    pub(crate) fn open_for_write(path: &Path) -> Result<Self> {
++    pub fn open_for_write(path: &Path) -> Result<Self> {
+         let db = Archive::open_with_cache(path, WRITER_CACHE_SIZE_KIB, false)?;
+         ArchiveMut::wrap_locked(db, path)
+     }
+ 
++    /// Probe only: set a pragma on this connection.
++    pub fn probe_pragma(&self, name: &str, value: &str) -> Result<()> {
++        self.set_pragma(name, value)
++    }
++
+     /// How many transactions this connection has COMMITTED.
+     ///
+     /// Exists so "one commit per tick, whatever the endpoint count" is a
