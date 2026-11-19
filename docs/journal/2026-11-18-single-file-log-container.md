@@ -235,10 +235,11 @@ Setup: Debian 13 guests (`debian-13-6.12`, image build 20261113.1, kernel
 24 GiB loop device (`--direct-io=on`), backed by a file on the guest's ext4
 root disk `vda`, which reports `write back`. A guest `fdatasync` therefore
 goes through the loop device and virtio to the host's storage. Each tick
-takes 16 to 19 ms on this stack, about 80 times the Mac's SQLite arm and 250
-times its log arm; the probe did not time `fdatasync` separately. The time
-follows the host rather than the filesystem: hv02 gave about 18.7 ms in
-both of its runs, hv01 16.2 to 16.6 ms. The absolute times describe
+takes 15.5 to 18.8 ms on this stack, about 73 to 84 times the Mac's SQLite
+arm and 219 to 253 times its log arm; the probe did not time `fdatasync`
+separately. The time follows the host rather than the filesystem: the
+SQLite arm took 18.7 and 18.8 ms on hv02 and 16.2 and 16.6 ms on hv01,
+counting the follow-up runs below, which swap the hosts. The absolute times describe
 this stack, not bare-metal disks; the comparison between arms holds because
 both arms ran on the same stack, interleaved.
 
@@ -259,7 +260,7 @@ Measured, 15 trials, per-tick microseconds, median of trial medians:
   the Mac's 151 us. I don't know why; the probe did not measure where
   inside the commit the time goes.
 - **The first trials of each job ran fast.** Trial 0 of each job, and on
-  xfs the first two arms of trial 1, ran at 35% to 55% of the others'
+  xfs the first two arms of trial 1, ran at 31% to 54% of the others'
   per-tick time, in every arm that ran in that window: about the first 45 s
   of the job. I don't know why. The trial ranges in the table include them.
 
@@ -433,8 +434,9 @@ G1, per-tick microseconds, median of 15 trial medians:
   stays inside allocated space does not have to persist an allocation; the
   probe did not trace it.
 - **The fast first trials did not recur.** Every Linux arm's range is now
-  within 4% of its median. This G1 ran after about 30 minutes of G2, so it
-  never ran in a job's first 45 s; that is probably why (inferred).
+  within 4% of its median. This G1 ran after 27 (ext4) to 60 (xfs) minutes
+  of G2, so it never ran in a job's first 45 s; that is probably why
+  (inferred).
 
 Both mechanisms work on xfs. Chunks work on all three filesystems, bound
 the allocation at the working set plus one chunk whatever the filesystem

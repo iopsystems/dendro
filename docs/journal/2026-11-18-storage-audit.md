@@ -74,7 +74,7 @@ the auditor, not taken from the docs.
 
 | Invariant | Verdict | Evidence |
 |---|---|---|
-| 1 | broken | finding 1 (a refused open writes); plausibly also across a kill during create (finding 10, not staged) |
+| 1 | plausibly broken | finding 10: a kill during create leaves a file with no stamp (traced, not staged). Finding 1's refused open writes, but `-lock` refuses it, not the id or version check |
 | 2 | broken | finding 1 (committed rows lost); finding 11 on Apple; finding 5 (loss bound under a failing disk) |
 | 3 | holds | one transaction; `seq` advances after commit; a failed seal left seqs 0..16 contiguous |
 | 4 | holds | writer, retention and copy paths traced; retention control test below |
