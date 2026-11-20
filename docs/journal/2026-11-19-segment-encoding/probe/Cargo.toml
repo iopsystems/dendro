@@ -10,12 +10,17 @@ metriken-types = { path = "../../../../../metriken/metriken-types" }
 arrow = { version = "60.0.0", default-features = false }
 arrow-array = "60.0.0"
 arrow-schema = "60.0.0"
+arrow-buffer = "60.0.0"
 arrow-ord = "60.0.0"
 arrow-select = "60.0.0"
 arrow-ipc = { version = "60.0.0", features = ["lz4", "zstd"] }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "lz4", "zstd"] }
 bytes = "1"
 rusqlite = { version = "0.41", features = ["bundled"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
 
 [profile.release]
 debug = true

@@ -17,6 +17,9 @@
 //!   floor), A (IPC, LZ4), Az (IPC, zstd) and Pl (Parquet, LZ4_RAW; a
 //!   control), runs interleaved, for both row orders. Every reader decodes
 //!   one batch per segment, as the IPC files hold one batch each.
+//! - `cold DIR TABLE [RUNS] [PACK_DIR]`: the cold-read measures (c0, c3, c4,
+//!   c6) over arms P, P2, Az and Au (IPC, uncompressed), from one pack file
+//!   per arm written to PACK_DIR. See `cold.rs`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -43,7 +46,9 @@ use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::file::metadata::{KeyValue, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 
-type R<T> = Result<T, Box<dyn std::error::Error>>;
+mod cold;
+
+pub(crate) type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 const FIXED: &[&str] = &["timestamp", ":wall_offset", ":window_begin", ":window_width"];
 /// Labels that describe the metric or the producer, never the occupant.
@@ -355,6 +360,8 @@ enum Arm {
     Pl,
     /// Follow-up: Parquet, zstd 3, `DELTA_BINARY_PACKED` on integer columns.
     Pd,
+    /// Cold-read follow-up: IPC, uncompressed.
+    Au,
 }
 const ARMS: [Arm; 6] = [Arm::P, Arm::P2, Arm::A, Arm::Az, Arm::Pl, Arm::Pd];
 
@@ -367,14 +374,19 @@ impl Arm {
             Arm::Az => "Az",
             Arm::Pl => "Pl",
             Arm::Pd => "Pd",
+            Arm::Au => "Au",
         }
     }
     fn is_ipc(self) -> bool {
-        matches!(self, Arm::A | Arm::Az)
+        matches!(self, Arm::A | Arm::Az | Arm::Au)
     }
     fn ipc_options(self) -> IpcWriteOptions {
-        let c = if self == Arm::Az { CompressionType::ZSTD } else { CompressionType::LZ4_FRAME };
-        IpcWriteOptions::default().try_with_compression(Some(c)).unwrap()
+        let c = match self {
+            Arm::Az => Some(CompressionType::ZSTD),
+            Arm::Au => None,
+            _ => Some(CompressionType::LZ4_FRAME),
+        };
+        IpcWriteOptions::default().try_with_compression(c).unwrap()
     }
 }
 
@@ -751,13 +763,19 @@ fn main() -> R<()> {
     match args.get(1).map(String::as_str) {
         Some("reshape") => reshape(Path::new(&args[2]), Path::new(&args[3]), &args[4..]),
         Some("extract") => extract(Path::new(&args[2]), Path::new(&args[3]), &args[4..]),
+        Some("cold") => cold::cold(
+            Path::new(&args[2]),
+            &args[3],
+            args.get(4).map(|s| s.parse().unwrap()).unwrap_or(5),
+            Path::new(args.get(5).map(String::as_str).unwrap_or(".")),
+        ),
         Some("bench") => bench(
             Path::new(&args[2]),
             &args[3],
             args.get(4).map(|s| s.parse().unwrap()).unwrap_or(5),
         ),
         _ => {
-            eprintln!("usage: segenc-probe reshape|extract IN OUT TABLE... | bench DIR TASK_TABLE [RUNS]");
+            eprintln!("usage: segenc-probe reshape|extract IN OUT TABLE... | bench DIR TASK_TABLE [RUNS] | cold DIR TABLE [RUNS] [PACK_DIR]");
             Ok(())
         }
     }
