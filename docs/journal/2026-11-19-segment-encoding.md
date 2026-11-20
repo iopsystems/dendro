@@ -530,3 +530,47 @@ measure 6.
   layout cost. Storing them once per tick, not once per occupant row,
   would shrink and speed up every format. That is rezolus's layout to
   change, not dendro's.
+
+## Follow-up: cold reads from disk
+
+Opened 2026-11-20, written before running. Exploratory, not a GO/NO-GO.
+
+Every measure above decodes bytes already in memory. The owner asked
+whether either format allows reads that skip the page cache (`O_DIRECT`
+through io_uring), and named the two problems they care about: the memory
+it takes to read a `.dendro` file, and query times of several seconds for
+one chart. The full scan of the syscall table above takes 6.8 ms warm with
+P, so segment decode explains well under 1% of a multi-second chart. Where
+the rest goes is being measured separately, on rezolus's viewer.
+
+- **Container.** SQLite cannot serve this: dendro reads a segment with
+  `SELECT bytes FROM segments` (`src/archive/sqlite.rs`, `read_segment_bytes`),
+  through the page cache, and a large blob spans overflow pages. The probe
+  models the single-file log container instead: one pack file per arm,
+  segments back to back at recorded offsets, each read rounded out to
+  4 KiB.
+- **Arms.** P (production Parquet, zstd 3), P2 (P again, the floor), Az
+  (IPC, zstd), and Au (IPC, uncompressed; decodes without a decompression
+  step, so its buffers could be used in place).
+- **I/O.** Linux: io_uring, file opened `O_DIRECT`, every read of a measure
+  submitted at once. macOS: `pread` one after another on a file with
+  `F_NOCACHE`; indicative only.
+- **Measures**, on the target table, arrival order:
+  - c0: 64 random aligned 4 KiB reads of the pack file, one at a time.
+    This is the calibration: it shows whether reads reach the device or
+    a cache below the file system.
+  - c3: one series across every segment, plus the occupant stream. Only
+    the columns needed are read: Parquet column chunks from footers held
+    in memory; IPC buffers from footers and message headers held in
+    memory.
+  - c4: the largest segment, every column, one read.
+  - c6: every segment, every column.
+  - Each measure reports I/O time, decode time and bytes read.
+- **Prediction.**
+  - c6: I/O is under half of decode time for every arm, so the cold scan
+    is within 1.5x of the warm one, and Az stays faster than P.
+  - c3: P reads fewer bytes than Az, but both cold single-series reads
+    stay under 2x their warm time.
+  - Au reads about twice Az's bytes and decodes fastest.
+- **Refutation.** I/O exceeds decode time on c6 for P or Az, or the cold
+  ranking of P and Az on c6 differs from the warm one.
