@@ -33,6 +33,18 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `ArchiveMut::replace_segment_index` and
+  `Transaction::replace_segment_index` replace an existing segment's caller
+  index, or remove it with `None`, leaving the segment's bytes and catalog
+  row as they are. A reader whose index format grew after a segment was
+  written can rewrite the index without rewriting the segment, in one
+  transaction for many segments. Each returns whether the archive now holds
+  the given index: `false` when there is no such segment, or on a schema 4
+  archive from before the index column, which holds no indexes. A copy
+  already made by replication keeps the index it was sent with.
+
 ## [0.8.1] - 2026-11-18
 
 ### Added
