@@ -353,8 +353,10 @@ enum Arm {
     /// Not in the pre-registered criteria: Parquet with the segment
     /// format's default LZ4_RAW pages, a control for the codec.
     Pl,
+    /// Follow-up: Parquet, zstd 3, `DELTA_BINARY_PACKED` on integer columns.
+    Pd,
 }
-const ARMS: [Arm; 5] = [Arm::P, Arm::P2, Arm::A, Arm::Az, Arm::Pl];
+const ARMS: [Arm; 6] = [Arm::P, Arm::P2, Arm::A, Arm::Az, Arm::Pl, Arm::Pd];
 
 impl Arm {
     fn name(self) -> &'static str {
@@ -364,6 +366,7 @@ impl Arm {
             Arm::A => "A",
             Arm::Az => "Az",
             Arm::Pl => "Pl",
+            Arm::Pd => "Pd",
         }
     }
     fn is_ipc(self) -> bool {
@@ -407,12 +410,12 @@ fn load_dir(dir: &Path) -> R<Vec<Vec<u8>>> {
 }
 
 fn convert(segs: &[Vec<u8>], arm: Arm) -> R<Vec<Vec<u8>>> {
-    if arm == Arm::Pl {
+    if matches!(arm, Arm::Pl | Arm::Pd) {
         return segs
             .iter()
             .map(|s| {
                 let (b, kv) = decode_parquet(s)?;
-                encode_parquet(&b, &kv, true)
+                encode_parquet_arm(&b, &kv, arm)
             })
             .collect();
     }
@@ -522,11 +525,33 @@ fn encode_parquet(batch: &RecordBatch, kv: &[KeyValue], lz4: bool) -> R<Vec<u8>>
     Ok(out)
 }
 
+/// Parquet for a Parquet arm: Pl is LZ4_RAW; Pd adds `DELTA_BINARY_PACKED`
+/// on every integer column; P and P2 are the archive writer's properties.
+fn encode_parquet_arm(batch: &RecordBatch, kv: &[KeyValue], arm: Arm) -> R<Vec<u8>> {
+    if arm != Arm::Pd {
+        return encode_parquet(batch, kv, arm == Arm::Pl);
+    }
+    let mut b = props_with(kv.to_vec(), false).into_builder();
+    for f in batch.schema().fields() {
+        if matches!(f.data_type(), DataType::UInt64 | DataType::Int64 | DataType::UInt32 | DataType::Int32) {
+            b = b.set_column_encoding(
+                parquet::schema::types::ColumnPath::from(f.name().as_str()),
+                parquet::basic::Encoding::DELTA_BINARY_PACKED,
+            );
+        }
+    }
+    let mut out = Vec::new();
+    let mut w = ArrowWriter::try_new(&mut out, batch.schema(), Some(b.build()))?;
+    w.write(batch)?;
+    w.close()?;
+    Ok(out)
+}
+
 fn encode_one(batch: &RecordBatch, kv: &[KeyValue], arm: Arm) -> R<usize> {
     if arm.is_ipc() {
         Ok(to_ipc(batch, kv, arm)?.len())
     } else {
-        Ok(encode_parquet(batch, kv, arm == Arm::Pl)?.len())
+        Ok(encode_parquet_arm(batch, kv, arm)?.len())
     }
 }
 
@@ -610,12 +635,14 @@ fn bench(dir: &Path, task_table: &str, runs: usize) -> R<()> {
             p_task.iter().map(|s| decode_parquet(s)).collect::<R<_>>()?;
 
         // Timed measures, interleaved: run r starts at arm r mod ARMS.len().
-        let names = ["m2a_ms", "m2b_ms", "m3_ms", "m4_ms", "m5_ms"];
+        let names = ["m2a_ms", "m2b_ms", "m3_ms", "m4_ms", "m5_ms", "m6_ms"];
+        let nm = names.len();
+        let na = ARMS.len();
         let mut times: HashMap<(usize, usize), Vec<f64>> = HashMap::new();
-        let mut bytes2a = [0usize; 5];
-        let mut bytes2b = [0usize; 5];
-        let mut bytes3 = [0usize; 5];
-        let mut rows3 = [0usize; 5];
+        let mut bytes2a = vec![0usize; na];
+        let mut bytes2b = vec![0usize; na];
+        let mut bytes3 = vec![0usize; na];
+        let mut rows3 = vec![0usize; na];
         println!("run,arm,{}", names.join(","));
         for r in 0..runs {
             for k in 0..ARMS.len() {
@@ -674,6 +701,14 @@ fn bench(dir: &Path, task_table: &str, runs: usize) -> R<()> {
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 times.entry((ai, 4)).or_default().push(ms);
                 row.push(ms);
+                // 6: every column of every segment of the target table.
+                let t0 = Instant::now();
+                for s in &data[&(task.clone(), "data", ai)].segs {
+                    decode_all(s, ipc)?;
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                times.entry((ai, 5)).or_default().push(ms);
+                row.push(ms);
                 println!(
                     "{r},{},{}",
                     arm.name(),
@@ -682,27 +717,27 @@ fn bench(dir: &Path, task_table: &str, runs: usize) -> R<()> {
             }
         }
         println!("summary ({runs} runs; median ms per measure):");
-        let mut med = [[0f64; 5]; 5];
-        for ai in 0..5 {
-            for mi in 0..5 {
+        let mut med = vec![vec![0f64; nm]; na];
+        for ai in 0..na {
+            for mi in 0..nm {
                 med[ai][mi] = median(&mut times[&(ai, mi)].clone());
             }
         }
         for (ai, arm) in ARMS.iter().enumerate() {
             println!(
-                "  {:3} m2a {:9.3} ({} B)  m2b {:9.3} ({} B)  m3 {:9.3} ({} B, {} rows)  m4 {:9.3}  m5 {:9.3}",
+                "  {:3} m2a {:9.3} ({} B)  m2b {:9.3} ({} B)  m3 {:9.3} ({} B, {} rows)  m4 {:9.3}  m5 {:9.3}  m6 {:9.3}",
                 arm.name(),
-                med[ai][0], bytes2a[ai], med[ai][1], bytes2b[ai], med[ai][2], bytes3[ai], rows3[ai], med[ai][3], med[ai][4]
+                med[ai][0], bytes2a[ai], med[ai][1], bytes2b[ai], med[ai][2], bytes3[ai], rows3[ai], med[ai][3], med[ai][4], med[ai][5]
             );
         }
         print!("  floor |P-P2|/P:");
-        for mi in 0..5 {
+        for mi in 0..nm {
             print!(" {} {:.1}%", names[mi], 100.0 * (med[0][mi] - med[1][mi]).abs() / med[0][mi]);
         }
         println!();
-        for (ai, arm) in [(2usize, "A"), (3, "Az"), (4, "Pl")] {
+        for (ai, arm) in [(2usize, "A"), (3, "Az"), (4, "Pl"), (5, "Pd")] {
             print!("  {arm} vs P:");
-            for mi in 0..5 {
+            for mi in 0..nm {
                 print!(" {} {:+.1}%", names[mi], 100.0 * (med[ai][mi] - med[0][mi]) / med[0][mi]);
             }
             println!();

@@ -480,3 +480,53 @@ row order.
   - Az stays faster than both on measure 6.
 - **Refutation:** Pd saves under 10% in sorted order, or decodes more than
   20% slower than P.
+
+### Follow-up results
+
+Same setup and four inputs as above, 3 sessions of 7 interleaved runs per
+input; target table `syscall_counts_cgroup`. Each figure is the median of
+the session medians. Bytes are the target table's data stream. Times are
+against P; negative is faster. The P-against-P2 floor was at most 4.5% on
+measures 3, 4 and 6 in every session.
+
+Arrival order:
+
+| input | Az bytes | Az m3 | Az m4 | Az m6 | Pd bytes | Pd m6 | A m6 | Pl m6 |
+|---|---|---|---|---|---|---|---|---|
+| real, busy | 1.03x | −7.3% | −26.2% | −26.6% | 2.94x | +43.4% | +60.1% | +56.4% |
+| real, quiet | 1.05x | −2.7% | −27.9% | −25.9% | 8.05x | +110.6% | +52.1% | +51.1% |
+| fresh, 1 s | 0.97x | −12.9% | −32.2% | −29.6% | 5.50x | +25.7% | +83.0% | +91.7% |
+| fresh, 100 ms | 0.92x | −11.7% | −31.9% | −32.0% | 7.23x | +61.2% | +91.2% | +103.6% |
+
+Sorted order: Az is 0.92x to 1.05x of P's bytes and 12% to 33% faster on
+measure 6. Pd is 1.56x to 2.51x of P's bytes and 46% to 61% faster on
+measure 6.
+
+- **The prediction is refuted.**
+  - `DELTA_BINARY_PACKED` makes the table larger than P in every case:
+    2.9x to 8.1x in arrival order and 1.6x to 2.5x sorted.
+  - Checked independently with pyarrow on one fresh 100 ms sorted
+    segment: delta plus zstd 3 is 2.55x the bytes of plain plus zstd 3,
+    against the probe's 2.51x on that input.
+- **Why delta loses, from the per-column sizes of that segment.**
+  - The bulk is the tick-level columns. The long layout repeats
+    `timestamp`, `:wall_offset`, `:window_begin` and `:window_width` on
+    every occupant's row.
+  - Plain encoding leaves those repeats for zstd to remove: `timestamp`
+    is 1,561 bytes plain.
+  - Delta bit-packs the nanosecond jitter between ticks, which zstd
+    cannot remove: `timestamp` is 31,381 bytes with delta.
+  - The metric columns are small either way: 94 bytes plain against 123
+    with delta for the first op.
+- **IPC with zstd (Az) is the only arm faster than P on the full scan
+  everywhere.**
+  - It is 26% to 32% faster in arrival order, at 0.92x to 1.05x of P's
+    bytes.
+  - On the single-series read, measure 3, it is only 3% to 13% faster.
+  - IPC with LZ4 (A) and Parquet with LZ4 (Pl) are slower than zstd P,
+    by 51% to 104% on measure 6. I don't know why LZ4 decodes slower
+    here; they hold about twice the bytes.
+- **What this suggests, not tested:** the tick-level columns are a
+  layout cost. Storing them once per tick, not once per occupant row,
+  would shrink and speed up every format. That is rezolus's layout to
+  change, not dendro's.
