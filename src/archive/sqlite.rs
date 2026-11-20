@@ -2666,6 +2666,30 @@ impl ArchiveMut {
         )
     }
 
+    /// Replace the caller index of an existing segment, leaving the
+    /// segment's bytes and catalog row as they are: for a reader whose index
+    /// format grew after the segment was written, to rewrite the index
+    /// without rewriting the segment. `None` removes the index.
+    ///
+    /// Returns whether the archive now holds `index` for that segment:
+    /// `false` when there is no segment at `(source_id, stream, seq)`, or
+    /// when the archive is a schema 4 one from before the index column,
+    /// which holds no indexes (an index given to
+    /// [`insert_segment_with_index`](Self::insert_segment_with_index) there
+    /// is dropped too).
+    ///
+    /// A copy already made by replication keeps the index it was sent with:
+    /// a replaced index is not sent as a frame.
+    pub fn replace_segment_index(
+        &mut self,
+        source_id: i64,
+        stream: &str,
+        seq: u64,
+        index: Option<&[u8]>,
+    ) -> Result<bool> {
+        replace_segment_index_sql(&self.db.conn, self.db.layout, source_id, stream, seq, index)
+    }
+
     /// Insert every WAL row for one tick — one stream each, typically — in a
     /// single transaction. This is what makes a tick atomic: either every
     /// stream's row for this tick lands, or none does.
@@ -3355,6 +3379,18 @@ impl Transaction<'_> {
         )
     }
 
+    /// [`ArchiveMut::replace_segment_index`], in this transaction: a
+    /// re-index of many segments commits once.
+    pub fn replace_segment_index(
+        &self,
+        source_id: i64,
+        stream: &str,
+        seq: u64,
+        index: Option<&[u8]>,
+    ) -> Result<bool> {
+        replace_segment_index_sql(&self.tx, self.layout, source_id, stream, seq, index)
+    }
+
     /// Insert every WAL row for one tick — one stream each, typically.
     pub fn insert_wal_rows(&self, source_id: i64, rows: &[WalRow]) -> Result<()> {
         let mut stmt = self
@@ -3739,6 +3775,80 @@ fn insert_segment_sql(
         }
     }
     Ok(())
+}
+
+/// See [`ArchiveMut::replace_segment_index`].
+fn replace_segment_index_sql(
+    conn: &Connection,
+    layout: IndexLayout,
+    source_id: i64,
+    stream: &str,
+    seq: u64,
+    index: Option<&[u8]>,
+) -> Result<bool> {
+    let failed = || {
+        Error::sqlite(format!(
+            "failed to replace the index of segment {stream}#{seq}"
+        ))
+    };
+    let key = rusqlite::params![source_id, stream, seq as i64];
+    match layout {
+        IndexLayout::Column => {
+            let updated = conn
+                .execute(
+                    "UPDATE segments SET caller_index = ?4 \
+                     WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+                    rusqlite::params![source_id, stream, seq as i64, index],
+                )
+                .map_err(failed())?;
+            Ok(updated == 1)
+        }
+        IndexLayout::Table => {
+            // The old row's removal and the new row land together, inside a
+            // caller's transaction or not, as in `insert_segment_sql`.
+            conn.execute_batch("SAVEPOINT segment_index_replace")
+                .map_err(failed())?;
+            let replaced = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM segments \
+                     WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+                    key,
+                    |r| r.get::<_, i64>(0),
+                )
+                .and_then(|n| {
+                    if n == 0 {
+                        return Ok(false);
+                    }
+                    conn.execute(
+                        "DELETE FROM segment_indexes \
+                         WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+                        key,
+                    )?;
+                    if let Some(index) = index {
+                        conn.execute(
+                            "INSERT INTO segment_indexes(source_id, stream, seq, bytes) \
+                             VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![source_id, stream, seq as i64, index],
+                        )?;
+                    }
+                    Ok(true)
+                });
+            match replaced {
+                Ok(found) => {
+                    conn.execute_batch("RELEASE segment_index_replace")
+                        .map_err(failed())?;
+                    Ok(found)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch(
+                        "ROLLBACK TO segment_index_replace; RELEASE segment_index_replace",
+                    );
+                    Err(failed()(e))
+                }
+            }
+        }
+        IndexLayout::Absent => Ok(false),
+    }
 }
 
 /// The catalog. Segment and WAL payloads are opaque BLOBs; everything the
