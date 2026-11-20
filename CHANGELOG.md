@@ -39,11 +39,14 @@ cannot reach a failed release any other way.
   `Transaction::replace_segment_index` replace an existing segment's caller
   index, or remove it with `None`, leaving the segment's bytes and catalog
   row as they are. A reader whose index format grew after a segment was
-  written can rewrite the index without rewriting the segment, in one
-  transaction for many segments. Each returns whether the archive now holds
-  the given index: `false` when there is no such segment, or on a schema 4
-  archive from before the index column, which holds no indexes. A copy
-  already made by replication keeps the index it was sent with.
+  written can rewrite the index without re-encoding the segment, in one
+  transaction for many segments. On schema 5 this writes only the index
+  row; on schema 4 the index is a column of the segment's row, so SQLite
+  rewrites the row with its bytes. Each returns `true` when the segment
+  exists and the archive can hold an index, and `false` when there is no
+  such segment or on a schema 4 archive from before the index column. A
+  copy already made by replication keeps the index it was sent with until
+  a segment is sent to it again.
 
 ## [0.8.1] - 2026-11-18
 
