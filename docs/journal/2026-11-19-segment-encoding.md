@@ -1,7 +1,7 @@
 ---
-status: open
+status: resolved
 opened: 2026-11-19
-updated: 2026-11-19
+updated: 2026-11-20
 ---
 
 # Segment encoding: whether Parquet is the right format inside a segment
@@ -251,6 +251,9 @@ What a change of encoding would cost, given and not measured:
 
 - **Where it ran:** Apple M4 Max, macOS 26.6.2, release build. Warm reads
   from memory: every arm's segments are loaded before timing.
+  On Linux x86_64 the gap between Az and P on the syscall table is
+  larger, for a reason specific to Parquet's zstd reader; see "Cold-read
+  results" below.
 - **Arms:**
   - P and P2 are the same bytes, timed separately; their difference is the
     floor.
@@ -407,7 +410,8 @@ would see. The figures are in the raw output, which the probe regenerates.
 
 ## Verdict
 
-**No verdict as the criteria are written.**
+**No verdict as the criteria are written.** Decided NO-GO by the owner
+on 2026-11-20; see Outcome.
 
 - **Three inputs are NO-GO,** under any reading.
 - **Fresh 1 s is no verdict.** A reads 30.4% faster there, so the NO-GO
@@ -425,6 +429,12 @@ could move fresh 1 s to NO-GO, but could not make any input GO. Every
 other input is at least 6.8 points from the bar, and fresh 1 s fails the
 storage limit, which does not depend on the platform.
 
+Correction, 2026-11-20: the cold-read runs on Linux (below) moved one input
+toward the bar. On the busy task table, Az reads one series cold 30.8%
+faster than P (c3, the cold analogue of measure 3). That is past the 30%
+NO-GO bar, so the "6.8 points" above does not hold on Linux. It is under
+the 35% that GO needs with the floor, so no input becomes GO.
+
 What the runs show, across all four inputs, warm and from memory:
 
 - **Reads:** Arrow IPC with zstd reads one series 15% to 23% faster than
@@ -437,7 +447,8 @@ What the runs show, across all four inputs, warm and from memory:
 
 Not measured:
 
-- cold reads from disk;
+- cold reads from disk (measured later; see "Follow-up: cold reads from
+  disk");
 - Parquet with dictionary encoding on;
 - a reader that prunes Parquet pages;
 - rezolus's real query paths, which read through metriken-storage's
@@ -451,7 +462,33 @@ changing rezolus's reader, and giving up segments any Parquet tool opens.
 
 ## Outcome
 
-Open, pending the owner's decision on the verdict above.
+NO-GO, decided by the owner on 2026-11-20: segments stay Parquet. That
+reads the floor into the NO-GO rule, so fresh 1 s is NO-GO too.
+
+The follow-ups below ran after this verdict. Under the owner's reading
+they do not change it, but some of their results cut against it:
+
+- **For it:** Parquet's `DELTA_BINARY_PACKED` makes the syscall table
+  1.6x to 8.1x larger. Cold reads past the guest's page cache are at most 7%
+  of a full scan (whether the Linux host served them from its ZFS ARC or
+  the device was not checked) and leave the ranking of P and Az as it was warm.
+- **Against it, outside the verdict's measures:** on full scans of the
+  syscall table, Az is 26% to 32% faster warm on macOS and 73% to 77%
+  faster cold on a Linux x86 VM. On that VM, the cold series read of the
+  busy task table is 30.8% faster with Az, past the floor-free NO-GO bar
+  and under the 35% that GO needs with the floor.
+- **Most of the Linux full-scan gap is, by an estimate from the profile,
+  in how parquet 60 builds codecs** (derived; the reopen test in
+  "Cold-read results" would confirm it): it creates a zstd decompressor, and a compressor it
+  never uses, for every column chunk. That can be fixed upstream (see
+  "Cold-read results").
+- **One profile of rezolus's viewer** on macOS (not in this tree) put
+  segment decode under 7% of the first query's index build. It was not
+  measured on Linux, where Parquet decode is 4 to 6 times slower.
+
+Reopen if, after metriken's query-path costs are fixed, segment decode is
+more than a quarter of a chart query's time on a real recording, on
+macOS or on Linux x86_64.
 
 ## Follow-up: Parquet's own encodings, on the syscall count queries
 
@@ -539,9 +576,11 @@ Every measure above decodes bytes already in memory. The owner asked
 whether either format allows reads that skip the page cache (`O_DIRECT`
 through io_uring), and named the two problems they care about: the memory
 it takes to read a `.dendro` file, and query times of several seconds for
-one chart. The full scan of the syscall table above takes 6.8 ms warm with
-P, so segment decode explains well under 1% of a multi-second chart. Where
-the rest goes is being measured separately, on rezolus's viewer.
+one chart. The full scan of the syscall table above takes 6.9 ms (busy)
+to 31 ms (quiet) warm with P on macOS, so segment decode explains a small
+share of a multi-second chart. Where the rest goes was measured
+separately, on rezolus's viewer (see "What this means for the owner's two
+problems").
 
 - **Container.** SQLite cannot serve this: dendro reads a segment with
   `SELECT bytes FROM segments` (`src/archive/sqlite.rs`, `read_segment_bytes`),
@@ -574,3 +613,144 @@ the rest goes is being measured separately, on rezolus's viewer.
   - Au reads about twice Az's bytes and decodes fastest.
 - **Refutation.** I/O exceeds decode time on c6 for P or Az, or the cold
   ranking of P and Az on c6 differs from the warm one.
+
+### Cold-read results
+
+- **Where it ran.**
+  - Linux: an anvil VM on hv02 (`auto.c`, debian-13-6.12, kernel
+    6.12.116, 24 vCPUs, clocksource tsc). Packs on a 20 GiB ext4 scratch
+    disk, a zvol attached `cache='none'`. Experiments
+    01a1fa1b-2f9b-718d-7b51-d86ac76a09d8 (cold reads),
+    01a1fa1d-0e55-7105-ca4b-3fd2c4ad9a1b (`target-cpu=native`) and
+    01a1fa22-d319-716e-cc34-7028847340bf (perf).
+  - macOS: the M4 Max above, internal NVMe.
+- **Inputs:** the four inputs above, the syscall table on all four and
+  the task table on three. The quiet task table was left out: its packs
+  are 376 MB of input.
+- **Sessions:** 3 sessions of 7 interleaved runs, as above; figures are
+  the median of the three session medians. The P-against-P2 floor on c3
+  and c6 was under 4% on those medians everywhere, and up to 10.1% in
+  one session. On c4, one 38 KB segment, P and P2 differed by 32% to 34%
+  in every session on the busy syscall table, a systematic difference
+  rather than noise, so c4 is not used below.
+- **Where the reads were served from.**
+  - Linux: c0, one 4 KiB read at a time, was 75 to 81 us in every arm,
+    flat across packs from 0.25 MB to 55 MB. So the reads left the
+    guest. Whether the host served them from its ZFS ARC or from the
+    NVMe device was not checked: `cache='none'` bypasses the host's page
+    cache but not the ARC, and each pack is read again in each of 7
+    runs after being written. `zfs get primarycache` on the zvol, or ARC hit counts
+    during a run, would settle it. Until then, the I/O figures below
+    may understate a read from the device.
+  - macOS: writing the pack with `F_NOCACHE` was needed. Before that, c0
+    was 0.9 us, so reads came from the cache. After it, c0 was 19 to 27
+    us on packs up to 1.4 MB and 72 to 99 us on packs of 4 MB or more.
+    A latency that depends on the file's size suggests a cache for the
+    small packs; I don't know which.
+- **Au is out.** Uncompressed IPC is 13 to 173 times P's bytes (data
+  plus occupant stream), 55 MB for the busy syscall table against 0.96
+  MB. Inferred from the format, not measured: Arrow keeps a value slot
+  for every null cell. Its packs went over the probe's 64 MB limit on
+  four of the seven tables. Where it ran, I/O was 53% to 89% of its time.
+
+Linux, c6 (every segment, every column), median ms:
+
+| table | P io | P decode | Az io | Az decode | io share | Az vs P |
+|---|---|---|---|---|---|---|
+| busy syscall | 0.56 | 40.1 | 0.49 | 8.9 | 1.4% / 5.2% | −76.9% |
+| quiet syscall | 1.24 | 171.9 | 1.19 | 41.9 | 0.7% / 2.8% | −75.1% |
+| fresh 1 s syscall | 0.27 | 11.2 | 0.21 | 2.9 | 2.4% / 6.7% | −73.1% |
+| fresh 100 ms syscall | 0.71 | 110.4 | 0.60 | 25.1 | 0.6% / 2.3% | −76.9% |
+| busy task | 3.19 | 284.5 | 2.71 | 192.0 | 1.1% / 1.4% | −32.3% |
+| fresh 1 s task | 0.62 | 12.8 | 0.45 | 9.5 | 4.6% / 4.6% | −26.1% |
+| fresh 100 ms task | 1.49 | 112.0 | 1.60 | 74.9 | 1.3% / 2.1% | −32.5% |
+
+macOS, same measure: I/O is 0.7% to 4.2% of c6 for P and Az; Az is 25%
+to 32% faster than P on the syscall tables and 13% to 14% on the task
+tables. On c3, macOS issues its reads one at a time, and I/O is 45% of
+P's time on the quiet syscall table (4.0 ms of 9.1). On Linux, with
+every read submitted at once, c3 I/O is at most 7% of P's time and at
+most 17% of Az's.
+
+- **The prediction holds for I/O.** c6 I/O is under half of decode for
+  P and Az on every table and both systems; it is at most 7% of the
+  total. Cold reads leave the ranking of P and Az as it was warm.
+- **The prediction on c3 bytes mostly holds:** P reads fewer bytes than
+  Az on five of seven tables, because Parquet reads only the three column
+  chunks. The quiet syscall table is equal. On the busy task table P
+  reads 3% more (20.7 MB against 20.1), because its three column chunks
+  (15.8 MB) outweigh Az's buffers (12.8 MB); Az's occupant stream is the
+  larger (7.3 MB against 4.9).
+- **The prediction on Au is refuted.** It reads 13 to 173 times P's
+  bytes, not about twice Az's, and on Linux it decodes the fresh 1 s
+  syscall table slower than Az (3.4 ms against 2.9).
+- **The prediction on c3 time holds on macOS for the syscall table:**
+  cold single-series reads take 0.85x to 1.07x their warm measure-3 time
+  (P busy 1.92 to 1.80 ms, quiet 8.45 to 9.05; Az busy 1.77 to 1.51,
+  quiet 8.29 to 8.32). This is approximate, because the cold path holds
+  footers in memory. Not compared on Linux, where measure 3 did not run
+  warm.
+- **Parquet decodes the syscall table 4 to 6 times slower on Linux than
+  on macOS** (busy: 40.1 ms against 6.9). Az is 1.5 to 1.8 times slower.
+  On the task table, with 6 columns against 21 or 22, P is 1.6 times
+  slower and Az 1.2 to 1.4 times.
+- **Refuted: missing x86 SIMD.** A build with `-C target-cpu=native`
+  (the host has AVX2 and BMI2) gives the same times as the default
+  build: busy syscall c6 decode 40.6 ms against 40.0.
+- **The cause, from a perf profile** of the cold run on the busy syscall
+  table (`perf record -e cpu-clock -g`, all four arms):
+  - 19.0% of samples are in `ZSTD_createDCtx` and 18.3% in
+    `ZSTD_createCCtx`, against 12.8% in zstd's sequence decoding.
+  - parquet 60's `ZSTDCodec::new` (`src/compression.rs`) builds a
+    `zstd::bulk::Compressor` and a `Decompressor`, and the reader builds a
+    codec for every column chunk (`create_codec` in
+    `src/file/serialized_reader.rs`). A scan of the busy syscall table
+    creates 588 of each (28 segments, 21 columns), and the compressor is
+    never used.
+  - arrow-ipc 60 keeps one zstd decompression context per decoder,
+    which is why Az does not pay this.
+  - These shares are of one profile: the busy syscall table, all four
+    arms, the whole process including the probe's re-encoding. On the
+    task tables, with 6 columns, context creation explains much less of
+    the Linux slowdown (derived: about 10 ms of the busy task table's
+    63 ms excess, where the excess is P's Linux decode less P's macOS
+    decode scaled by Az's Linux-to-macOS ratio, 284.5 − 178.5 × 1.24).
+  - Why this costs more on the Linux VM than on macOS is not known. The
+    page faults with attributed callers are under the probe's own read
+    buffers,
+    not the zstd contexts. One candidate: both context constructors
+    execute CPUID (zstd 1.5.7, `ZSTD_cpuSupportsBmi2`), which traps to
+    the hypervisor in a VM. A bare-metal x86 run would tell the two
+    apart.
+  - Reopen condition for this explanation: a parquet build that reuses
+    one zstd decompression context per file and builds no compressor
+    on read, run on the same host, should bring P's c6 decode of the
+    busy syscall table within 1.5x of Az's. If it does not, the
+    explanation is wrong.
+
+### What this means for the owner's two problems
+
+- **Neither format nor cold I/O explains multi-second charts.** A cold
+  full scan of the largest syscall table (quiet) costs 1.2 ms of I/O on
+  Linux, with the caveat on where the reads were served from.
+- **The Parquet codec cost is real and can be removed upstream:** reusing
+  one decompression context per reader, as arrow-ipc does, and not
+  building the compressor on read should remove most of the Linux VM's
+  gap between P and Az on the syscall table without a format change.
+  Making only the compressor lazy would remove about half of the context
+  cost.
+- **A separate profile of rezolus's viewer** (rezolus c9e043ad,
+  metriken-storage 0.13.0, metriken-query 0.50.0; M4 Max; not in this
+  tree) found where the seconds and the memory go. This is context for
+  the owner's question, not part of this entry's evidence:
+  - The first query on a table builds an in-memory index of every
+    series: 2.0 s for the task table of the fresh 100 ms recording, 3.8 s
+    on the 9.6 h one. 85% to 99% of that is copying and hashing
+    per-series label maps, and segment decode is under 7%.
+  - After one task-table query RSS is 1.94 GB, of which 860 MB is copied
+    `BTreeMap<String, String>` label maps for 161,222 series.
+  - Warm `sum` of `irate` queries take 0.37 to 0.68 s, mostly stepping
+    every series through every grid point in metriken-query's
+    `batch_rate.rs`.
+  - Those belong in metriken's journal, with a baseline, before any
+    change.
