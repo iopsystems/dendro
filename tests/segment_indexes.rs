@@ -454,3 +454,149 @@ fn an_orphan_index_with_a_wrong_typed_key_is_reported() {
         report.problems
     );
 }
+
+#[test]
+fn replacing_an_index_rewrites_only_that_segments_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace.dendro");
+    let id = archive(&path);
+    let before = Archive::open(&path).unwrap();
+    let indexes = before.read_segment_indexes(id, "a").unwrap();
+    let bytes: Vec<Vec<u8>> = before
+        .read_segments(id, "a")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    let metas = before.read_segment_meta(id, "a").unwrap();
+    drop(before);
+    let (seq, _) = indexes[1].clone();
+
+    let mut db = ArchiveMut::open(&path).unwrap();
+    assert!(db
+        .replace_segment_index(id, "a", seq, Some(b"new"))
+        .unwrap());
+    drop(db);
+    let after = Archive::open(&path).unwrap();
+    let mut want = indexes.clone();
+    want[1].1 = Some(b"new".to_vec());
+    assert_eq!(after.read_segment_indexes(id, "a").unwrap(), want);
+    let after_bytes: Vec<Vec<u8>> = after
+        .read_segments(id, "a")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.bytes)
+        .collect();
+    assert_eq!(after_bytes, bytes, "the segments' bytes are unchanged");
+    assert_eq!(
+        after.read_segment_meta(id, "a").unwrap(),
+        metas,
+        "the segments' catalog rows are unchanged"
+    );
+    assert_eq!(
+        after.read_segment_indexes(id, "b").unwrap().len(),
+        indexes.len(),
+        "the other stream is untouched"
+    );
+    drop(after);
+    in_step(&path);
+
+    // `None` removes the row.
+    let mut db = ArchiveMut::open(&path).unwrap();
+    assert!(db.replace_segment_index(id, "a", seq, None).unwrap());
+    drop(db);
+    want[1].1 = None;
+    assert_eq!(
+        Archive::open(&path)
+            .unwrap()
+            .read_segment_indexes(id, "a")
+            .unwrap(),
+        want
+    );
+    in_step(&path);
+}
+
+#[test]
+fn replacing_the_index_of_a_segment_that_is_not_there_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.dendro");
+    let id = archive(&path);
+    let rows = count(&path, "SELECT COUNT(*) FROM segment_indexes");
+    let mut db = ArchiveMut::open(&path).unwrap();
+    assert!(!db.replace_segment_index(id, "a", 999, Some(b"x")).unwrap());
+    assert!(!db.replace_segment_index(id, "nope", 0, Some(b"x")).unwrap());
+    drop(db);
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM segment_indexes"), rows);
+    in_step(&path);
+}
+
+#[test]
+fn indexes_replaced_in_one_transaction_land_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.dendro");
+    let id = archive(&path);
+    let seqs: Vec<u64> = Archive::open(&path)
+        .unwrap()
+        .read_segment_indexes(id, "a")
+        .unwrap()
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect();
+    let mut db = ArchiveMut::open(&path).unwrap();
+    db.transaction(|tx| {
+        for seq in &seqs {
+            assert!(tx.replace_segment_index(id, "a", *seq, Some(b"all"))?);
+        }
+        Ok(())
+    })
+    .unwrap();
+    // A transaction that fails part way leaves the indexes as they were.
+    let failed: dendro::Result<()> = db.transaction(|tx| {
+        tx.replace_segment_index(id, "a", seqs[0], Some(b"half"))?;
+        Err(dendro::Error::Message("stop".to_string()))
+    });
+    assert!(failed.is_err());
+    drop(db);
+    let indexes = Archive::open(&path)
+        .unwrap()
+        .read_segment_indexes(id, "a")
+        .unwrap();
+    assert!(
+        indexes
+            .iter()
+            .all(|(_, i)| i.as_deref() == Some(&b"all"[..])),
+        "{indexes:?}"
+    );
+    in_step(&path);
+}
+
+#[test]
+fn a_v4_archive_replaces_the_index_in_its_column_or_holds_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = SegmentMeta {
+        rows: 1,
+        first_ts: 1,
+        last_ts: 1,
+    };
+
+    let path = dir.path().join("v4.dendro");
+    let id = v4_archive(&path, true);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    db.insert_segment_with_index(id, "a", 0, &m, b"x", Some(b"old"))
+        .unwrap();
+    let metas = db.read_segment_meta(id, "a").unwrap();
+    assert!(db.replace_segment_index(id, "a", 0, Some(b"new")).unwrap());
+    assert_eq!(
+        db.read_segment_indexes(id, "a").unwrap(),
+        vec![(0, Some(b"new".to_vec()))]
+    );
+    assert_eq!(db.read_segment_meta(id, "a").unwrap(), metas);
+    assert!(!db.replace_segment_index(id, "a", 1, Some(b"x")).unwrap());
+
+    let path = dir.path().join("v4-old.dendro");
+    let id = v4_archive(&path, false);
+    let mut db = ArchiveMut::open(&path).unwrap();
+    db.insert_segment(id, "a", 0, &m, b"x").unwrap();
+    assert!(!db.replace_segment_index(id, "a", 0, Some(b"new")).unwrap());
+    assert_eq!(db.read_segment_indexes(id, "a").unwrap(), vec![(0, None)]);
+}
