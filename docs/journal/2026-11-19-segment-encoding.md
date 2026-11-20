@@ -452,3 +452,31 @@ changing rezolus's reader, and giving up segments any Parquet tool opens.
 ## Outcome
 
 Open, pending the owner's decision on the verdict above.
+
+## Follow-up: Parquet's own encodings, on the syscall count queries
+
+Opened 2026-11-19, after the verdict above, written before running. This is
+exploratory, not a second GO/NO-GO.
+
+The owner asked whether another format queries faster and still packs
+efficiently, and named the syscall count queries as the workload that
+matters. metriken-storage writes every column `PLAIN` with dictionary off,
+then zstd 3. Two cheaper changes come first, because neither needs a new
+format: Parquet's `DELTA_BINARY_PACKED` encoding on integer columns, and
+row order.
+
+- **Arm Pd:** Parquet, zstd 3, dictionary off, `DELTA_BINARY_PACKED` on every
+  integer column, re-encoded from the same rows as P.
+- **Target table:** `syscall_counts_cgroup` (`syscall/syscall_counts_cgroup`
+  on the fresh recordings), with one column per syscall op.
+- **New measure 6:** decode every column of every segment of the target
+  table, as a query summing across cgroups by op does.
+- **Prediction:**
+  - In sorted order, Pd stores at least 30% fewer bytes than P.
+  - In arrival order, Pd saves less, because one occupant's counter
+    values are interleaved with other occupants' and their deltas are
+    large.
+  - Pd decodes within 10% of P's time on measures 3, 4 and 6.
+  - Az stays faster than both on measure 6.
+- **Refutation:** Pd saves under 10% in sorted order, or decodes more than
+  20% slower than P.
