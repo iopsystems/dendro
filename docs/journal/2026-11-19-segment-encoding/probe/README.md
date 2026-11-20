@@ -4,15 +4,19 @@ The probe for
 [2026-11-19-segment-encoding.md](../../2026-11-19-segment-encoding.md).
 It is not part of the crate or its workspace, and CI does not build it.
 
-It depends on metriken-storage and metriken-types from a metriken checkout
-at 9320a63, beside the dendro checkout:
+It depends on metriken-storage and metriken-types at metriken 9320a63,
+through the path `../metriken` relative to the dendro checkout. From the
+dendro checkout's root, with a metriken clone somewhere, add a worktree
+there rather than moving the clone's checkout:
 
 ```sh
-git -C .. clone https://github.com/iopsystems/metriken   # if not there
-git -C ../metriken checkout 9320a63
+git -C <your metriken clone> worktree add --detach "$PWD/../metriken" 9320a63
 cd docs/journal/2026-11-19-segment-encoding/probe
 cargo build --release
 ```
+
+If `../metriken` is already your metriken clone, use a worktree elsewhere
+and change the two `path` entries in `Cargo.toml` to it.
 
 Subcommands:
 
@@ -26,6 +30,11 @@ Subcommands:
   with the same properties.
 - `bench DIR TASK_TABLE [RUNS]` runs the entry's measures over arms P, P2,
   A, Az and Pl, interleaved, for both row orders.
+
+`validate.py WIDE_ARCHIVE TABLE OUT/<table> SEQ...` checks a reshape: every
+non-null cell of each named wide segment appears with the same value under
+the same occupant labels and timestamp in the long segment, and nothing
+else does. It needs pyarrow.
 
 `rack/` holds the load generator (`loadgen.c`) and the systemslab spec that
 recorded the two fresh recordings on a rack VM. The spec embeds

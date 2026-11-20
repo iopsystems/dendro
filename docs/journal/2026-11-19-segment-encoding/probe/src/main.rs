@@ -12,9 +12,11 @@
 //!   its `<table>/occupants` stream) and write the same layout: `arr` is the
 //!   recorded bytes, `sort` is the same rows sorted by (occupant, timestamp)
 //!   and re-encoded with metriken-storage's writer properties.
-//! - `bench DIR TASK_TABLE [RUNS]`: the measures in the entry, over arms P,
-//!   P2 (P again, for the floor), A (IPC, LZ4) and Az (IPC, zstd), runs
-//!   interleaved, for both row orders.
+//! - `bench DIR TASK_TABLE [RUNS]`: the measures in the entry, over arms P
+//!   (Parquet, the archive writer's seal properties), P2 (P again, for the
+//!   floor), A (IPC, LZ4), Az (IPC, zstd) and Pl (Parquet, LZ4_RAW; a
+//!   control), runs interleaved, for both row orders. Every reader decodes
+//!   one batch per segment, as the IPC files hold one batch each.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -486,11 +488,18 @@ fn read_series(seg: &[u8], ipc: bool, occupant: u64, metric: &str) -> R<(usize, 
             .iter()
             .filter_map(|n| s.index_of(n).ok())
             .collect();
+        let rows = b.metadata().file_metadata().num_rows() as usize;
         let rg = &b.metadata().row_groups()[0];
         read_bytes = idx.iter().map(|&i| rg.column(i).compressed_size() as usize).sum::<usize>()
             + footer_bytes(seg, false);
         let mask = ProjectionMask::roots(b.parquet_schema(), idx);
-        batches = b.with_projection(mask).build()?.collect::<Result<_, _>>()?;
+        // One batch per segment, like `decode_parquet` and like the IPC
+        // files, which hold one batch each.
+        batches = b
+            .with_projection(mask)
+            .with_batch_size(rows.max(1))
+            .build()?
+            .collect::<Result<_, _>>()?;
     }
     let mut n = 0;
     let key = arrow_array::Scalar::new(UInt64Array::from(vec![occupant]));
@@ -585,7 +594,12 @@ fn bench(dir: &Path, task_table: &str, runs: usize) -> R<()> {
                 largest = i;
             }
         }
-        let (&target, &target_rows) = counts.iter().max_by_key(|(_, n)| **n).ok_or("empty task table")?;
+        // The occupant with the most rows; the lowest number among ties, so
+        // every invocation reads the same one.
+        let (&target, &target_rows) = counts
+            .iter()
+            .max_by_key(|(o, n)| (**n, std::cmp::Reverse(**o)))
+            .ok_or("empty task table")?;
         println!(
             "task table {task}: {} segments; metric `{metric}`; occupant {target} with {target_rows} rows; largest segment #{largest} ({} bytes P)",
             p_task.len(),
@@ -595,7 +609,7 @@ fn bench(dir: &Path, task_table: &str, runs: usize) -> R<()> {
         let decoded: Vec<(RecordBatch, Vec<KeyValue>)> =
             p_task.iter().map(|s| decode_parquet(s)).collect::<R<_>>()?;
 
-        // Timed measures, interleaved: run r starts at arm r mod 4.
+        // Timed measures, interleaved: run r starts at arm r mod ARMS.len().
         let names = ["m2a_ms", "m2b_ms", "m3_ms", "m4_ms", "m5_ms"];
         let mut times: HashMap<(usize, usize), Vec<f64>> = HashMap::new();
         let mut bytes2a = [0usize; 5];
@@ -630,10 +644,12 @@ fn bench(dir: &Path, task_table: &str, runs: usize) -> R<()> {
                 }
                 // 3: occupant lookup (decode the occupant stream) + one series.
                 let t0 = Instant::now();
+                let mut b = 0;
                 for s in &data[&(task.clone(), "occ", ai)].segs {
                     decode_all(s, ipc)?;
+                    b += s.len();
                 }
-                let (mut n, mut b) = (0, 0);
+                let mut n = 0;
                 for s in &data[&(task.clone(), "data", ai)].segs {
                     let (rows, rb) = read_series(s, ipc, target, &metric)?;
                     n += rows;
