@@ -2669,17 +2669,24 @@ impl ArchiveMut {
     /// Replace the caller index of an existing segment, leaving the
     /// segment's bytes and catalog row as they are: for a reader whose index
     /// format grew after the segment was written, to rewrite the index
-    /// without rewriting the segment. `None` removes the index.
+    /// without re-encoding the segment. `None` removes the index.
     ///
-    /// Returns whether the archive now holds `index` for that segment:
-    /// `false` when there is no segment at `(source_id, stream, seq)`, or
-    /// when the archive is a schema 4 one from before the index column,
-    /// which holds no indexes (an index given to
+    /// On schema 5 this writes only the index row. On schema 4 the index is
+    /// a column of the segment's row, and SQLite rewrites the row with its
+    /// bytes, so replacing an index costs as much I/O as writing the
+    /// segment again.
+    ///
+    /// Returns `true` when the segment exists and the archive can hold an
+    /// index; `false` when there is no segment at `(source_id, stream,
+    /// seq)`, or the archive is a schema 4 one from before the index column
+    /// (an index given to
     /// [`insert_segment_with_index`](Self::insert_segment_with_index) there
-    /// is dropped too).
+    /// is dropped too), whatever `index` is.
     ///
-    /// A copy already made by replication keeps the index it was sent with:
-    /// a replaced index is not sent as a frame.
+    /// A copy already made by replication keeps the index it was sent
+    /// with. A replaced index is not sent on its own, but a segment sent
+    /// again (a stream a resumed copy does not hold, or the segments above
+    /// a `Sync` point) carries the current one.
     pub fn replace_segment_index(
         &mut self,
         source_id: i64,

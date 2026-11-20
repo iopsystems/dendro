@@ -468,6 +468,7 @@ fn replacing_an_index_rewrites_only_that_segments_index() {
         .into_iter()
         .map(|s| s.bytes)
         .collect();
+    let metas = before.read_segment_meta(id, "a").unwrap();
     drop(before);
     let (seq, _) = indexes[1].clone();
 
@@ -487,6 +488,11 @@ fn replacing_an_index_rewrites_only_that_segments_index() {
         .map(|s| s.bytes)
         .collect();
     assert_eq!(after_bytes, bytes, "the segments' bytes are unchanged");
+    assert_eq!(
+        after.read_segment_meta(id, "a").unwrap(),
+        metas,
+        "the segments' catalog rows are unchanged"
+    );
     assert_eq!(
         after.read_segment_indexes(id, "b").unwrap().len(),
         indexes.len(),
@@ -578,11 +584,13 @@ fn a_v4_archive_replaces_the_index_in_its_column_or_holds_none() {
     let mut db = ArchiveMut::open(&path).unwrap();
     db.insert_segment_with_index(id, "a", 0, &m, b"x", Some(b"old"))
         .unwrap();
+    let metas = db.read_segment_meta(id, "a").unwrap();
     assert!(db.replace_segment_index(id, "a", 0, Some(b"new")).unwrap());
     assert_eq!(
         db.read_segment_indexes(id, "a").unwrap(),
         vec![(0, Some(b"new".to_vec()))]
     );
+    assert_eq!(db.read_segment_meta(id, "a").unwrap(), metas);
     assert!(!db.replace_segment_index(id, "a", 1, Some(b"x")).unwrap());
 
     let path = dir.path().join("v4-old.dendro");
