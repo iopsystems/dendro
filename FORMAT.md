@@ -258,7 +258,11 @@ what I am looking for" without opening it. On schema 5 it is a row of
 none for has no row. On schema 4 it is the last column of `segments`,
 `caller_index`, `NULL` where the caller wrote none; a v4 archive from before
 that column holds none, and an index written to one is dropped. A reader
-reads indexes through `Archive::read_segment_indexes` either way.
+reads indexes through `Archive::read_segment_indexes` either way. The caller
+may replace or remove a segment's index after insert
+(`ArchiveMut::replace_segment_index`); the segment's bytes and catalog row
+are unchanged. A replicated copy keeps the index it received, until a
+segment is sent to it again.
 
 It moved out of the segment row because SQLite stores a row's columns in
 declaration order and spills a large BLOB onto overflow pages: an index
