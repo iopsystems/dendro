@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-24
+
 ### Added
 
 - `rewrite::copy_sources_into_as_copies`: as `copy_sources_into`, except
