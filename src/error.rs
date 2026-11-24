@@ -70,8 +70,9 @@ pub enum Error {
 
     /// A source with this uuid is already in the archive. A uuid is a
     /// source's identity (FORMAT.md §3.1), so a second source with it would
-    /// claim to be the first: an insert, a copy and a replication subscriber
-    /// refuse one.
+    /// claim to be the first: an insert, a plain copy and a replication
+    /// subscriber refuse one; `rewrite::copy_sources_into_as_copies` mints
+    /// the copy a fresh uuid instead.
     DuplicateSource {
         /// The uuid.
         uuid: String,

@@ -33,6 +33,22 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `rewrite::copy_sources_into_as_copies`: as `copy_sources_into`, except
+  that a source the destination already holds is inserted under a fresh
+  uuid, with the uuid it copies recorded as its `origin`, instead of being
+  refused as `Error::DuplicateSource`. Two copies of one source (two
+  snapshots of one recording, or an archive an older build wrote holding a
+  source twice) can then be put in one archive. `SourceRow::origin` and
+  `read::SourceCatalog::origin` read it, and `SourceRow::identity` is the
+  origin when set, else the uuid.
+- `sources.origin`, a nullable column (FORMAT.md §3.1). An archive created
+  before it reads every origin as `NULL`, and gains the column when a copy
+  that has an origin is inserted into it; the schema version is unchanged.
+  Replication does not carry it.
+- `Transaction::set_origin`.
+
 ## [0.8.2] - 2026-11-23
 
 ### Added

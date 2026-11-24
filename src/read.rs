@@ -64,9 +64,15 @@ impl StreamCatalog {
 pub struct SourceCatalog {
     /// The `sources` row id, which names this source within one archive.
     pub id: i64,
-    /// The source's identity ACROSS files, carried verbatim by every copy.
-    /// `None` for an archive written before the column existed.
+    /// The row's name ACROSS files, carried verbatim by a copy except one
+    /// kept under a fresh uuid ([`origin`](Self::origin)). `None` for an
+    /// archive written before the column existed.
     pub uuid: Option<String>,
+    /// For a copy kept under a fresh uuid, and any copy of one, the uuid of
+    /// the first source in that chain of copies
+    /// ([`SourceRow::origin`](crate::archive::SourceRow::origin)); `None`
+    /// otherwise.
+    pub origin: Option<String>,
     /// What distinguishes this source from the others: one producer, one
     /// clock domain, one label set.
     pub labels: BTreeMap<String, String>,
@@ -131,6 +137,7 @@ fn catalog_snapshotted(db: &Archive) -> Result<Vec<SourceCatalog>> {
         out.push(SourceCatalog {
             id: src.id,
             uuid: src.uuid,
+            origin: src.origin,
             labels: src.meta.labels,
             metadata: src.meta.metadata,
             complete: src.complete,

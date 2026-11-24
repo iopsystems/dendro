@@ -115,7 +115,8 @@ CREATE TABLE sources(
   clock_anchor_wall_ns INTEGER NOT NULL,
   uuid TEXT,                           -- absent in archives before it existed
   heartbeat INTEGER,                   -- absent in archives before it existed
-  heartbeat_interval_ns INTEGER        -- absent in archives before it existed
+  heartbeat_interval_ns INTEGER,       -- absent in archives before it existed
+  origin TEXT                          -- absent in archives before it existed
 );
 CREATE UNIQUE INDEX sources_by_uuid ON sources(uuid);  -- absent in archives created before it
 CREATE TABLE segments(
@@ -192,19 +193,33 @@ caused).
 
 - **`id`** is the rowid and is local to this file. Every copy renumbers it;
   it is not an identity.
-- **`uuid`** is the identity: a random v4 UUID in canonical `8-4-4-4-12`
-  lowercase form, minted when the row is inserted and carried verbatim by
-  every copy. Two sources with equal `uuid` are the same source, so an
-  archive holds at most one source per `uuid`: an insert, a copy and a
-  replication subscriber refuse a second (`Error::DuplicateSource`), and
+- **`uuid`** names the row across files: a random v4 UUID in canonical
+  `8-4-4-4-12` lowercase form, minted when the row is inserted and carried
+  verbatim by a copy, except a copy kept under a fresh uuid (see `origin`).
+  Two sources with equal `uuid` are the same source, so an archive holds at
+  most one source per `uuid`: an insert, a plain copy and a replication
+  subscriber refuse a second (`Error::DuplicateSource`).
   `CopySpec::keep_sources` lets a copy leave out the ones the destination
-  holds. An archive created by a release that has the `UNIQUE` index
+  holds, and `rewrite::copy_sources_into_as_copies` keeps them under fresh
+  uuids. An archive created by a release that has the `UNIQUE` index
   `sources_by_uuid` carries it; one created earlier has none, and a build
   that did not check could leave a duplicate there, which `verify` reports
   (`Problem::DuplicateUuid`). `NULL` means unknown (the archive predates the
   column); a copy of such a source mints a fresh uuid, so two copies are not
   claimed identical, only not known to differ. `rewrite::shared_sources` is
   the comparison.
+- **`origin`** is set on a copy inserted under a fresh `uuid` because the
+  archive already held the copied source's own
+  (`rewrite::copy_sources_into_as_copies`):
+  the `uuid` of the source it copies, and a copy of such a copy keeps it. It
+  is `NULL` for every other source, and an archive created before the column
+  gains it when a copy that has an origin is inserted; a reader treats a
+  missing column as `NULL`. The source a row records is its `origin` when
+  set, else its `uuid` (`SourceRow::identity`): two rows of one identity
+  hold rows of one source,
+  copied separately, and a reader may read them as one. Replication does not
+  carry `origin`: a subscriber's copy of such a source has only its own
+  `uuid`.
 - **`labels`** is the source's *name*: an open string map for selection and
   display. Labels need not be unique; a tool that must name one source and
   cannot refuses.
@@ -610,8 +625,9 @@ release". The format is tracked here; the crate is tracked in `CHANGELOG.md`.
   Also a new table whose loss to an old copier loses data nobody can
   regenerate: see version 5 below.
 - **What does not.** A nullable column an old reader can ignore (`uuid`,
-  `caller_index`, `heartbeat` and `heartbeat_interval_ns` were added this
-  way); a new reserved metadata key
+  `caller_index`, `heartbeat`, `heartbeat_interval_ns` and `origin` were
+  added this way; an old reader or copier takes a copy with an `origin` for
+  a source of its own); a new reserved metadata key
   (`producer_epoch`, `writer_sessions` were); a new event kind. Old copiers
   drop what they do not know, which degrades to "unknown", never to wrong.
   One exception: a writer older than the heartbeat that resumes a source a
