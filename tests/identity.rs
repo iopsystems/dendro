@@ -598,3 +598,131 @@ fn a_file_with_duplicate_uuids_copies_with_one_of_each() {
         .unwrap();
     assert_eq!(dst.read_sources().unwrap().len(), 1);
 }
+
+/// One source copied twice into one archive, the second with
+/// `fresh_uuid_if_held`: the second copy gets a fresh uuid and records the
+/// first's as its origin, so both rows have one identity. A plain copy of
+/// that archive carries the origin, and copying it again keeps the uuid it
+/// copies as the origin, not the copy's.
+#[test]
+fn a_held_source_is_copied_under_a_fresh_uuid_with_its_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let mut src = ArchiveMut::create(&src_path).unwrap();
+    src.insert_source(&source("a")).unwrap();
+    let uuid = src.read_sources().unwrap()[0].uuid.clone().unwrap();
+    drop(src);
+    let src = Archive::open(&src_path).unwrap();
+    let fresh = CopySpec {
+        fresh_uuid_if_held: true,
+        ..CopySpec::everything()
+    };
+
+    let dst_path = dir.path().join("dst.dendro");
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    for spec in [&CopySpec::everything(), &fresh] {
+        dst.transaction(|tx| copy_sources_into(&src, tx, spec, &Never))
+            .unwrap();
+    }
+    let rows = dst.read_sources().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].uuid.as_deref(), rows[0].origin.as_deref()),
+        (Some(&*uuid), None)
+    );
+    assert_ne!(rows[1].uuid.as_deref(), Some(&*uuid));
+    assert_eq!(rows[1].origin.as_deref(), Some(&*uuid));
+    assert!(rows.iter().all(|r| r.identity() == Some(&*uuid)));
+    drop(dst);
+
+    // A plain copy carries each row's origin; a fresh copy of the copy
+    // records the uuid it copies, not a chain.
+    let dst = Archive::open(&dst_path).unwrap();
+    let again_path = dir.path().join("again.dendro");
+    let mut again = ArchiveMut::create(&again_path).unwrap();
+    for spec in [&CopySpec::everything(), &fresh] {
+        again
+            .transaction(|tx| copy_sources_into(&dst, tx, spec, &Never))
+            .unwrap();
+    }
+    let rows = again.read_sources().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[1].origin.as_deref(), Some(&*uuid));
+    assert!(
+        rows.iter().all(|r| r.identity() == Some(&*uuid)),
+        "{rows:?}"
+    );
+}
+
+/// A file an older build wrote with two sources under one uuid copies
+/// whole with `fresh_uuid_if_held`: the second becomes a copy of the first.
+#[test]
+fn a_file_holding_a_source_twice_copies_with_fresh_uuids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.dendro");
+    let mut db = ArchiveMut::create(&path).unwrap();
+    db.insert_source(&source("a")).unwrap();
+    let uuid = db.read_sources().unwrap()[0].uuid.clone().unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP INDEX sources_by_uuid;").unwrap();
+    conn.execute(
+        "INSERT INTO sources(labels, metadata, complete, clock_anchor_wall_ns, uuid) \
+         VALUES ('{}', '{}', 0, 0, ?1)",
+        [&uuid],
+    )
+    .unwrap();
+    drop(conn);
+    let src = Archive::open(&path).unwrap();
+
+    let dst_path = dir.path().join("dst.dendro");
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    let err = dst
+        .transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Never))
+        .unwrap_err();
+    assert!(matches!(err, Error::DuplicateSource { .. }), "{err}");
+    let fresh = CopySpec {
+        fresh_uuid_if_held: true,
+        ..CopySpec::everything()
+    };
+    dst.transaction(|tx| copy_sources_into(&src, tx, &fresh, &Never))
+        .unwrap();
+    let rows = dst.read_sources().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].origin.as_deref(), Some(&*uuid));
+    assert!(rows.iter().all(|r| r.identity() == Some(&*uuid)));
+}
+
+/// An archive created before the `origin` column reads every origin as
+/// `None`, and gains the column when a copy needs it.
+#[test]
+fn an_archive_before_the_origin_column_gains_it_when_a_copy_needs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.dendro");
+    let mut src = ArchiveMut::create(&src_path).unwrap();
+    src.insert_source(&source("a")).unwrap();
+    drop(src);
+    let src = Archive::open(&src_path).unwrap();
+
+    let dst_path = dir.path().join("older.dendro");
+    let mut dst = ArchiveMut::create(&dst_path).unwrap();
+    dst.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Never))
+        .unwrap();
+    drop(dst);
+    rusqlite::Connection::open(&dst_path)
+        .unwrap()
+        .execute_batch("ALTER TABLE sources DROP COLUMN origin;")
+        .unwrap();
+    let mut dst = ArchiveMut::open(&dst_path).unwrap();
+    assert_eq!(dst.read_sources().unwrap()[0].origin, None);
+    let fresh = CopySpec {
+        fresh_uuid_if_held: true,
+        ..CopySpec::everything()
+    };
+    dst.transaction(|tx| copy_sources_into(&src, tx, &fresh, &Never))
+        .unwrap();
+    let rows = dst.read_sources().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].origin, None);
+    assert_eq!(rows[1].origin, rows[0].uuid);
+}

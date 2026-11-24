@@ -733,6 +733,14 @@ pub struct CopySpec<'a> {
     /// pass them, or its projected segments come back encoded differently
     /// from its sealed ones.
     pub writer_props: Option<parquet::file::properties::WriterProperties>,
+    /// When the destination already holds a copied source's uuid, insert the
+    /// copy under a freshly minted uuid and record the uuid it is a copy of
+    /// as its [`origin`](crate::archive::SourceRow::origin), instead of
+    /// refusing it as [`Error::DuplicateSource`]. Its rows are copied whole;
+    /// a reader that takes [`SourceRow::identity`](crate::archive::SourceRow::identity)
+    /// as a source's identity reads the two as one source. A copy of such a
+    /// copy keeps its origin. `false` in [`everything`](Self::everything).
+    pub fresh_uuid_if_held: bool,
 }
 
 impl CopySpec<'_> {
@@ -759,6 +767,7 @@ impl CopySpec<'_> {
             metadata_extra: None,
             keep_columns: None,
             writer_props: None,
+            fresh_uuid_if_held: false,
         }
     }
 }
@@ -855,8 +864,20 @@ fn copy_sources_snapshotted(
             }
         }
         // The copy IS the source — same identity, so a later assembly can
-        // tell "this again" from "another one with the same labels".
-        let id = tx.insert_source_with_uuid(&meta, rec.uuid.as_deref())?;
+        // tell "this again" from "another one with the same labels". With
+        // `fresh_uuid_if_held`, a copy the destination already holds is kept
+        // under a fresh uuid, with the one it copies as its origin.
+        let (id, origin) = match tx.insert_source_with_uuid(&meta, rec.uuid.as_deref()) {
+            Ok(id) => (id, rec.origin.clone()),
+            Err(Error::DuplicateSource { uuid }) if spec.fresh_uuid_if_held => {
+                let id = tx.insert_source_with_uuid(&meta, None)?;
+                (id, Some(rec.origin.clone().unwrap_or(uuid)))
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(origin) = origin {
+            tx.set_origin(id, &origin)?;
+        }
         if rec.complete {
             tx.mark_complete(id)?;
         }

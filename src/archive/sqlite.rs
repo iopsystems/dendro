@@ -247,6 +247,22 @@ pub struct SourceRow {
     pub heartbeat: Option<i64>,
     /// How often the writer bumps [`heartbeat`](Self::heartbeat), in ns.
     pub heartbeat_interval_ns: Option<i64>,
+    /// For a source copied in under a fresh uuid because the destination
+    /// already held its own ([`CopySpec::fresh_uuid_if_held`](crate::rewrite::CopySpec::fresh_uuid_if_held)),
+    /// the uuid of the source it is a copy of; `None` for any other source,
+    /// and in an archive without the column. See [`identity`](Self::identity).
+    pub origin: Option<String>,
+}
+
+impl SourceRow {
+    /// The uuid of the source this row records: its [`origin`](Self::origin)
+    /// when it is a copy kept under a fresh uuid, else its own
+    /// [`uuid`](Self::uuid). Two rows with one identity hold rows of one
+    /// source, as two copies of a source under one uuid did before an
+    /// archive held a source once.
+    pub fn identity(&self) -> Option<&str> {
+        self.origin.as_deref().or(self.uuid.as_deref())
+    }
 }
 
 /// Whether a source's writer is running, judged from its heartbeat across
@@ -1372,11 +1388,16 @@ impl Archive {
         } else {
             "NULL"
         };
+        let origin_col = if has_column(&self.conn, "sources", "origin")? {
+            "origin"
+        } else {
+            "NULL"
+        };
         let mut stmt = self
             .conn
             .prepare(&format!(
                 "SELECT id, labels, metadata, complete, clock_anchor_wall_ns, {uuid_col}, \
-                 {heartbeat_col}, {interval_col} FROM sources ORDER BY id"
+                 {heartbeat_col}, {interval_col}, {origin_col} FROM sources ORDER BY id"
             ))
             .map_err(Error::sqlite("failed to query sources"))?;
         let rows = stmt
@@ -1390,19 +1411,30 @@ impl Archive {
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(Error::sqlite("failed to query sources"))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, labels, metadata, complete, anchor, uuid, heartbeat, heartbeat_interval_ns) =
-                row.map_err(Error::sqlite("failed to read source"))?;
+            let (
+                id,
+                labels,
+                metadata,
+                complete,
+                anchor,
+                uuid,
+                heartbeat,
+                heartbeat_interval_ns,
+                origin,
+            ) = row.map_err(Error::sqlite("failed to read source"))?;
             out.push(SourceRow {
                 id,
                 uuid,
                 heartbeat,
                 heartbeat_interval_ns,
+                origin,
                 meta: SourceMeta {
                     labels: serde_json::from_str(&labels).map_err(|e| {
                         Error::Message(format!("source {id} has invalid labels: {e}"))
@@ -3942,6 +3974,26 @@ impl Transaction<'_> {
         Ok(())
     }
 
+    /// Record that `source_id` is a copy of the source whose uuid is
+    /// `origin` ([`SourceRow::origin`]), adding the `origin` column to an
+    /// archive created before it.
+    pub fn set_origin(&self, source_id: i64, origin: &str) -> Result<()> {
+        if !has_column(&self.tx, "sources", "origin")? {
+            self.tx
+                .execute_batch("ALTER TABLE sources ADD COLUMN origin TEXT")
+                .map_err(Error::sqlite("failed to add the origin column"))?;
+        }
+        self.tx
+            .execute(
+                "UPDATE sources SET origin = ?2 WHERE id = ?1",
+                rusqlite::params![source_id, origin],
+            )
+            .map_err(Error::sqlite(format!(
+                "failed to set the origin of source {source_id}"
+            )))?;
+        Ok(())
+    }
+
     /// Set the interval a writer bumps `source_id`'s heartbeat at, keeping
     /// the count it has.
     pub fn set_heartbeat_interval(&self, source_id: i64, interval_ns: i64) -> Result<()> {
@@ -4298,7 +4350,11 @@ CREATE TABLE sources(
   -- archives written before the columns existed; readers treat that as
   -- unknown.
   heartbeat INTEGER,
-  heartbeat_interval_ns INTEGER
+  heartbeat_interval_ns INTEGER,
+  -- For a copy inserted under a fresh uuid because the archive already held
+  -- its own: the uuid of the source it copies. NULL for every other source,
+  -- and absent in archives created before the column.
+  origin TEXT
 );
 -- At most one source per uuid. Created with the archive; an archive created
 -- before it has no index, and every insert checks instead (FORMAT.md §3.1).

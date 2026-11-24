@@ -33,6 +33,21 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+### Added
+
+- `CopySpec::fresh_uuid_if_held`: a copy of a source the destination
+  already holds is inserted under a fresh uuid, with the uuid it copies
+  recorded as its `origin`, instead of being refused as
+  `Error::DuplicateSource`. Two copies of one source (two snapshots of one
+  recording, or an archive an older build wrote holding a source twice)
+  can then be put in one archive. `SourceRow::origin` reads it, and
+  `SourceRow::identity` is the origin when set, else the uuid.
+- `sources.origin`, a nullable column (FORMAT.md §3.1). An archive created
+  before it reads every origin as `NULL`, and gains the column when such a
+  copy is inserted; the schema version is unchanged. Replication does not
+  carry it.
+- `Transaction::set_origin`.
+
 ## [0.8.2] - 2026-11-23
 
 ### Added
