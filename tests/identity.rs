@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use dendro::archive::{sniff, sniff_bytes, Archive, ArchiveMut, Sniff, SourceMeta, WalRow};
-use dendro::rewrite::{copy_sources_into, shared_sources, CopySpec};
+use dendro::rewrite::{copy_sources_into, copy_sources_into_as_copies, shared_sources, CopySpec};
 use dendro::segment::{EncodeContext, EncodeResult, SegmentEncoder};
 use dendro::Error;
 
@@ -600,7 +600,7 @@ fn a_file_with_duplicate_uuids_copies_with_one_of_each() {
 }
 
 /// One source copied twice into one archive, the second with
-/// `fresh_uuid_if_held`: the second copy gets a fresh uuid and records the
+/// `copy_sources_into_as_copies`: the second copy gets a fresh uuid and records the
 /// first's as its origin, so both rows have one identity. A plain copy of
 /// that archive carries the origin, and copying it again keeps the uuid it
 /// copies as the origin, not the copy's.
@@ -613,17 +613,14 @@ fn a_held_source_is_copied_under_a_fresh_uuid_with_its_origin() {
     let uuid = src.read_sources().unwrap()[0].uuid.clone().unwrap();
     drop(src);
     let src = Archive::open(&src_path).unwrap();
-    let fresh = CopySpec {
-        fresh_uuid_if_held: true,
-        ..CopySpec::everything()
-    };
+    let all = CopySpec::everything();
 
     let dst_path = dir.path().join("dst.dendro");
     let mut dst = ArchiveMut::create(&dst_path).unwrap();
-    for spec in [&CopySpec::everything(), &fresh] {
-        dst.transaction(|tx| copy_sources_into(&src, tx, spec, &Never))
-            .unwrap();
-    }
+    dst.transaction(|tx| copy_sources_into(&src, tx, &all, &Never))
+        .unwrap();
+    dst.transaction(|tx| copy_sources_into_as_copies(&src, tx, &all, &Never))
+        .unwrap();
     let rows = dst.read_sources().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(
@@ -640,11 +637,12 @@ fn a_held_source_is_copied_under_a_fresh_uuid_with_its_origin() {
     let dst = Archive::open(&dst_path).unwrap();
     let again_path = dir.path().join("again.dendro");
     let mut again = ArchiveMut::create(&again_path).unwrap();
-    for spec in [&CopySpec::everything(), &fresh] {
-        again
-            .transaction(|tx| copy_sources_into(&dst, tx, spec, &Never))
-            .unwrap();
-    }
+    again
+        .transaction(|tx| copy_sources_into(&dst, tx, &all, &Never))
+        .unwrap();
+    again
+        .transaction(|tx| copy_sources_into_as_copies(&dst, tx, &all, &Never))
+        .unwrap();
     let rows = again.read_sources().unwrap();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[1].origin.as_deref(), Some(&*uuid));
@@ -655,7 +653,7 @@ fn a_held_source_is_copied_under_a_fresh_uuid_with_its_origin() {
 }
 
 /// A file an older build wrote with two sources under one uuid copies
-/// whole with `fresh_uuid_if_held`: the second becomes a copy of the first.
+/// whole with `copy_sources_into_as_copies`: the second becomes a copy of the first.
 #[test]
 fn a_file_holding_a_source_twice_copies_with_fresh_uuids() {
     let dir = tempfile::tempdir().unwrap();
@@ -681,11 +679,7 @@ fn a_file_holding_a_source_twice_copies_with_fresh_uuids() {
         .transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &Never))
         .unwrap_err();
     assert!(matches!(err, Error::DuplicateSource { .. }), "{err}");
-    let fresh = CopySpec {
-        fresh_uuid_if_held: true,
-        ..CopySpec::everything()
-    };
-    dst.transaction(|tx| copy_sources_into(&src, tx, &fresh, &Never))
+    dst.transaction(|tx| copy_sources_into_as_copies(&src, tx, &CopySpec::everything(), &Never))
         .unwrap();
     let rows = dst.read_sources().unwrap();
     assert_eq!(rows.len(), 2);
@@ -715,11 +709,7 @@ fn an_archive_before_the_origin_column_gains_it_when_a_copy_needs_it() {
         .unwrap();
     let mut dst = ArchiveMut::open(&dst_path).unwrap();
     assert_eq!(dst.read_sources().unwrap()[0].origin, None);
-    let fresh = CopySpec {
-        fresh_uuid_if_held: true,
-        ..CopySpec::everything()
-    };
-    dst.transaction(|tx| copy_sources_into(&src, tx, &fresh, &Never))
+    dst.transaction(|tx| copy_sources_into_as_copies(&src, tx, &CopySpec::everything(), &Never))
         .unwrap();
     let rows = dst.read_sources().unwrap();
     assert_eq!(rows.len(), 2);

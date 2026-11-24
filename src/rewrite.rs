@@ -703,14 +703,13 @@ pub struct CopySpec<'a> {
     pub keep_streams: Option<&'a dyn Fn(&str) -> bool>,
     /// Copy only the sources this accepts; `None` copies every source.
     ///
-    /// A destination holds at most one source per uuid, so a copy of a
-    /// source it already holds is refused as
-    /// [`Error::DuplicateSource`], and the
-    /// caller's transaction with it. A combine of archives that share a
-    /// source leaves the shared ones out here
-    /// ([`shared_sources`] lists them), and a repair of a file an older build
-    /// left with two sources per uuid keeps one of each. The rows of a
-    /// source left out are not copied; nothing merges two sources. The
+    /// A destination holds at most one source per uuid, so
+    /// [`copy_sources_into`] refuses a copy of a source it already holds as
+    /// [`Error::DuplicateSource`], and the caller's transaction with it. A
+    /// combine of archives that share a source can leave the shared ones
+    /// out here ([`shared_sources`] lists them), or keep them under fresh
+    /// uuids with [`copy_sources_into_as_copies`]. The rows of a source left
+    /// out are not copied. The
     /// archive's documents are copied whatever this leaves out.
     pub keep_sources: Option<&'a dyn Fn(&SourceRow) -> bool>,
     /// Extra metadata merged into each copied source's own, overwriting on
@@ -733,14 +732,6 @@ pub struct CopySpec<'a> {
     /// pass them, or its projected segments come back encoded differently
     /// from its sealed ones.
     pub writer_props: Option<parquet::file::properties::WriterProperties>,
-    /// When the destination already holds a copied source's uuid, insert the
-    /// copy under a freshly minted uuid and record the uuid it is a copy of
-    /// as its [`origin`](crate::archive::SourceRow::origin), instead of
-    /// refusing it as [`Error::DuplicateSource`]. Its rows are copied whole;
-    /// a reader that takes [`SourceRow::identity`](crate::archive::SourceRow::identity)
-    /// as a source's identity reads the two as one source. A copy of such a
-    /// copy keeps its origin. `false` in [`everything`](Self::everything).
-    pub fresh_uuid_if_held: bool,
 }
 
 impl CopySpec<'_> {
@@ -767,7 +758,6 @@ impl CopySpec<'_> {
             metadata_extra: None,
             keep_columns: None,
             writer_props: None,
-            fresh_uuid_if_held: false,
         }
     }
 }
@@ -778,7 +768,8 @@ impl CopySpec<'_> {
 /// alongside its original, holds sources the destination already has, which
 /// [`copy_sources_into`] refuses as
 /// [`Error::DuplicateSource`] unless
-/// [`CopySpec::keep_sources`] leaves them out. Sources without a uuid (archives from before the column)
+/// [`CopySpec::keep_sources`] leaves them out, and
+/// [`copy_sources_into_as_copies`] keeps under fresh uuids. Sources without a uuid (archives from before the column)
 /// are never reported; they are not known to be the same.
 pub fn shared_sources(a: &Archive, b: &Archive) -> Result<Vec<String>> {
     let in_a: std::collections::BTreeSet<String> = a
@@ -829,6 +820,39 @@ pub fn copy_sources_into(
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
 ) -> Result<usize> {
+    copy_sources(src, tx, spec, encoder, false)
+}
+
+/// [`copy_sources_into`], except that a source whose uuid the destination
+/// already holds is inserted under a freshly minted uuid, with the uuid it
+/// copies recorded as its [`origin`](crate::archive::SourceRow::origin),
+/// where `copy_sources_into` refuses it as [`Error::DuplicateSource`]. Its
+/// rows are copied as any other source's are. A copy of a source that has
+/// an origin keeps that origin. A reader that takes
+/// [`SourceRow::identity`](crate::archive::SourceRow::identity) as a
+/// source's identity reads the two as one source: two snapshots or dumps of
+/// one recording, or the two copies a file an older build wrote holds.
+///
+/// The encoder sees the uuid the source has in `src` while the copy seals
+/// its live tail, not the one the copy is minted with.
+pub fn copy_sources_into_as_copies(
+    src: &Archive,
+    tx: &Transaction<'_>,
+    spec: &CopySpec<'_>,
+    encoder: &dyn SegmentEncoder,
+) -> Result<usize> {
+    copy_sources(src, tx, spec, encoder, true)
+}
+
+/// [`copy_sources_into`], keeping a held source under a fresh uuid when
+/// `as_copies` ([`copy_sources_into_as_copies`]).
+fn copy_sources(
+    src: &Archive,
+    tx: &Transaction<'_>,
+    spec: &CopySpec<'_>,
+    encoder: &dyn SegmentEncoder,
+    as_copies: bool,
+) -> Result<usize> {
     // ONE snapshot over every read of the source. The destination transaction
     // is the caller's and is on another connection, so this only bounds what we
     // read.
@@ -839,7 +863,7 @@ pub fn copy_sources_into(
     // retention landing mid-copy can evict a segment between the query that
     // selected it and the read that copies its bytes. `read_snapshot`'s own
     // doc names that second one; this is the path it was describing.
-    src.read_snapshot(|src| copy_sources_snapshotted(src, tx, spec, encoder))
+    src.read_snapshot(|src| copy_sources_snapshotted(src, tx, spec, encoder, as_copies))
 }
 
 fn copy_sources_snapshotted(
@@ -847,6 +871,7 @@ fn copy_sources_snapshotted(
     tx: &Transaction<'_>,
     spec: &CopySpec<'_>,
     encoder: &dyn SegmentEncoder,
+    as_copies: bool,
 ) -> Result<usize> {
     let sources = src.read_sources()?;
     let mut copied = 0usize;
@@ -864,12 +889,12 @@ fn copy_sources_snapshotted(
             }
         }
         // The copy IS the source — same identity, so a later assembly can
-        // tell "this again" from "another one with the same labels". With
-        // `fresh_uuid_if_held`, a copy the destination already holds is kept
-        // under a fresh uuid, with the one it copies as its origin.
+        // tell "this again" from "another one with the same labels". As
+        // copies, a source the destination already holds is kept under a
+        // fresh uuid, with the one it copies as its origin.
         let (id, origin) = match tx.insert_source_with_uuid(&meta, rec.uuid.as_deref()) {
             Ok(id) => (id, rec.origin.clone()),
-            Err(Error::DuplicateSource { uuid }) if spec.fresh_uuid_if_held => {
+            Err(Error::DuplicateSource { uuid }) if as_copies => {
                 let id = tx.insert_source_with_uuid(&meta, None)?;
                 (id, Some(rec.origin.clone().unwrap_or(uuid)))
             }

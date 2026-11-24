@@ -230,10 +230,13 @@ pub struct SourceRow {
     pub id: i64,
     /// The identity the source was started with.
     pub meta: SourceMeta,
-    /// The source's identity across files: a v4 UUID minted when the row was
-    /// inserted and carried verbatim by every copy, so whether two archives
-    /// hold the same source is a comparison rather than a guess from labels.
-    /// `None` for an archive written before the column existed.
+    /// The row's name across files: a v4 UUID minted when the row was
+    /// inserted and carried verbatim by a copy, so whether two archives hold
+    /// the same source is a comparison rather than a guess from labels. A
+    /// copy made with [`copy_sources_into_as_copies`](crate::rewrite::copy_sources_into_as_copies)
+    /// of a source the destination holds is minted one instead (see
+    /// [`origin`](Self::origin)). `None` for an archive written before the
+    /// column existed.
     pub uuid: Option<String>,
     /// Whether the source was cleanly finalized. This is what replaced the
     /// `.partial` filename convention: an archive is a valid file from creation,
@@ -248,9 +251,10 @@ pub struct SourceRow {
     /// How often the writer bumps [`heartbeat`](Self::heartbeat), in ns.
     pub heartbeat_interval_ns: Option<i64>,
     /// For a source copied in under a fresh uuid because the destination
-    /// already held its own ([`CopySpec::fresh_uuid_if_held`](crate::rewrite::CopySpec::fresh_uuid_if_held)),
-    /// the uuid of the source it is a copy of; `None` for any other source,
-    /// and in an archive without the column. See [`identity`](Self::identity).
+    /// already held its own ([`copy_sources_into_as_copies`](crate::rewrite::copy_sources_into_as_copies)),
+    /// and for any copy of such a source, the uuid of the first source in
+    /// that chain of copies; `None` for any other source, and in an archive
+    /// without the column. See [`identity`](Self::identity).
     pub origin: Option<String>,
 }
 
@@ -4340,9 +4344,10 @@ CREATE TABLE sources(
   metadata TEXT NOT NULL,             -- JSON
   complete INTEGER NOT NULL DEFAULT 0,
   clock_anchor_wall_ns INTEGER NOT NULL,
-  -- The source's identity across files: minted at insert, carried verbatim
-  -- by every copy, so whether two archives hold the same source is a
-  -- comparison rather than a guess from labels. NULL only in archives
+  -- The row's name across files: minted at insert, carried verbatim by a
+  -- copy (except a copy kept under a fresh uuid; see origin), so whether two
+  -- archives hold the same source is a comparison rather than a guess from
+  -- labels. NULL only in archives
   -- written before the column existed; readers treat that as unknown.
   uuid TEXT,
   -- Bumped by a running writer every heartbeat_interval_ns, so a reader can
@@ -4352,8 +4357,9 @@ CREATE TABLE sources(
   heartbeat INTEGER,
   heartbeat_interval_ns INTEGER,
   -- For a copy inserted under a fresh uuid because the archive already held
-  -- its own: the uuid of the source it copies. NULL for every other source,
-  -- and absent in archives created before the column.
+  -- its own, and for any copy of such a source: the uuid of the first source
+  -- in that chain of copies. NULL for every other source, and absent in
+  -- archives created before the column.
   origin TEXT
 );
 -- At most one source per uuid. Created with the archive; an archive created
