@@ -33,6 +33,8 @@ cannot reach a failed release any other way.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-23
+
 ### Added
 
 - `ArchiveMut::replace_segment_index` and
